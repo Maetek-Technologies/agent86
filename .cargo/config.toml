@@ -1,0 +1,4 @@
+# Resolve dependencies to versions that support the crate's rust-version (the MSRV),
+# so `cargo add` and `cargo update` never lock a version CI's MSRV job cannot build.
+[resolver]
+incompatible-rust-versions = "fallback"

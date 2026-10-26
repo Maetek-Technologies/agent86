@@ -21,7 +21,7 @@ cargo clippy --all-targets -- -D warnings    # warnings are errors
 cargo run -- --help
 ```
 
-All three checks (test, fmt, clippy `-D warnings`) must pass. `unsafe_code` is forbidden at the crate level. MSRV is Rust 1.88 (`rust-version` in Cargo.toml, set by `tokio`/`reqwest` and their URL dependencies); avoid newer language/std features, and check a new dependency's `rust-version` before adding it. Raising the MSRV is a deliberate change: update Cargo.toml and the CI matrix together.
+All three checks (test, fmt, clippy `-D warnings`) must pass. `unsafe_code` is forbidden at the crate level. MSRV is Rust 1.88 (`rust-version` in Cargo.toml, set by `tokio`/`reqwest` and their URL dependencies); avoid newer language/std features, and check a new dependency's `rust-version` before adding it. `.cargo/config.toml` makes the resolver prefer MSRV-compatible versions, but platform-specific dependencies (for example the Linux keyring stack) only build in CI, so watch the Linux and macOS MSRV jobs. Raising the MSRV is a deliberate change: update Cargo.toml and the CI matrix together.
 
 CI (`.github/workflows/ci.yml`) runs tests on Linux, macOS, and Windows against both stable and the MSRV, with fmt and clippy on stable. Windows builds need the Visual Studio Build Tools C++ workload for `link.exe`.
 
