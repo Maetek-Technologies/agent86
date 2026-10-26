@@ -7,6 +7,7 @@ use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
+use agent86::tools::sandbox::build_executor;
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::format_turn_summary;
 use agent86::types::ApprovalMode;
@@ -14,6 +15,7 @@ use agent86::types::ModelRef;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 /// What to do next when a model cannot be built: a bad ref, an unknown provider, a missing key.
 ///
@@ -151,13 +153,20 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
 
     // Tools are jailed to the directory `agent86` runs in, as in Python.
-    let context = match std::env::current_dir().and_then(|dir| ToolContext::new(&dir)) {
+    let mut context = match std::env::current_dir().and_then(|dir| ToolContext::new(&dir)) {
         Ok(context) => context,
         Err(error) => {
             stderr.error(&format!("could not open the workspace: {error}"));
             return ExitCode::from(1);
         }
     };
+    context.policy.timeout = Duration::from_secs(config.limits.tool_timeout_s);
+    context.policy.env_passthrough = config.sandbox.env_passthrough.clone();
+    let (executor, sandbox_note) = build_executor(&config.sandbox);
+    context.executor = executor;
+    if let Some(note) = sandbox_note.filter(|_| !as_json) {
+        stderr.warn(&format!("sandbox: {note}"));
+    }
     let harness = Harness {
         provider: provider.as_ref(),
         registry: builtin_registry(),
@@ -287,6 +296,15 @@ impl Stderr {
     /// An error printed after streamed text, starting on a fresh line.
     fn error_after_stream(&self, message: &str) {
         self.write("\n", "\x1b[31m", "error:", message);
+    }
+
+    /// A yellow notice, as Rich's `[yellow]...[/yellow]`.
+    fn warn(&self, message: &str) {
+        if self.color {
+            eprintln!("\x1b[33m{message}\x1b[0m");
+        } else {
+            eprintln!("{message}");
+        }
     }
 
     fn dim(&self, message: &str) {

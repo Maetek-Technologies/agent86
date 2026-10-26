@@ -702,3 +702,40 @@ async fn redact_mode_from_config_covers_text_and_json_output() {
     );
     assert!(!stdout(&json).contains("jane@example.com"));
 }
+
+#[tokio::test]
+async fn shell_commands_need_approval_like_any_side_effect() {
+    let command_then_answer = || {
+        vec![
+            sse_tool_calls(&[(
+                "c",
+                "run_command",
+                r#"{"command": "echo from-the-sandbox"}"#,
+            )]),
+            sse_text("ran it", "stop"),
+        ]
+    };
+
+    let server = MockServer::start(command_then_answer()).await;
+    let workspace = Workspace::with_mock_provider("shell-piped", &server);
+    let piped = workspace.run(&["run", "run it"]).await;
+    assert!(
+        stdout(&piped).contains(
+            "[tool] run_command -> error: Not executed: approval required but no prompt available."
+        ),
+        "{}",
+        stdout(&piped)
+    );
+
+    let server = MockServer::start(command_then_answer()).await;
+    let workspace = Workspace::with_mock_provider("shell-yes", &server);
+    let approved = workspace.run(&["run", "--yes", "run it"]).await;
+    assert!(approved.status.success(), "{}", stderr(&approved));
+    assert!(
+        stdout(&approved).contains("[tool] run_command -> exit code: 0\n"),
+        "{}",
+        stdout(&approved)
+    );
+    let observed = server.requests()[1].body["messages"][3]["content"].clone();
+    assert_eq!(observed, "exit code: 0\nstdout:\nfrom-the-sandbox");
+}

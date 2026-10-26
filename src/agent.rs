@@ -547,6 +547,7 @@ mod tests {
             max_consecutive_errors: 1,
             max_output_tokens: 8192,
             parallel_tools: true,
+            tool_timeout_s: 60,
         }
     }
 

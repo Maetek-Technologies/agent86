@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, and guardrails (stage 5) done; sandboxed command and Python execution (stages 5-6) next
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), and sandboxed command and Python execution (stage 6) done; sessions, memory, and observability (stage 7) next
 
 ## 1. Purpose
 
@@ -59,15 +59,17 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added the ReAct loop (stage 4), ported from `orchestration/loop.py` and `orchestration/circuit.py`: each step sends the full history plus the tool specs; tool calls are announced as `[tool] name(<json.dumps args>)` and observed as `[tool] name -> <first line>`, both in the streamed output and in `run --json`'s `output`, as Python does; results return to the model in call order; read-only calls in one step run concurrently (`limits.parallel_tools`); unparseable tool-call JSON is answered before dispatch; the circuit breaker enforces `max_steps` (40), `max_cost_usd` (5.0), `max_wall_clock_s` (900), and `max_consecutive_errors` (3) with Python's messages; answers cut off by the output cap get up to 3 continuations, collapsed into one answer. `run` offers `read_file` and `list_dir`, jailed to the current directory. Tool-call arguments are sent back as Python's `json.dumps` output, and `serde_json`'s `preserve_order` keeps argument key order
 - Added the approval gate and the file-writing tools (stage 5, part 1), ported from `guardrails/policy.py`, `ui/repl.py`, and `tools/builtin/files.py`: `[guardrails] approval` (`ask` by default, `auto`, `deny`) with `AGENT86_APPROVAL`, `--approval`, and `run --yes`/`-y`; a `[y/N]` terminal prompt that shows the tool's preview (a unified diff) and is installed only when stdin is a terminal, so piped runs decline side effects under `ask`; Python's batch ordering (approvals first, reads in parallel, then writes in call order) and its `Not executed: <reason>.` observations; `write_file` and `edit_file` with Python's messages, BOM and CRLF preservation, aliases (`old`/`new`), and pydantic's boolean rules. Diffs come from a port of CPython's `difflib` (`SequenceMatcher` with its autojunk heuristic, and `unified_diff`), checked against CPython output
 - Added the guardrails (stage 5, part 2), ported from `guardrails/scanners.py`, `ingress.py`, and `egress.py`: Python's injection, secret, and PII regexes verbatim (checked against strings extracted from the Python source by parsing it) with results checked against CPython's `re`; `[guardrails] ingress` (`off`/`warn`/`block`), `egress` (`off`/`warn`/`redact`), and `scan_observations`. As in Python, a flagged goal is noted (`[guardrail] input flagged: ...`) or, in block mode with injection, refused without a model call; each answer is scanned and flagged after it, or in redact mode buffered and replayed redacted, including in the history; tool output with injection is wrapped in the untrusted-data banner; and `run --json` output gets a final egress pass
+- Added sandboxed execution (stage 6), ported from `tools/sandbox/policy.py`, `subprocess_exec.py`, `docker_exec.py`, `executor.py`, and `builtin/shell.py` and `python_exec.py`: `run_command` (`cmd.exe /c` or `/bin/sh -c`, as Python's `shell=True`) and `python_exec` (code over stdin to `python -I -`), both side-effecting; the workspace as working directory; Python's environment allowlist, `LC_`/`XDG_` families, `sandbox.env_passthrough`, and credential-name refusal; `limits.tool_timeout_s` (60) with the child in its own process group and the whole tree killed on timeout (`taskkill /T` or a group `SIGKILL`), exit code 124 and `[timed out after Ns]`; text-mode decoding with universal newlines; and the opt-in Docker backend (`--rm`, `--memory`, `--cpus`, `--pids-limit 256`, `--network none` unless enabled, `/workspace` bind mount, named containers killed on timeout), falling back to the subprocess sandbox with Python's `sandbox:` note when Docker is unavailable
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **149 passed** (46 unit, 10 compatibility, 18 provider integration, 24 CLI end-to-end, 13 tools, 11 write tools and approvals, 2 difflib, 2 guardrails, 19 agent loop, 2 system prompt, 2 API key), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **161 passed on Windows** (46 unit, 10 compatibility, 18 provider integration, 25 CLI end-to-end, 13 tools, 11 write tools and approvals, 11 exec tools, 2 difflib, 2 guardrails, 19 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live sandbox check (2026-10-26, `openrouter:openai/gpt-4o-mini`, `run --yes`): the model ran `python_exec` (sum of squares, 385) and `run_command` (`ls`) in one step and reported both correctly
 - Live file-writing check (2026-10-26, `openrouter:openai/gpt-4o-mini`, `run --yes` in a throwaway directory): the model called `edit_file` and `write_file` in one step, and both files on disk were correct
 - Live agent-loop check (2026-10-26, `openrouter:openai/gpt-4o-mini`): asked to inspect this repository, the model called `list_dir`, then `read_file README.md` and `list_dir tests` in one parallel step, and answered correctly (3 steps, 3 tools, about 2.7k input tokens)
 - Live keyring check (2026-10-26): with no environment variable set, `run` used the OpenRouter key from Windows Credential Manager and sent the system prompt (337 input tokens)
@@ -79,7 +81,7 @@ The project is **not yet a usable agent**. It currently has no:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
-- `run_command`, `python_exec`, and `web_fetch`, and the sandbox executors behind them (stages 5 and 6)
+- `web_fetch`
 - Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
 - Guardrails, approvals, or sandbox executors
 - Session persistence, memory, or tracing
@@ -103,7 +105,7 @@ The project is **not yet a usable agent**. It currently has no:
 
 ### Known loop differences from Python
 
-- Only `read_file`, `write_file`, `edit_file`, and `list_dir` are offered. Python also offers `run_command`, `python_exec`, and `web_fetch`, plus memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
+- `web_fetch` is not offered yet. Python also offers memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
 - The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
 - Tool-call arguments are not egress-scanned; Python only records those findings in its flight recorder, which is not ported.
 - There is no cancellation (Ctrl-C ends the process), no flight recorder, and no session persistence.
@@ -116,6 +118,11 @@ The project is **not yet a usable agent**. It currently has no:
 ### Known guardrail differences from Python
 
 - Python's `\s` also matches the control characters U+001C to U+001F; the Rust `regex` crate's does not, so whitespace made of those characters can split a pattern differently. Otherwise the patterns use the same Unicode-aware `\b`, `\d`, `\s`, and case folding.
+
+### Known sandbox differences from Python
+
+- `python_exec` runs the `python` (Windows) or `python3` (elsewhere) found on PATH; Python runs its own interpreter (`sys.executable`).
+- On Windows, a child's working directory is passed without the `\\?\` verbatim prefix, which `cmd.exe` cannot use.
 
 ### Known tool differences from Python
 

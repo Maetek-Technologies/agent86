@@ -35,9 +35,15 @@ max_wall_clock_s = 900
 max_consecutive_errors = 3
 max_output_tokens = 8192
 parallel_tools = true
+tool_timeout_s = 60
 
 [sandbox]
 mode = "subprocess"
+docker_image = "python:3.12-slim"
+docker_memory = "512m"
+docker_cpus = "1"
+docker_network = false
+env_passthrough = []
 
 [guardrails]
 approval = "ask"
@@ -101,6 +107,8 @@ pub struct LimitsConfig {
     pub max_output_tokens: u32,
     /// Run a step's read-only tool calls concurrently.
     pub parallel_tools: bool,
+    /// Seconds a single sandboxed tool may run before its process tree is killed.
+    pub tool_timeout_s: u64,
 }
 
 /// Safety settings (`[guardrails]`).
@@ -138,10 +146,18 @@ pub enum EgressMode {
     Redact,
 }
 
-/// Where tool code runs (`[sandbox]`). Only `mode` is read so far.
+/// Where tool code runs (`[sandbox]`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SandboxConfig {
     pub mode: SandboxMode,
+    pub docker_image: String,
+    pub docker_memory: String,
+    pub docker_cpus: String,
+    /// Containers run with `--network none` unless this is true.
+    pub docker_network: bool,
+    /// Extra environment variable names forwarded into tool subprocesses. Names
+    /// only: values are read at spawn time, and credential-looking names are refused.
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

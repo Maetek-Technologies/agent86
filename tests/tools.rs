@@ -67,13 +67,25 @@ fn error_of(result: &ToolResult) -> &str {
 fn specs_match_the_schemas_pydantic_generates() {
     let read_only: Value = serde_json::from_str(&fixture("tools/schemas.json")).unwrap();
     let writers: Value = serde_json::from_str(&fixture("tools/write_tools.json")).unwrap();
+    let exec: Value = serde_json::from_str(&fixture("tools/exec_tools.json")).unwrap();
     let specs = builtin_registry().specs();
 
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-    assert_eq!(names, ["read_file", "write_file", "edit_file", "list_dir"]);
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "run_command",
+            "python_exec"
+        ]
+    );
     for spec in &specs {
         let expected = match spec.name.as_str() {
             "write_file" | "edit_file" => &writers["schemas"][&spec.name],
+            "run_command" | "python_exec" => &exec[&spec.name],
             _ => &read_only[&spec.name],
         };
         // Compared as text, so key order (pydantic's) is checked too.
@@ -83,7 +95,7 @@ fn specs_match_the_schemas_pydantic_generates() {
             "{}",
             spec.name
         );
-        let writes = matches!(spec.name.as_str(), "write_file" | "edit_file");
+        let writes = !matches!(spec.name.as_str(), "read_file" | "list_dir");
         assert_eq!(spec.side_effecting, writes, "{}", spec.name);
     }
     assert_eq!(
@@ -278,13 +290,13 @@ fn long_output_is_truncated_with_a_count() {
 fn unknown_tools_name_the_available_ones() {
     let workspace = Workspace::new("unknown");
 
-    let result = dispatch(&workspace.context(), "run_command", json!({"command": "x"}));
+    let result = dispatch(&workspace.context(), "web_fetch", json!({"url": "x"}));
 
     assert_eq!(result.call_id, "call-1");
-    assert_eq!(result.name, "run_command");
+    assert_eq!(result.name, "web_fetch");
     assert_eq!(
         error_of(&result),
-        "Unknown tool 'run_command'. Available: edit_file, list_dir, read_file, write_file."
+        "Unknown tool 'web_fetch'. Available: edit_file, list_dir, python_exec, read_file, run_command, write_file."
     );
 }
 
