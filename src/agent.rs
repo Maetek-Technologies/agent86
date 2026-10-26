@@ -149,9 +149,27 @@ pub struct Harness<'a> {
     pub guardrails: Guardrails,
     /// The flight recorder; [`Recorder::disabled`] writes nothing.
     pub recorder: Recorder,
+    /// Live MCP servers; their section of the system message is rebuilt for every
+    /// request, because servers drop, reconnect, and change their tools mid-turn.
+    pub mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
 }
 
 impl Harness<'_> {
+    /// The system message for the next request: the prompt plus, when MCP servers
+    /// are live, their section, as Python's `_system_content`.
+    fn system_message(&self) -> Message {
+        let mut system = self.system.clone();
+        if let Some(section) = self
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.prompt_section())
+            .filter(|section| !section.is_empty())
+        {
+            system.content = format!("{}\n\n{section}", system.content);
+        }
+        system
+    }
+
     /// Run one user turn on `state`, passing every piece of streamed text,
     /// including tool notices, to `on_text`, and return everything streamed.
     ///
@@ -251,7 +269,7 @@ impl Harness<'_> {
 
             let completion = {
                 let mut request_messages = Vec::with_capacity(state.messages.len() + 1);
-                request_messages.push(self.system.clone());
+                request_messages.push(self.system_message());
                 request_messages.extend(state.messages.iter().cloned());
                 let request = CompletionRequest {
                     model: self.provider.model().to_owned(),
@@ -524,7 +542,7 @@ impl Harness<'_> {
             // The registry's own "Unknown tool" answer.
             return (Some(self.registry.dispatch(call, &self.context)), false);
         };
-        let decision = self.gate.decide(tool, call, &self.context);
+        let decision = self.gate.decide(tool.as_ref(), call, &self.context);
         if !decision.approved {
             return (Some(not_executed(call, decision.reason)), false);
         }

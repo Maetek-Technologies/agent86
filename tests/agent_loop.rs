@@ -134,6 +134,7 @@ async fn run_with(
         gate,
         guardrails,
         recorder: Recorder::disabled(),
+        mcp: None,
     };
     let mut state = AgentState::new();
     let output = harness.run_turn(&mut state, goal, |_| {}).await?;
@@ -643,6 +644,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         gate: ask_gate(),
         guardrails: redact,
         recorder: Recorder::disabled(),
+        mcp: None,
     };
     let mut state = AgentState::new();
     let output = harness
@@ -732,6 +734,7 @@ async fn recorded_turn(
         gate,
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder,
+        mcp: None,
     };
     let mut state = AgentState::new();
     let _ = harness.run_turn(&mut state, goal, |_| {}).await;

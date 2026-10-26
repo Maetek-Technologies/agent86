@@ -16,7 +16,7 @@ use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::session::{expand_home, AgentState, SessionStore};
 use agent86::tools::sandbox::build_executor;
 use agent86::tools::web::WebSettings;
-use agent86::tools::{builtin_registry, Tool, ToolContext};
+use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
 use agent86::types::ModelRef;
@@ -300,31 +300,24 @@ fn run(
         }
     };
     // MCP servers that fail to start contribute no tools; `agent86 mcp tools` says why.
-    let mut registry = builtin_registry();
-    let mut system = build_system_prompt(config);
-    if let Some(manager) = McpManager::start(config) {
-        let section = manager.mount(&mut registry);
-        if !section.is_empty() {
-            system.content = format!(
-                "{}
-
-{section}",
-                system.content
-            );
-        }
+    let registry = builtin_registry();
+    let mcp = McpManager::start(config).map(std::sync::Arc::new);
+    if let Some(manager) = &mcp {
+        manager.attach(&registry);
     }
     let harness = Harness {
         provider: provider.as_ref(),
         registry,
         context,
         limits: config.limits.clone(),
-        system,
+        system: build_system_prompt(config),
         max_tokens,
         // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
         // there is no prompt, so `ask` declines them unless --yes was given.
         gate: ApprovalGate::new(config.guardrails.approval, terminal_prompt_if_interactive()),
         guardrails: Guardrails::new(&config.guardrails),
         recorder: Recorder::from_config(&config.observability),
+        mcp,
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -420,7 +413,7 @@ fn mcp_command(config: &Config, command: McpCommand, stderr: &Stderr) -> ExitCod
                 return ExitCode::SUCCESS;
             };
             // One line per failed server, so none is skimmed past.
-            for note in &manager.notes {
+            for note in &manager.notes() {
                 stderr.warn(note);
             }
             let rows: Vec<Vec<String>> = manager

@@ -1,0 +1,149 @@
+{
+  "schemas": {
+    "empty": {
+      "description": "Default argument model for tools that take no parameters.",
+      "properties": {},
+      "type": "object"
+    },
+    "uri": {
+      "properties": {
+        "uri": {
+          "description": "The resource URI, exactly as returned by the list_resources tool.",
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "get_prompt": {
+      "properties": {
+        "name": {
+          "description": "Prompt name, exactly as returned by the list_prompts tool.",
+          "title": "Name",
+          "type": "string"
+        },
+        "arguments": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Values for the prompt's arguments, keyed by argument name. Omit or pass {} for a prompt that takes none.",
+          "title": "Arguments",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "complete": {
+      "properties": {
+        "ref_type": {
+          "description": "'prompt' to complete a prompt argument, 'resource' to complete a resource-template variable.",
+          "enum": [
+            "prompt",
+            "resource"
+          ],
+          "title": "Ref Type",
+          "type": "string"
+        },
+        "ref": {
+          "description": "For ref_type='prompt', the prompt name from list_prompts. For ref_type='resource', the uri_template from list_resource_templates.",
+          "title": "Ref",
+          "type": "string"
+        },
+        "argument_name": {
+          "description": "Which argument or template variable to complete.",
+          "title": "Argument Name",
+          "type": "string"
+        },
+        "argument_value": {
+          "default": "",
+          "description": "The partial value typed so far. Pass '' to ask for every suggestion.",
+          "title": "Argument Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref_type",
+        "ref",
+        "argument_name"
+      ],
+      "type": "object"
+    }
+  },
+  "errors": [
+    {
+      "model": "uri",
+      "input": {},
+      "error": "uri: Field required"
+    },
+    {
+      "model": "uri",
+      "input": {
+        "uri": 3
+      },
+      "error": "uri: Input should be a valid string"
+    },
+    {
+      "model": "prompt",
+      "input": {},
+      "error": "name: Field required"
+    },
+    {
+      "model": "prompt",
+      "input": {
+        "name": "p",
+        "arguments": "x"
+      },
+      "error": "arguments: Input should be a valid dictionary"
+    },
+    {
+      "model": "prompt",
+      "input": {
+        "name": "p",
+        "arguments": {
+          "a": 1,
+          "b": "ok",
+          "c": null
+        }
+      },
+      "error": "arguments.a: Input should be a valid string; arguments.c: Input should be a valid string"
+    },
+    {
+      "model": "prompt",
+      "input": {
+        "name": "p",
+        "arguments": null
+      },
+      "error": "arguments: Input should be a valid dictionary"
+    },
+    {
+      "model": "complete",
+      "input": {},
+      "error": "ref_type: Field required; ref: Field required; argument_name: Field required"
+    },
+    {
+      "model": "complete",
+      "input": {
+        "ref_type": "tool",
+        "ref": "r",
+        "argument_name": "a"
+      },
+      "error": "ref_type: Input should be 'prompt' or 'resource'"
+    },
+    {
+      "model": "complete",
+      "input": {
+        "ref_type": 3,
+        "ref": "r",
+        "argument_name": "a",
+        "argument_value": 4
+      },
+      "error": "ref_type: Input should be 'prompt' or 'resource'; argument_value: Input should be a valid string"
+    }
+  ]
+}
