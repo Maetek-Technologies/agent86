@@ -6,15 +6,17 @@ The Python implementation remains the reference. This repository starts with a s
 
 ## Status
 
-**Core-types stage — not yet a usable agent.** The repository currently contains:
+**Provider stage — not yet a usable agent.** The repository currently contains:
 
 - Provider-neutral roles, phases, stop reasons, messages, tool calls, completions, steps, and usage accounting
 - `provider:model` parsing
 - Serde-based JSON representations and initial compatibility tests
+- An async provider interface and an OpenAI-compatible streaming (SSE) provider for OpenAI, OpenRouter, and other compatible endpoints, with retries, timeouts, and secret redaction
+- Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
 - A placeholder CLI that supports only `--help` and `--version`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-There are no model providers, orchestration loops, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
+The CLI cannot call a model yet. There are no orchestration loops, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
 
 ## Why Rust?
 
@@ -36,8 +38,10 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 ## Roadmap
 
 - [x] Core provider-neutral vocabulary
-- [ ] Recorded provider fixtures and differential test harness
-- [ ] OpenAI-compatible and Ollama streaming providers
+- [x] Recorded provider fixtures and mock-server tests
+- [x] OpenAI-compatible streaming provider
+- [ ] Differential test harness against the Python implementation
+- [ ] Ollama streaming provider
 - [ ] Minimal ReAct loop and one-shot `run --json`
 - [ ] Read-only workspace tools
 - [ ] Guardrails, approvals, and sandboxed side-effecting tools
