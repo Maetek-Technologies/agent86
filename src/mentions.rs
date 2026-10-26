@@ -1,0 +1,267 @@
+//! `@file` mentions, ported from Python's `tui/mentions.py`: pulling a file into
+//! the prompt without asking for a tool call.
+//!
+//! Typing `@src/types.rs` puts that file in front of the model directly: no round
+//! trip, no `read_file` step. Two hard rules, because a mention is user text that
+//! makes the harness read the disk:
+//!
+//! - every mentioned path goes through [`SandboxPolicy::resolve_within`], so a mention
+//!   can never reach outside the workspace jail. A refused path is reported and never
+//!   opened, not even to check its size or type;
+//! - what gets inlined is bounded: a size cap per file (`tools.mention_max_bytes`), at
+//!   most [`MAX_DIR_ENTRIES`] names for a directory, and binaries refused outright.
+
+use crate::tools::{SandboxPolicy, ToolError};
+use std::path::{Path, PathBuf};
+
+/// Most names listed for a mentioned directory.
+pub const MAX_DIR_ENTRIES: usize = 200;
+
+/// Directories never worth listing: huge, generated, or not source.
+pub const SKIP_DIRS: [&str; 10] = [
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".idea",
+];
+
+/// Trailing characters stripped off an unquoted path: prose punctuation, not
+/// filename. `.` is deliberately absent; it is far more often an extension.
+const TRAILING_PUNCT: &[char] = &[',', ';', ':', '!', '?', ')', ']', '}', '>'];
+
+/// Bytes sniffed when deciding whether a file is binary.
+const SNIFF_BYTES: usize = 8192;
+
+/// What one prompt's mentions expanded to.
+///
+/// `prompt` is what to send the model: the user's text, then one block per mention.
+/// `errors` are why some were not attached; a surface shows them to the user, and
+/// they are in `prompt` too, so the model knows a promised file is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionResult {
+    pub prompt: String,
+    pub attachments: Vec<PathBuf>,
+    pub errors: Vec<String>,
+}
+
+/// Python's `\s` for `str` patterns: Unicode whitespace plus U+001C to U+001F.
+fn is_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The raw paths mentioned in `text`, in order, without duplicates.
+///
+/// Python's pattern is `(?<![^\s(\[{])@(?:"([^"\n]+)"|([^\s"'`]+))`: the `@` must
+/// start the text or follow whitespace or an opening bracket, so `user@example.com`
+/// is an address, not a mention of `example.com`.
+pub fn find_mentions(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        let starts = c == '@' && previous.is_none_or(|p| is_space(p) || "([{".contains(p));
+        previous = Some(c);
+        if !starts {
+            continue;
+        }
+        let rest = &text[index + 1..];
+        let (raw, consumed) = if let Some(quoted) = rest.strip_prefix('"') {
+            match quoted.find(['"', '\n']) {
+                Some(end) if end > 0 && quoted[end..].starts_with('"') => {
+                    (quoted[..end].to_owned(), end + 2)
+                }
+                _ => continue,
+            }
+        } else {
+            let end = rest
+                .find(|c: char| is_space(c) || "\"'`".contains(c))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                continue;
+            }
+            (rest[..end].trim_end_matches(TRAILING_PUNCT).to_owned(), end)
+        };
+        // Matches never overlap: scanning resumes after this one.
+        let stop = index + 1 + consumed;
+        while chars.peek().is_some_and(|&(next, _)| next < stop) {
+            previous = chars.next().map(|(_, c)| c);
+        }
+        if !raw.is_empty() && !found.contains(&raw) {
+            found.push(raw);
+        }
+    }
+    found
+}
+
+/// Expand every `@path` in `text` into an inline block, jailed by `policy`.
+pub fn expand_mentions(text: &str, policy: &SandboxPolicy, max_bytes: u64) -> MentionResult {
+    let raws = find_mentions(text);
+    let mut result = MentionResult {
+        prompt: text.to_owned(),
+        attachments: Vec::new(),
+        errors: Vec::new(),
+    };
+    if raws.is_empty() {
+        return result;
+    }
+    let mut blocks = Vec::with_capacity(raws.len());
+    for raw in &raws {
+        match expand_one(raw, policy, max_bytes) {
+            Ok((block, path)) => {
+                blocks.push(block);
+                result.attachments.push(path);
+            }
+            Err(reason) => {
+                blocks.push(format!("--- @{raw} (not attached) ---\n{reason}"));
+                result.errors.push(format!("@{raw}: {reason}"));
+            }
+        }
+    }
+    result.prompt = format!("{}\n\n{}", text.trim_end(), blocks.join("\n\n"));
+    result
+}
+
+/// Render one mention: its block and the inlined path, or why it was not attached.
+fn expand_one(
+    raw: &str,
+    policy: &SandboxPolicy,
+    max_bytes: u64,
+) -> Result<(String, PathBuf), String> {
+    if raw.contains('\0') {
+        return Err("unreadable path (ValueError)".to_owned());
+    }
+    // Deliberately not echoing the resolved location: the refusal says where the
+    // jail is, never what happens to exist outside it.
+    let resolved = policy
+        .resolve_within(raw)
+        .map_err(|_| "refused - resolves outside the workspace".to_owned())?;
+    let unreadable = |error: std::io::Error| {
+        let exception = match ToolError::io(&error) {
+            ToolError::Raised { exception, .. } => exception,
+            ToolError::InvalidArguments(_) => "OSError".to_owned(),
+        };
+        format!("could not be read ({exception}: {error})")
+    };
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("no such file or directory".to_owned())
+        }
+        Err(error) => return Err(unreadable(error)),
+    };
+    let label = display(&resolved, policy, raw);
+    if metadata.is_dir() {
+        let block = expand_dir(&resolved, &label).map_err(unreadable)?;
+        return Ok((block, resolved));
+    }
+    let size = metadata.len();
+    if max_bytes > 0 && size > max_bytes {
+        return Err(format!(
+            "{size} bytes is over the {max_bytes}-byte mention cap; \
+             read it with a tool instead of inlining it"
+        ));
+    }
+    let data = std::fs::read(&resolved).map_err(unreadable)?;
+    let text = decode(&data).ok_or_else(|| "looks like a binary file".to_owned())?;
+    let lines = crate::difflib::splitlines(&text).len();
+    let header = format!("--- @{label} ({lines} lines) ---");
+    Ok((format!("{header}\n{}", fenced(&text)), resolved))
+}
+
+fn expand_dir(resolved: &Path, label: &str) -> std::io::Result<String> {
+    let mut children: Vec<(bool, String)> = std::fs::read_dir(resolved)?
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let is_dir = entry.path().is_dir();
+            (is_dir, entry.file_name().to_string_lossy().into_owned())
+        })
+        .filter(|(_, name)| !SKIP_DIRS.contains(&name.as_str()))
+        .collect();
+    children.sort_by_key(|(is_dir, name)| (!is_dir, name.to_lowercase()));
+    let names: Vec<String> = children
+        .into_iter()
+        .map(|(is_dir, name)| if is_dir { format!("{name}/") } else { name })
+        .collect();
+    let shown = &names[..names.len().min(MAX_DIR_ENTRIES)];
+    let mut body = if shown.is_empty() {
+        "(empty)".to_owned()
+    } else {
+        shown.join("\n")
+    };
+    if names.len() > shown.len() {
+        body.push_str(&format!("\n... and {} more", names.len() - shown.len()));
+    }
+    let header = format!("--- @{label} (directory, {} entries) ---", names.len());
+    Ok(format!("{header}\n{}", fenced(&body)))
+}
+
+/// `data` as text, or `None` if it is binary (a NUL early on, or not UTF-8).
+fn decode(data: &[u8]) -> Option<String> {
+    if data[..data.len().min(SNIFF_BYTES)].contains(&0) {
+        return None;
+    }
+    String::from_utf8(data.to_vec()).ok()
+}
+
+/// `body` in a code fence long enough to survive backticks inside it.
+fn fenced(body: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in body.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{}\n{fence}", body.trim_end_matches('\n'))
+}
+
+/// The path as the user should see it: workspace-relative when it can be.
+fn display(resolved: &Path, policy: &SandboxPolicy, raw: &str) -> String {
+    match resolved.strip_prefix(policy.workspace()) {
+        Ok(relative) => {
+            let parts: Vec<String> = relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            if parts.is_empty() {
+                ".".to_owned()
+            } else {
+                parts.join("/")
+            }
+        }
+        Err(_) => raw.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mentions_follow_pythons_pattern() {
+        assert_eq!(find_mentions("see @a.py and @b/c.rs."), ["a.py", "b/c.rs."]);
+        assert_eq!(find_mentions("mail user@example.com"), Vec::<String>::new());
+        assert_eq!(find_mentions("(@x), [@y] {@z}"), ["x", "y", "z"]);
+        assert_eq!(
+            find_mentions("@\"my file.txt\" @a @a"),
+            ["my file.txt", "a"]
+        );
+        assert_eq!(find_mentions("@\"open @b"), ["b"]);
+        assert_eq!(find_mentions("@ alone, @'q'"), Vec::<String>::new());
+        assert_eq!(find_mentions("@a@b @c"), ["a@b", "c"]);
+        assert_eq!(find_mentions("@x?!"), ["x"]);
+        assert_eq!(find_mentions("@),"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn fences_outgrow_the_backticks_inside() {
+        assert_eq!(fenced("plain\n"), "```\nplain\n```");
+        assert_eq!(fenced("a ```` b"), "`````\na ```` b\n`````");
+    }
+}

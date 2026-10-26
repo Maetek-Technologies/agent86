@@ -27,6 +27,11 @@ use toml::{Table, Value};
 const DEFAULTS: &str = r#"
 [model]
 default = "anthropic:claude-opus-4-8"
+router = "off"
+
+[model.route]
+cheap = "ollama:llama3.1"
+frontier = "anthropic:claude-opus-4-8"
 
 [limits]
 max_steps = 40
@@ -63,6 +68,13 @@ path = "~/.agent86/memory.db"
 [tools]
 web_allow_private = false
 web_max_chars = 8000
+mention_max_bytes = 200000
+
+[ui]
+spinner = true
+history_file = "~/.agent86/history"
+history_size = 1000
+markdown = true
 
 [guardrails]
 approval = "ask"
@@ -110,6 +122,10 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub pricing: PricingConfig,
+    pub ui: UiConfig,
+    /// Every layer merged, before deserializing; `/config` shows it.
+    #[serde(skip)]
+    pub table: Table,
     /// The config files that contributed, in the order they were read.
     #[serde(skip)]
     pub sources: Vec<PathBuf>,
@@ -118,6 +134,49 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelConfig {
     pub default: String,
+    /// `off` or `triage`. Only reported: triage routing is not ported.
+    pub router: RouterMode,
+    pub route: ModelRoute,
+}
+
+/// `[model] router`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterMode {
+    Off,
+    Triage,
+}
+
+impl RouterMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Triage => "triage",
+        }
+    }
+}
+
+/// `[model.route]`: the models triage routing would choose between.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModelRoute {
+    pub cheap: String,
+    pub frontier: String,
+}
+
+/// Interactive-surface settings (`[ui]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UiConfig {
+    /// Use the full-screen interface when the terminal can host it. Python's
+    /// pre-v0.6 spelling, `status_line`, is mapped onto it.
+    #[serde(default = "default_true")]
+    pub tui: bool,
+    pub spinner: bool,
+    /// Where submitted prompts are recorded; `~` and `$VARS` expand at use time.
+    pub history_file: String,
+    /// How many entries `history_file` keeps; `0` disables the cap.
+    pub history_size: i64,
+    /// Render answers as Markdown in the full-screen interface.
+    pub markdown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -276,6 +335,8 @@ pub struct ToolsConfig {
     pub web_user_agent: String,
     /// Characters of page text `web_fetch` returns at most; `0` disables the cap.
     pub web_max_chars: usize,
+    /// Largest file an `@path` mention inlines; `0` disables the cap.
+    pub mention_max_bytes: u64,
 }
 
 /// Safety settings (`[guardrails]`).
@@ -503,14 +564,16 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
         }
     }
 
+    accept_legacy_status_line(&mut merged);
     let mut config: Config =
-        Value::Table(merged)
+        Value::Table(merged.clone())
             .try_into()
             .map_err(|error: toml::de::Error| ConfigError::Invalid {
                 detail: error.message().to_owned(),
             })?;
     validate(&mut config)?;
     config.sources = sources;
+    config.table = merged;
     Ok(config)
 }
 
@@ -527,6 +590,16 @@ fn normalize(mut layer: Table) -> Table {
         }
     }
     layer
+}
+
+/// Map `[ui] status_line` onto `tui` (an explicit `tui` wins), as Python's
+/// `UIConfig` validator does on the merged layers.
+fn accept_legacy_status_line(merged: &mut Table) {
+    if let Some(Value::Table(ui)) = merged.get_mut("ui") {
+        if let Some(legacy) = ui.remove("status_line") {
+            ui.entry("tui").or_insert(legacy);
+        }
+    }
 }
 
 fn validate(config: &mut Config) -> Result<(), ConfigError> {
@@ -631,6 +704,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn ui_settings_default_and_accept_the_legacy_status_line_key() {
+        let dir = temp_dir("ui");
+        let paths = paths_in(&dir);
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert!(config.ui.tui);
+        assert_eq!(config.ui.history_file, "~/.agent86/history");
+        assert_eq!(config.ui.history_size, 1000);
+        assert_eq!(config.tools.mention_max_bytes, 200_000);
+        assert_eq!(config.model.router, RouterMode::Off);
+        assert_eq!(config.model.route.cheap, "ollama:llama3.1");
+
+        // Pre-v0.6 configs spelled `tui` as `status_line`...
+        std::fs::write(&paths.project, "[ui]\nstatus_line = false\n").unwrap();
+        assert!(!load_config(&paths, &Overrides::default()).unwrap().ui.tui);
+        // ...and an explicit `tui` in any layer wins over it.
+        std::fs::write(dir.join("user.toml"), "[ui]\ntui = true\n").unwrap();
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert!(config.ui.tui);
+        assert!(!config.table["ui"]
+            .as_table()
+            .unwrap()
+            .contains_key("status_line"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

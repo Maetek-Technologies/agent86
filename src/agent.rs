@@ -10,8 +10,11 @@
 //!
 //! Guardrails scan the goal, each answer, and each tool observation.
 //!
-//! Not ported yet: context-window fitting and compaction, cancellation, sub-agents, and
-//! persistence.
+//! A turn can be cancelled from another thread or task ([`CancelToken`]). It stops at
+//! the next safe point: before a model call, while a response streams, and between
+//! tool calls, never in the middle of one. The partial exchange is kept.
+//!
+//! Not ported yet: context-window fitting and compaction, sub-agents, and persistence.
 
 use crate::approval::ApprovalGate;
 use crate::config::EgressMode;
@@ -28,6 +31,8 @@ use crate::types::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -40,6 +45,53 @@ pub const MAX_CONTINUATIONS: u64 = 3;
 /// The user-visible line announcing continuation `index`.
 pub fn continuation_notice(index: u64) -> String {
     format!("\n[continuation {index}/{MAX_CONTINUATIONS}]\n")
+}
+
+/// What a cancelled turn says, as Python's `_cancelled`.
+pub const CANCELLED_NOTICE: &str = "\n[cancelled]\n";
+
+/// Asks the in-flight turn to stop at its next safe point, as Python's `Harness.cancel`.
+///
+/// Clones share one flag, so a signal handler or another task can hold one. Cancelling
+/// when no turn is running is harmless: every turn clears the flag on entry.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    inner: Arc<CancelInner>,
+}
+
+#[derive(Default)]
+struct CancelInner {
+    flag: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelToken {
+    pub fn cancel(&self) {
+        self.inner.flag.store(true, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.flag.load(Ordering::SeqCst)
+    }
+
+    pub fn clear(&self) {
+        self.inner.flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Resolves once [`CancelToken::cancel`] has been called.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the flag is read, so a cancel in between is not missed.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// A turn could not be completed.
@@ -135,8 +187,9 @@ fn trip(reason: String) -> HarnessError {
 }
 
 /// Everything one turn needs.
-pub struct Harness<'a> {
-    pub provider: &'a dyn Provider,
+pub struct Harness {
+    /// The model; the REPL's `/model` replaces it between turns.
+    pub provider: Box<dyn Provider>,
     pub registry: ToolRegistry,
     pub context: ToolContext,
     pub limits: LimitsConfig,
@@ -152,9 +205,11 @@ pub struct Harness<'a> {
     /// Live MCP servers; their section of the system message is rebuilt for every
     /// request, because servers drop, reconnect, and change their tools mid-turn.
     pub mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
+    /// Stops the running turn at its next safe point.
+    pub cancel: CancelToken,
 }
 
-impl Harness<'_> {
+impl Harness {
     /// The system message for the next request: the prompt plus, when MCP servers
     /// are live, their section, as Python's `_system_content`.
     fn system_message(&self) -> Message {
@@ -182,9 +237,26 @@ impl Harness<'_> {
         goal: &str,
         on_text: impl FnMut(&str),
     ) -> Result<String, HarnessError> {
+        self.run_turn_as(state, goal, goal, on_text).await
+    }
+
+    /// [`Harness::run_turn`] where the model sees `user_text` (for a prompt with
+    /// `@file` mentions, the expanded text) and the trace records `display_text`,
+    /// what the user typed, as Python's `display_text` argument.
+    pub async fn run_turn_as(
+        &self,
+        state: &mut AgentState,
+        user_text: &str,
+        display_text: &str,
+        on_text: impl FnMut(&str),
+    ) -> Result<String, HarnessError> {
+        // A cancel requested while no turn was running must not kill this one.
+        self.cancel.clear();
         let started = Instant::now();
         let mut summary = TurnSummary::default();
-        let result = self.turn(state, goal, &mut summary, on_text).await;
+        let result = self
+            .turn(state, user_text, display_text, &mut summary, on_text)
+            .await;
         summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
         state.last_turn = Some(summary);
         if let Err(error) = &result {
@@ -211,6 +283,7 @@ impl Harness<'_> {
         &self,
         state: &mut AgentState,
         goal: &str,
+        display_text: &str,
         summary: &mut TurnSummary,
         mut on_text: impl FnMut(&str),
     ) -> Result<String, HarnessError> {
@@ -222,7 +295,7 @@ impl Harness<'_> {
 
         let sid = state.session_id.clone();
         self.recorder
-            .event(&sid, "turn_start", vec![("task", json!(goal))]);
+            .event(&sid, "turn_start", vec![("task", json!(display_text))]);
 
         // Ingress guardrail on the user's input.
         let report = self.guardrails.inspect_ingress(goal);
@@ -265,6 +338,12 @@ impl Harness<'_> {
         let mut continuation_parts: Vec<String> = Vec::new();
 
         loop {
+            // Never start another model call once cancelled: that is the expensive,
+            // long-latency step the user is trying to escape.
+            if self.cancel.is_cancelled() {
+                self.cancelled(state, breaker.steps(), &mut emit);
+                return Ok(output);
+            }
             breaker.before_step()?;
 
             let completion = {
@@ -281,14 +360,37 @@ impl Harness<'_> {
                 };
                 let mut stream = self.provider.stream(request);
                 let mut completion = None;
-                while let Some(delta) = stream.next().await {
+                let mut buffered = String::new();
+                loop {
+                    // A long or stalled response stops mid-flight, not after it ends.
+                    // Dropping the stream drops the HTTP response.
+                    let next = tokio::select! {
+                        biased;
+                        () = self.cancel.cancelled() => None,
+                        delta = stream.next() => Some(delta),
+                    };
+                    let Some(Some(delta)) = next else { break };
                     let delta = delta?;
-                    if !delta.text.is_empty() && !buffering {
-                        emit(&delta.text);
+                    if !delta.text.is_empty() {
+                        if buffering {
+                            buffered.push_str(&delta.text);
+                        } else {
+                            emit(&delta.text);
+                        }
                     }
                     if delta.done && delta.completion.is_some() {
                         completion = delta.completion;
                     }
+                }
+                drop(stream);
+                if self.cancel.is_cancelled() {
+                    // Whatever was held back still belongs to the user: redacted, then shown.
+                    let partial = self.guardrails.inspect_egress(&buffered).1;
+                    if !partial.is_empty() {
+                        emit(&partial);
+                    }
+                    self.cancelled(state, breaker.steps(), &mut emit);
+                    return Ok(output);
                 }
                 completion.ok_or_else(|| HarnessError::NoFinalCompletion {
                     provider: self.provider.name().to_owned(),
@@ -410,6 +512,24 @@ impl Harness<'_> {
             continuation_start = None;
             continuation_parts.clear();
 
+            // Before the batch, never mid-execution. Python leaves these calls
+            // unanswered, which providers reject on the next request; each is
+            // answered here as not executed, as a cancel mid-batch does.
+            if self.cancel.is_cancelled() {
+                for call in &tool_calls {
+                    let result = not_executed(call, "cancelled");
+                    state.messages.push(Message {
+                        tool_call_id: Some(call.id.clone()),
+                        name: Some(call.name.clone()),
+                        ..message(Role::Tool, &observation(&result))
+                    });
+                    step.results.push(result);
+                }
+                record_step(state, step);
+                self.cancelled(state, breaker.steps(), &mut emit);
+                return Ok(output);
+            }
+
             // The whole batch is announced up front, then observed strictly in call order.
             for call in &tool_calls {
                 emit(&format!(
@@ -446,8 +566,31 @@ impl Harness<'_> {
                     return Err(tripped);
                 }
             }
+            // Every call has an observation by now, including any skipped because
+            // the cancel landed mid-batch.
             record_step(state, step);
+            if self.cancel.is_cancelled() {
+                self.cancelled(state, breaker.steps(), &mut emit);
+                return Ok(output);
+            }
         }
+    }
+
+    /// Close out a cancelled turn and say so, as Python's `_cancelled`. The partial
+    /// exchange is kept: the user stopped the agent, they did not undo it. The phase
+    /// is `error`; "cancelled" is carried by the trace's `status` and `reason`.
+    fn cancelled(&self, state: &mut AgentState, steps: u32, emit: &mut impl FnMut(&str)) {
+        state.phase = AgentPhase::Error;
+        self.recorder.event(
+            &state.session_id,
+            "turn_end",
+            vec![
+                ("status", json!("cancelled")),
+                ("reason", json!("cancelled")),
+                ("steps", json!(steps)),
+            ],
+        );
+        emit(CANCELLED_NOTICE);
     }
 
     /// Run a step's tool calls and return their results in call order.
@@ -465,7 +608,13 @@ impl Harness<'_> {
             // Strictly sequential: each call is resolved and run before the next.
             return calls
                 .iter()
-                .map(|call| self.execute_tool(call, sid))
+                .map(|call| {
+                    if self.cancel.is_cancelled() {
+                        not_executed(call, "cancelled")
+                    } else {
+                        self.execute_tool(call, sid)
+                    }
+                })
                 .collect();
         }
 
@@ -506,11 +655,12 @@ impl Harness<'_> {
             }
         } else {
             for &index in &reads {
-                settled[index] = Some(self.dispatch(&calls[index], sid));
+                settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid));
             }
         }
+        // Between calls, never mid-execution: a tool that started is allowed to finish.
         for index in writes {
-            settled[index] = Some(self.dispatch(&calls[index], sid));
+            settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid));
         }
 
         settled
@@ -547,6 +697,14 @@ impl Harness<'_> {
             return (Some(not_executed(call, decision.reason)), false);
         }
         (None, !tool.side_effecting())
+    }
+
+    fn dispatch_unless_cancelled(&self, call: &ToolCall, sid: &str) -> ToolResult {
+        if self.cancel.is_cancelled() {
+            not_executed(call, "cancelled")
+        } else {
+            self.dispatch(call, sid)
+        }
     }
 
     /// Run one approved call and record it in the flight recorder.

@@ -206,6 +206,69 @@ impl SessionStore {
         };
         self.save(state, title.as_deref())
     }
+
+    /// Recent sessions, newest first, as Python's `MemoryStore.recent_sessions`.
+    pub fn recent_sessions(&self, limit: usize) -> Result<Vec<SessionInfo>, StoreError> {
+        let error = |error: rusqlite::Error| StoreError(error.to_string());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id, updated_at, title FROM sessions \
+                 ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(error)?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(SessionInfo {
+                    session_id: row.get(0)?,
+                    updated_at: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                    title: row.get(2)?,
+                })
+            })
+            .map_err(error)?;
+        rows.collect::<Result<_, _>>().map_err(error)
+    }
+
+    /// Row counts of the three tables, for `/memory`.
+    pub fn counts(&self) -> Result<StoreCounts, StoreError> {
+        let count = |table: &str| {
+            self.connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|error| StoreError(error.to_string()))
+        };
+        Ok(StoreCounts {
+            sessions: count("sessions")?,
+            episodes: count("episodes")?,
+            memories: count("memories")?,
+        })
+    }
+}
+
+/// One row of the session list, as Python's `SessionInfo`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInfo {
+    pub session_id: String,
+    /// `None` for a session saved before its first user message.
+    pub title: Option<String>,
+    /// Seconds since the Unix epoch.
+    pub updated_at: f64,
+}
+
+impl SessionInfo {
+    /// The title, or a stand-in for a session that never got one.
+    pub fn label(&self) -> &str {
+        self.title.as_deref().unwrap_or("(untitled)")
+    }
+}
+
+/// How many rows the memory database holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreCounts {
+    pub sessions: i64,
+    pub episodes: i64,
+    pub memories: i64,
 }
 
 /// Python's schema, verbatim.

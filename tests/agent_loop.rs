@@ -3,16 +3,16 @@
 
 mod support;
 
-use agent86::agent::{Harness, HarnessError, CONTINUE_PROMPT};
+use agent86::agent::{CancelToken, Harness, HarnessError, CONTINUE_PROMPT};
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
-use agent86::config::{EgressMode, IngressMode, LimitsConfig};
+use agent86::config::{EgressMode, IngressMode, LimitsConfig, ObservabilityConfig, RedactMode};
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
 use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::session::AgentState;
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::RunOutput;
-use agent86::types::{ApprovalMode, Message, Role};
+use agent86::types::{AgentPhase, ApprovalMode, Message, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use support::{sse_text, sse_tool_calls, MockServer, Reply};
@@ -125,7 +125,7 @@ async fn run_with(
 ) -> Result<RunOutput, HarnessError> {
     let provider = provider(server);
     let harness = Harness {
-        provider: &provider,
+        provider: Box::new(provider),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits,
@@ -135,6 +135,7 @@ async fn run_with(
         guardrails,
         recorder: Recorder::disabled(),
         mcp: None,
+        cancel: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness.run_turn(&mut state, goal, |_| {}).await?;
@@ -635,7 +636,7 @@ async fn redact_mode_never_shows_the_raw_text() {
 
     let provider = provider(&server);
     let harness = Harness {
-        provider: &provider,
+        provider: Box::new(provider),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -645,6 +646,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         guardrails: redact,
         recorder: Recorder::disabled(),
         mcp: None,
+        cancel: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness
@@ -725,7 +727,7 @@ async fn recorded_turn(
     });
     let provider = provider(server);
     let harness = Harness {
-        provider: &provider,
+        provider: Box::new(provider),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -735,6 +737,7 @@ async fn recorded_turn(
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder,
         mcp: None,
+        cancel: Default::default(),
     };
     let mut state = AgentState::new();
     let _ = harness.run_turn(&mut state, goal, |_| {}).await;
@@ -826,4 +829,151 @@ async fn failed_turns_are_recorded_with_pythons_reason() {
         "{:?}",
         kinds(&events)
     );
+}
+
+/// A harness on `server` whose turns can be cancelled with `cancel`.
+fn cancellable(
+    server: &MockServer,
+    workspace: &Workspace,
+    gate: ApprovalGate,
+    recorder: Recorder,
+    cancel: &CancelToken,
+) -> Harness {
+    Harness {
+        provider: Box::new(provider(server)),
+        registry: builtin_registry(),
+        context: ToolContext::new(&workspace.root).unwrap(),
+        limits: limits(),
+        system: system(),
+        max_tokens: 1024,
+        gate,
+        guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
+        recorder,
+        mcp: None,
+        cancel: cancel.clone(),
+    }
+}
+
+fn trace_recorder(dir: &std::path::Path) -> Recorder {
+    Recorder::from_config(&ObservabilityConfig {
+        trace: true,
+        path: dir.display().to_string(),
+        redact: RedactMode::Secrets,
+        max_field_chars: 2000,
+        max_trace_bytes: 0,
+        keep_traces: 5,
+    })
+}
+
+fn trace_events(dir: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_cancel_wakes_a_stalled_stream_and_keeps_the_partial_exchange() {
+    let partial = "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Hel\"}, \"finish_reason\": null}]}\n\n";
+    let server = MockServer::start(vec![Reply::StallAfter(partial.to_owned())]).await;
+    let workspace = Workspace::new("cancel-stall");
+    let traces = workspace.root.join("traces");
+    let cancel = CancelToken::default();
+    let harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        trace_recorder(&traces),
+        &cancel,
+    );
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        canceller.cancel();
+    });
+
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, "Say hello", |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(output, "Hel\n[cancelled]\n");
+    // The user stopped the agent, they did not undo it: the question stays.
+    assert_eq!(state.phase, AgentPhase::Error);
+    assert_eq!(state.messages.len(), 1);
+    assert_eq!(state.messages[0].content, "Say hello");
+    assert!(state.last_turn.is_some());
+    let end = trace_events(&traces).pop().unwrap();
+    assert_eq!(end["kind"], "turn_end");
+    assert_eq!(end["status"], "cancelled");
+    assert_eq!(end["reason"], "cancelled");
+    assert_eq!(end["steps"], 0);
+}
+
+#[tokio::test]
+async fn a_cancel_mid_batch_lets_the_running_tool_finish_and_skips_the_rest() {
+    let server = MockServer::start(vec![sse_tool_calls(&[
+        ("w1", "write_file", r#"{"path": "a.txt", "content": "A"}"#),
+        ("w2", "write_file", r#"{"path": "b.txt", "content": "B"}"#),
+    ])])
+    .await;
+    let workspace = Workspace::new("cancel-batch");
+    let cancel = CancelToken::default();
+    // The user approves the first write, then presses Ctrl+C.
+    let canceller = cancel.clone();
+    let prompt: ApprovalPrompt = Box::new(move |_, _| {
+        canceller.cancel();
+        true
+    });
+    let harness = cancellable(
+        &server,
+        &workspace,
+        ApprovalGate::new(ApprovalMode::Ask, Some(prompt)),
+        Recorder::disabled(),
+        &cancel,
+    );
+
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "write", |_| {}).await.unwrap();
+
+    assert!(
+        output.contains("[tool] write_file -> Wrote 1 bytes to a.txt"),
+        "{output}"
+    );
+    assert!(
+        output.ends_with("[tool] write_file -> error: Not executed: cancelled.\n\n[cancelled]\n"),
+        "{output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "A"
+    );
+    assert!(!workspace.root.join("b.txt").exists());
+    // Every tool call is answered, so the history stays valid for the next request.
+    let roles: Vec<Role> = state.messages.iter().map(|message| message.role).collect();
+    assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool, Role::Tool]);
+    assert_eq!(server.requests().len(), 1, "no model call after the cancel");
+}
+
+#[tokio::test]
+async fn a_cancel_before_the_turn_does_not_stop_it() {
+    let server = MockServer::start(vec![sse_text("Hello", "stop")]).await;
+    let workspace = Workspace::new("cancel-stale");
+    let cancel = CancelToken::default();
+    let harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    cancel.cancel();
+
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "hi", |_| {}).await.unwrap();
+
+    assert_eq!(output, "Hello");
+    assert_eq!(state.phase, AgentPhase::Done);
 }

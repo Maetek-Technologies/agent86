@@ -101,29 +101,38 @@ pub fn terminal_prompt_if_interactive() -> Option<ApprovalPrompt> {
 /// sight-unseen is what this prompt exists to prevent. Python prints the prompt
 /// on stdout; it goes to stderr here so `run --json` output stays one object.
 pub fn terminal_prompt(tool_name: &str, preview: &ApprovalPreview) -> bool {
+    let color = std::io::stderr().is_terminal() && color_allowed();
+    ask(&mut std::io::stderr(), color, tool_name, preview)
+}
+
+/// [`terminal_prompt`] on stdout, as Python's REPL asks; the REPL has no JSON
+/// output to protect.
+pub fn stdout_prompt(tool_name: &str, preview: &ApprovalPreview) -> bool {
+    let color = std::io::stdout().is_terminal() && color_allowed();
+    ask(&mut std::io::stdout(), color, tool_name, preview)
+}
+
+fn color_allowed() -> bool {
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
+fn ask(out: &mut dyn Write, color: bool, tool_name: &str, preview: &ApprovalPreview) -> bool {
     let detail = preview.detail.as_deref().unwrap_or(&preview.summary);
-    let color = std::io::stderr().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr);
-    let _ = writeln!(stderr, "{}", cap_lines(detail, APPROVAL_DETAIL_LINES));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", cap_lines(detail, APPROVAL_DETAIL_LINES));
     if color {
-        let _ = writeln!(
-            stderr,
-            "\x1b[1;33mapprove \x1b[0m\x1b[1m{tool_name}?\x1b[0m"
-        );
+        let _ = writeln!(out, "\x1b[1;33mapprove \x1b[0m\x1b[1m{tool_name}?\x1b[0m");
     } else {
-        let _ = writeln!(stderr, "approve {tool_name}?");
+        let _ = writeln!(out, "approve {tool_name}?");
     }
-    let _ = write!(stderr, "  [y/N] ");
-    let _ = stderr.flush();
-    drop(stderr);
+    let _ = write!(out, "  [y/N] ");
+    let _ = out.flush();
 
     let mut answer = String::new();
     match std::io::stdin().lock().read_line(&mut answer) {
         Ok(0) | Err(_) => {
             // Nobody is there to answer: decline, the safe default.
-            eprintln!("declined");
+            let _ = writeln!(out, "declined");
             false
         }
         Ok(_) => matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"),

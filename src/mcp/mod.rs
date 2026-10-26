@@ -353,6 +353,8 @@ struct Notes {
 
 struct Inner {
     passthrough: Vec<String>,
+    /// The enabled servers named in config, started or not.
+    configured: Vec<String>,
     slots: Mutex<IndexMap<String, Slot>>,
     notes: Mutex<Notes>,
     registry: Mutex<Option<ToolRegistry>>,
@@ -386,6 +388,7 @@ impl McpManager {
         let manager = Self {
             inner: Arc::new(Inner {
                 passthrough: config.sandbox.env_passthrough.clone(),
+                configured: enabled.iter().map(|(name, _)| (*name).clone()).collect(),
                 slots: Mutex::new(IndexMap::new()),
                 notes: Mutex::new(Notes::default()),
                 registry: Mutex::new(None),
@@ -487,6 +490,25 @@ impl McpManager {
             )),
             State::Disconnected => Some(format!("disconnected: {cause}")),
         }
+    }
+
+    /// Every known server that is not connected, sorted by name, with its status, as
+    /// Python's `server_statuses`. A server that never started is `not connected`.
+    pub fn server_statuses(&self) -> Vec<(String, String)> {
+        let mut names: Vec<String> = self.inner.configured.clone();
+        names.extend(lock(&self.inner.slots).keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let status = self.server_status(&name).or_else(|| {
+                    (!lock(&self.inner.slots).contains_key(&name))
+                        .then(|| "not connected".to_owned())
+                })?;
+                Some((name, status))
+            })
+            .collect()
     }
 
     /// The latest `(progress, total, message)` a server reported for any call.
