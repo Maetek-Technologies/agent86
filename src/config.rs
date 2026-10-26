@@ -45,6 +45,9 @@ docker_cpus = "1"
 docker_network = false
 env_passthrough = []
 
+[mcp]
+enabled = true
+
 [observability]
 trace = true
 path = "~/.agent86/traces"
@@ -99,6 +102,10 @@ pub struct Config {
     pub tools: ToolsConfig,
     pub memory: MemoryConfig,
     pub observability: ObservabilityConfig,
+    pub mcp: McpConfig,
+    /// MCP servers in config order, from `[mcp_servers.<name>]` or `[mcp.servers.<name>]`.
+    #[serde(default)]
+    pub mcp_servers: indexmap::IndexMap<String, McpServerConfig>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -128,6 +135,101 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
     pub tool_timeout_s: u64,
+}
+
+/// `[mcp]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpConfig {
+    pub enabled: bool,
+}
+
+/// One MCP server, reached over `stdio` (a local subprocess) or, in Python, `sse`/`http`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct McpServerConfig {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: indexmap::IndexMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: indexmap::IndexMap<String, String>,
+    /// `stdio`, `sse`, or `http`; inferred from `command` or `url` when omitted.
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_mcp_connect_timeout_s")]
+    pub connect_timeout_s: f64,
+    #[serde(default = "default_mcp_call_timeout_s")]
+    pub call_timeout_s: f64,
+    #[serde(default = "default_mcp_max_result_chars")]
+    pub max_result_chars: usize,
+}
+
+impl McpServerConfig {
+    /// Validate and fill in `transport`, with Python's messages.
+    pub fn resolve_transport(&mut self) -> Result<(), String> {
+        let (has_command, has_url) = (
+            self.command.as_deref().is_some_and(|c| !c.is_empty()),
+            self.url.as_deref().is_some_and(|u| !u.is_empty()),
+        );
+        if has_command && has_url {
+            return Err("MCP server sets both 'command' and 'url'; use one transport".to_owned());
+        }
+        if !has_command && !has_url {
+            return Err("MCP server needs 'command' (stdio) or 'url' (sse/http)".to_owned());
+        }
+        let given = self
+            .transport
+            .clone()
+            .unwrap_or_else(|| if has_command { "stdio" } else { "http" }.to_owned());
+        let mut transport = given.to_lowercase().replace('-', "_");
+        if transport == "streamable_http" {
+            transport = "http".to_owned();
+        }
+        if !matches!(transport.as_str(), "stdio" | "sse" | "http") {
+            return Err(format!("unknown MCP transport '{given}' (stdio|sse|http)"));
+        }
+        if transport == "stdio" && !has_command {
+            return Err("stdio transport requires 'command'".to_owned());
+        }
+        if transport != "stdio" && !has_url {
+            return Err(format!("{transport} transport requires 'url'"));
+        }
+        for (field, value) in [
+            ("connect_timeout_s", self.connect_timeout_s),
+            ("call_timeout_s", self.call_timeout_s),
+        ] {
+            if !(value > 0.0 && value.is_finite()) {
+                return Err(format!("{field} must be greater than 0"));
+            }
+        }
+        if self.max_result_chars == 0 {
+            return Err("max_result_chars must be greater than 0".to_owned());
+        }
+        self.transport = Some(transport);
+        Ok(())
+    }
+
+    /// The resolved transport (`stdio`, `sse`, or `http`).
+    pub fn transport(&self) -> &str {
+        self.transport.as_deref().unwrap_or("stdio")
+    }
+}
+
+fn default_mcp_connect_timeout_s() -> f64 {
+    30.0
+}
+
+fn default_mcp_call_timeout_s() -> f64 {
+    120.0
+}
+
+fn default_mcp_max_result_chars() -> usize {
+    8000
 }
 
 /// Flight-recorder settings (`[observability]`). OpenTelemetry export is not ported.
@@ -376,7 +478,7 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
 
     let files = paths.user.iter().chain(std::iter::once(&paths.project));
     for path in files {
-        let layer = read_toml(path)?;
+        let layer = normalize(read_toml(path)?);
         if !layer.is_empty() {
             deep_merge(&mut merged, layer);
             sources.push(path.clone());
@@ -407,13 +509,34 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
             .map_err(|error: toml::de::Error| ConfigError::Invalid {
                 detail: error.message().to_owned(),
             })?;
-    validate(&config)?;
+    validate(&mut config)?;
     config.sources = sources;
     Ok(config)
 }
 
 /// Checks serde cannot express, matching the Python schema's constraints.
-fn validate(config: &Config) -> Result<(), ConfigError> {
+/// Map `[mcp.servers.<name>]` onto `mcp_servers`, as Python's `_normalize`.
+fn normalize(mut layer: Table) -> Table {
+    if let Some(Value::Table(mcp)) = layer.get_mut("mcp") {
+        if let Some(servers) = mcp.remove("servers") {
+            let empty = mcp.is_empty();
+            if empty {
+                layer.remove("mcp");
+            }
+            layer.insert("mcp_servers".to_owned(), servers);
+        }
+    }
+    layer
+}
+
+fn validate(config: &mut Config) -> Result<(), ConfigError> {
+    for (name, server) in &mut config.mcp_servers {
+        server
+            .resolve_transport()
+            .map_err(|detail| ConfigError::Invalid {
+                detail: format!("mcp_servers.{name}: {detail}"),
+            })?;
+    }
     for (model, price) in &config.pricing.models {
         for (field, value) in [
             ("input_per_mtok", price.input_per_mtok),

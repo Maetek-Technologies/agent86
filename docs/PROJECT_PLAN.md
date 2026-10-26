@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; MCP (stage 8) next, with episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; MCP over stdio (stage 8, part 1) done; the HTTP/SSE transports and MCP lifecycle (stage 8, part 2) next, with episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -63,15 +63,17 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added `web_fetch`, ported from `tools/builtin/web.py`: read-only; http(s) only; every hop (the URL and each redirect, followed manually up to 5) resolved and refused if any address is unspecified, loopback, link-local, private, multicast, or reserved, with Python 3.12 `ipaddress` semantics including unwrapping IPv4-mapped, 6to4, and Teredo addresses (checked against stdlib `ipaddress`); connections pinned to the vetted addresses; a 2 MB body cap before decoding; textual content types only; charset decoding; Python's regex HTML reducer (checked against a mirror of it); `[tools] web_allow_private`, `web_user_agent`, and `web_max_chars` (8000)
 - Added sessions (stage 7, part 1), ported from `orchestration/state.py`, the session half of `memory/store.py`, and `Harness.new_session`/`resume`/`_persist`: `AgentState` (messages, steps, cumulative usage, `last_turn`) threaded through the loop, which now records each model call as a `Step`; Python's SQLite schema and upsert in `[memory] path` (`~/.agent86/memory.db`), saved when a session starts and after every turn, including failed ones (phase `error`); write-once titles from Python's `session_title`; `run --session`/`-s` to resume, starting a new session for an unknown id as Python does; `run --json` `steps` and `usage` cumulative across the session. Interoperability was checked both ways: Rust reads a pydantic-shaped `state_json`, and a Rust-written session with tool calls validates against pydantic mirrors of Python's models
 - Added the flight recorder (stage 7, part 2), ported from `observability/recorder.py`, `observability/redact.py`, and the `trace` commands in `cli.py`: Python's events and fields (`turn_start`, `guardrail` at the `ingress_input`, `egress`, `egress_tool_args`, and `observation` stages, `model_call`, `tool_call` for dispatched calls, `continuation`, and `turn_end` with `done`, `blocked`, or `error` and Python's reasons) written as `json.dumps` lines to `[observability] path`/`trace.jsonl`; every event redacted (the guardrail secret patterns and key shapes become `***REDACTED***`, and `arguments`, `task`, `content`, `error`, and `outcome` are clipped to `max_field_chars`); rotation at `max_trace_bytes` keeping `keep_traces` generations; `agent86 trace path`, `trace show` (`-s`, `-n`, `-k`, `--since`), and `trace export` (`jsonl`, `json`, `otlp-json`, `-o`), with the OTLP reconstruction matching Python's output byte for byte
+- Added the MCP client over stdio (stage 8, part 1), ported from `tools/mcp_client.py`, `tools/mcp_content.py`, the `${VAR}` expansion in `secrets.py`, `render_mcp_section` in `cognitive/prompt.py`, and the `mcp` commands in `cli.py`: `[mcp] enabled` and `[mcp.servers.<name>]`/`[mcp_servers.<name>]` with Python's fields, defaults, and transport validation messages; a hand-written newline-delimited JSON-RPC client (`initialize` with protocol `2025-06-18`, `notifications/initialized`, paginated `tools/list`, `tools/call`, `ping` answered) for a server started with the scrubbed tool environment plus its own `env`, with `${VAR}` in `args`, `env`, `url`, and `headers` resolved from the environment and then the keyring; `connect_timeout_s`, `call_timeout_s`, and `max_result_chars` with Python's messages; start failures as notes, including the server's redacted stderr tail; tools named `mcp__<server>__<tool>` (sanitized, 64 characters), described `<description> (MCP: <server>)`, side-effecting unless `readOnlyHint`, with the argument schema deferred until first use (ADR 0003) and Python's missing-argument error; Python's content rendering (text, image, audio, embedded resources, resource links); name collisions skipped rather than shadowing; the MCP section of the system message; and `agent86 mcp list` and `agent86 mcp tools`. Tests run a stdlib-only Python MCP server fixture
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **194 passed on Windows** (47 unit, 10 compatibility, 18 provider integration, 31 CLI end-to-end, 5 sessions, 8 trace, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 21 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **207 passed on Windows** (47 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 5 sessions, 8 trace, 12 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 21 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live MCP check (2026-10-26, `openrouter:openai/gpt-4o-mini`): with the test MCP server configured, `mcp tools` listed its eight tools; in a `run`, the model first called `mcp__test__add` with no arguments (its schema was still deferred), got the missing-argument error, called it again with both numbers, and reported 5555 (3 steps)
 - Live flight-recorder check (2026-10-26): after a `run` that listed a directory, `trace show` listed the turn's five events with local times, token counts, and details
 - Live session check (2026-10-26, `openrouter:openai/gpt-4o-mini`): a turn that read a file was saved; its `state_json` validated against pydantic mirrors of Python's models; and `run -s <id>` resumed it, with the model recalling the file's last item without tools
 - Live `web_fetch` check (2026-10-26, `openrouter:openai/gpt-4o-mini`): the model fetched https://example.com and reported its heading, and a fetch of `http://169.254.169.254/latest/meta-data/` was refused before any connection
@@ -90,7 +92,7 @@ The project is **not yet a usable agent**. It currently has no:
 - Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
 - Guardrails, approvals, or sandbox executors
 - Episodic and semantic memory, or OpenTelemetry span export (`[observability] otel`)
-- MCP support
+- MCP over HTTP or SSE, MCP reconnects and notifications, or the MCP resource, prompt, and completion tools
 - Interactive terminal interface
 - Local embedding backend
 
@@ -141,6 +143,16 @@ The project is **not yet a usable agent**. It currently has no:
 - Python records an episode per turn and adds an episodic recall note to the system prompt; neither is ported, because they need embeddings. The `episodes` and `memories` tables are created but not written.
 - `state_json` is valid in both directions but not byte-identical: Rust omits empty lists and nulls that pydantic writes, and writes floats in Python's `json.dumps` style where pydantic uses shortest-decimal notation.
 - A long resumed session is sent in full; Python fits it to the model's context window and compacts it (not ported).
+
+### Known MCP differences from Python
+
+- Only the `stdio` transport is implemented. A server configured with `sse` or `http` fails to start with a note saying the transport is not supported yet.
+- A server that disconnects stays disconnected for the rest of the run; Python reconnects up to its attempt limit. Its tools then fail with a message saying they are unavailable until agent86 is restarted (Python points at `/config mcp`).
+- Server notifications (`tools/list_changed`, progress, logging) are ignored, and the resource, prompt, and completion tools Python adds for servers that declare those capabilities are not offered.
+- The JSON-RPC client is hand-written rather than the MCP Python SDK, so transport error wording can differ; the user-facing messages for start failures, timeouts, and disconnects follow Python's.
+- On Windows a bare `command` is looked up on PATH with `PATHEXT`, so `npx` finds `npx.cmd`, as the Python SDK does.
+- `mcp list` and `mcp tools` print plain aligned tables with the same columns as Python's Rich tables, and the no-servers hint does not mention `/config mcp`.
+- `run` does not print MCP start notes; `agent86 mcp tools` shows them.
 
 ### Known flight-recorder differences from Python
 
