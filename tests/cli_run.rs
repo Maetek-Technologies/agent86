@@ -739,3 +739,133 @@ async fn shell_commands_need_approval_like_any_side_effect() {
     let observed = server.requests()[1].body["messages"][3]["content"].clone();
     assert_eq!(observed, "exit code: 0\nstdout:\nfrom-the-sandbox");
 }
+
+impl Workspace {
+    fn memory_db(&self) -> PathBuf {
+        self.root.join("home").join(".agent86").join("memory.db")
+    }
+
+    /// `(title, state_json)` for a stored session.
+    fn stored_session(&self, session_id: &str) -> Option<(Option<String>, Value)> {
+        let connection = rusqlite::Connection::open(self.memory_db()).ok()?;
+        connection
+            .query_row(
+                "SELECT title, state_json FROM sessions WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    let json: String = row.get(1)?;
+                    Ok((row.get(0)?, serde_json::from_str(&json).unwrap()))
+                },
+            )
+            .ok()
+    }
+}
+
+#[tokio::test]
+async fn sessions_are_saved_and_resumed_with_their_history() {
+    let server = MockServer::start(vec![
+        sse_text("Nice to meet you, Ada.", "stop"),
+        sse_text("Your name is Ada.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("session-resume", &server);
+
+    let first = workspace.run(&["run", "--json", "My name is Ada."]).await;
+    assert!(first.status.success(), "{}", stderr(&first));
+    let first: Value = serde_json::from_str(&stdout(&first)).unwrap();
+    let session_id = first["session_id"].as_str().unwrap().to_owned();
+
+    let (title, state) = workspace.stored_session(&session_id).unwrap();
+    assert_eq!(title.as_deref(), Some("My name is Ada."));
+    assert_eq!(state["phase"], "done");
+    assert_eq!(state["messages"].as_array().unwrap().len(), 2);
+
+    let second = workspace
+        .run(&[
+            "run",
+            "--json",
+            "--session",
+            &session_id,
+            "What is my name?",
+        ])
+        .await;
+    assert!(second.status.success(), "{}", stderr(&second));
+    let second: Value = serde_json::from_str(&stdout(&second)).unwrap();
+
+    // The resumed request carries the earlier exchange.
+    let messages = server.requests()[1].body["messages"].clone();
+    let roles: Vec<&str> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant", "user"]);
+    assert_eq!(messages[2]["content"], "Nice to meet you, Ada.");
+
+    // Steps and usage accumulate across the session; `turn` is this turn only.
+    assert_eq!(second["session_id"], session_id.as_str());
+    assert_eq!(second["steps"], 2);
+    assert_eq!(second["usage"]["input_tokens"], 20);
+    assert_eq!(second["turn"]["steps"], 1);
+    assert_eq!(second["turn"]["input_tokens"], 10);
+
+    let (title, state) = workspace.stored_session(&session_id).unwrap();
+    assert_eq!(title.as_deref(), Some("My name is Ada."));
+    assert_eq!(state["messages"].as_array().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn unknown_session_ids_start_a_new_session() {
+    let server = MockServer::start(vec![sse_text("hello", "stop")]).await;
+    let workspace = Workspace::with_mock_provider("session-unknown", &server);
+
+    let output = workspace
+        .run(&["run", "--json", "-s", "doesnotexist", "hi"])
+        .await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let document: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let session_id = document["session_id"].as_str().unwrap();
+    assert_ne!(session_id, "doesnotexist");
+    assert!(workspace.stored_session(session_id).is_some());
+    assert!(workspace.stored_session("doesnotexist").is_none());
+}
+
+#[tokio::test]
+async fn failed_turns_are_saved_in_the_error_phase() {
+    let server = MockServer::start(vec![Reply::Status {
+        status: 500,
+        headers: Vec::new(),
+        body: "boom".to_owned(),
+    }])
+    .await;
+    let workspace = Workspace::with_mock_provider("session-error", &server);
+
+    let output = workspace.run(&["run", "this will fail"]).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    let connection = rusqlite::Connection::open(workspace.memory_db()).unwrap();
+    let (title, json): (Option<String>, String) = connection
+        .query_row("SELECT title, state_json FROM sessions", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let state: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(title.as_deref(), Some("this will fail"));
+    assert_eq!(state["phase"], "error");
+    assert_eq!(state["messages"][0]["content"], "this will fail");
+    assert!(state["last_turn"].is_object());
+}
+
+#[tokio::test]
+async fn memory_can_be_turned_off() {
+    let server = MockServer::start(vec![sse_text("ok", "stop")]).await;
+    let workspace = Workspace::with_mock_provider("session-off", &server);
+    workspace.append_project_config("\n[memory]\nenabled = false\n");
+
+    let output = workspace.run(&["run", "hi"]).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!workspace.memory_db().exists());
+}

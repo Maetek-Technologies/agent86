@@ -3,12 +3,13 @@
 
 use crate::pricing::format_cost;
 use crate::types::Usage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 
 /// What one user turn cost and did, matching the Python `TurnSummary` fields and order.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TurnSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,

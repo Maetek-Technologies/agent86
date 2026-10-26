@@ -7,10 +7,11 @@ use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
+use agent86::session::{expand_home, AgentState, SessionStore};
 use agent86::tools::sandbox::build_executor;
 use agent86::tools::web::WebSettings;
 use agent86::tools::{builtin_registry, ToolContext};
-use agent86::turn::format_turn_summary;
+use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
 use agent86::types::ModelRef;
 use clap::{Parser, Subcommand};
@@ -61,6 +62,10 @@ enum Command {
         /// Auto-approve side-effecting tools (non-interactive).
         #[arg(short, long)]
         yes: bool,
+
+        /// Resume/continue a session by id.
+        #[arg(short, long)]
+        session: Option<String>,
     },
 
     /// Store or delete provider API keys in the OS keyring.
@@ -104,12 +109,17 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
-        Some(Command::Run { goal, json, yes }) => {
+        Some(Command::Run {
+            goal,
+            json,
+            yes,
+            session,
+        }) => {
             let mut config = config;
             if yes {
                 config.guardrails.approval = ApprovalMode::Auto;
             }
-            run(&config, &goal, json, &stderr)
+            run(&config, &goal, json, session.as_deref(), &stderr)
         }
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         None => {
@@ -122,7 +132,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode {
+fn run(
+    config: &Config,
+    goal: &str,
+    as_json: bool,
+    session: Option<&str>,
+    stderr: &Stderr,
+) -> ExitCode {
     let provider = ModelRef::parse(&config.model.default)
         .map_err(|error| error.to_string())
         .and_then(|reference| {
@@ -170,9 +186,46 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
     let (executor, sandbox_note) = build_executor(&config.sandbox);
     context.executor = executor;
+
+    // Sessions live in the memory database; if it cannot be opened, run statelessly.
+    let store = if config.memory.enabled {
+        match SessionStore::open(&expand_home(&config.memory.path)) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                if !as_json {
+                    stderr.dim(&format!(
+                        "memory: unavailable, running without recall or session history. {error}"
+                    ));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(note) = sandbox_note.filter(|_| !as_json) {
         stderr.warn(&format!("sandbox: {note}"));
     }
+
+    // Resume the named session, or start a new one (also when the id is unknown).
+    let resumed = match (&store, session) {
+        (Some(store), Some(id)) => match store.load(id) {
+            Ok(found) => found,
+            Err(error) => {
+                stderr.error(&error.to_string());
+                return ExitCode::from(1);
+            }
+        },
+        _ => None,
+    };
+    let mut state = match resumed {
+        Some(state) => state,
+        None => {
+            let state = AgentState::new();
+            persist(store.as_ref(), &state, as_json, stderr);
+            state
+        }
+    };
     let harness = Harness {
         provider: provider.as_ref(),
         registry: builtin_registry(),
@@ -187,16 +240,18 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
 
     let mut stdout = std::io::stdout().lock();
-    let result = runtime.block_on(harness.run_turn(goal, |text| {
+    let result = runtime.block_on(harness.run_turn(&mut state, goal, |text| {
         if !as_json {
             // Raw write + flush streams partial lines reliably across terminals.
             let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
         }
     }));
+    // Saved whether the turn finished or failed, so the session stays resumable.
+    persist(store.as_ref(), &state, as_json, stderr);
 
-    let mut output = match result {
-        Ok(output) => output,
+    let streamed = match result {
+        Ok(streamed) => streamed,
         Err(error) => {
             stderr.error_after_stream(&error.to_string());
             // Python adds the model hint for provider failures only.
@@ -206,10 +261,16 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
             return ExitCode::from(1);
         }
     };
+    let output = RunOutput {
+        session_id: state.session_id.clone(),
+        // Honor the egress guardrail (e.g. redact mode) on the machine-readable output.
+        output: harness.guardrails.inspect_egress(&streamed).1,
+        steps: state.step_count() as u64,
+        usage: state.usage,
+        turn: state.last_turn.clone(),
+    };
 
     if as_json {
-        // Honor the egress guardrail (e.g. redact mode) on the machine-readable output.
-        output.output = harness.guardrails.inspect_egress(&output.output).1;
         match serde_json::to_string_pretty(&output) {
             Ok(document) => {
                 let _ = writeln!(stdout, "{document}");
@@ -228,6 +289,15 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Save the session if there is a store; a failure is reported, not fatal.
+fn persist(store: Option<&SessionStore>, state: &AgentState, as_json: bool, stderr: &Stderr) {
+    if let Some(Err(error)) = store.map(|store| store.persist(state)) {
+        if !as_json {
+            stderr.dim(&format!("memory: could not save the session: {error}"));
+        }
+    }
 }
 
 fn keys_command(config: &Config, command: KeysCommand, stderr: &Stderr) -> ExitCode {
