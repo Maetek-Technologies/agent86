@@ -21,6 +21,7 @@ dependencies = [
  "clap",
  "futures-util",
  "keyring-core",
+ "regex",
  "reqwest",
  "rpassword",
  "serde",

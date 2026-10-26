@@ -679,3 +679,26 @@ fn unknown_approval_modes_are_invalid_config() {
         stderr(&output)
     );
 }
+
+#[tokio::test]
+async fn redact_mode_from_config_covers_text_and_json_output() {
+    let answer = || sse_text("Contact jane@example.com today.", "stop");
+    let server = MockServer::start(vec![answer(), answer()]).await;
+    let workspace = Workspace::with_mock_provider("redact", &server);
+    workspace.append_project_config("\n[guardrails]\negress = \"redact\"\n");
+
+    let text = workspace.run(&["run", "who?"]).await;
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert_eq!(
+        stdout(&text),
+        "Contact [REDACTED:email] today.\n[guardrail] output flagged: pii:email\n\n"
+    );
+
+    let json = workspace.run(&["run", "--json", "who?"]).await;
+    let document: Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(
+        document["output"],
+        "Contact [REDACTED:email] today.\n[guardrail] output flagged: pii:email\n"
+    );
+    assert!(!stdout(&json).contains("jane@example.com"));
+}

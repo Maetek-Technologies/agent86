@@ -1,6 +1,7 @@
 use agent86::agent::{Harness, HarnessError};
 use agent86::approval::{terminal_prompt_if_interactive, ApprovalGate};
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
+use agent86::guardrails::Guardrails;
 use agent86::keys;
 use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
@@ -167,6 +168,7 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
         // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
         // there is no prompt, so `ask` declines them unless --yes was given.
         gate: ApprovalGate::new(config.guardrails.approval, terminal_prompt_if_interactive()),
+        guardrails: Guardrails::new(&config.guardrails),
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -178,7 +180,7 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
         }
     }));
 
-    let output = match result {
+    let mut output = match result {
         Ok(output) => output,
         Err(error) => {
             stderr.error_after_stream(&error.to_string());
@@ -191,6 +193,8 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
 
     if as_json {
+        // Honor the egress guardrail (e.g. redact mode) on the machine-readable output.
+        output.output = harness.guardrails.inspect_egress(&output.output).1;
         match serde_json::to_string_pretty(&output) {
             Ok(document) => {
                 let _ = writeln!(stdout, "{document}");
