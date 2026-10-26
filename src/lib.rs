@@ -6,6 +6,7 @@
 //! compatibility tests as the port progresses.
 
 pub mod config;
+pub mod keys;
 pub mod pricing;
 pub mod prompt;
 pub mod provider;

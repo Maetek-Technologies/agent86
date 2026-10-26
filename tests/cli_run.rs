@@ -440,3 +440,98 @@ async fn the_system_prompt_reports_overridden_model_and_sandbox() {
         "{system}"
     );
 }
+
+/// Run `agent86` with `input` on stdin.
+fn run_with_stdin(workspace: &Workspace, args: &[&str], input: &str) -> Output {
+    use std::io::Write as _;
+    let mut child = workspace
+        .command(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+// These `keys` tests only exercise refusals, which all happen before the OS
+// keyring is touched; a successful `keys set` would write the real keyring.
+
+#[test]
+fn keys_set_refuses_unknown_and_keyless_providers() {
+    let workspace = Workspace::new("keys-providers");
+
+    let unknown = workspace
+        .command(&["keys", "set", "openroutr"])
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(
+        stderr(&unknown)
+            .starts_with("error: Unknown provider 'openroutr'. Providers that take a key: "),
+        "{}",
+        stderr(&unknown)
+    );
+
+    let keyless = workspace
+        .command(&["keys", "delete", "ollama"])
+        .output()
+        .unwrap();
+    assert_eq!(keyless.status.code(), Some(1));
+    assert!(
+        stderr(&keyless).contains("has no api_key_env"),
+        "{}",
+        stderr(&keyless)
+    );
+}
+
+#[test]
+fn keys_set_will_not_prompt_without_a_terminal() {
+    let workspace = Workspace::new("keys-no-tty");
+
+    let output = workspace
+        .command(&["keys", "set", "openrouter"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("Pass --stdin"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn keys_set_rejects_empty_and_repeated_pastes() {
+    let workspace = Workspace::new("keys-bad-paste");
+
+    let empty = run_with_stdin(&workspace, &["keys", "set", "openrouter", "--stdin"], "\n");
+    assert_eq!(empty.status.code(), Some(1));
+    assert!(
+        stderr(&empty).contains("No key was entered."),
+        "{}",
+        stderr(&empty)
+    );
+
+    let key = "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
+    let repeated = run_with_stdin(
+        &workspace,
+        &["keys", "set", "openrouter", "--stdin"],
+        &key.repeat(4),
+    );
+    assert_eq!(repeated.status.code(), Some(1));
+    let errors = stderr(&repeated);
+    assert!(errors.contains("pasted more than once"), "{errors}");
+    assert!(
+        !errors.contains(key),
+        "the key must never be echoed: {errors}"
+    );
+}

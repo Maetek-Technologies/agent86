@@ -27,3 +27,31 @@ fn entries_written_by_python_keyring_are_readable() {
     );
     assert_eq!(store.get_password(SERVICE, "third"), None);
 }
+
+#[test]
+#[ignore = "writes and deletes throwaway entries in the real OS keyring"]
+fn store_read_and_delete_round_trip() {
+    let store = OsKeyring;
+    let service = "agent86-rs-roundtrip-test";
+
+    store.set_password(service, "first", "one").unwrap();
+    store.set_password(service, "second", "two").unwrap();
+    store.set_password(service, "first", "uno").unwrap();
+    let read = (
+        store.get_password(service, "first"),
+        store.get_password(service, "second"),
+    );
+    let deleted = (
+        store.delete_password(service, "first"),
+        store.delete_password(service, "second"),
+        store.delete_password(service, "second"),
+    );
+    let after = (
+        store.get_password(service, "first"),
+        store.get_password(service, "second"),
+    );
+
+    assert_eq!(read, (Some("uno".to_owned()), Some("two".to_owned())));
+    assert_eq!(deleted, (Ok(true), Ok(true), Ok(false)));
+    assert_eq!(after, (None, None));
+}

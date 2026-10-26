@@ -67,7 +67,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Try it against OpenRouter. Either set `OPENROUTER_API_KEY` in your environment, or store the key once in the OS keyring, for example with Python's `keyring` tool (`pip install keyring`, then `keyring set agent86 openrouter`, which prompts for the key without echoing it). Then run:
+Try it against OpenRouter. Either set `OPENROUTER_API_KEY` in your environment, or store the key once in the OS keyring:
+
+```bash
+cargo run -- keys set openrouter      # prompts with input hidden, including in Git Bash
+```
+
+Then run:
 
 ```bash
 cargo run -- --model openrouter:<model> run "Say hello"
