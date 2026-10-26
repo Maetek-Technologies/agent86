@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** Text-only one-shot `run` complete; live OpenRouter smoke test next
+**Current stage:** First milestone complete (one real OpenAI-compatible model turn); stage 2 next
 
 ## 1. Purpose
 
@@ -58,6 +58,7 @@ Local validation completed successfully:
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live OpenRouter smoke test (2026-10-26, `openrouter:openai/gpt-4o-mini`): `run` streamed the answer with the summary line on stderr, and `run --json` produced the contract fields with real token usage (12 in / 7 out). The key was read from the environment and appeared in no output
 
 ### Not implemented
 
@@ -90,7 +91,7 @@ The project is **not yet a usable agent**. It currently has no:
 - Python retries only `ConnectError`, `ConnectTimeout`, and `RemoteProtocolError`. `reqwest` does not expose the same classes, so Rust retries any transport failure other than a read timeout, still only before text has been emitted.
 - Like Python, an SSE `data:` chunk carrying an `{"error": ...}` object (sent by OpenRouter for mid-stream failures) is silently ignored. Both implementations should probably surface it; change them together.
 
-## 4. Immediate milestone: one real OpenAI-compatible model turn
+## 4. First milestone (complete): one real OpenAI-compatible model turn
 
 The next milestone is a minimal text-only, one-shot CLI using an OpenAI-compatible provider, with OpenRouter as the first live target.
 
@@ -136,6 +137,8 @@ OpenRouter comes before Ollama because it:
    - Keep live tests opt-in and outside normal CI
 
 ### Acceptance criteria
+
+All criteria were met on 2026-10-26.
 
 - Formatting, tests, and Clippy pass
 - The CLI executes against the mock provider without external credentials
@@ -209,5 +212,5 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] Add TOML provider config, env-var key resolution, and the `provider:model` factory
 - [x] Implement text-only `run` and `run --json`
 - [x] Validate locally without credentials
-- [ ] Perform an optional live OpenRouter smoke test
+- [x] Perform an optional live OpenRouter smoke test (2026-10-26, `openrouter:openai/gpt-4o-mini`)
 - [x] Upload the CI workflow
