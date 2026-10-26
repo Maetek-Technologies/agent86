@@ -1,7 +1,9 @@
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
+use agent86::keys;
 use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
+use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::turn::{format_turn_summary, run_text_turn};
 use agent86::types::ModelRef;
 use clap::{Parser, Subcommand};
@@ -44,6 +46,29 @@ enum Command {
         #[arg(long = "json")]
         json: bool,
     },
+
+    /// Store or delete provider API keys in the OS keyring.
+    #[command(subcommand)]
+    Keys(KeysCommand),
+}
+
+#[derive(Subcommand)]
+enum KeysCommand {
+    /// Store a provider's API key, prompting for it with input hidden.
+    Set {
+        /// The provider section name, e.g. openrouter.
+        provider: String,
+
+        /// Read the key from stdin instead of prompting.
+        #[arg(long)]
+        stdin: bool,
+    },
+
+    /// Delete a provider's stored API key.
+    Delete {
+        /// The provider section name, e.g. openrouter.
+        provider: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -61,6 +86,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         Some(Command::Run { goal, json }) => run(&config, &goal, json, &stderr),
+        Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         None => {
             eprintln!(
                 "agent86: the interactive REPL is not implemented yet in the Rust port; \
@@ -145,6 +171,58 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
         }
     }
     ExitCode::SUCCESS
+}
+
+fn keys_command(config: &Config, command: KeysCommand, stderr: &Stderr) -> ExitCode {
+    let store = OsKeyring;
+    let (provider, result) = match command {
+        KeysCommand::Set { provider, stdin } => {
+            let result = keys::check_provider(config, &provider)
+                .and_then(|()| keys::read_key(&provider, stdin))
+                .and_then(|key| {
+                    store
+                        .set_password(SERVICE_NAME, &provider, &key)
+                        .map_err(|error| {
+                            format!("Could not store the key for '{provider}': {error}")
+                        })
+                })
+                .map(|()| {
+                    format!(
+                        "Stored the key for '{provider}' in the OS keyring \
+                         (service \"{SERVICE_NAME}\", account \"{provider}\")."
+                    )
+                });
+            (provider, result)
+        }
+        KeysCommand::Delete { provider } => {
+            let result = keys::check_provider(config, &provider).and_then(|()| {
+                match store.delete_password(SERVICE_NAME, &provider) {
+                    Ok(true) => Ok(format!("Deleted the stored key for '{provider}'.")),
+                    Ok(false) => Ok(format!("No key was stored for '{provider}'.")),
+                    Err(error) => Err(format!(
+                        "Could not delete the key for '{provider}': {error}"
+                    )),
+                }
+            });
+            (provider, result)
+        }
+    };
+
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            if let Some(variable) = keys::overriding_variable(config, &provider) {
+                stderr.dim(&format!(
+                    "Note: {variable} is set in this environment and takes precedence over the keyring."
+                ));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            stderr.error(&message);
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// stderr writer that styles like Rich: colour only on a terminal, and never with `NO_COLOR`.
