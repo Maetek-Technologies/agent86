@@ -42,7 +42,8 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added ten initial compatibility tests
 - Added a placeholder `agent86` CLI supporting `--help` and `--version`
 - Added the README, MIT license, `.gitignore`, and an implementation roadmap
-- Prepared a cross-platform CI workflow for Linux, macOS, and Windows
+- Added a cross-platform CI workflow for Linux, macOS, and Windows, testing on stable and the MSRV
+- Raised the MSRV from 1.74 to 1.77, the minimum required by the locked `thiserror` 2.x
 
 Local validation completed successfully:
 
@@ -64,10 +65,6 @@ The project is **not yet a usable agent**. It currently has no:
 - MCP support
 - Interactive terminal interface
 - Local embedding backend
-
-### Infrastructure limitation
-
-The prepared `.github/workflows/ci.yml` has not been uploaded. GitHub rejects workflow creation with the current connection because it lacks workflow permission. All other initial files have been pushed and verified.
 
 ## 4. Immediate milestone: one real OpenAI-compatible model turn
 
@@ -188,4 +185,4 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [ ] Implement text-only `run` and `run --json`
 - [ ] Validate locally without credentials
 - [ ] Perform an optional live OpenRouter smoke test
-- [ ] Upload the prepared CI workflow after workflow permission is available
+- [x] Upload the CI workflow
