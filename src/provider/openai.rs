@@ -9,6 +9,7 @@ use super::capabilities::supports_sampling_params;
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy, DEFAULT_MAX_RETRIES};
 use super::{DeltaStream, Provider, ProviderError};
 use crate::pricing::PriceTable;
+use crate::pyjson::python_json_dumps;
 use crate::secrets::redact;
 use crate::types::{
     Completion, CompletionDelta, CompletionRequest, Message, Role, StopReason, ToolCall, ToolSpec,
@@ -342,7 +343,8 @@ fn to_messages(messages: &[Message]) -> Value {
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        "arguments": Value::Object(call.arguments.clone()).to_string(),
+                        // json.dumps(arguments), as Python sends them back.
+                        "arguments": python_json_dumps(&Value::Object(call.arguments.clone()), true),
                     },
                 })).collect::<Vec<_>>(),
             }),

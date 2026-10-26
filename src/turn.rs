@@ -1,17 +1,11 @@
-//! A single text-only turn: the slice of the Python orchestration loop that
-//! `agent86 run` needs before tools and the ReAct loop are ported.
-//!
-//! The Python loop also continues answers cut off by `max_tokens` and applies
-//! the egress guardrail; neither is ported yet.
+//! The record of one turn: the `run --json` document, the per-turn summary,
+//! and the summary line printed on stderr. The loop itself is in `agent`.
 
 use crate::pricing::format_cost;
-use crate::provider::{Provider, ProviderError};
-use crate::types::{CompletionRequest, Message, Role, Usage};
-use futures_util::StreamExt;
+use crate::types::Usage;
 use serde::Serialize;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::time::Instant;
 
 /// What one user turn cost and did, matching the Python `TurnSummary` fields and order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -31,7 +25,8 @@ pub struct TurnSummary {
 }
 
 impl TurnSummary {
-    fn add_usage(&mut self, usage: &Usage) {
+    /// Fold one model call's usage in.
+    pub fn add_usage(&mut self, usage: &Usage) {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cost_usd += usage.cost_usd;
@@ -59,65 +54,6 @@ pub fn new_session_id() -> String {
             .map_or(0, |elapsed| elapsed.as_nanos()),
     );
     format!("{:012x}", hasher.finish() & 0xffff_ffff_ffff)
-}
-
-/// Run one text-only turn, passing each streamed text delta to `on_text`.
-///
-/// The request is `[system, user]`, the same shape as Python's first request of a turn.
-pub async fn run_text_turn(
-    provider: &dyn Provider,
-    system: Message,
-    goal: &str,
-    max_tokens: u32,
-    mut on_text: impl FnMut(&str),
-) -> Result<RunOutput, ProviderError> {
-    let started = Instant::now();
-    let request = CompletionRequest {
-        model: provider.model().to_owned(),
-        messages: vec![
-            system,
-            Message {
-                role: Role::User,
-                content: goal.to_owned(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                name: None,
-            },
-        ],
-        tools: Vec::new(),
-        temperature: 0.0,
-        max_tokens: Some(max_tokens),
-        stream: true,
-    };
-
-    let mut output = String::new();
-    let mut usage = Usage::default();
-    let mut stream = provider.stream(request);
-    while let Some(delta) = stream.next().await {
-        let delta = delta?;
-        if !delta.text.is_empty() {
-            output.push_str(&delta.text);
-            on_text(&delta.text);
-        }
-        if let Some(completion) = delta.completion.filter(|_| delta.done) {
-            usage = completion.usage;
-        }
-    }
-
-    let mut turn = TurnSummary {
-        steps: 1,
-        ..TurnSummary::default()
-    };
-    turn.add_usage(&usage);
-    turn.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
-
-    Ok(RunOutput {
-        session_id: new_session_id(),
-        output,
-        steps: 1,
-        usage,
-        turn: Some(turn),
-    })
 }
 
 /// Compact token count: 512 -> `512`, 1234 -> `1.2k`, 32768 -> `33k`.

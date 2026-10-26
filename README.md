@@ -20,7 +20,7 @@ The Python implementation remains the reference. This repository starts with a s
 - A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-Turns send Python's system prompt but are text only: there is no orchestration loop, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
+`run` is a working read-only agent: the model can list directories and read files inside the current directory, see the results, and keep going until it answers. There are no side-effecting tools (writing files, running commands), approvals, MCP connections, persistent sessions, or interactive interfaces yet.
 
 ## Why Rust?
 
@@ -47,8 +47,8 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [ ] Differential test harness against the Python implementation
 - [ ] Ollama streaming provider
 - [x] Text-only one-shot `run` and `run --json`
-- [x] Read-only workspace tools (`read_file`, `list_dir`; not yet offered to the model)
-- [ ] Minimal ReAct loop
+- [x] Read-only workspace tools (`read_file`, `list_dir`)
+- [x] ReAct loop with circuit breakers and continuations
 - [ ] Guardrails, approvals, and sandboxed side-effecting tools
 - [ ] Sessions, memory, and observability
 - [ ] MCP transports and lifecycle behavior

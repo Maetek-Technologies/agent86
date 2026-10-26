@@ -1,10 +1,12 @@
+use agent86::agent::{Harness, HarnessError};
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::keys;
 use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
-use agent86::turn::{format_turn_summary, run_text_turn};
+use agent86::tools::{read_only_registry, ToolContext};
+use agent86::turn::format_turn_summary;
 use agent86::types::ModelRef;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
@@ -128,26 +130,40 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
         }
     };
 
-    let mut stdout = std::io::stdout().lock();
-    let result = runtime.block_on(run_text_turn(
-        provider.as_ref(),
-        build_system_prompt(config),
-        goal,
+    // Tools are jailed to the directory `agent86` runs in, as in Python.
+    let context = match std::env::current_dir().and_then(|dir| ToolContext::new(&dir)) {
+        Ok(context) => context,
+        Err(error) => {
+            stderr.error(&format!("could not open the workspace: {error}"));
+            return ExitCode::from(1);
+        }
+    };
+    let harness = Harness {
+        provider: provider.as_ref(),
+        registry: read_only_registry(),
+        context,
+        limits: config.limits.clone(),
+        system: build_system_prompt(config),
         max_tokens,
-        |text| {
-            if !as_json {
-                // Raw write + flush streams partial lines reliably across terminals.
-                let _ = stdout.write_all(text.as_bytes());
-                let _ = stdout.flush();
-            }
-        },
-    ));
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    let result = runtime.block_on(harness.run_turn(goal, |text| {
+        if !as_json {
+            // Raw write + flush streams partial lines reliably across terminals.
+            let _ = stdout.write_all(text.as_bytes());
+            let _ = stdout.flush();
+        }
+    }));
 
     let output = match result {
         Ok(output) => output,
         Err(error) => {
             stderr.error_after_stream(&error.to_string());
-            stderr.dim(MODEL_HELP);
+            // Python adds the model hint for provider failures only.
+            if matches!(error, HarnessError::Provider(_)) {
+                stderr.dim(MODEL_HELP);
+            }
             return ExitCode::from(1);
         }
     };
