@@ -326,12 +326,13 @@ async fn unreachable_endpoints_report_a_connect_error() {
 fn a_missing_key_names_the_configured_environment_variable() {
     let config = OpenAiConfig {
         api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
+        config_name: "openrouter".to_owned(),
         ..OpenAiConfig::default()
     };
     let error = OpenAiProvider::new("m", config, Some(String::new())).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "No API key found. Set the OPENROUTER_API_KEY environment variable."
+        "No API key found. Set the OPENROUTER_API_KEY environment variable or store a key in the OS keyring (service \"agent86\", account \"openrouter\")."
     );
 
     let keyless = OpenAiConfig {

@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+keyring-core = "1.0.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -26,3 +27,12 @@ all = "warn"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[target."cfg(windows)".dependencies]
+windows-native-keyring-store = "1.1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }

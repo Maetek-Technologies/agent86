@@ -48,6 +48,8 @@ pub struct OpenAiConfig {
     pub base_url: Option<String>,
     /// The environment variable named in config, used in the missing-key message.
     pub api_key_env: Option<String>,
+    /// The config section name, which is also the keyring account for its key.
+    pub config_name: String,
     /// Whether construction fails without an API key. Keyless local endpoints set this to false.
     pub require_key: bool,
     /// Standing output cap, used when the request does not set one.
@@ -63,6 +65,7 @@ impl Default for OpenAiConfig {
         Self {
             base_url: None,
             api_key_env: None,
+            config_name: "openai".to_owned(),
             require_key: true,
             max_tokens: None,
             connect_timeout: Duration::from_secs(10),
@@ -109,6 +112,7 @@ impl OpenAiProvider {
                     .api_key_env
                     .clone()
                     .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_owned()),
+                account: config.config_name.clone(),
             });
         }
 

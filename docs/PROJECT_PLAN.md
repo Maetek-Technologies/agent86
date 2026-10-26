@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing and the system prompt ported
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported
 
 ## 1. Purpose
 
@@ -53,22 +53,24 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Matched Python's `json.dumps` float formatting for `cost_usd` and `duration_s` (`1.44e-05`, not `0.0000144`)
 - Added the system prompt ported from `cognitive/prompt.py`: Python's identity text plus `Environment: agent86 v<version>. Default model: <ref>. Sandbox: <mode>.`, sent as the first message of every request. A fixture extracted from the Python source (by parsing, not executing it) keeps the text identical
 - Added `[sandbox] mode` (`subprocess` or `docker`) and the `AGENT86_SANDBOX` override; the mode is only reported in the prompt, since no sandbox exists yet
+- Added OS keyring lookup ported from `secrets.py`: the `api_key_env` variable wins, then the keyring entry with service `agent86` and the provider section name as the account (Windows Credential Manager, macOS Keychain, Secret Service on Linux). Windows lookups follow the Python `keyring` package's layout (`agent86`, then `<account>@agent86`), confirmed against its source, so keys Python stored are found. Any keyring failure degrades to environment-only
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **71 passed** (27 unit, 10 compatibility, 18 provider integration, 14 CLI end-to-end, 2 system prompt)
+- `cargo test --all-targets`: **78 passed** (32 unit, 10 compatibility, 18 provider integration, 14 CLI end-to-end, 2 system prompt, 2 API key), plus 1 opt-in live keyring test
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live keyring check (2026-10-26): with no environment variable set, `run` used the OpenRouter key from Windows Credential Manager and sent the system prompt (337 input tokens)
 - Live OpenRouter smoke test (2026-10-26, `openrouter:openai/gpt-4o-mini`): `run` streamed the answer with the summary line on stderr, and `run --json` produced the contract fields with real token usage (12 in / 7 out). The key was read from the environment and appeared in no output
 
 ### Not implemented
 
 The project is **not yet a usable agent**. It currently has no:
 
-- API-key lookup in the OS keyring (environment variables only)
+- Storing or deleting keyring entries (Python does this from its interactive `/config model` screen, which is not ported)
 - Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
 - Tool execution or ReAct orchestration
@@ -86,6 +88,8 @@ The project is **not yet a usable agent**. It currently has no:
 - The session id is ephemeral and is not persisted; `--session`/`-s`, `--yes`, `--sandbox`, `--approval`, `--resume`, and `--plain` are not accepted yet.
 - With no subcommand, Python opens the REPL; Rust prints a not-implemented message and exits 2.
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
+- The missing-key error names the keyring entry to create (service `agent86`, account `<provider>`) instead of pointing at `/config model`.
+- Reading keys that Python stored is verified on Windows against the `keyring` package's source, and live on 2026-10-26: a key saved with Python's `keyring set agent86 openrouter` was read by Rust and accepted by OpenRouter. On macOS and Linux the attribute layouts match by inspection but have not been tested against entries Python wrote. `tests/os_keyring.rs` is an opt-in check for any platform.
 - The model-error hint suggests `--model` and an API key instead of the `agent86 models` command, which is not ported. The malformed-config hint does not mention `agent86 config path` for the same reason.
 - Rich wraps stderr at 80 columns when it is not a terminal; Rust does not wrap. stdout, including `--json` output (2-space indent, non-ASCII unescaped), is unaffected.
 
