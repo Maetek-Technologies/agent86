@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) ported, agent loop (stage 4) next
 
 ## 1. Purpose
 
@@ -55,12 +55,13 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added `[sandbox] mode` (`subprocess` or `docker`) and the `AGENT86_SANDBOX` override; the mode is only reported in the prompt, since no sandbox exists yet
 - Added OS keyring lookup ported from `secrets.py`: the `api_key_env` variable wins, then the keyring entry with service `agent86` and the provider section name as the account (Windows Credential Manager, macOS Keychain, Secret Service on Linux). Windows lookups follow the Python `keyring` package's layout (`agent86`, then `<account>@agent86`), confirmed against its source, so keys Python stored are found. Any keyring failure degrades to environment-only
 - Added `agent86 keys set <provider> [--stdin]` and `agent86 keys delete <provider>`, which write and delete the same keyring entries Python uses (on Windows, Python's `agent86` / `<account>@agent86` layout). The prompt hides input, including in Git Bash, where it uses `stty -echo` because console-based prompts (Python's `getpass`, `rpassword`) cannot read mintty input. Keys are checked before storing: empty input, embedded whitespace, and a key pasted more than once are refused. Verified live on Windows with a store, read, and delete round trip under a throwaway service name
+- Added the tool layer and the read-only workspace tools (stage 3), ported from `tools/base.py`, `tools/registry.py`, `tools/sandbox/policy.py`, and `tools/builtin/files.py`: the `Tool` trait, pydantic-style argument validation with pydantic's messages, the workspace jail (`resolve_within`, following symlinks like `Path.resolve()`), output truncation, the registry (registration-order specs, sorted names, unknown-tool errors), and `read_file` and `list_dir`. Their advertised JSON schemas match a fixture generated with pydantic from mirrors of the Python argument models. The tools are not yet offered to the model; that needs the agent loop
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **88 passed** (39 unit, 10 compatibility, 18 provider integration, 17 CLI end-to-end, 2 system prompt, 2 API key), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **101 passed** (39 unit, 10 compatibility, 18 provider integration, 17 CLI end-to-end, 13 tools, 2 system prompt, 2 API key), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -73,7 +74,8 @@ The project is **not yet a usable agent**. It currently has no:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
-- Tool execution or ReAct orchestration
+- The ReAct loop, so no tools are offered to the model yet (stage 4)
+- Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
 - Guardrails, approvals, or sandbox executors
 - Session persistence, memory, or tracing
 - MCP support
@@ -93,6 +95,12 @@ The project is **not yet a usable agent**. It currently has no:
 - Reading keys that Python stored is verified on Windows against the `keyring` package's source, and live on 2026-10-26: a key saved with Python's `keyring set agent86 openrouter` was read by Rust and accepted by OpenRouter. On macOS and Linux the attribute layouts match by inspection but have not been tested against entries Python wrote. `tests/os_keyring.rs` is an opt-in check for any platform.
 - The model-error hint suggests `--model` and an API key instead of the `agent86 models` command, which is not ported. The malformed-config hint does not mention `agent86 config path` for the same reason.
 - Rich wraps stderr at 80 columns when it is not a terminal; Rust does not wrap. stdout, including `--json` output (2-space indent, non-ASCII unescaped), is unaffected.
+
+### Known tool differences from Python
+
+- I/O failures other than the handled cases report Rust's error text after Python's exception name (for example `PermissionError: Access is denied. (os error 5)` rather than Python's `[Errno 13] Permission denied: '...'`).
+- Invalid UTF-8 is replaced per maximal invalid sequence (Rust's `from_utf8_lossy`) rather than per byte, so a run of bad bytes can yield fewer U+FFFD characters than Python.
+- The jail has no extra allowed roots yet; Python adds skill directories, which are not ported.
 
 ### Known provider differences from Python
 

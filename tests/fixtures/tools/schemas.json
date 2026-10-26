@@ -1,0 +1,1 @@
+{"read_file": {"properties": {"path": {"description": "Path to the file, relative to the workspace.", "title": "Path", "type": "string"}}, "required": ["path"], "type": "object"}, "list_dir": {"properties": {"path": {"default": ".", "description": "Directory path, relative to the workspace.", "title": "Path", "type": "string"}}, "type": "object"}}

@@ -12,5 +12,6 @@ pub mod prompt;
 pub mod provider;
 pub mod pyjson;
 pub mod secrets;
+pub mod tools;
 pub mod turn;
 pub mod types;

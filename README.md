@@ -47,8 +47,8 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [ ] Differential test harness against the Python implementation
 - [ ] Ollama streaming provider
 - [x] Text-only one-shot `run` and `run --json`
+- [x] Read-only workspace tools (`read_file`, `list_dir`; not yet offered to the model)
 - [ ] Minimal ReAct loop
-- [ ] Read-only workspace tools
 - [ ] Guardrails, approvals, and sandboxed side-effecting tools
 - [ ] Sessions, memory, and observability
 - [ ] MCP transports and lifecycle behavior
