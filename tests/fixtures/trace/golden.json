@@ -1,0 +1,148 @@
+{
+ "redact": [
+  {
+   "event": {
+    "ts": 1.5,
+    "session": "s1",
+    "kind": "turn_start",
+    "task": "use sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa please xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+   },
+   "redacted": {
+    "ts": 1.5,
+    "session": "s1",
+    "kind": "turn_start",
+    "task": "use ***REDACTED*** p\u2026[truncated 46 chars]"
+   }
+  },
+  {
+   "event": {
+    "ts": 2.0,
+    "session": "s1",
+    "kind": "tool_call",
+    "tool": "write_file",
+    "ok": true,
+    "arguments": {
+     "path": "a.txt",
+     "content": "token = abcdef0123456789 and more text here",
+     "n": 3
+    },
+    "error": null
+   },
+   "redacted": {
+    "ts": 2.0,
+    "session": "s1",
+    "kind": "tool_call",
+    "tool": "write_file",
+    "ok": true,
+    "arguments": {
+     "path": "a.txt",
+     "content": "***REDACTED*** and m\u2026[truncated 13 chars]",
+     "n": 3
+    },
+    "error": null
+   }
+  },
+  {
+   "event": {
+    "ts": 3.0,
+    "session": "s1",
+    "kind": "guardrail",
+    "stage": "egress",
+    "findings": "AKIAABCDEFGHIJKLMNOP yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+    "nested": [
+     {
+      "outcome": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+     }
+    ]
+   },
+   "redacted": {
+    "ts": 3.0,
+    "session": "s1",
+    "kind": "guardrail",
+    "stage": "egress",
+    "findings": "***REDACTED*** yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+    "nested": [
+     {
+      "outcome": "zzzzzzzzzzzzzzzzzzzz\u2026[truncated 30 chars]"
+     }
+    ]
+   }
+  }
+ ],
+ "otlp": {
+  "events": [
+   {
+    "ts": 1761500000.25,
+    "session": "aaa111",
+    "kind": "turn_start",
+    "task": "first"
+   },
+   {
+    "ts": 1761500001.5,
+    "session": "aaa111",
+    "kind": "model_call",
+    "step": 1,
+    "model": "m",
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cost_usd": 0.0,
+    "stop_reason": "tool_use",
+    "tool_calls": [
+     "read_file"
+    ]
+   },
+   {
+    "ts": 1761500001.75,
+    "session": "aaa111",
+    "kind": "tool_call",
+    "tool": "read_file",
+    "ok": false,
+    "arguments": {
+     "path": "x"
+    },
+    "error": "No such file: x"
+   },
+   {
+    "ts": 1761500002.0,
+    "session": "aaa111",
+    "kind": "model_call",
+    "step": 2,
+    "model": "m",
+    "input_tokens": 12,
+    "output_tokens": 3,
+    "cost_usd": 1.5e-05,
+    "stop_reason": "end_turn",
+    "tool_calls": []
+   },
+   {
+    "ts": 1761500002.125,
+    "session": "aaa111",
+    "kind": "turn_end",
+    "status": "done",
+    "steps": 2,
+    "continuations": 0
+   },
+   {
+    "ts": 1761500003.0,
+    "session": "bbb222",
+    "kind": "turn_start",
+    "task": "second"
+   },
+   {
+    "ts": 1761500004.0,
+    "session": "bbb222",
+    "kind": "turn_end",
+    "status": "error",
+    "reason": "circuit tripped: x"
+   },
+   {
+    "ts": 1761500005.0,
+    "session": "bbb222",
+    "kind": "turn_start",
+    "task": "crashed"
+   }
+  ],
+  "document_text": "{\n  \"resourceSpans\": [\n    {\n      \"resource\": {\n        \"attributes\": [\n          {\n            \"key\": \"service.name\",\n            \"value\": {\n              \"stringValue\": \"agent86\"\n            }\n          },\n          {\n            \"key\": \"service.version\",\n            \"value\": {\n              \"stringValue\": \"0.1.0\"\n            }\n          }\n        ]\n      },\n      \"scopeSpans\": [\n        {\n          \"scope\": {\n            \"name\": \"agent86\",\n            \"version\": \"0.1.0\"\n          },\n          \"spans\": [\n            {\n              \"traceId\": \"4a0cde71aee7158542d013fc0c9f5acf\",\n              \"spanId\": \"bbb95bb3968331d8\",\n              \"name\": \"model_call\",\n              \"kind\": 1,\n              \"startTimeUnixNano\": \"1761500000249999872\",\n              \"endTimeUnixNano\": \"1761500001500000000\",\n              \"attributes\": [\n                {\n                  \"key\": \"gen_ai.request.model\",\n                  \"value\": {\n                    \"stringValue\": \"m\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.usage.input_tokens\",\n                  \"value\": {\n                    \"intValue\": \"10\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.usage.output_tokens\",\n                  \"value\": {\n                    \"intValue\": \"5\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.response.finish_reasons\",\n                  \"value\": {\n                    \"arrayValue\": {\n                      \"values\": [\n                        {\n                          \"stringValue\": \"tool_use\"\n                        }\n                      ]\n                    }\n                  }\n                },\n                {\n                  \"key\": \"agent86.cost_usd\",\n                  \"value\": {\n                    \"doubleValue\": 0.0\n                  }\n                },\n                {\n                  \"key\": \"agent86.step\",\n                  \"value\": {\n                    \"intValue\": \"1\"\n                  }\n                }\n              ],\n              \"status\": {\n                \"code\": 1\n              },\n              \"parentSpanId\": \"304e4feb13162541\"\n            },\n            {\n              \"traceId\": \"4a0cde71aee7158542d013fc0c9f5acf\",\n              \"spanId\": \"13b0c5ff4a620f40\",\n              \"name\": \"tool_call\",\n              \"kind\": 1,\n              \"startTimeUnixNano\": \"1761500001500000000\",\n              \"endTimeUnixNano\": \"1761500001750000128\",\n              \"attributes\": [\n                {\n                  \"key\": \"tool.name\",\n                  \"value\": {\n                    \"stringValue\": \"read_file\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.tool.name\",\n                  \"value\": {\n                    \"stringValue\": \"read_file\"\n                  }\n                },\n                {\n                  \"key\": \"tool.ok\",\n                  \"value\": {\n                    \"boolValue\": false\n                  }\n                },\n                {\n                  \"key\": \"agent86.error\",\n                  \"value\": {\n                    \"stringValue\": \"No such file: x\"\n                  }\n                }\n              ],\n              \"status\": {\n                \"code\": 2\n              },\n              \"parentSpanId\": \"304e4feb13162541\"\n            },\n            {\n              \"traceId\": \"4a0cde71aee7158542d013fc0c9f5acf\",\n              \"spanId\": \"d4f4851ca15d33f7\",\n              \"name\": \"model_call\",\n              \"kind\": 1,\n              \"startTimeUnixNano\": \"1761500001750000128\",\n              \"endTimeUnixNano\": \"1761500002000000000\",\n              \"attributes\": [\n                {\n                  \"key\": \"gen_ai.request.model\",\n                  \"value\": {\n                    \"stringValue\": \"m\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.usage.input_tokens\",\n                  \"value\": {\n                    \"intValue\": \"12\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.usage.output_tokens\",\n                  \"value\": {\n                    \"intValue\": \"3\"\n                  }\n                },\n                {\n                  \"key\": \"gen_ai.response.finish_reasons\",\n                  \"value\": {\n                    \"arrayValue\": {\n                      \"values\": [\n                        {\n                          \"stringValue\": \"end_turn\"\n                        }\n                      ]\n                    }\n                  }\n                },\n                {\n                  \"key\": \"agent86.cost_usd\",\n                  \"value\": {\n                    \"doubleValue\": 1.5e-05\n                  }\n                },\n                {\n                  \"key\": \"agent86.step\",\n                  \"value\": {\n                    \"intValue\": \"2\"\n                  }\n                }\n              ],\n              \"status\": {\n                \"code\": 1\n              },\n              \"parentSpanId\": \"304e4feb13162541\"\n            },\n            {\n              \"traceId\": \"4a0cde71aee7158542d013fc0c9f5acf\",\n              \"spanId\": \"304e4feb13162541\",\n              \"name\": \"turn\",\n              \"kind\": 1,\n              \"startTimeUnixNano\": \"1761500000249999872\",\n              \"endTimeUnixNano\": \"1761500002124999936\",\n              \"attributes\": [\n                {\n                  \"key\": \"session.id\",\n                  \"value\": {\n                    \"stringValue\": \"aaa111\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.task\",\n                  \"value\": {\n                    \"stringValue\": \"first\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.status\",\n                  \"value\": {\n                    \"stringValue\": \"done\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.steps\",\n                  \"value\": {\n                    \"intValue\": \"2\"\n                  }\n                }\n              ],\n              \"status\": {\n                \"code\": 1\n              }\n            },\n            {\n              \"traceId\": \"6be712a6e73d979726c02a308b3457f9\",\n              \"spanId\": \"8ad7ed75eaf6da12\",\n              \"name\": \"turn\",\n              \"kind\": 1,\n              \"startTimeUnixNano\": \"1761500003000000000\",\n              \"endTimeUnixNano\": \"1761500004000000000\",\n              \"attributes\": [\n                {\n                  \"key\": \"session.id\",\n                  \"value\": {\n                    \"stringValue\": \"bbb222\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.task\",\n                  \"value\": {\n                    \"stringValue\": \"second\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.status\",\n                  \"value\": {\n                    \"stringValue\": \"error\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.reason\",\n                  \"value\": {\n                    \"stringValue\": \"circuit tripped: x\"\n                  }\n                }\n              ],\n              \"status\": {\n                \"code\": 2\n              }\n            },\n            {\n              \"traceId\": \"6be712a6e73d979726c02a308b3457f9\",\n              \"spanId\": \"8fdaf73b1eafe135\",\n              \"name\": \"turn\",\n              \"kind\": 1,\n              \"startTimeUnixNano\": \"1761500005000000000\",\n              \"endTimeUnixNano\": \"1761500005000000000\",\n              \"attributes\": [\n                {\n                  \"key\": \"session.id\",\n                  \"value\": {\n                    \"stringValue\": \"bbb222\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.task\",\n                  \"value\": {\n                    \"stringValue\": \"crashed\"\n                  }\n                },\n                {\n                  \"key\": \"agent86.status\",\n                  \"value\": {\n                    \"stringValue\": \"unfinished\"\n                  }\n                }\n              ],\n              \"status\": {\n                \"code\": 0\n              }\n            }\n          ]\n        }\n      ]\n    }\n  ]\n}\n"
+ },
+ "jsonl_line": "{\"ts\": 1761500001.5, \"session\": \"aaa111\", \"kind\": \"model_call\", \"step\": 1, \"model\": \"m\", \"input_tokens\": 10, \"output_tokens\": 5, \"cost_usd\": 0.0, \"stop_reason\": \"tool_use\", \"tool_calls\": [\"read_file\"]}"
+}

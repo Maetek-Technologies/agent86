@@ -128,11 +128,79 @@ mod tests {
 /// (UTF-16 surrogate pairs above the Basic Multilingual Plane).
 pub fn python_json_dumps(value: &serde_json::Value, ensure_ascii: bool) -> String {
     let mut out = String::new();
-    write_value(&mut out, value, ensure_ascii);
+    write_value(&mut out, value, ensure_ascii, None, 0);
     out
 }
 
-fn write_value(out: &mut String, value: &serde_json::Value, ensure_ascii: bool) {
+/// `json.dumps(value, ensure_ascii=..., indent=indent)`: one item per line, `", "`
+/// becoming `","` at line ends, and empty containers kept as `[]` and `{}`.
+pub fn python_json_dumps_indented(
+    value: &serde_json::Value,
+    ensure_ascii: bool,
+    indent: usize,
+) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value, ensure_ascii, Some(indent), 0);
+    out
+}
+
+/// The separator before item `index` of a container at `depth`.
+fn separator(out: &mut String, index: usize, indent: Option<usize>, depth: usize) {
+    match indent {
+        Some(width) => {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push('\n');
+            out.push_str(&" ".repeat(width * (depth + 1)));
+        }
+        None if index > 0 => out.push_str(", "),
+        None => {}
+    }
+}
+
+fn close(out: &mut String, bracket: char, indent: Option<usize>, depth: usize) {
+    if let Some(width) = indent {
+        out.push('\n');
+        out.push_str(&" ".repeat(width * depth));
+    }
+    out.push(bracket);
+}
+
+fn write_value(
+    out: &mut String,
+    value: &serde_json::Value,
+    ensure_ascii: bool,
+    indent: Option<usize>,
+    depth: usize,
+) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) if items.is_empty() => out.push_str("[]"),
+        Value::Object(map) if map.is_empty() => out.push_str("{}"),
+        Value::Array(items) if indent.is_some() => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                separator(out, index, indent, depth);
+                write_value(out, item, ensure_ascii, indent, depth + 1);
+            }
+            close(out, ']', indent, depth);
+        }
+        Value::Object(map) if indent.is_some() => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                separator(out, index, indent, depth);
+                write_string(out, key, ensure_ascii);
+                out.push_str(": ");
+                write_value(out, item, ensure_ascii, indent, depth + 1);
+            }
+            close(out, '}', indent, depth);
+        }
+        _ => write_compact(out, value, ensure_ascii),
+    }
+}
+
+fn write_compact(out: &mut String, value: &serde_json::Value, ensure_ascii: bool) {
     use serde_json::Value;
     match value {
         Value::Null => out.push_str("null"),
@@ -152,7 +220,7 @@ fn write_value(out: &mut String, value: &serde_json::Value, ensure_ascii: bool) 
                 if index > 0 {
                     out.push_str(", ");
                 }
-                write_value(out, item, ensure_ascii);
+                write_compact(out, item, ensure_ascii);
             }
             out.push(']');
         }
@@ -164,7 +232,7 @@ fn write_value(out: &mut String, value: &serde_json::Value, ensure_ascii: bool) 
                 }
                 write_string(out, key, ensure_ascii);
                 out.push_str(": ");
-                write_value(out, item, ensure_ascii);
+                write_compact(out, item, ensure_ascii);
             }
             out.push('}');
         }
@@ -241,5 +309,15 @@ mod dumps_tests {
             esc(r#"{"e": "|ud83d|ude00"}"#)
         );
         assert_eq!(python_json_dumps(&json!({}), false), "{}");
+    }
+
+    #[test]
+    fn indented_dumps_matches_python() {
+        // CPython: json.dumps(value, indent=2, ensure_ascii=False)
+        let value = json!({"a": [1, {"b": null, "c": []}], "d": {}, "e": 1.5e-05, "f": "x"});
+        assert_eq!(
+            super::python_json_dumps_indented(&value, false, 2),
+            "{\n  \"a\": [\n    1,\n    {\n      \"b\": null,\n      \"c\": []\n    }\n  ],\n  \"d\": {},\n  \"e\": 1.5e-05,\n  \"f\": \"x\"\n}"
+        );
     }
 }

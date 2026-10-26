@@ -7,6 +7,7 @@ use agent86::agent::{Harness, HarnessError, CONTINUE_PROMPT};
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
 use agent86::config::{EgressMode, IngressMode, LimitsConfig};
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
+use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::session::AgentState;
 use agent86::tools::{builtin_registry, ToolContext};
@@ -132,6 +133,7 @@ async fn run_with(
         max_tokens: 1024,
         gate,
         guardrails,
+        recorder: Recorder::disabled(),
     };
     let mut state = AgentState::new();
     let output = harness.run_turn(&mut state, goal, |_| {}).await?;
@@ -640,6 +642,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         max_tokens: 1024,
         gate: ask_gate(),
         guardrails: redact,
+        recorder: Recorder::disabled(),
     };
     let mut state = AgentState::new();
     let output = harness
@@ -700,4 +703,124 @@ async fn tool_output_that_looks_like_injection_is_marked_untrusted() {
         };
         assert_eq!(observed, expected, "{name}");
     }
+}
+
+/// Run one turn with a recorder writing to `dir`, returning the recorded events.
+async fn recorded_turn(
+    server: &MockServer,
+    workspace: &Workspace,
+    goal: &str,
+    gate: ApprovalGate,
+) -> Vec<Value> {
+    let trace_dir = workspace.root.join("traces");
+    let recorder = Recorder::from_config(&agent86::config::ObservabilityConfig {
+        trace: true,
+        path: trace_dir.display().to_string(),
+        redact: agent86::config::RedactMode::Secrets,
+        max_field_chars: 2000,
+        max_trace_bytes: 0,
+        keep_traces: 5,
+    });
+    let provider = provider(server);
+    let harness = Harness {
+        provider: &provider,
+        registry: builtin_registry(),
+        context: ToolContext::new(&workspace.root).unwrap(),
+        limits: limits(),
+        system: system(),
+        max_tokens: 1024,
+        gate,
+        guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
+        recorder,
+    };
+    let mut state = AgentState::new();
+    let _ = harness.run_turn(&mut state, goal, |_| {}).await;
+    std::fs::read_to_string(trace_dir.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn kinds(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn turns_are_recorded_like_python() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("r", "read_file", r#"{"path": "notes.txt"}"#)]),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("recorded");
+
+    let events = recorded_turn(
+        &server,
+        &workspace,
+        "read notes jane@example.com",
+        ask_gate(),
+    )
+    .await;
+
+    assert_eq!(
+        kinds(&events),
+        [
+            "turn_start",
+            "guardrail",
+            "model_call",
+            "tool_call",
+            "model_call",
+            "turn_end"
+        ]
+    );
+    let session = events[0]["session"].as_str().unwrap();
+    assert!(events.iter().all(|event| event["session"] == session));
+    assert_eq!(events[0]["task"], "read notes jane@example.com");
+    assert_eq!(events[1]["stage"], "ingress_input");
+    assert_eq!(events[1]["findings"], "pii:email");
+    assert_eq!(events[2]["step"], 1);
+    assert_eq!(events[2]["model"], "test/model");
+    assert_eq!(events[2]["stop_reason"], "tool_use");
+    assert_eq!(events[2]["tool_calls"], json!(["read_file"]));
+    assert_eq!(events[3]["tool"], "read_file");
+    assert_eq!(events[3]["ok"], true);
+    assert_eq!(events[3]["arguments"], json!({"path": "notes.txt"}));
+    assert_eq!(events[3]["error"], Value::Null);
+    assert_eq!(events[5]["status"], "done");
+    assert_eq!(events[5]["steps"], 2);
+    assert_eq!(events[5]["continuations"], 0);
+}
+
+#[tokio::test]
+async fn failed_turns_are_recorded_with_pythons_reason() {
+    let missing = || sse_tool_calls(&[("m", "read_file", r#"{"path": "missing.txt"}"#)]);
+    let server = MockServer::start(vec![missing(), missing(), missing(), missing()]).await;
+    let workspace = Workspace::new("recorded-error");
+
+    let events = recorded_turn(&server, &workspace, "loop", ask_gate()).await;
+
+    let last = events.last().unwrap();
+    assert_eq!(last["kind"], "turn_end");
+    assert_eq!(last["status"], "error");
+    assert_eq!(
+        last["reason"],
+        "circuit tripped: aborted after 4 consecutive tool errors"
+    );
+    // Calls the gate declined are never dispatched, so they are not tool_call events.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("w", "write_file", r#"{"path": "x.txt", "content": "hi"}"#)]),
+        sse_text("ok", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("recorded-declined");
+    let events = recorded_turn(&server, &workspace, "write", ask_gate()).await;
+    assert!(
+        !kinds(&events).contains(&"tool_call"),
+        "{:?}",
+        kinds(&events)
+    );
 }

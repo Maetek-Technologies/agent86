@@ -182,6 +182,18 @@ pub fn scan_pii(text: &str) -> Vec<Finding> {
     scan(text, &PII)
 }
 
+/// Replace every match of the secret patterns with `replacement`, pattern by pattern.
+pub fn scrub_secrets(text: &str, replacement: &str) -> String {
+    let mut result = text.to_owned();
+    for scanner in SECRETS.iter() {
+        result = scanner
+            .regex
+            .replace_all(&result, regex::NoExpand(replacement))
+            .into_owned();
+    }
+    result
+}
+
 /// Replace secret and PII matches with `[REDACTED:label]`, pattern by pattern.
 pub fn redact(text: &str) -> (String, Vec<Finding>) {
     let mut result = text.to_owned();
@@ -252,12 +264,20 @@ impl Guardrails {
         (ScanReport { findings }, text.to_owned())
     }
 
-    /// A tool observation, wrapped as untrusted data when it looks like injection.
-    pub fn observe(&self, content: String) -> String {
-        if self.scan_observations && self.inspect_ingress(&content).has_injection() {
-            format!("{UNTRUSTED_BANNER}{content}")
+    /// A tool observation, wrapped as untrusted data when it looks like injection,
+    /// with the findings summary when it was wrapped.
+    pub fn observe(&self, content: String) -> (String, Option<String>) {
+        if !self.scan_observations {
+            return (content, None);
+        }
+        let report = self.inspect_ingress(&content);
+        if report.has_injection() {
+            (
+                format!("{UNTRUSTED_BANNER}{content}"),
+                Some(report.summary()),
+            )
         } else {
-            content
+            (content, None)
         }
     }
 }

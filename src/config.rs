@@ -45,6 +45,14 @@ docker_cpus = "1"
 docker_network = false
 env_passthrough = []
 
+[observability]
+trace = true
+path = "~/.agent86/traces"
+redact = "secrets"
+max_field_chars = 2000
+max_trace_bytes = 50000000
+keep_traces = 5
+
 [memory]
 enabled = true
 path = "~/.agent86/memory.db"
@@ -90,6 +98,7 @@ pub struct Config {
     pub guardrails: GuardrailsConfig,
     pub tools: ToolsConfig,
     pub memory: MemoryConfig,
+    pub observability: ObservabilityConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -119,6 +128,32 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
     pub tool_timeout_s: u64,
+}
+
+/// Flight-recorder settings (`[observability]`). OpenTelemetry export is not ported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ObservabilityConfig {
+    /// Write the JSONL flight recorder.
+    pub trace: bool,
+    /// The trace directory; `~` expands.
+    pub path: String,
+    pub redact: RedactMode,
+    /// Free-text fields are clipped to this many characters.
+    pub max_field_chars: usize,
+    /// The live trace rotates at this size; `0` disables rotation.
+    pub max_trace_bytes: u64,
+    /// Rotated generations kept; `0` keeps no history.
+    pub keep_traces: usize,
+}
+
+/// What the recorder may write (`[observability] redact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactMode {
+    /// Scrub secret-shaped values and clip the big free-text fields.
+    Secrets,
+    /// Write events exactly as the loop emitted them.
+    None,
 }
 
 /// Memory settings (`[memory]`). Only session persistence uses them so far.

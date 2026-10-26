@@ -17,6 +17,7 @@ use crate::approval::ApprovalGate;
 use crate::config::EgressMode;
 use crate::config::LimitsConfig;
 use crate::guardrails::Guardrails;
+use crate::observability::Recorder;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
 use crate::session::AgentState;
@@ -26,7 +27,7 @@ use crate::types::{
     python_repr, AgentPhase, CompletionRequest, Message, Role, Step, ToolCall, ToolResult, Usage,
 };
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -146,6 +147,8 @@ pub struct Harness<'a> {
     pub gate: ApprovalGate,
     /// Ingress, egress, and observation scanning.
     pub guardrails: Guardrails,
+    /// The flight recorder; [`Recorder::disabled`] writes nothing.
+    pub recorder: Recorder,
 }
 
 impl Harness<'_> {
@@ -166,8 +169,22 @@ impl Harness<'_> {
         let result = self.turn(state, goal, &mut summary, on_text).await;
         summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
         state.last_turn = Some(summary);
-        if result.is_err() {
+        if let Err(error) = &result {
             state.phase = AgentPhase::Error;
+            let reason = match error {
+                HarnessError::CircuitTripped(detail) => format!("circuit tripped: {detail}"),
+                HarnessError::Provider(detail) => {
+                    format!("provider stream failed: ProviderError: {detail}")
+                }
+                HarnessError::NoFinalCompletion { .. } => {
+                    "provider stream ended without a final completion".to_owned()
+                }
+            };
+            self.recorder.event(
+                &state.session_id,
+                "turn_end",
+                vec![("status", json!("error")), ("reason", json!(reason))],
+            );
         }
         result
     }
@@ -185,9 +202,21 @@ impl Harness<'_> {
             on_text(text);
         };
 
+        let sid = state.session_id.clone();
+        self.recorder
+            .event(&sid, "turn_start", vec![("task", json!(goal))]);
+
         // Ingress guardrail on the user's input.
         let report = self.guardrails.inspect_ingress(goal);
         if report.flagged() {
+            self.recorder.event(
+                &sid,
+                "guardrail",
+                vec![
+                    ("stage", json!("ingress_input")),
+                    ("findings", json!(report.summary())),
+                ],
+            );
             if self.guardrails.should_block(&report) {
                 let refusal = format!(
                     "Refused: input tripped the ingress guardrail ({}).",
@@ -196,6 +225,8 @@ impl Harness<'_> {
                 state.messages.push(message(Role::User, goal));
                 state.messages.push(message(Role::Assistant, &refusal));
                 state.phase = AgentPhase::Error;
+                self.recorder
+                    .event(&sid, "turn_end", vec![("status", json!("blocked"))]);
                 emit(&refusal);
                 return Ok(output);
             }
@@ -250,6 +281,24 @@ impl Harness<'_> {
             breaker.record_step(&completion.usage);
             summary.steps = u64::from(breaker.steps());
             summary.add_usage(&completion.usage);
+            let names: Vec<&str> = completion
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect();
+            self.recorder.event(
+                &sid,
+                "model_call",
+                vec![
+                    ("step", json!(breaker.steps())),
+                    ("model", json!(self.provider.model())),
+                    ("input_tokens", json!(completion.usage.input_tokens)),
+                    ("output_tokens", json!(completion.usage.output_tokens)),
+                    ("cost_usd", json!(completion.usage.cost_usd)),
+                    ("stop_reason", json!(completion.stop_reason)),
+                    ("tool_calls", json!(names)),
+                ],
+            );
 
             // Egress guardrail on the model's text. In redact mode the redacted copy
             // is what everything downstream sees: the output, the history, and the step.
@@ -263,12 +312,21 @@ impl Harness<'_> {
                 completion.text
             };
             if egress.flagged() {
+                self.recorder.event(
+                    &sid,
+                    "guardrail",
+                    vec![
+                        ("stage", json!("egress")),
+                        ("findings", json!(egress.summary())),
+                    ],
+                );
                 emit(&format!(
                     "\n[guardrail] output flagged: {}\n",
                     egress.summary()
                 ));
             }
             let tool_calls = completion.tool_calls;
+            self.scan_tool_arguments(&tool_calls, &sid);
             let mut step = Step {
                 index: state.steps.len() as u64 + 1,
                 phase: AgentPhase::Execute,
@@ -290,6 +348,21 @@ impl Harness<'_> {
                     continuation_parts.push(text);
                     state.messages.push(message(Role::User, CONTINUE_PROMPT));
                     record_step(state, step);
+                    self.recorder.event(
+                        &sid,
+                        "continuation",
+                        vec![
+                            ("index", json!(summary.continuations)),
+                            ("step", json!(breaker.steps())),
+                            ("model", json!(self.provider.model())),
+                            (
+                                "chars",
+                                json!(continuation_parts
+                                    .last()
+                                    .map_or(0, |part| part.chars().count())),
+                            ),
+                        ],
+                    );
                     emit(&continuation_notice(summary.continuations));
                     continue;
                 }
@@ -303,6 +376,15 @@ impl Harness<'_> {
                 }
                 record_step(state, step);
                 state.phase = AgentPhase::Done;
+                self.recorder.event(
+                    &sid,
+                    "turn_end",
+                    vec![
+                        ("status", json!("done")),
+                        ("steps", json!(breaker.steps())),
+                        ("continuations", json!(summary.continuations)),
+                    ],
+                );
                 return Ok(output);
             }
 
@@ -318,13 +400,25 @@ impl Harness<'_> {
                     preview_arguments(&call.arguments)
                 ));
             }
-            let results = self.execute_batch(&tool_calls);
+            let results = self.execute_batch(&tool_calls, &sid);
             for (call, result) in tool_calls.iter().zip(results) {
                 summary.tool_calls += 1;
+                let (content, findings) = self.guardrails.observe(observation(&result));
+                if let Some(findings) = findings {
+                    self.recorder.event(
+                        &sid,
+                        "guardrail",
+                        vec![
+                            ("stage", json!("observation")),
+                            ("tool", json!(call.name)),
+                            ("findings", json!(findings)),
+                        ],
+                    );
+                }
                 state.messages.push(Message {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
-                    ..message(Role::Tool, &self.guardrails.observe(observation(&result)))
+                    ..message(Role::Tool, &content)
                 });
                 emit(&format!("[tool] {} -> {}\n", call.name, summarize(&result)));
                 let ok = result.ok;
@@ -344,14 +438,17 @@ impl Harness<'_> {
     /// run sequentially, in the order the model asked for them, after the reads.
     /// Every approval is settled first, on this thread, because the gate may
     /// prompt a human.
-    fn execute_batch(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
+    fn execute_batch(&self, calls: &[ToolCall], sid: &str) -> Vec<ToolResult> {
         let eligible = calls
             .iter()
             .filter(|call| self.parallel_eligible(call))
             .count();
         if !self.limits.parallel_tools || eligible < 2 {
             // Strictly sequential: each call is resolved and run before the next.
-            return calls.iter().map(|call| self.execute_tool(call)).collect();
+            return calls
+                .iter()
+                .map(|call| self.execute_tool(call, sid))
+                .collect();
         }
 
         let mut settled: Vec<Option<ToolResult>> = Vec::with_capacity(calls.len());
@@ -369,7 +466,12 @@ impl Harness<'_> {
             let collected: Vec<(usize, ToolResult)> = std::thread::scope(|scope| {
                 let handles: Vec<_> = reads
                     .iter()
-                    .map(|&index| (index, scope.spawn(move || self.dispatch(&calls[index]))))
+                    .map(|&index| {
+                        (
+                            index,
+                            scope.spawn(move || self.dispatch(&calls[index], sid)),
+                        )
+                    })
                     .collect();
                 handles
                     .into_iter()
@@ -386,11 +488,11 @@ impl Harness<'_> {
             }
         } else {
             for &index in &reads {
-                settled[index] = Some(self.dispatch(&calls[index]));
+                settled[index] = Some(self.dispatch(&calls[index], sid));
             }
         }
         for index in writes {
-            settled[index] = Some(self.dispatch(&calls[index]));
+            settled[index] = Some(self.dispatch(&calls[index], sid));
         }
 
         settled
@@ -429,15 +531,50 @@ impl Harness<'_> {
         (None, !tool.side_effecting())
     }
 
-    fn dispatch(&self, call: &ToolCall) -> ToolResult {
-        self.registry.dispatch(call, &self.context)
+    /// Run one approved call and record it in the flight recorder.
+    fn dispatch(&self, call: &ToolCall, sid: &str) -> ToolResult {
+        let result = self.registry.dispatch(call, &self.context);
+        self.recorder.event(
+            sid,
+            "tool_call",
+            vec![
+                ("tool", json!(call.name)),
+                ("ok", json!(result.ok)),
+                ("arguments", Value::Object(call.arguments.clone())),
+                ("error", json!(result.error)),
+            ],
+        );
+        result
+    }
+
+    /// Egress-scan tool-call arguments, the other way a secret leaves the harness.
+    /// Findings are recorded, not acted on; the approval gate stops side effects.
+    fn scan_tool_arguments(&self, calls: &[ToolCall], sid: &str) {
+        if self.guardrails.egress == EgressMode::Off {
+            return;
+        }
+        for call in calls {
+            let payload = python_json_dumps(&Value::Object(call.arguments.clone()), false);
+            let (report, _) = self.guardrails.inspect_egress(&payload);
+            if report.flagged() {
+                self.recorder.event(
+                    sid,
+                    "guardrail",
+                    vec![
+                        ("stage", json!("egress_tool_args")),
+                        ("tool", json!(call.name)),
+                        ("findings", json!(report.summary())),
+                    ],
+                );
+            }
+        }
     }
 
     /// Resolve and run one call.
-    fn execute_tool(&self, call: &ToolCall) -> ToolResult {
+    fn execute_tool(&self, call: &ToolCall, sid: &str) -> ToolResult {
         match self.resolve_call(call) {
             (Some(result), _) => result,
-            (None, _) => self.dispatch(call),
+            (None, _) => self.dispatch(call, sid),
         }
     }
 }

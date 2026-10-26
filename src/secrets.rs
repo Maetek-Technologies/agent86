@@ -404,10 +404,11 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
             out = out.replace(secret, REDACTED);
         }
     }
-    redact_key_shapes(&out)
+    redact_key_shapes(&out, REDACTED)
 }
 
-fn redact_key_shapes(text: &str) -> String {
+/// Replace every key-shaped token (Python's `_KEY_SHAPES`) in `text` with `replacement`.
+pub fn redact_key_shapes(text: &str, replacement: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut previous: Option<char> = None;
@@ -427,7 +428,7 @@ fn redact_key_shapes(text: &str) -> String {
                     let token_end = prefix.len() + body_len;
                     let next = rest[token_end..].chars().next();
                     if body_len >= min_body && !next.is_some_and(is_word_char) {
-                        out.push_str(REDACTED);
+                        out.push_str(replacement);
                         previous = rest[..token_end].chars().next_back();
                         rest = &rest[token_end..];
                         continue 'scan;

@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, and sessions (stage 7, part 1) done; the flight recorder (stage 7, part 2) next
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; MCP (stage 8) next, with episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -62,15 +62,17 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added sandboxed execution (stage 6), ported from `tools/sandbox/policy.py`, `subprocess_exec.py`, `docker_exec.py`, `executor.py`, and `builtin/shell.py` and `python_exec.py`: `run_command` (`cmd.exe /c` or `/bin/sh -c`, as Python's `shell=True`) and `python_exec` (code over stdin to `python -I -`), both side-effecting; the workspace as working directory; Python's environment allowlist, `LC_`/`XDG_` families, `sandbox.env_passthrough`, and credential-name refusal; `limits.tool_timeout_s` (60) with the child in its own process group and the whole tree killed on timeout (`taskkill /T` or a group `SIGKILL`), exit code 124 and `[timed out after Ns]`; text-mode decoding with universal newlines; and the opt-in Docker backend (`--rm`, `--memory`, `--cpus`, `--pids-limit 256`, `--network none` unless enabled, `/workspace` bind mount, named containers killed on timeout), falling back to the subprocess sandbox with Python's `sandbox:` note when Docker is unavailable
 - Added `web_fetch`, ported from `tools/builtin/web.py`: read-only; http(s) only; every hop (the URL and each redirect, followed manually up to 5) resolved and refused if any address is unspecified, loopback, link-local, private, multicast, or reserved, with Python 3.12 `ipaddress` semantics including unwrapping IPv4-mapped, 6to4, and Teredo addresses (checked against stdlib `ipaddress`); connections pinned to the vetted addresses; a 2 MB body cap before decoding; textual content types only; charset decoding; Python's regex HTML reducer (checked against a mirror of it); `[tools] web_allow_private`, `web_user_agent`, and `web_max_chars` (8000)
 - Added sessions (stage 7, part 1), ported from `orchestration/state.py`, the session half of `memory/store.py`, and `Harness.new_session`/`resume`/`_persist`: `AgentState` (messages, steps, cumulative usage, `last_turn`) threaded through the loop, which now records each model call as a `Step`; Python's SQLite schema and upsert in `[memory] path` (`~/.agent86/memory.db`), saved when a session starts and after every turn, including failed ones (phase `error`); write-once titles from Python's `session_title`; `run --session`/`-s` to resume, starting a new session for an unknown id as Python does; `run --json` `steps` and `usage` cumulative across the session. Interoperability was checked both ways: Rust reads a pydantic-shaped `state_json`, and a Rust-written session with tool calls validates against pydantic mirrors of Python's models
+- Added the flight recorder (stage 7, part 2), ported from `observability/recorder.py`, `observability/redact.py`, and the `trace` commands in `cli.py`: Python's events and fields (`turn_start`, `guardrail` at the `ingress_input`, `egress`, `egress_tool_args`, and `observation` stages, `model_call`, `tool_call` for dispatched calls, `continuation`, and `turn_end` with `done`, `blocked`, or `error` and Python's reasons) written as `json.dumps` lines to `[observability] path`/`trace.jsonl`; every event redacted (the guardrail secret patterns and key shapes become `***REDACTED***`, and `arguments`, `task`, `content`, `error`, and `outcome` are clipped to `max_field_chars`); rotation at `max_trace_bytes` keeping `keep_traces` generations; `agent86 trace path`, `trace show` (`-s`, `-n`, `-k`, `--since`), and `trace export` (`jsonl`, `json`, `otlp-json`, `-o`), with the OTLP reconstruction matching Python's output byte for byte
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **181 passed on Windows** (46 unit, 10 compatibility, 18 provider integration, 29 CLI end-to-end, 5 sessions, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 19 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **194 passed on Windows** (47 unit, 10 compatibility, 18 provider integration, 31 CLI end-to-end, 5 sessions, 8 trace, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 21 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live flight-recorder check (2026-10-26): after a `run` that listed a directory, `trace show` listed the turn's five events with local times, token counts, and details
 - Live session check (2026-10-26, `openrouter:openai/gpt-4o-mini`): a turn that read a file was saved; its `state_json` validated against pydantic mirrors of Python's models; and `run -s <id>` resumed it, with the model recalling the file's last item without tools
 - Live `web_fetch` check (2026-10-26, `openrouter:openai/gpt-4o-mini`): the model fetched https://example.com and reported its heading, and a fetch of `http://169.254.169.254/latest/meta-data/` was refused before any connection
 - Live sandbox check (2026-10-26, `openrouter:openai/gpt-4o-mini`, `run --yes`): the model ran `python_exec` (sum of squares, 385) and `run_command` (`ls`) in one step and reported both correctly
@@ -87,7 +89,7 @@ The project is **not yet a usable agent**. It currently has no:
 - Anthropic, Ollama, and llama.cpp providers
 - Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
 - Guardrails, approvals, or sandbox executors
-- Episodic and semantic memory, or the flight recorder and tracing
+- Episodic and semantic memory, or OpenTelemetry span export (`[observability] otel`)
 - MCP support
 - Interactive terminal interface
 - Local embedding backend
@@ -111,7 +113,7 @@ The project is **not yet a usable agent**. It currently has no:
 - Python also offers memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
 - The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
 - Tool-call arguments are not egress-scanned; Python only records those findings in its flight recorder, which is not ported.
-- There is no cancellation (Ctrl-C ends the process) and no flight recorder.
+- There is no cancellation (Ctrl-C ends the process).
 
 ### Known approval differences from Python
 
@@ -139,6 +141,12 @@ The project is **not yet a usable agent**. It currently has no:
 - Python records an episode per turn and adds an episodic recall note to the system prompt; neither is ported, because they need embeddings. The `episodes` and `memories` tables are created but not written.
 - `state_json` is valid in both directions but not byte-identical: Rust omits empty lists and nulls that pydantic writes, and writes floats in Python's `json.dumps` style where pydantic uses shortest-decimal notation.
 - A long resumed session is sent in full; Python fits it to the model's context window and compacts it (not ported).
+
+### Known flight-recorder differences from Python
+
+- `trace show` prints a plain aligned table with the same columns as Python's Rich table.
+- Live OpenTelemetry export (`[observability] otel`) is not ported; `trace export -f otlp-json` covers the offline case.
+- Events for subsystems that are not ported (`compaction`, `route`, sub-agent `spawn`, `retention_prune`, and `cancelled` turns) are never written.
 
 ### Known tool differences from Python
 

@@ -869,3 +869,134 @@ async fn memory_can_be_turned_off() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!workspace.memory_db().exists());
 }
+
+#[tokio::test]
+async fn runs_are_traced_and_the_trace_commands_read_them() {
+    let server = MockServer::start(vec![sse_text("Hello there.", "stop")]).await;
+    let workspace = Workspace::with_mock_provider("trace-commands", &server);
+    let key = "sk-abcdefghijklmnopqrstuvwxyz012345";
+
+    let run = workspace
+        .run(&["run", "--json", &format!("say hi, my key is {key}")])
+        .await;
+    assert!(run.status.success(), "{}", stderr(&run));
+    let session = serde_json::from_str::<Value>(&stdout(&run)).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let trace_file = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("traces")
+        .join("trace.jsonl");
+
+    let path = workspace.command(&["trace", "path"]).output().unwrap();
+    assert_eq!(
+        stdout(&path),
+        format!("{} (exists)\n", trace_file.display())
+    );
+
+    let raw = std::fs::read_to_string(&trace_file).unwrap();
+    assert!(!raw.contains(key), "the key must be redacted: {raw}");
+    assert!(raw.contains("***REDACTED***"));
+
+    let export = workspace
+        .command(&["trace", "export", "-s", &session])
+        .output()
+        .unwrap();
+    let kinds: Vec<String> = stdout(&export)
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(kinds, ["turn_start", "model_call", "turn_end"]);
+
+    let json = workspace
+        .command(&["trace", "export", "-f", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&json))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let out_file = workspace.root.join("spans.json");
+    let otlp = workspace
+        .command(&[
+            "trace",
+            "export",
+            "-f",
+            "otlp-json",
+            "-o",
+            &out_file.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        stdout(&otlp),
+        format!("Wrote 3 event(s) to {} (otlp-json).\n", out_file.display())
+    );
+    let document: Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let spans = document["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let names: Vec<&str> = spans
+        .iter()
+        .map(|span| span["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["model_call", "turn"]);
+
+    let show = workspace
+        .command(&["trace", "show", "-k", "model_call"])
+        .output()
+        .unwrap();
+    let table = stdout(&show);
+    let lines: Vec<&str> = table.lines().collect();
+    assert!(lines[0].starts_with("time"), "{table}");
+    assert!(lines[1].contains("model_call"), "{table}");
+    assert!(
+        lines[1].contains("  10  ") || lines[1].contains(" 10 "),
+        "{table}"
+    );
+    assert!(
+        lines[2].starts_with("10 in / 5 out tokens, $0.0000 across 1 event(s)"),
+        "{table}"
+    );
+}
+
+#[test]
+fn trace_commands_handle_empty_traces_and_bad_options() {
+    let workspace = Workspace::new("trace-empty");
+
+    let show = workspace.command(&["trace", "show"]).output().unwrap();
+    assert!(show.status.success());
+    assert_eq!(stdout(&show), "no trace events\n");
+
+    let since = workspace
+        .command(&["trace", "show", "--since", "soon"])
+        .output()
+        .unwrap();
+    assert_eq!(since.status.code(), Some(2));
+    assert!(
+        stderr(&since).contains("Invalid value for '--since': 'soon' is not a duration"),
+        "{}",
+        stderr(&since)
+    );
+
+    let format = workspace
+        .command(&["trace", "export", "-f", "xml"])
+        .output()
+        .unwrap();
+    assert_eq!(format.status.code(), Some(2));
+    assert!(stderr(&format).contains("unknown format 'xml' (jsonl | json | otlp-json)"));
+}

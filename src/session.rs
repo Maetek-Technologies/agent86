@@ -247,7 +247,13 @@ pub fn expand_home(path: &str) -> PathBuf {
     let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     match (path.strip_prefix('~'), std::env::var_os(home)) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
-            PathBuf::from(home).join(rest.trim_start_matches(['/', '\\']))
+            // Joined part by part, so the separators are the platform's, as with
+            // Python's `Path`; `~/.agent86/x` must not become `...\.agent86/x`.
+            let mut expanded = PathBuf::from(home);
+            for part in rest.split(['/', '\\']).filter(|part| !part.is_empty()) {
+                expanded.push(part);
+            }
+            expanded
         }
         _ => PathBuf::from(path),
     }

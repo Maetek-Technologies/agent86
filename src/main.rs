@@ -3,9 +3,14 @@ use agent86::approval::{terminal_prompt_if_interactive, ApprovalGate};
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::guardrails::Guardrails;
 use agent86::keys;
+use agent86::observability::{
+    otlp_document, parse_since, python_repr_value, read_trace, trace_generations, Recorder,
+    TraceFilter, SPAN_KINDS,
+};
 use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
+use agent86::pyjson::{python_json_dumps, python_json_dumps_indented};
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::session::{expand_home, AgentState, SessionStore};
 use agent86::tools::sandbox::build_executor;
@@ -68,9 +73,61 @@ enum Command {
         session: Option<String>,
     },
 
+    /// Inspect the flight-data recorder.
+    #[command(subcommand)]
+    Trace(TraceCommand),
+
     /// Store or delete provider API keys in the OS keyring.
     #[command(subcommand)]
     Keys(KeysCommand),
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// Show the trace file location.
+    Path,
+
+    /// Show recent events from the flight recorder.
+    Show {
+        /// Filter to one session.
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// Max events to show.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: usize,
+
+        /// Only this event kind (repeatable), e.g. -k tool_call.
+        #[arg(short, long)]
+        kind: Vec<String>,
+
+        /// Only events newer than this duration, e.g. 30m, 2h, 7d.
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Export the trace: raw events, or spans reconstructed into the OTLP JSON shape.
+    Export {
+        /// Export one session (default: every session in the trace).
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// jsonl (filtered events) | json (one array) | otlp-json.
+        #[arg(short = 'f', long = "format", default_value = "jsonl")]
+        format: String,
+
+        /// Write here instead of stdout.
+        #[arg(short, long)]
+        out: Option<String>,
+
+        /// Max events to consider.
+        #[arg(short = 'n', long, default_value_t = 100_000)]
+        limit: usize,
+
+        /// Only events newer than this duration, e.g. 2h.
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +179,7 @@ fn main() -> ExitCode {
             run(&config, &goal, json, session.as_deref(), &stderr)
         }
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
+        Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         None => {
             eprintln!(
                 "agent86: the interactive REPL is not implemented yet in the Rust port; \
@@ -237,6 +295,7 @@ fn run(
         // there is no prompt, so `ask` declines them unless --yes was given.
         gate: ApprovalGate::new(config.guardrails.approval, terminal_prompt_if_interactive()),
         guardrails: Guardrails::new(&config.guardrails),
+        recorder: Recorder::from_config(&config.observability),
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -289,6 +348,283 @@ fn run(
         }
     }
     ExitCode::SUCCESS
+}
+
+fn trace_command(config: &Config, command: TraceCommand, stderr: &Stderr) -> ExitCode {
+    let observability = &config.observability;
+    let path = expand_home(&observability.path).join("trace.jsonl");
+    let keep = observability.keep_traces;
+    let since = |since: &Option<String>| -> Result<Option<f64>, String> {
+        match since {
+            None => Ok(None),
+            Some(text) => {
+                let seconds = parse_since(text)
+                    .map_err(|message| format!("Invalid value for '--since': {message}"))?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+                Ok(Some(now - seconds))
+            }
+        }
+    };
+    let usage_error = |message: &str| {
+        stderr.error(message);
+        ExitCode::from(2)
+    };
+
+    match command {
+        TraceCommand::Path => {
+            let exists = if path.exists() { "exists" } else { "not found" };
+            println!("{} ({exists})", path.display());
+            for older in trace_generations(&path, keep)
+                .into_iter()
+                .filter(|older| *older != path)
+            {
+                let size = std::fs::metadata(&older).map_or(0, |metadata| metadata.len());
+                stdout_dim(
+                    &format!("{} ({} bytes)", older.display(), thousands(size)),
+                    stderr,
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        TraceCommand::Show {
+            session,
+            limit,
+            kind,
+            since: since_text,
+        } => {
+            let after_ts = match since(&since_text) {
+                Ok(after) => after,
+                Err(message) => return usage_error(&message),
+            };
+            let filter = TraceFilter {
+                session,
+                kinds: (!kind.is_empty()).then_some(kind),
+                after_ts,
+            };
+            let events = read_trace(&path, &filter, limit, keep);
+            if events.is_empty() {
+                stdout_dim("no trace events", stderr);
+                return ExitCode::SUCCESS;
+            }
+            print_trace_table(&events, stderr);
+            ExitCode::SUCCESS
+        }
+        TraceCommand::Export {
+            session,
+            format,
+            out,
+            limit,
+            since: since_text,
+        } => {
+            let choice = format.to_lowercase().replace('_', "-");
+            if !matches!(choice.as_str(), "jsonl" | "json" | "otlp-json") {
+                return usage_error(&format!(
+                    "Invalid value: unknown format {} (jsonl | json | otlp-json)",
+                    agent86::types::python_repr(&format)
+                ));
+            }
+            let after_ts = match since(&since_text) {
+                Ok(after) => after,
+                Err(message) => return usage_error(&message),
+            };
+            let filter = TraceFilter {
+                session,
+                kinds: (choice == "otlp-json")
+                    .then(|| SPAN_KINDS.iter().map(|kind| (*kind).to_owned()).collect()),
+                after_ts,
+            };
+            let events = read_trace(&path, &filter, limit, keep);
+            let values: Vec<serde_json::Value> = events
+                .iter()
+                .cloned()
+                .map(serde_json::Value::Object)
+                .collect();
+            let text = match choice.as_str() {
+                "jsonl" => values
+                    .iter()
+                    .map(|event| format!("{}\n", python_json_dumps(event, false)))
+                    .collect::<String>(),
+                "json" => format!(
+                    "{}\n",
+                    python_json_dumps_indented(&serde_json::Value::Array(values), false, 2)
+                ),
+                _ => format!(
+                    "{}\n",
+                    python_json_dumps_indented(&otlp_document(&events), false, 2)
+                ),
+            };
+            match out {
+                None => {
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(text.as_bytes());
+                    let _ = stdout.flush();
+                }
+                Some(out) => {
+                    let target = expand_home(&out);
+                    if let Some(parent) = target
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                    {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // As Python's write_text: text mode, so `\n` is `\r\n` on Windows.
+                    let on_disk = if cfg!(windows) {
+                        text.replace('\n', "\r\n")
+                    } else {
+                        text
+                    };
+                    if let Err(error) = std::fs::write(&target, on_disk) {
+                        stderr.error(&format!("could not write {}: {error}", target.display()));
+                        return ExitCode::from(1);
+                    }
+                    println!(
+                        "Wrote {} event(s) to {} ({choice}).",
+                        events.len(),
+                        target.display()
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// A dim line on stdout, as Python's `console.print("[dim]...")`.
+fn stdout_dim(message: &str, stderr: &Stderr) {
+    if stderr.color && std::io::stdout().is_terminal() {
+        println!("\x1b[2m{message}\x1b[0m");
+    } else {
+        println!("{message}");
+    }
+}
+
+/// `1234567` as `1,234,567`, as Python's `{:,}`.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// The trace as a plain aligned table: time, session, kind, tokens, cost, detail.
+/// Python renders the same columns as a Rich table.
+fn print_trace_table(events: &[serde_json::Map<String, serde_json::Value>], stderr: &Stderr) {
+    const SKIP: &[&str] = &[
+        "ts",
+        "session",
+        "kind",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
+    ];
+    let mut rows: Vec<[String; 7]> = Vec::new();
+    let (mut spent, mut tokens_in, mut tokens_out) = (0.0_f64, 0_u64, 0_u64);
+    for event in events {
+        let text = |name: &str| match event.get(name) {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(other) => python_repr_value(other),
+        };
+        let is_call = event.get("kind").and_then(serde_json::Value::as_str) == Some("model_call");
+        let cost = event.get("cost_usd").and_then(serde_json::Value::as_f64);
+        if is_call {
+            spent += cost.unwrap_or(0.0);
+            tokens_in += event
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            tokens_out += event
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+        let detail: serde_json::Map<String, serde_json::Value> = event
+            .iter()
+            .filter(|(key, _)| !SKIP.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let clock = event
+            .get("ts")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts.trunc() as i64, 0))
+            .map(|utc| {
+                utc.with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        rows.push([
+            clock,
+            text("session").chars().take(12).collect(),
+            text("kind"),
+            if is_call {
+                text("input_tokens")
+            } else {
+                String::new()
+            },
+            if is_call {
+                text("output_tokens")
+            } else {
+                String::new()
+            },
+            match (is_call, cost) {
+                (true, Some(cost)) => format!("${cost:.4}"),
+                _ => String::new(),
+            },
+            python_repr_value(&serde_json::Value::Object(detail))
+                .chars()
+                .take(100)
+                .collect(),
+        ]);
+    }
+
+    let headers = ["time", "session", "kind", "in", "out", "cost", "detail"];
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let right_aligned = [false, false, false, true, true, true, false];
+    let render = |cells: [&str; 7]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let pad = widths[index].saturating_sub(cell.chars().count());
+                if index == 6 {
+                    (*cell).to_owned()
+                } else if right_aligned[index] {
+                    format!("{}{cell}", " ".repeat(pad))
+                } else {
+                    format!("{cell}{}", " ".repeat(pad))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    println!("{}", render(headers));
+    for row in &rows {
+        println!("{}", render(row.each_ref().map(String::as_str)));
+    }
+    if tokens_in > 0 || tokens_out > 0 || spent > 0.0 {
+        stdout_dim(
+            &format!(
+                "{} in / {} out tokens, ${spent:.4} across {} event(s)",
+                thousands(tokens_in),
+                thousands(tokens_out),
+                events.len()
+            ),
+            stderr,
+        );
+    }
 }
 
 /// Save the session if there is a store; a failure is reported, not fatal.
