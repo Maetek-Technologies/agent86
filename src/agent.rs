@@ -6,10 +6,12 @@
 //! turn by steps, cost, wall-clock time, and consecutive tool errors. Tool
 //! activity is reported inline as `[tool] ...` lines, exactly as Python streams it.
 //!
-//! Not ported yet: approvals and guardrails (no side-effecting tools exist),
-//! context-window fitting and compaction, cancellation, sub-agents, and
+//! Side-effecting calls pass through the approval gate before they run.
+//!
+//! Not ported yet: guardrails, context-window fitting and compaction, cancellation, sub-agents, and
 //! persistence.
 
+use crate::approval::ApprovalGate;
 use crate::config::LimitsConfig;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
@@ -133,6 +135,8 @@ pub struct Harness<'a> {
     pub system: Message,
     /// The output cap sent with every model call.
     pub max_tokens: u32,
+    /// Decides whether side-effecting calls may run.
+    pub gate: ApprovalGate,
 }
 
 impl Harness<'_> {
@@ -264,38 +268,68 @@ impl Harness<'_> {
 
     /// Run a step's tool calls and return their results in call order.
     ///
-    /// Read-only calls may run concurrently with each other; anything else runs
-    /// sequentially. All current tools are read-only.
+    /// Read-only calls may run concurrently with each other; side-effecting calls
+    /// run sequentially, in the order the model asked for them, after the reads.
+    /// Every approval is settled first, on this thread, because the gate may
+    /// prompt a human.
     fn execute_batch(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
-        let parallel: Vec<bool> = calls
+        let eligible = calls
             .iter()
-            .map(|call| self.parallel_eligible(call))
-            .collect();
-        let eligible = parallel.iter().filter(|&&flag| flag).count();
+            .filter(|call| self.parallel_eligible(call))
+            .count();
         if !self.limits.parallel_tools || eligible < 2 {
+            // Strictly sequential: each call is resolved and run before the next.
             return calls.iter().map(|call| self.execute_tool(call)).collect();
         }
 
-        let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = calls
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| parallel[*index])
-                .map(|(index, call)| (index, scope.spawn(move || self.execute_tool(call))))
-                .collect();
-            for (index, handle) in handles {
-                results[index] = handle.join().ok();
+        let mut settled: Vec<Option<ToolResult>> = Vec::with_capacity(calls.len());
+        let mut may_parallel = Vec::with_capacity(calls.len());
+        for call in calls {
+            let (result, parallel) = self.resolve_call(call);
+            settled.push(result);
+            may_parallel.push(parallel);
+        }
+        let pending = || (0..calls.len()).filter(|&index| settled[index].is_none());
+        let reads: Vec<usize> = pending().filter(|&index| may_parallel[index]).collect();
+        let writes: Vec<usize> = pending().filter(|&index| !may_parallel[index]).collect();
+
+        if reads.len() > 1 {
+            let collected: Vec<(usize, ToolResult)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = reads
+                    .iter()
+                    .map(|&index| (index, scope.spawn(move || self.dispatch(&calls[index]))))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(index, handle)| {
+                        let result = handle
+                            .join()
+                            .unwrap_or_else(|_| not_executed(&calls[index], "the tool panicked"));
+                        (index, result)
+                    })
+                    .collect()
+            });
+            for (index, result) in collected {
+                settled[index] = Some(result);
             }
-        });
-        for (index, call) in calls.iter().enumerate() {
-            if results[index].is_none() {
-                results[index] = Some(self.execute_tool(call));
+        } else {
+            for &index in &reads {
+                settled[index] = Some(self.dispatch(&calls[index]));
             }
         }
-        results.into_iter().flatten().collect()
+        for index in writes {
+            settled[index] = Some(self.dispatch(&calls[index]));
+        }
+
+        settled
+            .into_iter()
+            .zip(calls)
+            .map(|(result, call)| result.unwrap_or_else(|| not_executed(call, "skipped")))
+            .collect()
     }
 
+    /// Could this call share a step with its siblings? Decided from the tool alone,
+    /// never the gate, which may prompt and must be consulted exactly once.
     fn parallel_eligible(&self, call: &ToolCall) -> bool {
         call.invalid_arguments().is_none()
             && self
@@ -304,13 +338,47 @@ impl Harness<'_> {
                 .is_some_and(|tool| !tool.side_effecting())
     }
 
-    /// Resolve and run one call. Arguments the provider could not parse are
-    /// answered here, before any tool sees them.
-    fn execute_tool(&self, call: &ToolCall) -> ToolResult {
-        match call.invalid_arguments() {
-            Some(raw) => invalid_arguments_result(call, raw),
-            None => self.registry.dispatch(call, &self.context),
+    /// Decide one call without running it: `(settled result, may run in parallel)`.
+    ///
+    /// Arguments the provider could not parse are answered here, before the
+    /// registry, the approval gate, or any tool sees them.
+    fn resolve_call(&self, call: &ToolCall) -> (Option<ToolResult>, bool) {
+        if let Some(raw) = call.invalid_arguments() {
+            return (Some(invalid_arguments_result(call, raw)), false);
         }
+        let Some(tool) = self.registry.get(&call.name) else {
+            // The registry's own "Unknown tool" answer.
+            return (Some(self.registry.dispatch(call, &self.context)), false);
+        };
+        let decision = self.gate.decide(tool, call, &self.context);
+        if !decision.approved {
+            return (Some(not_executed(call, decision.reason)), false);
+        }
+        (None, !tool.side_effecting())
+    }
+
+    fn dispatch(&self, call: &ToolCall) -> ToolResult {
+        self.registry.dispatch(call, &self.context)
+    }
+
+    /// Resolve and run one call.
+    fn execute_tool(&self, call: &ToolCall) -> ToolResult {
+        match self.resolve_call(call) {
+            (Some(result), _) => result,
+            (None, _) => self.dispatch(call),
+        }
+    }
+}
+
+/// The observation for a call that was not run.
+fn not_executed(call: &ToolCall, reason: &str) -> ToolResult {
+    ToolResult {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+        ok: false,
+        content: String::new(),
+        error: Some(format!("Not executed: {reason}.")),
+        metadata: serde_json::Map::new(),
     }
 }
 
