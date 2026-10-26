@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A compatibility-first Rust port of [agent86](https://github.com/Maetek-Technologies/agent-86), a Python agentic CLI harness. **The Python implementation is the behavioral oracle**: the Rust code must reproduce its observable behavior (CLI output streams, exit codes, `run --json` fields, TOML config semantics, provider streaming/tool-call behavior, approvals, session/trace formats, error degradation), not its internal structure.
 
-The project has a working OpenAI-compatible provider but is not a usable agent yet; the CLI cannot call a model. `docs/PROJECT_PLAN.md` is the source of truth for current status, the next milestone (text-only `run` / `run --json` against OpenRouter), the staged roadmap, known differences from Python, and the credential policy. Read it before starting feature work, and update it (plus the README status/roadmap) when a stage lands. Keep both honest about what is and is not implemented.
+The CLI can run one text-only turn against any OpenAI-compatible provider (`agent86 --model provider:model run [--json] <goal>`), but there are no tools, system prompt, or agent loop yet. `docs/PROJECT_PLAN.md` is the source of truth for current status, the next steps, the staged roadmap, known differences from Python, and the credential policy. Read it before starting feature work, and update it (plus the README status/roadmap) when a stage lands. Keep both honest about what is and is not implemented.
 
 ## Commands
 
@@ -14,6 +14,7 @@ The project has a working OpenAI-compatible provider but is not a usable agent y
 cargo test --all-targets                     # all tests
 cargo test --test compatibility              # just the compatibility suite
 cargo test --test openai_provider            # provider tests against the local mock server
+cargo test --test cli_run                    # end-to-end tests that run the agent86 binary
 cargo test <test_name_substring>             # single test, e.g. cargo test model_refs_split
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings    # warnings are errors
@@ -28,14 +29,17 @@ CI (`.github/workflows/ci.yml`) runs tests on Linux, macOS, and Windows against 
 
 - `src/types.rs`: the provider-neutral vocabulary everything else will build on: `Role`, `AgentPhase`, `ApprovalMode`, `StopReason`, `ModelRef`, `ToolSpec`/`ToolCall`/`ToolResult`, `Message`, `CompletionRequest`/`Completion`/`CompletionDelta`, `Step`, `Usage` (implements `Add` for accumulation).
 - `src/provider/`: the model layer, ported from Python's `agent86/cognitive/`.
-  - `mod.rs`: the object-safe `Provider` trait and `ProviderError`. Providers implement only `stream()`, which returns a boxed stream of `CompletionDelta`s whose last item has `done = true` plus the full `Completion`. `complete()` is derived by collecting that stream, so streamed and non-streamed text always agree. `ProviderError` messages mirror the Python wording and are stored already redacted.
+  - `mod.rs`: the object-safe `Provider` trait, `ProviderError`, and `provider_for_ref`, the factory. Any provider section with a `base_url` becomes the OpenAI-compatible adapter; `anthropic`, `ollama`, and `llamacpp` return `NotPorted` because Python gives them dedicated adapters. Providers implement only `stream()`, which returns a boxed stream of `CompletionDelta`s whose last item has `done = true` plus the full `Completion`. `complete()` is derived by collecting that stream, so streamed and non-streamed text always agree. `ProviderError` messages mirror the Python wording and are stored already redacted.
   - `openai.rs`: the OpenAI-compatible SSE provider (OpenAI, OpenRouter, Groq, local servers). The stream is a hand-written state machine (`StreamState`) driven by `futures_util::stream::unfold`; dropping the stream drops the HTTP response, which is how cancellation works. Per-attempt accumulators live in `TurnState` and reset on every retry.
   - `retry.rs`: retryable statuses, `Retry-After`, and jittered backoff. A retry is never allowed once a text delta has been emitted, because the caller already saw that text.
   - `capabilities.rs`: models that reject sampling parameters.
-- `src/secrets.rs`: `redact()`, ported from Python's `secrets.py`. Run every response body or transport error through it before it reaches a `ProviderError`.
-- `src/main.rs`: placeholder CLI with hand-rolled arg parsing (`--help`, `--version`; anything else exits 2 on stderr).
+- `src/secrets.rs`: `redact()`, ported from Python's `secrets.py`. Run every response body or transport error through it before it reaches a `ProviderError`. Also `resolve_api_key()` (environment only; Python's keyring fallback is not ported).
+- `src/config.rs`: layered TOML config: built-in defaults (a TOML string), the user file, the project file, `AGENT86_MODEL`, then `--model`, deep-merged as `toml::Table`s before deserializing. Only `[model]`, `[limits]`, and `[providers.*]` are modelled; unknown sections are ignored. `ConfigPaths` and `Overrides` are explicit parameters so tests never touch the real home directory.
+- `src/turn.rs`: the one text-only turn behind `run`, plus `RunOutput` (the `run --json` document; field order is the contract, so it is a struct, not a `serde_json::Value`, whose map would sort keys) and the stderr summary line.
+- `src/main.rs`: the `clap` CLI. As with Typer, `--model` is a top-level option and must come before the subcommand. Errors print `error: ...` plus a hint on stderr and exit 1; usage errors exit 2; ANSI styling only when stderr is a terminal and `NO_COLOR` is unset.
 - `tests/compatibility.rs`: integration tests that pin the JSON wire format to the Python vocabulary.
 - `tests/openai_provider.rs` with `tests/support/mod.rs`: a scripted HTTP/1.1 mock server (one `Reply` per connection: full status, SSE, truncated, or stalled) plus recorded fixtures in `tests/fixtures/openai/*.sse` (kept LF by `.gitattributes`).
+- `tests/cli_run.rs`: runs the real binary against the mock server inside a throwaway workspace whose `HOME`/`USERPROFILE`, working directory, and environment are isolated. Use this pattern for any test of CLI output or exit codes.
 
 When porting a module, read the Python source first. It is public at `Maetek-Technologies/agent-86` (`src/agent86/...`); its comments explain why each behavior exists, and those reasons usually belong in the Rust doc comments too.
 

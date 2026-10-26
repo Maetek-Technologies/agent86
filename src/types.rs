@@ -94,10 +94,42 @@ impl FromStr for ModelRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ModelRefParseError {
-    #[error("model reference {reference:?} has no provider:model separator")]
+    #[error(
+        "Model reference {} must be 'provider:model' (e.g. 'anthropic:claude-opus-4-8').",
+        python_repr(reference)
+    )]
     MissingSeparator { reference: String },
-    #[error("model reference {reference:?} has an empty provider or model")]
+    #[error(
+        "Model reference {} has an empty provider or model.",
+        python_repr(reference)
+    )]
     EmptyComponent { reference: String },
+}
+
+/// Quote a string the way Python's `repr()` does, so messages match the reference.
+pub fn python_repr(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(quote);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

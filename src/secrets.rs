@@ -30,6 +30,15 @@ impl KeyShape {
     }
 }
 
+/// Resolve a provider's API key from the environment variable its config names.
+///
+/// A missing `api_key_env` means a keyless endpoint, so nothing is looked up.
+/// The Python implementation falls back to the OS keyring; that is not ported yet.
+pub fn resolve_api_key(api_key_env: Option<&str>) -> Option<String> {
+    let name = api_key_env.filter(|name| !name.is_empty())?;
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 /// Return `text` with every known secret and key-shaped token replaced.
 ///
 /// Known secrets shorter than eight characters are ignored, as in the Python
