@@ -5,6 +5,7 @@
 //! tools, persistence, and user interfaces will be added behind explicit
 //! compatibility tests as the port progresses.
 
+pub mod agent;
 pub mod config;
 pub mod keys;
 pub mod pricing;
