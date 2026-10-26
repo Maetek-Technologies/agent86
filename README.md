@@ -15,10 +15,11 @@ The Python implementation remains the reference. This repository starts with a s
 - Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
 - Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
+- Python's system prompt (identity plus environment line), checked against text extracted from the Python source
 - A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-Turns are text only: there is no system prompt yet, and no orchestration loop, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
+Turns send Python's system prompt but are text only: there is no orchestration loop, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
 
 ## Why Rust?
 

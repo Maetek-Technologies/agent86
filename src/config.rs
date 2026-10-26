@@ -30,6 +30,9 @@ default = "anthropic:claude-opus-4-8"
 [limits]
 max_output_tokens = 8192
 
+[sandbox]
+mode = "subprocess"
+
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
 
@@ -57,6 +60,7 @@ base_url = "http://localhost:8080"
 pub struct Config {
     pub model: ModelConfig,
     pub limits: LimitsConfig,
+    pub sandbox: SandboxConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -74,6 +78,31 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LimitsConfig {
     pub max_output_tokens: u32,
+}
+
+/// Where tool code runs (`[sandbox]`). Only `mode` is read so far.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SandboxConfig {
+    pub mode: SandboxMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// A local subprocess with resource limits.
+    Subprocess,
+    /// A throwaway container (opt-in).
+    Docker,
+}
+
+impl SandboxMode {
+    /// The config spelling, which is also how Python renders the mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subprocess => "subprocess",
+            Self::Docker => "docker",
+        }
+    }
 }
 
 /// Per-model price overrides (`[pricing.models."<ref or id>"]`).
@@ -169,6 +198,8 @@ impl ConfigPaths {
 pub struct Overrides {
     /// `AGENT86_MODEL`.
     pub env_model: Option<String>,
+    /// `AGENT86_SANDBOX`.
+    pub env_sandbox: Option<String>,
     /// `--model`.
     pub model: Option<String>,
 }
@@ -177,9 +208,8 @@ impl Overrides {
     /// Read the supported `AGENT86_*` environment variables; empty values are ignored.
     pub fn from_env(model: Option<String>) -> Self {
         Self {
-            env_model: std::env::var("AGENT86_MODEL")
-                .ok()
-                .filter(|v| !v.is_empty()),
+            env_model: non_empty_env("AGENT86_MODEL"),
+            env_sandbox: non_empty_env("AGENT86_SANDBOX"),
             model,
         }
     }
@@ -207,15 +237,20 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
         }
     }
 
-    for model in [&overrides.env_model, &overrides.model]
-        .into_iter()
-        .flatten()
-    {
-        let mut layer = Table::new();
-        let mut section = Table::new();
-        section.insert("default".to_owned(), Value::String(model.clone()));
-        layer.insert("model".to_owned(), Value::Table(section));
-        deep_merge(&mut merged, layer);
+    // Environment variables first, then CLI flags, as in Python.
+    let layers = [
+        ("model", "default", &overrides.env_model),
+        ("sandbox", "mode", &overrides.env_sandbox),
+        ("model", "default", &overrides.model),
+    ];
+    for (section, key, value) in layers {
+        if let Some(value) = value {
+            let mut table = Table::new();
+            table.insert(key.to_owned(), Value::String(value.clone()));
+            let mut layer = Table::new();
+            layer.insert(section.to_owned(), Value::Table(table));
+            deep_merge(&mut merged, layer);
+        }
     }
 
     let mut config: Config =
@@ -278,6 +313,10 @@ fn deep_merge(base: &mut Table, overlay: Table) {
             }
         }
     }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// The home directory as Python's `Path.home()` resolves it.
@@ -372,7 +411,7 @@ mod tests {
 
         let env = Overrides {
             env_model: Some("groq:b".to_owned()),
-            model: None,
+            ..Overrides::default()
         };
         assert_eq!(
             load_config(&paths_in(&dir), &env).unwrap().model.default,
@@ -382,6 +421,7 @@ mod tests {
         let flag = Overrides {
             env_model: Some("groq:b".to_owned()),
             model: Some("openai:c".to_owned()),
+            ..Overrides::default()
         };
         assert_eq!(
             load_config(&paths_in(&dir), &flag).unwrap().model.default,
@@ -423,5 +463,31 @@ mod tests {
         let error = load_config(&paths_in(&dir), &Overrides::default()).unwrap_err();
         assert!(matches!(error, ConfigError::Invalid { .. }), "{error:?}");
         assert!(error.to_string().contains("input_per_mtok"), "{error}");
+    }
+
+    #[test]
+    fn sandbox_mode_defaults_to_subprocess_and_rejects_unknown_values() {
+        let dir = temp_dir("sandbox");
+        let config = load_config(&paths_in(&dir), &Overrides::default()).unwrap();
+        assert_eq!(config.sandbox.mode, SandboxMode::Subprocess);
+
+        let env = Overrides {
+            env_sandbox: Some("docker".to_owned()),
+            ..Overrides::default()
+        };
+        assert_eq!(
+            load_config(&paths_in(&dir), &env).unwrap().sandbox.mode,
+            SandboxMode::Docker
+        );
+
+        std::fs::write(
+            dir.join("project.toml"),
+            "[sandbox]
+mode = \"vm\"
+",
+        )
+        .unwrap();
+        let error = load_config(&paths_in(&dir), &Overrides::default()).unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid { .. }), "{error:?}");
     }
 }
