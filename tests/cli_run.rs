@@ -37,6 +37,12 @@ impl Workspace {
         std::fs::write(self.project().join(".agent86").join("config.toml"), text).unwrap();
     }
 
+    fn append_project_config(&self, text: &str) {
+        let path = self.project().join(".agent86").join("config.toml");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        std::fs::write(path, existing + text).unwrap();
+    }
+
     fn project(&self) -> PathBuf {
         self.root.join("project")
     }
@@ -315,4 +321,84 @@ fn version_prints_the_package_version() {
             format!("agent86 {}\n", env!("CARGO_PKG_VERSION"))
         );
     }
+}
+
+/// The fixture reports 12 prompt tokens (4 of them cached) and 3 output tokens.
+fn fixture_cost(input_per_mtok: f64, output_per_mtok: f64) -> f64 {
+    (8.0 / 1_000_000.0) * input_per_mtok
+        + (4.0 / 1_000_000.0) * (input_per_mtok * 0.1)
+        + (0.0 / 1_000_000.0) * (input_per_mtok * 1.25)
+        + (3.0 / 1_000_000.0) * output_per_mtok
+}
+
+#[tokio::test]
+async fn pricing_overrides_keyed_by_the_full_ref_are_applied() {
+    let server = MockServer::start(vec![
+        Reply::Sse(fixture("openai/text.sse")),
+        Reply::Sse(fixture("openai/text.sse")),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("priced-ref", &server);
+    workspace.append_project_config(
+        "
+[pricing.models.\"mock:test/model\"]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+",
+    );
+
+    let text = workspace.run(&["run", "hi"]).await;
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(stderr(&text).contains(" · $0.0000 · "), "{}", stderr(&text));
+
+    let json = workspace.run(&["run", "--json", "hi"]).await;
+    let raw = stdout(&json);
+    let document: Value = serde_json::from_str(&raw).unwrap();
+    let expected = fixture_cost(1.0, 2.0);
+    // Python's json.dumps writes this as 1.44e-05, not serde_json's 0.0000144.
+    assert!(raw.contains("\"cost_usd\": 1.44e-05"), "{raw}");
+    assert_eq!(document["usage"]["cost_usd"].as_f64(), Some(expected));
+    assert_eq!(document["turn"]["cost_usd"].as_f64(), Some(expected));
+}
+
+#[tokio::test]
+async fn pricing_overrides_keyed_by_the_bare_model_id_are_applied() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
+    let workspace = Workspace::with_mock_provider("priced-bare", &server);
+    workspace.append_project_config(
+        "
+[pricing.models.\"test/model\"]
+input_per_mtok = 1000.0
+output_per_mtok = 2000.0
+",
+    );
+
+    let output = workspace.run(&["run", "hi"]).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let expected = format!(" · ${:.4} · ", fixture_cost(1000.0, 2000.0));
+    assert!(stderr(&output).contains(&expected), "{}", stderr(&output));
+}
+
+#[test]
+fn negative_prices_are_rejected_as_invalid_config() {
+    let workspace = Workspace::new("negative-price");
+    workspace.write_project_config(
+        "[pricing.models.m]
+input_per_mtok = -1.0
+output_per_mtok = 0.0
+",
+    );
+
+    let output = workspace
+        .command(&["-m", "openai:gpt-4o", "run", "hi"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("error: Invalid config: "),
+        "{}",
+        stderr(&output)
+    );
 }

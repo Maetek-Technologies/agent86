@@ -8,6 +8,7 @@
 use super::capabilities::supports_sampling_params;
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy, DEFAULT_MAX_RETRIES};
 use super::{DeltaStream, Provider, ProviderError};
+use crate::pricing::PriceTable;
 use crate::secrets::redact;
 use crate::types::{
     Completion, CompletionDelta, CompletionRequest, Message, Role, StopReason, ToolCall, ToolSpec,
@@ -77,6 +78,9 @@ pub struct OpenAiProvider {
     api_key: Option<String>,
     config: OpenAiConfig,
     client: reqwest::Client,
+    pricing: PriceTable,
+    /// The name usage is priced under, normally the `provider:model` ref.
+    price_ref: String,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -87,6 +91,7 @@ impl fmt::Debug for OpenAiProvider {
             .field("url", &self.url)
             .field("api_key", &self.api_key.as_ref().map(|_| "***redacted***"))
             .field("config", &self.config)
+            .field("price_ref", &self.price_ref)
             .finish()
     }
 }
@@ -124,13 +129,28 @@ impl OpenAiProvider {
                 detail: error_chain(&error),
             })?;
 
+        let model = model.into();
         Ok(Self {
-            model: model.into(),
+            price_ref: model.clone(),
+            model,
             url,
             api_key,
             config,
             client,
+            pricing: PriceTable::builtin(),
         })
+    }
+
+    /// Price usage with `pricing`, looked up under `price_ref`.
+    ///
+    /// Python prices with the bare model id, so a `[pricing.models]` override keyed by
+    /// the `provider:model` ref marks the model as priced without applying its rate.
+    /// Pricing under the ref tries the ref first and then the bare id, which gives
+    /// the same result as Python in every other case.
+    pub fn with_pricing(mut self, pricing: PriceTable, price_ref: impl Into<String>) -> Self {
+        self.pricing = pricing;
+        self.price_ref = price_ref.into();
+        self
     }
 
     /// The resolved Chat Completions endpoint.
@@ -598,12 +618,15 @@ impl StreamState<'_> {
             completion: Some(Completion {
                 text: turn.text,
                 tool_calls,
-                usage: Usage {
-                    input_tokens: turn.prompt_tokens,
-                    output_tokens: turn.completion_tokens,
-                    cache_read_tokens: turn.cached_tokens,
-                    ..Usage::default()
-                },
+                usage: self.provider.pricing.priced_usage(
+                    &self.provider.price_ref,
+                    Usage {
+                        input_tokens: turn.prompt_tokens,
+                        output_tokens: turn.completion_tokens,
+                        cache_read_tokens: turn.cached_tokens,
+                        ..Usage::default()
+                    },
+                ),
                 stop_reason: stop_reason.map(stop_reason_wire),
                 model: Some(self.provider.model.clone()),
             }),

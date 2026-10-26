@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete (one real OpenAI-compatible model turn); stage 2 next
+**Current stage:** First milestone complete (one real OpenAI-compatible model turn); pricing ported
 
 ## 1. Purpose
 
@@ -49,12 +49,14 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added layered TOML configuration ported from `config.py` (defaults, user file, project file, `AGENT86_MODEL`, `--model`), limited to `[model]`, `[limits]`, and `[providers.*]`
 - Added the `provider:model` factory: `openai`, and any provider block with a `base_url`, build the OpenAI-compatible provider; keys come from the environment variable named by `api_key_env`
 - Added the one-shot CLI (`clap`): `agent86 [--model provider:model] run [--json] <goal>`, streaming text to stdout with the turn summary on stderr, or one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`; errors go to stderr with exit code 1, usage errors exit 2
+- Added pricing ported from `pricing.py`: the built-in price table, local providers priced at zero, dated-snapshot prefix matching, prompt-cache rates, and `[pricing.models]` config overrides. The summary line shows `$0.0000`-style costs for priced models and `cost n/a (unpriced model)` otherwise, and `cost_usd` is filled in. As in Python, OpenRouter and Groq models stay unpriced unless overridden
+- Matched Python's `json.dumps` float formatting for `cost_usd` and `duration_s` (`1.44e-05`, not `0.0000144`)
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **54 passed** (18 unit, 10 compatibility, 16 provider integration, 10 CLI end-to-end)
+- `cargo test --all-targets`: **67 passed** (26 unit, 10 compatibility, 18 provider integration, 13 CLI end-to-end)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -67,7 +69,6 @@ The project is **not yet a usable agent**. It currently has no:
 - API-key lookup in the OS keyring (environment variables only)
 - Config sections other than `[model]`, `[limits]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
-- Pricing (`Usage.cost_usd` is always 0.0)
 - Tool execution or ReAct orchestration
 - Guardrails, approvals, or sandbox executors
 - Session persistence, memory, or tracing
@@ -81,7 +82,7 @@ The project is **not yet a usable agent**. It currently has no:
 - Answers cut off by `max_tokens` are not continued automatically, and the egress guardrail is not applied.
 - The session id is ephemeral and is not persisted; `--session`/`-s`, `--yes`, `--sandbox`, `--approval`, `--resume`, and `--plain` are not accepted yet.
 - With no subcommand, Python opens the REPL; Rust prints a not-implemented message and exits 2.
-- Pricing is not ported, so the summary line always says `cost n/a (unpriced model)` and `cost_usd` is 0.0.
+- Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
 - The model-error hint suggests `--model` and an API key instead of the `agent86 models` command, which is not ported. The malformed-config hint does not mention `agent86 config path` for the same reason.
 - Rich wraps stderr at 80 columns when it is not a terminal; Rust does not wrap. stdout, including `--json` output (2-space indent, non-ASCII unescaped), is unaffected.
 

@@ -201,7 +201,7 @@ pub struct Usage {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, serialize_with = "crate::pyjson::python_float")]
     pub cost_usd: f64,
     #[serde(default)]
     pub cache_read_tokens: u64,

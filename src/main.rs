@@ -1,4 +1,5 @@
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
+use agent86::pricing::PriceTable;
 use agent86::provider::provider_for_ref;
 use agent86::turn::{format_turn_summary, run_text_turn};
 use agent86::types::ModelRef;
@@ -72,12 +73,11 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     let provider = ModelRef::parse(&config.model.default)
         .map_err(|error| error.to_string())
         .and_then(|reference| {
-            let max_tokens = config.max_output_tokens_for(&reference.provider);
             provider_for_ref(&reference, config)
-                .map(|provider| (provider, max_tokens))
+                .map(|provider| (provider, reference))
                 .map_err(|error| error.to_string())
         });
-    let (provider, max_tokens) = match provider {
+    let (provider, reference) = match provider {
         Ok(built) => built,
         Err(message) => {
             stderr.error(&message);
@@ -85,6 +85,9 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
             return ExitCode::from(1);
         }
     };
+
+    let max_tokens = config.max_output_tokens_for(&reference.provider);
+    let priced = PriceTable::from_config(config).is_priced(&reference.to_string());
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -130,7 +133,7 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
         let _ = stdout.flush();
         if let Some(turn) = &output.turn {
             // stderr: stdout is the answer, and `agent86 run ... > out.txt` must keep only that.
-            stderr.dim(&format_turn_summary(turn));
+            stderr.dim(&format_turn_summary(turn, priced));
         }
     }
     ExitCode::SUCCESS
