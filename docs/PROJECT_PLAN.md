@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete (one real OpenAI-compatible model turn); pricing ported
+**Current stage:** First milestone complete; pricing and the system prompt ported
 
 ## 1. Purpose
 
@@ -51,12 +51,14 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added the one-shot CLI (`clap`): `agent86 [--model provider:model] run [--json] <goal>`, streaming text to stdout with the turn summary on stderr, or one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`; errors go to stderr with exit code 1, usage errors exit 2
 - Added pricing ported from `pricing.py`: the built-in price table, local providers priced at zero, dated-snapshot prefix matching, prompt-cache rates, and `[pricing.models]` config overrides. The summary line shows `$0.0000`-style costs for priced models and `cost n/a (unpriced model)` otherwise, and `cost_usd` is filled in. As in Python, OpenRouter and Groq models stay unpriced unless overridden
 - Matched Python's `json.dumps` float formatting for `cost_usd` and `duration_s` (`1.44e-05`, not `0.0000144`)
+- Added the system prompt ported from `cognitive/prompt.py`: Python's identity text plus `Environment: agent86 v<version>. Default model: <ref>. Sandbox: <mode>.`, sent as the first message of every request. A fixture extracted from the Python source (by parsing, not executing it) keeps the text identical
+- Added `[sandbox] mode` (`subprocess` or `docker`) and the `AGENT86_SANDBOX` override; the mode is only reported in the prompt, since no sandbox exists yet
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **67 passed** (26 unit, 10 compatibility, 18 provider integration, 13 CLI end-to-end)
+- `cargo test --all-targets`: **71 passed** (27 unit, 10 compatibility, 18 provider integration, 14 CLI end-to-end, 2 system prompt)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -67,7 +69,7 @@ Local validation completed successfully:
 The project is **not yet a usable agent**. It currently has no:
 
 - API-key lookup in the OS keyring (environment variables only)
-- Config sections other than `[model]`, `[limits]`, and `[providers.*]` (others are accepted and ignored, not validated)
+- Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
 - Tool execution or ReAct orchestration
 - Guardrails, approvals, or sandbox executors
@@ -78,7 +80,8 @@ The project is **not yet a usable agent**. It currently has no:
 
 ### Known `run` differences from Python
 
-- No system prompt is sent and no tools are offered; the request carries only the user's goal. The Python loop sends its full system prompt.
+- No tools are offered. The system prompt is the identity plus the environment line, which is what Python sends when no skills are installed, no MCP servers are configured, and episodic memory has nothing to recall. Those three optional sections are not ported.
+- The environment line reports the Rust crate version (`agent86 v0.1.0`), not Python's (`v1.0.0`).
 - Answers cut off by `max_tokens` are not continued automatically, and the egress guardrail is not applied.
 - The session id is ephemeral and is not persisted; `--session`/`-s`, `--yes`, `--sandbox`, `--approval`, `--resume`, and `--plain` are not accepted yet.
 - With no subcommand, Python opens the REPL; Rust prints a not-implemented message and exits 2.

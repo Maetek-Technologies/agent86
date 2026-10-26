@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod pricing;
+pub mod prompt;
 pub mod provider;
 pub mod pyjson;
 pub mod secrets;

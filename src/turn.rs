@@ -1,8 +1,8 @@
 //! A single text-only turn: the slice of the Python orchestration loop that
 //! `agent86 run` needs before tools and the ReAct loop are ported.
 //!
-//! The Python loop also sends a system prompt, continues answers cut off by
-//! `max_tokens`, and applies the egress guardrail; none of that is ported yet.
+//! The Python loop also continues answers cut off by `max_tokens` and applies
+//! the egress guardrail; neither is ported yet.
 
 use crate::pricing::format_cost;
 use crate::provider::{Provider, ProviderError};
@@ -62,8 +62,11 @@ pub fn new_session_id() -> String {
 }
 
 /// Run one text-only turn, passing each streamed text delta to `on_text`.
+///
+/// The request is `[system, user]`, the same shape as Python's first request of a turn.
 pub async fn run_text_turn(
     provider: &dyn Provider,
+    system: Message,
     goal: &str,
     max_tokens: u32,
     mut on_text: impl FnMut(&str),
@@ -71,13 +74,16 @@ pub async fn run_text_turn(
     let started = Instant::now();
     let request = CompletionRequest {
         model: provider.model().to_owned(),
-        messages: vec![Message {
-            role: Role::User,
-            content: goal.to_owned(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }],
+        messages: vec![
+            system,
+            Message {
+                role: Role::User,
+                content: goal.to_owned(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            },
+        ],
         tools: Vec::new(),
         temperature: 0.0,
         max_tokens: Some(max_tokens),

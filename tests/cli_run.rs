@@ -55,7 +55,8 @@ impl Workspace {
             .env("HOME", self.root.join("home"))
             .env("USERPROFILE", self.root.join("home"))
             .env("AGENT86_TEST_MOCK_KEY", TEST_KEY)
-            .env_remove("AGENT86_MODEL");
+            .env_remove("AGENT86_MODEL")
+            .env_remove("AGENT86_SANDBOX");
         command
     }
 
@@ -109,7 +110,21 @@ async fn run_streams_the_answer_to_stdout_and_the_summary_to_stderr() {
         Some(format!("Bearer {TEST_KEY}").as_str())
     );
     assert_eq!(sent.body["model"], "test/model");
-    assert_eq!(sent.body["messages"][0]["content"], "Say hello");
+    let messages = sent.body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "system");
+    let expected_system = format!(
+        "{}
+
+Environment: agent86 v{}. Default model: mock:test/model. Sandbox: subprocess.",
+        fixture("prompt/base_identity.txt").trim(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    assert_eq!(messages[0]["content"], expected_system.as_str());
+    assert_eq!(
+        messages[1],
+        serde_json::json!({"role": "user", "content": "Say hello"})
+    );
     assert_eq!(sent.body["max_completion_tokens"], 8192);
     assert_eq!(sent.body["temperature"], 0.0);
 }
@@ -400,5 +415,27 @@ output_per_mtok = 0.0
         stderr(&output).starts_with("error: Invalid config: "),
         "{}",
         stderr(&output)
+    );
+}
+
+#[tokio::test]
+async fn the_system_prompt_reports_overridden_model_and_sandbox() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
+    let workspace = Workspace::with_mock_provider("prompt-env", &server);
+
+    let mut command = workspace.command(&["--model", "mock:other-model", "run", "hi"]);
+    command.env("AGENT86_SANDBOX", "docker");
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let system = server.requests()[0].body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        system.ends_with("Default model: mock:other-model. Sandbox: docker."),
+        "{system}"
     );
 }

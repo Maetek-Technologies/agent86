@@ -1,5 +1,6 @@
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::pricing::PriceTable;
+use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
 use agent86::turn::{format_turn_summary, run_text_turn};
 use agent86::types::ModelRef;
@@ -101,13 +102,19 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
 
     let mut stdout = std::io::stdout().lock();
-    let result = runtime.block_on(run_text_turn(provider.as_ref(), goal, max_tokens, |text| {
-        if !as_json {
-            // Raw write + flush streams partial lines reliably across terminals.
-            let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
-        }
-    }));
+    let result = runtime.block_on(run_text_turn(
+        provider.as_ref(),
+        build_system_prompt(config),
+        goal,
+        max_tokens,
+        |text| {
+            if !as_json {
+                // Raw write + flush streams partial lines reliably across terminals.
+                let _ = stdout.write_all(text.as_bytes());
+                let _ = stdout.flush();
+            }
+        },
+    ));
 
     let output = match result {
         Ok(output) => output,
