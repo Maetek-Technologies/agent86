@@ -45,6 +45,10 @@ docker_cpus = "1"
 docker_network = false
 env_passthrough = []
 
+[memory]
+enabled = true
+path = "~/.agent86/memory.db"
+
 [tools]
 web_allow_private = false
 web_max_chars = 8000
@@ -85,6 +89,7 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub guardrails: GuardrailsConfig,
     pub tools: ToolsConfig,
+    pub memory: MemoryConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -114,6 +119,14 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
     pub tool_timeout_s: u64,
+}
+
+/// Memory settings (`[memory]`). Only session persistence uses them so far.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    /// The SQLite database, shared with the Python implementation; `~` expands.
+    pub path: String,
 }
 
 /// Tool settings (`[tools]`).

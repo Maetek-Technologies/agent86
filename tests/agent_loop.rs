@@ -8,6 +8,7 @@ use agent86::approval::{ApprovalGate, ApprovalPrompt};
 use agent86::config::{EgressMode, IngressMode, LimitsConfig};
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
+use agent86::session::AgentState;
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::RunOutput;
 use agent86::types::{ApprovalMode, Message, Role};
@@ -132,7 +133,15 @@ async fn run_with(
         gate,
         guardrails,
     };
-    harness.run_turn(goal, |_| {}).await
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, goal, |_| {}).await?;
+    Ok(RunOutput {
+        session_id: state.session_id.clone(),
+        output,
+        steps: state.step_count() as u64,
+        usage: state.usage,
+        turn: state.last_turn.clone(),
+    })
 }
 
 #[tokio::test]
@@ -632,14 +641,17 @@ async fn redact_mode_never_shows_the_raw_text() {
         gate: ask_gate(),
         guardrails: redact,
     };
+    let mut state = AgentState::new();
     let output = harness
-        .run_turn("hi", |text| sink.lock().unwrap().push_str(text))
+        .run_turn(&mut state, "hi", |text| sink.lock().unwrap().push_str(text))
         .await
         .unwrap();
 
     let expected = "write to [REDACTED:email]\n[guardrail] output flagged: pii:email\n";
-    assert_eq!(output.output, expected);
+    assert_eq!(output, expected);
     assert_eq!(*shown.lock().unwrap(), expected);
+    // The redacted text is also what the history keeps.
+    assert_eq!(state.messages[1].content, "write to [REDACTED:email]");
 }
 
 #[tokio::test]

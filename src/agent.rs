@@ -19,9 +19,12 @@ use crate::config::LimitsConfig;
 use crate::guardrails::Guardrails;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
+use crate::session::AgentState;
 use crate::tools::{ToolContext, ToolRegistry};
-use crate::turn::{new_session_id, RunOutput, TurnSummary};
-use crate::types::{python_repr, CompletionRequest, Message, Role, ToolCall, ToolResult, Usage};
+use crate::turn::TurnSummary;
+use crate::types::{
+    python_repr, AgentPhase, CompletionRequest, Message, Role, Step, ToolCall, ToolResult, Usage,
+};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -146,38 +149,55 @@ pub struct Harness<'a> {
 }
 
 impl Harness<'_> {
-    /// Run one user turn to completion, passing every piece of streamed text,
-    /// including tool notices, to `on_text`.
+    /// Run one user turn on `state`, passing every piece of streamed text,
+    /// including tool notices, to `on_text`, and return everything streamed.
+    ///
+    /// The turn's messages and steps are appended to `state`, its usage added,
+    /// and its summary left on `state.last_turn`. A failed turn still leaves
+    /// `state` in the `error` phase with its summary, so it can be persisted.
     pub async fn run_turn(
         &self,
+        state: &mut AgentState,
         goal: &str,
-        mut on_text: impl FnMut(&str),
-    ) -> Result<RunOutput, HarnessError> {
+        on_text: impl FnMut(&str),
+    ) -> Result<String, HarnessError> {
         let started = Instant::now();
+        let mut summary = TurnSummary::default();
+        let result = self.turn(state, goal, &mut summary, on_text).await;
+        summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
+        state.last_turn = Some(summary);
+        if result.is_err() {
+            state.phase = AgentPhase::Error;
+        }
+        result
+    }
+
+    async fn turn(
+        &self,
+        state: &mut AgentState,
+        goal: &str,
+        summary: &mut TurnSummary,
+        mut on_text: impl FnMut(&str),
+    ) -> Result<String, HarnessError> {
         let mut output = String::new();
         let mut emit = |text: &str| {
             output.push_str(text);
             on_text(text);
         };
 
-        let mut summary = TurnSummary::default();
-
         // Ingress guardrail on the user's input.
         let report = self.guardrails.inspect_ingress(goal);
         if report.flagged() {
             if self.guardrails.should_block(&report) {
-                emit(&format!(
+                let refusal = format!(
                     "Refused: input tripped the ingress guardrail ({}).",
                     report.summary()
-                ));
-                summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
-                return Ok(RunOutput {
-                    session_id: new_session_id(),
-                    output,
-                    steps: 0,
-                    usage: Usage::default(),
-                    turn: Some(summary),
-                });
+                );
+                state.messages.push(message(Role::User, goal));
+                state.messages.push(message(Role::Assistant, &refusal));
+                state.phase = AgentPhase::Error;
+                emit(&refusal);
+                return Ok(output);
             }
             emit(&format!(
                 "[guardrail] input flagged: {}\n",
@@ -189,10 +209,8 @@ impl Harness<'_> {
         // already leaked. Each step's text is held back and replayed redacted.
         let buffering = self.guardrails.egress == EgressMode::Redact;
 
+        state.messages.push(message(Role::User, goal));
         let mut breaker = CircuitBreaker::new(&self.limits);
-        let mut messages = vec![message(Role::User, goal)];
-        let mut steps = 0u64;
-        let mut usage = Usage::default();
         // Where the first partial answer went, and the pieces collected so far.
         let mut continuation_start: Option<usize> = None;
         let mut continuation_parts: Vec<String> = Vec::new();
@@ -201,9 +219,9 @@ impl Harness<'_> {
             breaker.before_step()?;
 
             let completion = {
-                let mut request_messages = Vec::with_capacity(messages.len() + 1);
+                let mut request_messages = Vec::with_capacity(state.messages.len() + 1);
                 request_messages.push(self.system.clone());
-                request_messages.extend(messages.iter().cloned());
+                request_messages.extend(state.messages.iter().cloned());
                 let request = CompletionRequest {
                     model: self.provider.model().to_owned(),
                     messages: request_messages,
@@ -232,10 +250,9 @@ impl Harness<'_> {
             breaker.record_step(&completion.usage);
             summary.steps = u64::from(breaker.steps());
             summary.add_usage(&completion.usage);
-            let step_usage = completion.usage;
 
             // Egress guardrail on the model's text. In redact mode the redacted copy
-            // is what everything downstream sees: the output and the history.
+            // is what everything downstream sees: the output, the history, and the step.
             let (egress, redacted) = self.guardrails.inspect_egress(&completion.text);
             let text = if buffering {
                 if !redacted.is_empty() {
@@ -252,7 +269,15 @@ impl Harness<'_> {
                 ));
             }
             let tool_calls = completion.tool_calls;
-            messages.push(Message {
+            let mut step = Step {
+                index: state.steps.len() as u64 + 1,
+                phase: AgentPhase::Execute,
+                thought: text.clone(),
+                tool_calls: tool_calls.clone(),
+                results: Vec::new(),
+                usage: completion.usage,
+            };
+            state.messages.push(Message {
                 tool_calls: tool_calls.clone(),
                 ..message(Role::Assistant, &text)
             });
@@ -261,23 +286,24 @@ impl Harness<'_> {
                 let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
                 if cut_off && summary.continuations < MAX_CONTINUATIONS {
                     summary.continuations += 1;
-                    continuation_start.get_or_insert(messages.len() - 1);
+                    continuation_start.get_or_insert(state.messages.len() - 1);
                     continuation_parts.push(text);
-                    messages.push(message(Role::User, CONTINUE_PROMPT));
-                    steps += 1;
-                    usage = usage + step_usage;
+                    state.messages.push(message(Role::User, CONTINUE_PROMPT));
+                    record_step(state, step);
                     emit(&continuation_notice(summary.continuations));
                     continue;
                 }
                 if let Some(start) = continuation_start {
                     // Collapse [partial, "continue", partial, ...] into one answer.
                     continuation_parts.push(text);
-                    messages.truncate(start);
-                    messages.push(message(Role::Assistant, &continuation_parts.concat()));
+                    let joined = continuation_parts.concat();
+                    state.messages.truncate(start);
+                    state.messages.push(message(Role::Assistant, &joined));
+                    step.thought = joined;
                 }
-                steps += 1;
-                usage = usage + step_usage;
-                break;
+                record_step(state, step);
+                state.phase = AgentPhase::Done;
+                return Ok(output);
             }
 
             // A step that wants tools ends any continuation in progress.
@@ -293,28 +319,23 @@ impl Harness<'_> {
                 ));
             }
             let results = self.execute_batch(&tool_calls);
-            for (call, result) in tool_calls.iter().zip(&results) {
+            for (call, result) in tool_calls.iter().zip(results) {
                 summary.tool_calls += 1;
-                messages.push(Message {
+                state.messages.push(Message {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
-                    ..message(Role::Tool, &self.guardrails.observe(observation(result)))
+                    ..message(Role::Tool, &self.guardrails.observe(observation(&result)))
                 });
-                emit(&format!("[tool] {} -> {}\n", call.name, summarize(result)));
-                breaker.record_tool_result(result.ok)?;
+                emit(&format!("[tool] {} -> {}\n", call.name, summarize(&result)));
+                let ok = result.ok;
+                step.results.push(result);
+                if let Err(tripped) = breaker.record_tool_result(ok) {
+                    record_step(state, step);
+                    return Err(tripped);
+                }
             }
-            steps += 1;
-            usage = usage + step_usage;
+            record_step(state, step);
         }
-
-        summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
-        Ok(RunOutput {
-            session_id: new_session_id(),
-            output,
-            steps,
-            usage,
-            turn: Some(summary),
-        })
     }
 
     /// Run a step's tool calls and return their results in call order.
@@ -431,6 +452,12 @@ fn not_executed(call: &ToolCall, reason: &str) -> ToolResult {
         error: Some(format!("Not executed: {reason}.")),
         metadata: serde_json::Map::new(),
     }
+}
+
+/// Append `step` to the session and add its usage, as Python's `AgentState.record_step`.
+fn record_step(state: &mut AgentState, step: Step) {
+    state.usage = state.usage + step.usage;
+    state.steps.push(step);
 }
 
 fn message(role: Role, content: &str) -> Message {
