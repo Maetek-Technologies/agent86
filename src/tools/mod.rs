@@ -8,11 +8,15 @@
 //!
 //! Only read-only workspace tools exist so far.
 
+pub mod exec;
 pub mod files;
+pub mod sandbox;
 
 use crate::types::{ToolCall, ToolResult, ToolSpec};
+use sandbox::Executor;
 use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 /// Default cap on a tool's output, in characters (Python's `max_output_bytes`).
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 100_000;
@@ -230,6 +234,10 @@ pub struct SandboxPolicy {
     /// Further roots tools may reach. Python adds skill directories here; none yet.
     allow_paths: Vec<PathBuf>,
     pub max_output_chars: usize,
+    /// How long one sandboxed process may run before its tree is killed.
+    pub timeout: Duration,
+    /// Extra environment variable names forwarded into tool processes.
+    pub env_passthrough: Vec<String>,
 }
 
 impl SandboxPolicy {
@@ -239,6 +247,8 @@ impl SandboxPolicy {
             workspace: std::fs::canonicalize(workspace)?,
             allow_paths: Vec::new(),
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
+            timeout: Duration::from_secs(30),
+            env_passthrough: Vec::new(),
         })
     }
 
@@ -307,6 +317,13 @@ fn resolve(path: &Path) -> PathBuf {
     resolved
 }
 
+/// `path` without Windows' `\\?\` verbatim prefix, for handing to other programs:
+/// `cmd.exe` refuses a verbatim working directory and falls back to the Windows
+/// directory, so child processes must get the plain form.
+pub fn plain_path(path: &Path) -> PathBuf {
+    PathBuf::from(display_path(path))
+}
+
 /// A path for messages, without Windows' `\\?\` verbatim prefix.
 pub fn display_path(path: &Path) -> String {
     let text = path.display().to_string();
@@ -323,6 +340,8 @@ pub fn display_path(path: &Path) -> String {
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub policy: SandboxPolicy,
+    /// Where commands and Python snippets run.
+    pub executor: Executor,
 }
 
 impl ToolContext {
@@ -330,6 +349,7 @@ impl ToolContext {
     pub fn new(workspace: &Path) -> std::io::Result<Self> {
         Ok(Self {
             policy: SandboxPolicy::new(workspace)?,
+            executor: Executor::Subprocess,
         })
     }
 }
@@ -393,7 +413,7 @@ impl ToolRegistry {
 
 /// The built-in tools ported so far, in Python's registration order.
 ///
-/// Python also registers `run_command`, `python_exec`, and `web_fetch`.
+/// Python also registers `web_fetch`.
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in [
@@ -401,6 +421,8 @@ pub fn builtin_registry() -> ToolRegistry {
         Box::new(files::WriteFileTool),
         Box::new(files::EditFileTool),
         Box::new(files::ListDirTool),
+        Box::new(exec::RunCommandTool),
+        Box::new(exec::PythonExecTool),
     ] {
         registry
             .register(tool)

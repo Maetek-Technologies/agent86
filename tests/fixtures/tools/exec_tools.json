@@ -1,0 +1,28 @@
+{
+ "run_command": {
+  "properties": {
+   "command": {
+    "description": "The shell command to execute.",
+    "title": "Command",
+    "type": "string"
+   }
+  },
+  "required": [
+   "command"
+  ],
+  "type": "object"
+ },
+ "python_exec": {
+  "properties": {
+   "code": {
+    "description": "Python source to execute. Use print() for output.",
+    "title": "Code",
+    "type": "string"
+   }
+  },
+  "required": [
+   "code"
+  ],
+  "type": "object"
+ }
+}

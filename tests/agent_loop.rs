@@ -45,6 +45,7 @@ fn limits() -> LimitsConfig {
         max_consecutive_errors: 3,
         max_output_tokens: 8192,
         parallel_tools: true,
+        tool_timeout_s: 60,
     }
 }
 
@@ -166,7 +167,17 @@ async fn tool_results_are_fed_back_and_the_turn_ends_with_text() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["read_file", "write_file", "edit_file", "list_dir"]);
+    assert_eq!(
+        tools,
+        [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "run_command",
+            "python_exec"
+        ]
+    );
 
     let second = requests[1].body["messages"].as_array().unwrap();
     assert_eq!(second.len(), 4);
@@ -231,7 +242,7 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
         sse_tool_calls(&[
             ("a", "read_file", r#"{"path": "../escape.txt"}"#),
             ("b", "read_file", r#"{"path": "#),
-            ("c", "run_command", r#"{"command": "ls"}"#),
+            ("c", "web_fetch", r#"{"url": "https://example.com"}"#),
         ]),
         sse_text("I could not do that.", "stop"),
     ])
@@ -259,11 +270,11 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
     );
     assert_eq!(
         observed[2],
-        "Unknown tool 'run_command'. Available: edit_file, list_dir, read_file, write_file."
+        "Unknown tool 'web_fetch'. Available: edit_file, list_dir, python_exec, read_file, run_command, write_file."
     );
     assert!(output
         .output
-        .contains("[tool] run_command -> error: Unknown tool 'run_command'."));
+        .contains("[tool] web_fetch -> error: Unknown tool 'web_fetch'."));
     assert!(output.output.ends_with("I could not do that."));
 }
 
