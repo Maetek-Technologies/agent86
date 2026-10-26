@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** Core foundation complete; OpenAI-compatible provider milestone next
+**Current stage:** OpenAI-compatible one-shot turn implemented; live smoke test and Ollama provider next
 
 ## 1. Purpose
 
@@ -43,21 +43,29 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added a placeholder `agent86` CLI supporting `--help` and `--version`
 - Added the README, MIT license, `.gitignore`, and an implementation roadmap
 - Prepared a cross-platform CI workflow for Linux, macOS, and Windows
+- Added layered TOML configuration for model providers: built-in defaults, `~/.agent86/config.toml`, `./.agent86/config.toml`, `AGENT86_MODEL`, and `--model`, deep-merged like the reference
+- Added an async provider interface (`ModelProvider::stream`, with `complete` derived from it) and provider-neutral `ProviderError` kinds
+- Added the OpenAI-compatible provider: chat-completions requests, incremental SSE decoding, text deltas, usage including cached tokens, streamed tool-call assembly, stop-reason normalization, the `max_completion_tokens` → `max_tokens` fallback, split connect/read timeouts, and retries for 429/5xx and connection failures that never fire after text has been emitted
+- Added `agent86 run <goal>` and `agent86 run --json <goal>` for one text-only turn
+- Added SSE fixtures (hand-written in the shape of OpenAI/OpenRouter streams), a scripted local mock server, and provider, CLI, and configuration tests
+- Added an opt-in live OpenRouter smoke test (`tests/live_openrouter.rs`, ignored by default)
+- Raised the minimum supported Rust version to 1.89, the highest required by the new dependencies (verified with a 1.89 toolchain)
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **10 passed**
+- `cargo test --all-targets`: **64 passed**, 1 ignored (the live smoke test)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
-- CLI `--help` and `--version` execution: passed
+- `cargo +1.89 test --all-targets`: passed
 
 ### Not implemented
 
 The project is **not yet a usable agent**. It currently has no:
 
-- Model providers or live model calls
-- Streaming SSE or NDJSON clients
-- One-shot `run` implementation
+- Anthropic, Ollama, or llama.cpp providers, or NDJSON streaming
+- OS keyring lookup for API keys (environment variables only)
+- Price table (`cost_usd` is reported as `0.0` and the model as unpriced)
+- System prompt (a turn sends only the user's goal)
 - Tool execution or ReAct orchestration
 - Guardrails, approvals, or sandbox executors
 - Session persistence, memory, or tracing
@@ -69,9 +77,18 @@ The project is **not yet a usable agent**. It currently has no:
 
 The prepared `.github/workflows/ci.yml` has not been uploaded. GitHub rejects workflow creation with the current connection because it lacks workflow permission. All other initial files have been pushed and verified.
 
-## 4. Immediate milestone: one real OpenAI-compatible model turn
+## 4. Milestone: one real OpenAI-compatible model turn
 
-The next milestone is a minimal text-only, one-shot CLI using an OpenAI-compatible provider, with OpenRouter as the first live target.
+**Status:** implemented and validated against the mock provider. The live OpenRouter smoke test has not been run yet: no credentials were available, and the development sandbox's network policy blocks `openrouter.ai`.
+
+Deliberate differences from the reference, chosen to meet the acceptance criteria below:
+
+- A stream that ends with no `finish_reason` and no `[DONE]` is a `TruncatedStream` error. The reference returns the partial text as a successful turn.
+- An `error` object inside a 200 stream (OpenRouter sends these when an upstream fails) is a `Stream` error. The reference ignores it and returns an empty turn.
+- `run --session` is rejected (exit 2) because nothing is persisted. The reference silently starts a new session when the id is unknown.
+- `Retry-After` is honored in its delta-seconds form only; HTTP-dates fall back to normal backoff.
+
+The milestone is a minimal text-only, one-shot CLI using an OpenAI-compatible provider, with OpenRouter as the first live target.
 
 OpenRouter comes before Ollama because it:
 
@@ -183,9 +200,11 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 
 ## 9. Next actions
 
-- [ ] Implement the async provider interface and OpenAI-compatible SSE client
-- [ ] Add recorded fixtures and mock-provider integration tests
-- [ ] Implement text-only `run` and `run --json`
-- [ ] Validate locally without credentials
-- [ ] Perform an optional live OpenRouter smoke test
+- [x] Implement the async provider interface and OpenAI-compatible SSE client
+- [x] Add fixtures and mock-provider integration tests
+- [x] Implement text-only `run` and `run --json`
+- [x] Validate locally without credentials
+- [ ] Perform the optional live OpenRouter smoke test (`cargo test --test live_openrouter -- --ignored`) with a user-supplied key and model
+- [ ] Capture real OpenRouter streams as fixtures and add differential tests against the Python `run --json`
+- [ ] Start stage 2: the Ollama NDJSON provider behind the same interface
 - [ ] Upload the prepared CI workflow after workflow permission is available

@@ -1,0 +1,2 @@
+data: {"id":"gen-5","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Complete"},"finish_reason":"stop"}]}
+
