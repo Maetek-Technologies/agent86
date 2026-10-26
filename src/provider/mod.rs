@@ -9,10 +9,73 @@ pub mod capabilities;
 pub mod openai;
 pub mod retry;
 
-use crate::types::{Completion, CompletionDelta, CompletionRequest};
+use crate::config::{Config, ProviderConfig};
+use crate::secrets::resolve_api_key;
+use crate::types::{Completion, CompletionDelta, CompletionRequest, ModelRef};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{BoxStream, StreamExt};
+use openai::{OpenAiConfig, OpenAiProvider};
+use std::time::Duration;
 use thiserror::Error;
+
+/// Providers with a dedicated adapter in Python that the Rust port does not have yet.
+const NOT_PORTED: &[&str] = &["anthropic", "ollama", "llamacpp"];
+
+/// Construct the provider that serves `reference`, e.g. `openrouter:openai/gpt-4o-mini`.
+///
+/// Any provider section with a `base_url` is treated as OpenAI-compatible, so
+/// OpenRouter, Groq, Together, vLLM, and LM Studio work with only a config block.
+/// A key is required for `openai` itself, and for other sections only when they
+/// name an `api_key_env`; a `base_url` without one is a keyless local endpoint.
+pub fn provider_for_ref(
+    reference: &ModelRef,
+    config: &Config,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    let name = reference.provider.as_str();
+    let section = config.providers.get(name).cloned().unwrap_or_default();
+
+    let require_key = match name {
+        "openai" | "openai-compatible" => true,
+        _ if NOT_PORTED.contains(&name) => {
+            return Err(ProviderError::NotPorted {
+                provider: name.to_owned(),
+            })
+        }
+        _ if section.base_url.is_some() => section.api_key_env.is_some(),
+        _ => {
+            return Err(ProviderError::UnknownProvider {
+                provider: name.to_owned(),
+            })
+        }
+    };
+
+    let api_key = resolve_api_key(section.api_key_env.as_deref());
+    let openai_config = openai_config(name, &section, require_key)?;
+    let provider = OpenAiProvider::new(reference.model.clone(), openai_config, api_key)?;
+    Ok(Box::new(provider))
+}
+
+fn openai_config(
+    name: &str,
+    section: &ProviderConfig,
+    require_key: bool,
+) -> Result<OpenAiConfig, ProviderError> {
+    let seconds = |field: &str, value: f64| {
+        Duration::try_from_secs_f64(value).map_err(|_| ProviderError::InvalidSetting {
+            provider: name.to_owned(),
+            detail: format!("{field} must be a non-negative number of seconds, not {value}"),
+        })
+    };
+    Ok(OpenAiConfig {
+        base_url: section.base_url.clone(),
+        api_key_env: section.api_key_env.clone(),
+        require_key,
+        max_tokens: section.max_tokens,
+        connect_timeout: seconds("connect_timeout_s", section.connect_timeout_s)?,
+        read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
+        max_retries: section.max_retries,
+    })
+}
 
 /// A stream of text deltas whose final item carries `done = true` and the full completion.
 pub type DeltaStream<'a> = BoxStream<'a, Result<CompletionDelta, ProviderError>>;
@@ -75,6 +138,22 @@ pub async fn collect_completion(
 /// redacted before they are stored here.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ProviderError {
+    #[error(
+        "Unknown provider '{provider}'. Built-in: anthropic, openai, ollama, llamacpp. \
+         For an OpenAI-compatible endpoint, add a [providers.{provider}] block with a base_url \
+         (e.g. OpenRouter, Groq, Together) to your config."
+    )]
+    UnknownProvider { provider: String },
+
+    #[error(
+        "The '{provider}' provider is not available in the Rust port yet. \
+         Use an OpenAI-compatible provider such as openrouter, openai, or groq."
+    )]
+    NotPorted { provider: String },
+
+    #[error("Invalid [providers.{provider}] setting: {detail}")]
+    InvalidSetting { provider: String, detail: String },
+
     #[error("No API key found. Set the {env} environment variable.")]
     MissingApiKey { env: String },
 

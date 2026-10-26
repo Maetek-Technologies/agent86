@@ -6,17 +6,18 @@ The Python implementation remains the reference. This repository starts with a s
 
 ## Status
 
-**Provider stage — not yet a usable agent.** The repository currently contains:
+**One-shot text stage — not yet a usable agent.** The repository currently contains:
 
 - Provider-neutral roles, phases, stop reasons, messages, tool calls, completions, steps, and usage accounting
 - `provider:model` parsing
 - Serde-based JSON representations and initial compatibility tests
 - An async provider interface and an OpenAI-compatible streaming (SSE) provider for OpenAI, OpenRouter, and other compatible endpoints, with retries, timeouts, and secret redaction
 - Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
-- A placeholder CLI that supports only `--help` and `--version`
+- Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks
+- A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-The CLI cannot call a model yet. There are no orchestration loops, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
+Turns are text only: there is no system prompt yet, and no orchestration loop, executable tools, MCP connections, persistent sessions, or interactive interfaces yet.
 
 ## Why Rust?
 
@@ -42,7 +43,8 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] OpenAI-compatible streaming provider
 - [ ] Differential test harness against the Python implementation
 - [ ] Ollama streaming provider
-- [ ] Minimal ReAct loop and one-shot `run --json`
+- [x] Text-only one-shot `run` and `run --json`
+- [ ] Minimal ReAct loop
 - [ ] Read-only workspace tools
 - [ ] Guardrails, approvals, and sandboxed side-effecting tools
 - [ ] Sessions, memory, and observability
@@ -62,11 +64,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Build the placeholder executable with:
+Try it against OpenRouter by setting `OPENROUTER_API_KEY` in your environment and running:
 
 ```bash
-cargo run -- --help
+cargo run -- --model openrouter:<model> run "Say hello"
+cargo run -- --model openrouter:<model> run --json "Say hello"
 ```
+
+Any `[providers.<name>]` block with a `base_url` is treated as OpenAI-compatible; add `api_key_env` if the endpoint needs a key.
 
 ## License
 
