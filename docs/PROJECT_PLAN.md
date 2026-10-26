@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals and side-effecting tools (stage 5) next
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals and file-writing tools (stage 5, part 1) done, guardrails (stage 5, part 2) next
 
 ## 1. Purpose
 
@@ -57,15 +57,17 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added `agent86 keys set <provider> [--stdin]` and `agent86 keys delete <provider>`, which write and delete the same keyring entries Python uses (on Windows, Python's `agent86` / `<account>@agent86` layout). The prompt hides input, including in Git Bash, where it uses `stty -echo` because console-based prompts (Python's `getpass`, `rpassword`) cannot read mintty input. Keys are checked before storing: empty input, embedded whitespace, and a key pasted more than once are refused. Verified live on Windows with a store, read, and delete round trip under a throwaway service name
 - Added the tool layer and the read-only workspace tools (stage 3), ported from `tools/base.py`, `tools/registry.py`, `tools/sandbox/policy.py`, and `tools/builtin/files.py`: the `Tool` trait, pydantic-style argument validation with pydantic's messages, the workspace jail (`resolve_within`, following symlinks like `Path.resolve()`), output truncation, the registry (registration-order specs, sorted names, unknown-tool errors), and `read_file` and `list_dir`. Their advertised JSON schemas match a fixture generated with pydantic from mirrors of the Python argument models. 
 - Added the ReAct loop (stage 4), ported from `orchestration/loop.py` and `orchestration/circuit.py`: each step sends the full history plus the tool specs; tool calls are announced as `[tool] name(<json.dumps args>)` and observed as `[tool] name -> <first line>`, both in the streamed output and in `run --json`'s `output`, as Python does; results return to the model in call order; read-only calls in one step run concurrently (`limits.parallel_tools`); unparseable tool-call JSON is answered before dispatch; the circuit breaker enforces `max_steps` (40), `max_cost_usd` (5.0), `max_wall_clock_s` (900), and `max_consecutive_errors` (3) with Python's messages; answers cut off by the output cap get up to 3 continuations, collapsed into one answer. `run` offers `read_file` and `list_dir`, jailed to the current directory. Tool-call arguments are sent back as Python's `json.dumps` output, and `serde_json`'s `preserve_order` keeps argument key order
+- Added the approval gate and the file-writing tools (stage 5, part 1), ported from `guardrails/policy.py`, `ui/repl.py`, and `tools/builtin/files.py`: `[guardrails] approval` (`ask` by default, `auto`, `deny`) with `AGENT86_APPROVAL`, `--approval`, and `run --yes`/`-y`; a `[y/N]` terminal prompt that shows the tool's preview (a unified diff) and is installed only when stdin is a terminal, so piped runs decline side effects under `ask`; Python's batch ordering (approvals first, reads in parallel, then writes in call order) and its `Not executed: <reason>.` observations; `write_file` and `edit_file` with Python's messages, BOM and CRLF preservation, aliases (`old`/`new`), and pydantic's boolean rules. Diffs come from a port of CPython's `difflib` (`SequenceMatcher` with its autojunk heuristic, and `unified_diff`), checked against CPython output
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **118 passed** (45 unit, 10 compatibility, 18 provider integration, 19 CLI end-to-end, 13 tools, 9 agent loop, 2 system prompt, 2 API key), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **141 passed** (46 unit, 10 compatibility, 18 provider integration, 23 CLI end-to-end, 13 tools, 11 write tools and approvals, 2 difflib, 14 agent loop, 2 system prompt, 2 API key), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live file-writing check (2026-10-26, `openrouter:openai/gpt-4o-mini`, `run --yes` in a throwaway directory): the model called `edit_file` and `write_file` in one step, and both files on disk were correct
 - Live agent-loop check (2026-10-26, `openrouter:openai/gpt-4o-mini`): asked to inspect this repository, the model called `list_dir`, then `read_file README.md` and `list_dir tests` in one parallel step, and answered correctly (3 steps, 3 tools, about 2.7k input tokens)
 - Live keyring check (2026-10-26): with no environment variable set, `run` used the OpenRouter key from Windows Credential Manager and sent the system prompt (337 input tokens)
 - Live OpenRouter smoke test (2026-10-26, `openrouter:openai/gpt-4o-mini`): `run` streamed the answer with the summary line on stderr, and `run --json` produced the contract fields with real token usage (12 in / 7 out). The key was read from the environment and appeared in no output
@@ -76,7 +78,8 @@ The project is **not yet a usable agent**. It currently has no:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
-- Approvals, guardrails (ingress, egress, observation scanning), and the side-effecting tools they gate (stage 5)
+- Guardrails: ingress and egress scanning and observation scanning (stage 5, part 2)
+- `run_command`, `python_exec`, and `web_fetch`, and the sandbox executors behind them (stages 5 and 6)
 - Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
 - Guardrails, approvals, or sandbox executors
 - Session persistence, memory, or tracing
@@ -100,10 +103,15 @@ The project is **not yet a usable agent**. It currently has no:
 
 ### Known loop differences from Python
 
-- Only `read_file` and `list_dir` are offered. Python also offers `write_file`, `edit_file`, `run_command`, `python_exec`, and `web_fetch`, plus memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
+- Only `read_file`, `write_file`, `edit_file`, and `list_dir` are offered. Python also offers `run_command`, `python_exec`, and `web_fetch`, plus memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
 - The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
 - Tool observations are not scanned for prompt injection (Python's `guardrails.scan_observations`), and the ingress and egress guardrails are not applied.
 - There is no cancellation (Ctrl-C ends the process), no flight recorder, and no session persistence.
+
+### Known approval differences from Python
+
+- The approval prompt is written to stderr; Python writes it to stdout, which would corrupt `run --json` output when a terminal is attached. The preview is shown as plain text, without Rich's syntax highlighting.
+- Ctrl+C at the prompt ends the process; Python treats it as declining.
 
 ### Known tool differences from Python
 

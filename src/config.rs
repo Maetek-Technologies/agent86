@@ -16,6 +16,7 @@
 //! Only the sections the Rust port uses so far are read; other sections are
 //! accepted and ignored.
 
+use crate::types::ApprovalMode;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,9 @@ parallel_tools = true
 
 [sandbox]
 mode = "subprocess"
+
+[guardrails]
+approval = "ask"
 
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
@@ -66,6 +70,7 @@ pub struct Config {
     pub model: ModelConfig,
     pub limits: LimitsConfig,
     pub sandbox: SandboxConfig,
+    pub guardrails: GuardrailsConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -93,6 +98,13 @@ pub struct LimitsConfig {
     pub max_output_tokens: u32,
     /// Run a step's read-only tool calls concurrently.
     pub parallel_tools: bool,
+}
+
+/// Safety settings (`[guardrails]`). Only `approval` is read so far.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GuardrailsConfig {
+    /// What happens before a side-effecting tool runs: `auto`, `ask`, or `deny`.
+    pub approval: ApprovalMode,
 }
 
 /// Where tool code runs (`[sandbox]`). Only `mode` is read so far.
@@ -215,17 +227,24 @@ pub struct Overrides {
     pub env_model: Option<String>,
     /// `AGENT86_SANDBOX`.
     pub env_sandbox: Option<String>,
+    /// `AGENT86_APPROVAL`.
+    pub env_approval: Option<String>,
     /// `--model`.
     pub model: Option<String>,
+    /// `--approval`.
+    pub approval: Option<String>,
 }
 
 impl Overrides {
     /// Read the supported `AGENT86_*` environment variables; empty values are ignored.
-    pub fn from_env(model: Option<String>) -> Self {
+    /// `model` and `approval` are the `--model` and `--approval` flags.
+    pub fn from_env(model: Option<String>, approval: Option<String>) -> Self {
         Self {
             env_model: non_empty_env("AGENT86_MODEL"),
             env_sandbox: non_empty_env("AGENT86_SANDBOX"),
+            env_approval: non_empty_env("AGENT86_APPROVAL"),
             model,
+            approval,
         }
     }
 }
@@ -256,7 +275,9 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
     let layers = [
         ("model", "default", &overrides.env_model),
         ("sandbox", "mode", &overrides.env_sandbox),
+        ("guardrails", "approval", &overrides.env_approval),
         ("model", "default", &overrides.model),
+        ("guardrails", "approval", &overrides.approval),
     ];
     for (section, key, value) in layers {
         if let Some(value) = value {

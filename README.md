@@ -20,7 +20,7 @@ The Python implementation remains the reference. This repository starts with a s
 - A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-`run` is a working read-only agent: the model can list directories and read files inside the current directory, see the results, and keep going until it answers. There are no side-effecting tools (writing files, running commands), approvals, MCP connections, persistent sessions, or interactive interfaces yet.
+`run` is a working agent for the current directory: the model can list, read, write, and edit files there, see the results, and keep going until it answers. Every write is shown as a diff and needs your approval: at a terminal `run` asks `[y/N]` for each one; piped or in CI it declines them unless you pass `--yes` (or set `--approval auto`). There is no shell or Python execution, guardrail scanning, MCP, persistent sessions, or interactive REPL yet.
 
 ## Why Rust?
 
@@ -49,7 +49,9 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Text-only one-shot `run` and `run --json`
 - [x] Read-only workspace tools (`read_file`, `list_dir`)
 - [x] ReAct loop with circuit breakers and continuations
-- [ ] Guardrails, approvals, and sandboxed side-effecting tools
+- [x] Approvals and file-writing tools (`write_file`, `edit_file`)
+- [ ] Guardrails (ingress, egress, observation scanning)
+- [ ] Sandboxed command and Python execution
 - [ ] Sessions, memory, and observability
 - [ ] MCP transports and lifecycle behavior
 - [ ] Interactive terminal interface

@@ -60,6 +60,13 @@ pub trait Tool: Send + Sync {
     /// The JSON Schema of the arguments, exactly as Python's pydantic models advertise it.
     fn parameters(&self) -> Value;
 
+    /// What this call would do, shown in the approval prompt before it runs (a
+    /// unified diff for a file write). Receives the raw, unvalidated arguments and
+    /// must never fail; `None` means the argument summary says it all.
+    fn preview(&self, _args: &Map<String, Value>, _ctx: &ToolContext) -> Option<String> {
+        None
+    }
+
     /// Run the tool. `ToolResult::call_id` may be left empty; [`Tool::run`] fills it in.
     fn execute(
         &self,
@@ -158,6 +165,51 @@ impl<'a> Arguments<'a> {
                 String::new()
             }
         }
+    }
+
+    /// A string field accepted under any of `names` (pydantic's `AliasChoices`);
+    /// the first name present wins, and errors name the first choice.
+    pub fn string_alias(&mut self, names: &[&str]) -> String {
+        match names.iter().find(|name| self.args.contains_key(**name)) {
+            Some(name) => self.string(name, None),
+            None => {
+                self.errors.push(format!("{}: Field required", names[0]));
+                String::new()
+            }
+        }
+    }
+
+    /// A boolean field with pydantic's lax parsing: `true`/`false`, `0`/`1`, and
+    /// strings such as `"yes"`, `"off"`, or `"t"` in any case.
+    pub fn boolean(&mut self, field: &str, default: bool) -> bool {
+        const PLAIN: &str = "Input should be a valid boolean";
+        const UNINTERPRETABLE: &str = "Input should be a valid boolean, unable to interpret input";
+        let parsed = match self.args.get(field) {
+            None => return default,
+            Some(Value::Bool(flag)) => Ok(*flag),
+            Some(Value::Number(number)) => {
+                let value = number.as_f64().unwrap_or(f64::NAN);
+                if value == 0.0 {
+                    Ok(false)
+                } else if value == 1.0 {
+                    Ok(true)
+                } else if number.is_f64() && value.fract() != 0.0 {
+                    Err(PLAIN)
+                } else {
+                    Err(UNINTERPRETABLE)
+                }
+            }
+            Some(Value::String(text)) => match text.to_lowercase().as_str() {
+                "0" | "off" | "f" | "false" | "n" | "no" => Ok(false),
+                "1" | "on" | "t" | "true" | "y" | "yes" => Ok(true),
+                _ => Err(UNINTERPRETABLE),
+            },
+            Some(_) => Err(PLAIN),
+        };
+        parsed.unwrap_or_else(|message| {
+            self.errors.push(format!("{field}: {message}"));
+            default
+        })
     }
 
     /// `Err` with every collected error, or `Ok` when all fields were valid.
@@ -339,11 +391,15 @@ impl ToolRegistry {
     }
 }
 
-/// The built-in read-only workspace tools, in Python's registration order.
-pub fn read_only_registry() -> ToolRegistry {
+/// The built-in tools ported so far, in Python's registration order.
+///
+/// Python also registers `run_command`, `python_exec`, and `web_fetch`.
+pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in [
         Box::new(files::ReadFileTool) as Box<dyn Tool>,
+        Box::new(files::WriteFileTool),
+        Box::new(files::EditFileTool),
         Box::new(files::ListDirTool),
     ] {
         registry

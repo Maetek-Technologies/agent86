@@ -56,7 +56,8 @@ impl Workspace {
             .env("USERPROFILE", self.root.join("home"))
             .env("AGENT86_TEST_MOCK_KEY", TEST_KEY)
             .env_remove("AGENT86_MODEL")
-            .env_remove("AGENT86_SANDBOX");
+            .env_remove("AGENT86_SANDBOX")
+            .env_remove("AGENT86_APPROVAL");
         command
     }
 
@@ -583,5 +584,98 @@ async fn a_tripped_circuit_exits_1_without_the_model_hint() {
     assert_eq!(
         stderr(&output),
         "\nerror: Circuit tripped: step budget reached (1 steps)\n"
+    );
+}
+
+fn write_request() -> Vec<Reply> {
+    vec![
+        sse_tool_calls(&[(
+            "w",
+            "write_file",
+            r#"{"path": "made.txt", "content": "made\n"}"#,
+        )]),
+        sse_text("ok", "stop"),
+    ]
+}
+
+#[tokio::test]
+async fn piped_runs_decline_side_effects_unless_told_otherwise() {
+    let server = MockServer::start(write_request()).await;
+    let workspace = Workspace::with_mock_provider("approval-piped", &server);
+
+    // stdin is not a terminal here, so `ask` has no one to ask.
+    let output = workspace.run(&["run", "make a file"]).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains(
+            "[tool] write_file -> error: Not executed: approval required but no prompt available."
+        ),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!workspace.project().join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn yes_and_auto_approve_side_effects() {
+    for (name, args, env) in [
+        ("approval-yes", vec!["run", "--yes", "make a file"], None),
+        ("approval-y", vec!["run", "-y", "make a file"], None),
+        (
+            "approval-flag",
+            vec!["--approval", "auto", "run", "make a file"],
+            None,
+        ),
+        ("approval-env", vec!["run", "make a file"], Some("auto")),
+    ] {
+        let server = MockServer::start(write_request()).await;
+        let workspace = Workspace::with_mock_provider(name, &server);
+        let mut command = workspace.command(&args);
+        if let Some(mode) = env {
+            command.env("AGENT86_APPROVAL", mode);
+        }
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+
+        assert!(output.status.success(), "{name}: {}", stderr(&output));
+        assert!(
+            stdout(&output).contains("[tool] write_file -> Wrote 5 bytes to made.txt (new file)."),
+            "{name}: {}",
+            stdout(&output)
+        );
+        assert!(workspace.project().join("made.txt").exists(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn approval_deny_blocks_side_effects() {
+    let server = MockServer::start(write_request()).await;
+    let workspace = Workspace::with_mock_provider("approval-deny", &server);
+
+    let output = workspace
+        .run(&["--approval", "deny", "run", "make a file"])
+        .await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Not executed: blocked by approval policy (deny)."));
+    assert!(!workspace.project().join("made.txt").exists());
+}
+
+#[test]
+fn unknown_approval_modes_are_invalid_config() {
+    let workspace = Workspace::new("approval-bad");
+
+    let output = workspace
+        .command(&["--approval", "sometimes", "run", "hi"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("error: Invalid config: "),
+        "{}",
+        stderr(&output)
     );
 }

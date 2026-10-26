@@ -1,12 +1,14 @@
 use agent86::agent::{Harness, HarnessError};
+use agent86::approval::{terminal_prompt_if_interactive, ApprovalGate};
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::keys;
 use agent86::pricing::PriceTable;
 use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
-use agent86::tools::{read_only_registry, ToolContext};
+use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::format_turn_summary;
+use agent86::types::ApprovalMode;
 use agent86::types::ModelRef;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
@@ -33,6 +35,10 @@ struct Cli {
     #[arg(short, long)]
     model: Option<String>,
 
+    /// HITL mode: auto|ask|deny.
+    #[arg(long)]
+    approval: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -47,6 +53,10 @@ enum Command {
         /// Emit structured JSON output.
         #[arg(long = "json")]
         json: bool,
+
+        /// Auto-approve side-effecting tools (non-interactive).
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Store or delete provider API keys in the OS keyring.
@@ -77,7 +87,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let stderr = Stderr::new();
 
-    let config = match load_config(&ConfigPaths::discover(), &Overrides::from_env(cli.model)) {
+    let config = match load_config(
+        &ConfigPaths::discover(),
+        &Overrides::from_env(cli.model, cli.approval),
+    ) {
         Ok(config) => config,
         Err(error) => {
             stderr.error(&error.to_string());
@@ -87,7 +100,13 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
-        Some(Command::Run { goal, json }) => run(&config, &goal, json, &stderr),
+        Some(Command::Run { goal, json, yes }) => {
+            let mut config = config;
+            if yes {
+                config.guardrails.approval = ApprovalMode::Auto;
+            }
+            run(&config, &goal, json, &stderr)
+        }
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         None => {
             eprintln!(
@@ -140,11 +159,14 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
     let harness = Harness {
         provider: provider.as_ref(),
-        registry: read_only_registry(),
+        registry: builtin_registry(),
         context,
         limits: config.limits.clone(),
         system: build_system_prompt(config),
         max_tokens,
+        // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
+        // there is no prompt, so `ask` declines them unless --yes was given.
+        gate: ApprovalGate::new(config.guardrails.approval, terminal_prompt_if_interactive()),
     };
 
     let mut stdout = std::io::stdout().lock();

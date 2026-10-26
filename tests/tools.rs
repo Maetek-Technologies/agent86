@@ -2,7 +2,7 @@
 
 mod support;
 
-use agent86::tools::{display_path, read_only_registry, ToolContext};
+use agent86::tools::{builtin_registry, display_path, ToolContext};
 use agent86::types::{ToolCall, ToolResult};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -55,7 +55,7 @@ fn call(name: &str, arguments: Value) -> ToolCall {
 }
 
 fn dispatch(ctx: &ToolContext, name: &str, arguments: Value) -> ToolResult {
-    read_only_registry().dispatch(&call(name, arguments), ctx)
+    builtin_registry().dispatch(&call(name, arguments), ctx)
 }
 
 fn error_of(result: &ToolResult) -> &str {
@@ -65,21 +65,33 @@ fn error_of(result: &ToolResult) -> &str {
 
 #[test]
 fn specs_match_the_schemas_pydantic_generates() {
-    let expected: Value = serde_json::from_str(&fixture("tools/schemas.json")).unwrap();
-    let specs = read_only_registry().specs();
+    let read_only: Value = serde_json::from_str(&fixture("tools/schemas.json")).unwrap();
+    let writers: Value = serde_json::from_str(&fixture("tools/write_tools.json")).unwrap();
+    let specs = builtin_registry().specs();
 
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-    assert_eq!(names, ["read_file", "list_dir"]);
+    assert_eq!(names, ["read_file", "write_file", "edit_file", "list_dir"]);
     for spec in &specs {
-        assert_eq!(spec.parameters, expected[&spec.name], "{}", spec.name);
-        assert!(!spec.side_effecting);
+        let expected = match spec.name.as_str() {
+            "write_file" | "edit_file" => &writers["schemas"][&spec.name],
+            _ => &read_only[&spec.name],
+        };
+        // Compared as text, so key order (pydantic's) is checked too.
+        assert_eq!(
+            serde_json::to_string(&spec.parameters).unwrap(),
+            serde_json::to_string(expected).unwrap(),
+            "{}",
+            spec.name
+        );
+        let writes = matches!(spec.name.as_str(), "write_file" | "edit_file");
+        assert_eq!(spec.side_effecting, writes, "{}", spec.name);
     }
     assert_eq!(
         specs[0].description,
         "Read a UTF-8 text file within the workspace and return its contents."
     );
     assert_eq!(
-        specs[1].description,
+        specs[3].description,
         "List the entries of a directory within the workspace."
     );
 }
@@ -266,19 +278,19 @@ fn long_output_is_truncated_with_a_count() {
 fn unknown_tools_name_the_available_ones() {
     let workspace = Workspace::new("unknown");
 
-    let result = dispatch(&workspace.context(), "write_file", json!({"path": "x"}));
+    let result = dispatch(&workspace.context(), "run_command", json!({"command": "x"}));
 
     assert_eq!(result.call_id, "call-1");
-    assert_eq!(result.name, "write_file");
+    assert_eq!(result.name, "run_command");
     assert_eq!(
         error_of(&result),
-        "Unknown tool 'write_file'. Available: list_dir, read_file."
+        "Unknown tool 'run_command'. Available: edit_file, list_dir, read_file, write_file."
     );
 }
 
 #[test]
 fn duplicate_registration_is_refused() {
-    let mut registry = read_only_registry();
+    let mut registry = builtin_registry();
     let error = registry
         .register(Box::new(agent86::tools::files::ReadFileTool))
         .unwrap_err();
