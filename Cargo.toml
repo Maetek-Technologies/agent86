@@ -2,7 +2,7 @@
 name = "agent86"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.77"
 description = "A compatibility-first Rust implementation of the agent86 agentic harness"
 repository = "https://github.com/tdfleming/agent-86-rs"
 license = "MIT"
