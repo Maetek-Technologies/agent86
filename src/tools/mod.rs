@@ -11,6 +11,7 @@
 pub mod exec;
 pub mod files;
 pub mod sandbox;
+pub mod web;
 
 use crate::types::{ToolCall, ToolResult, ToolSpec};
 use sandbox::Executor;
@@ -238,6 +239,8 @@ pub struct SandboxPolicy {
     pub timeout: Duration,
     /// Extra environment variable names forwarded into tool processes.
     pub env_passthrough: Vec<String>,
+    /// Whether network access is allowed (`web_fetch`).
+    pub network: bool,
 }
 
 impl SandboxPolicy {
@@ -249,6 +252,7 @@ impl SandboxPolicy {
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
             timeout: Duration::from_secs(30),
             env_passthrough: Vec::new(),
+            network: true,
         })
     }
 
@@ -274,6 +278,18 @@ impl SandboxPolicy {
                     "Path '{path}' resolves outside the workspace jail ({}).",
                     display_path(&self.workspace)
                 ),
+            ))
+        }
+    }
+
+    /// Fail unless network access is allowed.
+    pub fn require_network(&self) -> Result<(), ToolError> {
+        if self.network {
+            Ok(())
+        } else {
+            Err(ToolError::raised(
+                "PolicyError",
+                "Network access is disabled by the sandbox policy.",
             ))
         }
     }
@@ -342,6 +358,8 @@ pub struct ToolContext {
     pub policy: SandboxPolicy,
     /// Where commands and Python snippets run.
     pub executor: Executor,
+    /// `web_fetch` settings.
+    pub web: web::WebSettings,
 }
 
 impl ToolContext {
@@ -350,6 +368,7 @@ impl ToolContext {
         Ok(Self {
             policy: SandboxPolicy::new(workspace)?,
             executor: Executor::Subprocess,
+            web: web::WebSettings::default(),
         })
     }
 }
@@ -411,9 +430,7 @@ impl ToolRegistry {
     }
 }
 
-/// The built-in tools ported so far, in Python's registration order.
-///
-/// Python also registers `web_fetch`.
+/// Python's built-in tools, in its registration order.
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in [
@@ -423,6 +440,7 @@ pub fn builtin_registry() -> ToolRegistry {
         Box::new(files::ListDirTool),
         Box::new(exec::RunCommandTool),
         Box::new(exec::PythonExecTool),
+        Box::new(web::WebFetchTool),
     ] {
         registry
             .register(tool)

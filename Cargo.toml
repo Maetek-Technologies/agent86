@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+encoding_rs = "0.8.42"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 keyring-core = "1.0.1"
 regex = "1.13.1"
@@ -20,6 +21,7 @@ serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 thiserror = "2"
 tokio = { version = "1.54.1", features = ["rt", "time"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
+url = "2.5.8"
 
 [lints.rust]
 unsafe_code = "forbid"

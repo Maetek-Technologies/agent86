@@ -65,7 +65,8 @@ fn specs_match_pydantic_and_registration_order() {
             "edit_file",
             "list_dir",
             "run_command",
-            "python_exec"
+            "python_exec",
+            "web_fetch",
         ]
     );
     for name in ["run_command", "python_exec"] {

@@ -25,6 +25,12 @@ pub enum Reply {
     Truncated(String),
     /// A 200 SSE response that sends `prefix` and then stops sending without closing.
     StallAfter(String),
+    /// A complete response with exactly these headers (no default content type).
+    Raw {
+        status: u16,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    },
 }
 
 /// One request the server received.
@@ -146,6 +152,22 @@ async fn serve(mut socket: TcpStream, reply: Reply, recorded: Arc<Mutex<Vec<Reco
             head.push_str("\r\n");
             let _ = socket.write_all(head.as_bytes()).await;
             let _ = socket.write_all(body.as_bytes()).await;
+        }
+        Reply::Raw {
+            status,
+            headers,
+            body,
+        } => {
+            let mut head = format!(
+                "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for (name, value) in headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("\r\n");
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
         }
         Reply::Sse(body) => {
             let head =

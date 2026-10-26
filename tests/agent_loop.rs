@@ -175,7 +175,8 @@ async fn tool_results_are_fed_back_and_the_turn_ends_with_text() {
             "edit_file",
             "list_dir",
             "run_command",
-            "python_exec"
+            "python_exec",
+            "web_fetch",
         ]
     );
 
@@ -242,7 +243,7 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
         sse_tool_calls(&[
             ("a", "read_file", r#"{"path": "../escape.txt"}"#),
             ("b", "read_file", r#"{"path": "#),
-            ("c", "web_fetch", r#"{"url": "https://example.com"}"#),
+            ("c", "delegate", r#"{"task": "x"}"#),
         ]),
         sse_text("I could not do that.", "stop"),
     ])
@@ -270,11 +271,11 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
     );
     assert_eq!(
         observed[2],
-        "Unknown tool 'web_fetch'. Available: edit_file, list_dir, python_exec, read_file, run_command, write_file."
+        "Unknown tool 'delegate'. Available: edit_file, list_dir, python_exec, read_file, run_command, web_fetch, write_file."
     );
     assert!(output
         .output
-        .contains("[tool] web_fetch -> error: Unknown tool 'web_fetch'."));
+        .contains("[tool] delegate -> error: Unknown tool 'delegate'."));
     assert!(output.output.ends_with("I could not do that."));
 }
 

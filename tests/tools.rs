@@ -68,6 +68,7 @@ fn specs_match_the_schemas_pydantic_generates() {
     let read_only: Value = serde_json::from_str(&fixture("tools/schemas.json")).unwrap();
     let writers: Value = serde_json::from_str(&fixture("tools/write_tools.json")).unwrap();
     let exec: Value = serde_json::from_str(&fixture("tools/exec_tools.json")).unwrap();
+    let web: Value = serde_json::from_str(&fixture("web/schema.json")).unwrap();
     let specs = builtin_registry().specs();
 
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
@@ -79,13 +80,15 @@ fn specs_match_the_schemas_pydantic_generates() {
             "edit_file",
             "list_dir",
             "run_command",
-            "python_exec"
+            "python_exec",
+            "web_fetch",
         ]
     );
     for spec in &specs {
         let expected = match spec.name.as_str() {
             "write_file" | "edit_file" => &writers["schemas"][&spec.name],
             "run_command" | "python_exec" => &exec[&spec.name],
+            "web_fetch" => &web,
             _ => &read_only[&spec.name],
         };
         // Compared as text, so key order (pydantic's) is checked too.
@@ -95,7 +98,7 @@ fn specs_match_the_schemas_pydantic_generates() {
             "{}",
             spec.name
         );
-        let writes = !matches!(spec.name.as_str(), "read_file" | "list_dir");
+        let writes = !matches!(spec.name.as_str(), "read_file" | "list_dir" | "web_fetch");
         assert_eq!(spec.side_effecting, writes, "{}", spec.name);
     }
     assert_eq!(
@@ -290,13 +293,13 @@ fn long_output_is_truncated_with_a_count() {
 fn unknown_tools_name_the_available_ones() {
     let workspace = Workspace::new("unknown");
 
-    let result = dispatch(&workspace.context(), "web_fetch", json!({"url": "x"}));
+    let result = dispatch(&workspace.context(), "delegate", json!({"task": "x"}));
 
     assert_eq!(result.call_id, "call-1");
-    assert_eq!(result.name, "web_fetch");
+    assert_eq!(result.name, "delegate");
     assert_eq!(
         error_of(&result),
-        "Unknown tool 'web_fetch'. Available: edit_file, list_dir, python_exec, read_file, run_command, write_file."
+        "Unknown tool 'delegate'. Available: edit_file, list_dir, python_exec, read_file, run_command, web_fetch, write_file."
     );
 }
 
