@@ -16,6 +16,7 @@ The Python implementation remains the reference. This repository starts with a s
 - Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
 - Python's system prompt (identity plus environment line), checked against text extracted from the Python source
+- API keys from the provider's environment variable or, failing that, the OS keyring (service `agent86`, account = provider name), compatible with keys stored by the Python implementation
 - A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
@@ -66,7 +67,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Try it against OpenRouter by setting `OPENROUTER_API_KEY` in your environment and running:
+Try it against OpenRouter. Either set `OPENROUTER_API_KEY` in your environment, or store the key once in the OS keyring, for example with Python's `keyring` tool (`pip install keyring`, then `keyring set agent86 openrouter`, which prompts for the key without echoing it). Then run:
 
 ```bash
 cargo run -- --model openrouter:<model> run "Say hello"

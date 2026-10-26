@@ -12,7 +12,8 @@ use std::process::ExitCode;
 ///
 /// Python points at `agent86 models`, which is not ported yet.
 const MODEL_HELP: &str = "Pick an OpenAI-compatible provider with `--model provider:model` \
-                          (e.g. `openrouter:openai/gpt-4o-mini`) and set its API key environment variable.";
+                          (e.g. `openrouter:openai/gpt-4o-mini`) and set its API key environment variable \
+                          or store the key in the OS keyring.";
 
 #[derive(Parser)]
 #[command(

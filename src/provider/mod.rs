@@ -11,7 +11,7 @@ pub mod retry;
 
 use crate::config::{Config, ProviderConfig};
 use crate::pricing::PriceTable;
-use crate::secrets::resolve_api_key;
+use crate::secrets::{resolve_api_key, OsKeyring, SecretStore};
 use crate::types::{Completion, CompletionDelta, CompletionRequest, ModelRef};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{BoxStream, StreamExt};
@@ -28,9 +28,21 @@ const NOT_PORTED: &[&str] = &["anthropic", "ollama", "llamacpp"];
 /// OpenRouter, Groq, Together, vLLM, and LM Studio work with only a config block.
 /// A key is required for `openai` itself, and for other sections only when they
 /// name an `api_key_env`; a `base_url` without one is a keyless local endpoint.
+///
+/// API keys come from the environment variable named by `api_key_env`, then
+/// from the OS keyring (service `agent86`, account = the provider section name).
 pub fn provider_for_ref(
     reference: &ModelRef,
     config: &Config,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    provider_for_ref_with_store(reference, config, &OsKeyring)
+}
+
+/// [`provider_for_ref`] with an explicit secret store, so tests never touch the OS keyring.
+pub fn provider_for_ref_with_store(
+    reference: &ModelRef,
+    config: &Config,
+    store: &dyn SecretStore,
 ) -> Result<Box<dyn Provider>, ProviderError> {
     let name = reference.provider.as_str();
     let section = config.providers.get(name).cloned().unwrap_or_default();
@@ -50,7 +62,7 @@ pub fn provider_for_ref(
         }
     };
 
-    let api_key = resolve_api_key(section.api_key_env.as_deref());
+    let api_key = resolve_api_key(name, section.api_key_env.as_deref(), store);
     let openai_config = openai_config(name, &section, require_key)?;
     let provider = OpenAiProvider::new(reference.model.clone(), openai_config, api_key)?
         .with_pricing(PriceTable::from_config(config), reference.to_string());
@@ -71,6 +83,7 @@ fn openai_config(
     Ok(OpenAiConfig {
         base_url: section.base_url.clone(),
         api_key_env: section.api_key_env.clone(),
+        config_name: name.to_owned(),
         require_key,
         max_tokens: section.max_tokens,
         connect_timeout: seconds("connect_timeout_s", section.connect_timeout_s)?,
@@ -156,8 +169,10 @@ pub enum ProviderError {
     #[error("Invalid [providers.{provider}] setting: {detail}")]
     InvalidSetting { provider: String, detail: String },
 
-    #[error("No API key found. Set the {env} environment variable.")]
-    MissingApiKey { env: String },
+    #[error(
+        "No API key found. Set the {env} environment variable or store a key in the OS keyring (service \"agent86\", account \"{account}\")."
+    )]
+    MissingApiKey { env: String, account: String },
 
     #[error("Could not construct the HTTP client: {detail}")]
     Client { detail: String },

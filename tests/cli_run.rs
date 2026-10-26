@@ -216,7 +216,8 @@ async fn a_missing_key_names_the_environment_variable() {
     assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).starts_with(
-            "error: No API key found. Set the AGENT86_TEST_MOCK_KEY environment variable.\n"
+            "error: No API key found. Set the AGENT86_TEST_MOCK_KEY environment variable or store \
+             a key in the OS keyring (service \"agent86\", account \"mock\").\n"
         ),
         "{}",
         stderr(&output)
