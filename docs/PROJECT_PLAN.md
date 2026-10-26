@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** Core foundation complete; OpenAI-compatible provider milestone next
+**Current stage:** OpenAI-compatible provider complete; one-shot `run` CLI next
 
 ## 1. Purpose
 
@@ -43,11 +43,15 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added a placeholder `agent86` CLI supporting `--help` and `--version`
 - Added the README, MIT license, `.gitignore`, and an implementation roadmap
 - Added a cross-platform CI workflow for Linux, macOS, and Windows, testing on stable and the MSRV
-- Raised the MSRV from 1.74 to 1.77, the minimum required by the locked `thiserror` 2.x
+- Raised the MSRV from 1.74 to 1.88: `thiserror` 2.x needs 1.77, and current `tokio` and `reqwest` (with their URL/IDNA dependencies) need 1.85–1.88
+- Added the async `Provider` trait; `complete()` is derived from `stream()`, as in Python, so streamed and non-streamed text always agree
+- Added the OpenAI-compatible provider, ported from `openai_provider.py`: request shaping, the sampling-parameter gate, the `max_completion_tokens` to `max_tokens` fallback, SSE decoding, tool-call fragment accumulation, usage, stop-reason normalization, split connect/read timeouts, and retries that never fire after text was emitted
+- Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
+- Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **10 passed**
+- `cargo test --all-targets`: **38 passed** (12 unit, 10 compatibility, 16 provider integration)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `--help` and `--version` execution: passed
@@ -56,8 +60,10 @@ Local validation completed successfully:
 
 The project is **not yet a usable agent**. It currently has no:
 
-- Model providers or live model calls
-- Streaming SSE or NDJSON clients
+- Live model calls from the CLI (the provider exists but nothing invokes it yet)
+- Provider configuration loading, API-key resolution from the environment or keyring, or the provider factory
+- Pricing (`Usage.cost_usd` is always 0.0)
+- An Ollama (NDJSON) provider
 - One-shot `run` implementation
 - Tool execution or ReAct orchestration
 - Guardrails, approvals, or sandbox executors
@@ -65,6 +71,12 @@ The project is **not yet a usable agent**. It currently has no:
 - MCP support
 - Interactive terminal interface
 - Local embedding backend
+
+### Known provider differences from Python
+
+- `Retry-After` HTTP-date values are not parsed; they fall back to exponential backoff. Delta-seconds values are honoured.
+- Python retries only `ConnectError`, `ConnectTimeout`, and `RemoteProtocolError`. `reqwest` does not expose the same classes, so Rust retries any transport failure other than a read timeout, still only before text has been emitted.
+- Like Python, an SSE `data:` chunk carrying an `{"error": ...}` object (sent by OpenRouter for mid-stream failures) is silently ignored. Both implementations should probably surface it; change them together.
 
 ## 4. Immediate milestone: one real OpenAI-compatible model turn
 
@@ -180,8 +192,9 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 
 ## 9. Next actions
 
-- [ ] Implement the async provider interface and OpenAI-compatible SSE client
-- [ ] Add recorded fixtures and mock-provider integration tests
+- [x] Implement the async provider interface and OpenAI-compatible SSE client
+- [x] Add recorded fixtures and mock-provider integration tests
+- [ ] Add TOML provider config, env-var key resolution, and the `provider:model` factory
 - [ ] Implement text-only `run` and `run --json`
 - [ ] Validate locally without credentials
 - [ ] Perform an optional live OpenRouter smoke test

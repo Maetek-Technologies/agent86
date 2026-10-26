@@ -6,29 +6,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A compatibility-first Rust port of [agent86](https://github.com/Maetek-Technologies/agent-86), a Python agentic CLI harness. **The Python implementation is the behavioral oracle**: the Rust code must reproduce its observable behavior (CLI output streams, exit codes, `run --json` fields, TOML config semantics, provider streaming/tool-call behavior, approvals, session/trace formats, error degradation), not its internal structure.
 
-The project is at the **core-types stage** and is not a usable agent yet. `docs/PROJECT_PLAN.md` is the source of truth for current status, the next milestone (OpenAI-compatible/OpenRouter provider + text-only `run` / `run --json`), the staged roadmap, and the credential policy. Read it before starting feature work, and update it (plus the README status/roadmap) when a stage lands. Keep both honest about what is and is not implemented.
+The project has a working OpenAI-compatible provider but is not a usable agent yet; the CLI cannot call a model. `docs/PROJECT_PLAN.md` is the source of truth for current status, the next milestone (text-only `run` / `run --json` against OpenRouter), the staged roadmap, known differences from Python, and the credential policy. Read it before starting feature work, and update it (plus the README status/roadmap) when a stage lands. Keep both honest about what is and is not implemented.
 
 ## Commands
 
 ```bash
 cargo test --all-targets                     # all tests
 cargo test --test compatibility              # just the compatibility suite
+cargo test --test openai_provider            # provider tests against the local mock server
 cargo test <test_name_substring>             # single test, e.g. cargo test model_refs_split
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings    # warnings are errors
 cargo run -- --help
 ```
 
-All three checks (test, fmt, clippy `-D warnings`) must pass. `unsafe_code` is forbidden at the crate level. MSRV is Rust 1.77 (`rust-version` in Cargo.toml, set by `thiserror` 2.x); avoid newer language/std features, and check a new dependency's `rust-version` before adding it. Raising the MSRV is a deliberate change: update Cargo.toml and the CI matrix together.
+All three checks (test, fmt, clippy `-D warnings`) must pass. `unsafe_code` is forbidden at the crate level. MSRV is Rust 1.88 (`rust-version` in Cargo.toml, set by `tokio`/`reqwest` and their URL dependencies); avoid newer language/std features, and check a new dependency's `rust-version` before adding it. Raising the MSRV is a deliberate change: update Cargo.toml and the CI matrix together.
 
 CI (`.github/workflows/ci.yml`) runs tests on Linux, macOS, and Windows against both stable and the MSRV, with fmt and clippy on stable. Windows builds need the Visual Studio Build Tools C++ workload for `link.exe`.
 
 ## Architecture
 
 - `src/types.rs`: the provider-neutral vocabulary everything else will build on: `Role`, `AgentPhase`, `ApprovalMode`, `StopReason`, `ModelRef`, `ToolSpec`/`ToolCall`/`ToolResult`, `Message`, `CompletionRequest`/`Completion`/`CompletionDelta`, `Step`, `Usage` (implements `Add` for accumulation).
-- `src/lib.rs`: re-exports `types`; new subsystems (providers, orchestration, tools, sessions, MCP, TUI) will be added as sibling modules.
+- `src/provider/`: the model layer, ported from Python's `agent86/cognitive/`.
+  - `mod.rs`: the object-safe `Provider` trait and `ProviderError`. Providers implement only `stream()`, which returns a boxed stream of `CompletionDelta`s whose last item has `done = true` plus the full `Completion`. `complete()` is derived by collecting that stream, so streamed and non-streamed text always agree. `ProviderError` messages mirror the Python wording and are stored already redacted.
+  - `openai.rs`: the OpenAI-compatible SSE provider (OpenAI, OpenRouter, Groq, local servers). The stream is a hand-written state machine (`StreamState`) driven by `futures_util::stream::unfold`; dropping the stream drops the HTTP response, which is how cancellation works. Per-attempt accumulators live in `TurnState` and reset on every retry.
+  - `retry.rs`: retryable statuses, `Retry-After`, and jittered backoff. A retry is never allowed once a text delta has been emitted, because the caller already saw that text.
+  - `capabilities.rs`: models that reject sampling parameters.
+- `src/secrets.rs`: `redact()`, ported from Python's `secrets.py`. Run every response body or transport error through it before it reaches a `ProviderError`.
 - `src/main.rs`: placeholder CLI with hand-rolled arg parsing (`--help`, `--version`; anything else exits 2 on stderr).
 - `tests/compatibility.rs`: integration tests that pin the JSON wire format to the Python vocabulary.
+- `tests/openai_provider.rs` with `tests/support/mod.rs`: a scripted HTTP/1.1 mock server (one `Reply` per connection: full status, SSE, truncated, or stalled) plus recorded fixtures in `tests/fixtures/openai/*.sse` (kept LF by `.gitattributes`).
+
+When porting a module, read the Python source first. It is public at `Maetek-Technologies/agent-86` (`src/agent86/...`); its comments explain why each behavior exists, and those reasons usually belong in the Rust doc comments too.
 
 Conventions encoded in the types that must be preserved:
 
