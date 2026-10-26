@@ -59,6 +59,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub pricing: PricingConfig,
     /// The config files that contributed, in the order they were read.
     #[serde(skip)]
     pub sources: Vec<PathBuf>,
@@ -72,6 +74,24 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LimitsConfig {
     pub max_output_tokens: u32,
+}
+
+/// Per-model price overrides (`[pricing.models."<ref or id>"]`).
+///
+/// Keys are the `provider:model` ref or the bare model id; the ref form wins when
+/// both are present. Dated snapshots resolve by prefix, so overriding
+/// `claude-sonnet-5` also covers `claude-sonnet-5-20260101`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PricingConfig {
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelPrice>,
+}
+
+/// A per-model price override, USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct ModelPrice {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
 }
 
 /// One `[providers.<name>]` block.
@@ -204,8 +224,28 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
             .map_err(|error: toml::de::Error| ConfigError::Invalid {
                 detail: error.message().to_owned(),
             })?;
+    validate(&config)?;
     config.sources = sources;
     Ok(config)
+}
+
+/// Checks serde cannot express, matching the Python schema's constraints.
+fn validate(config: &Config) -> Result<(), ConfigError> {
+    for (model, price) in &config.pricing.models {
+        for (field, value) in [
+            ("input_per_mtok", price.input_per_mtok),
+            ("output_per_mtok", price.output_per_mtok),
+        ] {
+            if !(value >= 0.0 && value.is_finite()) {
+                return Err(ConfigError::Invalid {
+                    detail: format!(
+                        "pricing.models.\"{model}\".{field} must be a non-negative number, not {value}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_toml(path: &Path) -> Result<Table, ConfigError> {
@@ -360,5 +400,28 @@ mod tests {
         };
         assert!(path.ends_with("project.toml"));
         assert!(error.to_string().starts_with("Malformed config at "));
+    }
+
+    #[test]
+    fn pricing_overrides_load_and_negative_prices_are_rejected() {
+        let dir = temp_dir("pricing");
+        std::fs::write(
+            dir.join("project.toml"),
+            "[pricing.models.\"openrouter:openai/gpt-4o-mini\"]\ninput_per_mtok = 0.15\noutput_per_mtok = 0.6\n",
+        )
+        .unwrap();
+        let config = load_config(&paths_in(&dir), &Overrides::default()).unwrap();
+        let price = config.pricing.models["openrouter:openai/gpt-4o-mini"];
+        assert_eq!(price.input_per_mtok, 0.15);
+        assert_eq!(price.output_per_mtok, 0.6);
+
+        std::fs::write(
+            dir.join("project.toml"),
+            "[pricing.models.cheap]\ninput_per_mtok = -1\noutput_per_mtok = 0\n",
+        )
+        .unwrap();
+        let error = load_config(&paths_in(&dir), &Overrides::default()).unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid { .. }), "{error:?}");
+        assert!(error.to_string().contains("input_per_mtok"), "{error}");
     }
 }

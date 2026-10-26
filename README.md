@@ -14,6 +14,7 @@ The Python implementation remains the reference. This repository starts with a s
 - An async provider interface and an OpenAI-compatible streaming (SSE) provider for OpenAI, OpenRouter, and other compatible endpoints, with retries, timeouts, and secret redaction
 - Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
 - Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks
+- Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
 - A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
@@ -72,6 +73,14 @@ cargo run -- --model openrouter:<model> run --json "Say hello"
 ```
 
 Any `[providers.<name>]` block with a `base_url` is treated as OpenAI-compatible; add `api_key_env` if the endpoint needs a key.
+
+OpenRouter models have no built-in price. To see costs, add your model's rates (USD per million tokens) to `.agent86/config.toml`:
+
+```toml
+[pricing.models."openrouter:openai/gpt-4o-mini"]
+input_per_mtok = 0.15
+output_per_mtok = 0.60
+```
 
 ## License
 

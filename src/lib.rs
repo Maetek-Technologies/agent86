@@ -6,7 +6,9 @@
 //! compatibility tests as the port progresses.
 
 pub mod config;
+pub mod pricing;
 pub mod provider;
+pub mod pyjson;
 pub mod secrets;
 pub mod turn;
 pub mod types;

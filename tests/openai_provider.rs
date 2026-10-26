@@ -1,5 +1,6 @@
 mod support;
 
+use agent86::pricing::PriceTable;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::provider::{Provider, ProviderError};
 use agent86::types::{CompletionDelta, CompletionRequest, Message, Role, ToolSpec};
@@ -380,4 +381,29 @@ fn debug_output_never_contains_the_api_key() {
     let provider =
         OpenAiProvider::new("m", OpenAiConfig::default(), Some(TEST_KEY.to_owned())).unwrap();
     assert!(!format!("{provider:?}").contains(TEST_KEY));
+}
+
+#[tokio::test]
+async fn usage_is_priced_from_the_builtin_table_under_the_price_ref() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
+    let provider = OpenAiProvider::new("gpt-4o-mini", config(&server), Some(TEST_KEY.to_owned()))
+        .unwrap()
+        .with_pricing(PriceTable::builtin(), "openai:gpt-4o-mini");
+
+    let completion = provider.complete(request("hi")).await.unwrap();
+
+    // 12 prompt tokens, 4 of them read from cache, and 3 output tokens at $0.15 / $0.60.
+    let expected = (8.0 / 1e6) * 0.15 + (4.0 / 1e6) * (0.15 * 0.1) + 0.0 + (3.0 / 1e6) * 0.60;
+    assert_eq!(completion.usage.cost_usd, expected);
+}
+
+#[tokio::test]
+async fn unpriced_models_report_zero_cost() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
+    let provider =
+        provider(config(&server)).with_pricing(PriceTable::builtin(), "openrouter:test/model");
+
+    let completion = provider.complete(request("hi")).await.unwrap();
+
+    assert_eq!(completion.usage.cost_usd, 0.0);
 }

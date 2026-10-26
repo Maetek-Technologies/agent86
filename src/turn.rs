@@ -4,6 +4,7 @@
 //! The Python loop also sends a system prompt, continues answers cut off by
 //! `max_tokens`, and applies the egress guardrail; none of that is ported yet.
 
+use crate::pricing::format_cost;
 use crate::provider::{Provider, ProviderError};
 use crate::types::{CompletionRequest, Message, Role, Usage};
 use futures_util::StreamExt;
@@ -19,9 +20,11 @@ pub struct TurnSummary {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    #[serde(serialize_with = "crate::pyjson::python_float")]
     pub cost_usd: f64,
     pub steps: u64,
     pub tool_calls: u64,
+    #[serde(serialize_with = "crate::pyjson::python_float")]
     pub duration_s: f64,
     pub compactions: u64,
     pub continuations: u64,
@@ -123,13 +126,11 @@ pub fn human_tokens(count: u64) -> String {
     }
 }
 
-/// Shown instead of a dollar figure when no price is known for the model.
-pub const UNPRICED_LABEL: &str = "cost n/a (unpriced model)";
-
 /// One line summarising a finished turn, matching the Python `format_turn_summary`.
 ///
-/// Pricing is not ported yet, so every model is reported as unpriced.
-pub fn format_turn_summary(summary: &TurnSummary) -> String {
+/// `priced` says whether a price is known for the turn's model; without one the
+/// cost reads "n/a" rather than a misleading `$0.0000`.
+pub fn format_turn_summary(summary: &TurnSummary, priced: bool) -> String {
     let cached = summary.cache_read_tokens + summary.cache_creation_tokens;
     let mut tokens = format!(
         "{} in / {} out",
@@ -143,7 +144,7 @@ pub fn format_turn_summary(summary: &TurnSummary) -> String {
         plural(summary.steps, "step"),
         plural(summary.tool_calls, "tool"),
         tokens,
-        UNPRICED_LABEL.to_owned(),
+        format_cost(summary.cost_usd, priced),
         format!("{:.1}s", summary.duration_s),
     ];
     if summary.compactions > 0 {
@@ -186,7 +187,7 @@ mod tests {
             ..TurnSummary::default()
         };
         assert_eq!(
-            format_turn_summary(&summary),
+            format_turn_summary(&summary, false),
             "— 1 step · 0 tools · 4.1k in / 612 out · cost n/a (unpriced model) · 8.2s"
         );
 
@@ -198,8 +199,8 @@ mod tests {
             ..summary
         };
         assert_eq!(
-            format_turn_summary(&cached),
-            "— 3 steps · 1 tool · 4.1k in / 612 out (1.9k cached) · cost n/a (unpriced model) · 8.2s · 2 continuations"
+            format_turn_summary(&TurnSummary { cost_usd: 0.01234, ..cached }, true),
+            "— 3 steps · 1 tool · 4.1k in / 612 out (1.9k cached) · $0.0123 · 8.2s · 2 continuations"
         );
     }
 

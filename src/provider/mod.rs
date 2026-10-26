@@ -10,6 +10,7 @@ pub mod openai;
 pub mod retry;
 
 use crate::config::{Config, ProviderConfig};
+use crate::pricing::PriceTable;
 use crate::secrets::resolve_api_key;
 use crate::types::{Completion, CompletionDelta, CompletionRequest, ModelRef};
 use futures_util::future::BoxFuture;
@@ -51,7 +52,8 @@ pub fn provider_for_ref(
 
     let api_key = resolve_api_key(section.api_key_env.as_deref());
     let openai_config = openai_config(name, &section, require_key)?;
-    let provider = OpenAiProvider::new(reference.model.clone(), openai_config, api_key)?;
+    let provider = OpenAiProvider::new(reference.model.clone(), openai_config, api_key)?
+        .with_pricing(PriceTable::from_config(config), reference.to_string());
     Ok(Box::new(provider))
 }
 
