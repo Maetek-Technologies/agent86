@@ -8,6 +8,7 @@ use agent86::prompt::build_system_prompt;
 use agent86::provider::provider_for_ref;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::tools::sandbox::build_executor;
+use agent86::tools::web::WebSettings;
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::format_turn_summary;
 use agent86::types::ApprovalMode;
@@ -162,6 +163,11 @@ fn run(config: &Config, goal: &str, as_json: bool, stderr: &Stderr) -> ExitCode 
     };
     context.policy.timeout = Duration::from_secs(config.limits.tool_timeout_s);
     context.policy.env_passthrough = config.sandbox.env_passthrough.clone();
+    context.web = WebSettings {
+        allow_private: config.tools.web_allow_private,
+        user_agent: config.tools.web_user_agent.clone(),
+        max_chars: config.tools.web_max_chars,
+    };
     let (executor, sandbox_note) = build_executor(&config.sandbox);
     context.executor = executor;
     if let Some(note) = sandbox_note.filter(|_| !as_json) {

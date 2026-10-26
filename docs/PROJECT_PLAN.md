@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), and sandboxed command and Python execution (stage 6) done; sessions, memory, and observability (stage 7) next
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), and `web_fetch` done; sessions and the flight recorder (stage 7) next
 
 ## 1. Purpose
 
@@ -60,15 +60,17 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added the approval gate and the file-writing tools (stage 5, part 1), ported from `guardrails/policy.py`, `ui/repl.py`, and `tools/builtin/files.py`: `[guardrails] approval` (`ask` by default, `auto`, `deny`) with `AGENT86_APPROVAL`, `--approval`, and `run --yes`/`-y`; a `[y/N]` terminal prompt that shows the tool's preview (a unified diff) and is installed only when stdin is a terminal, so piped runs decline side effects under `ask`; Python's batch ordering (approvals first, reads in parallel, then writes in call order) and its `Not executed: <reason>.` observations; `write_file` and `edit_file` with Python's messages, BOM and CRLF preservation, aliases (`old`/`new`), and pydantic's boolean rules. Diffs come from a port of CPython's `difflib` (`SequenceMatcher` with its autojunk heuristic, and `unified_diff`), checked against CPython output
 - Added the guardrails (stage 5, part 2), ported from `guardrails/scanners.py`, `ingress.py`, and `egress.py`: Python's injection, secret, and PII regexes verbatim (checked against strings extracted from the Python source by parsing it) with results checked against CPython's `re`; `[guardrails] ingress` (`off`/`warn`/`block`), `egress` (`off`/`warn`/`redact`), and `scan_observations`. As in Python, a flagged goal is noted (`[guardrail] input flagged: ...`) or, in block mode with injection, refused without a model call; each answer is scanned and flagged after it, or in redact mode buffered and replayed redacted, including in the history; tool output with injection is wrapped in the untrusted-data banner; and `run --json` output gets a final egress pass
 - Added sandboxed execution (stage 6), ported from `tools/sandbox/policy.py`, `subprocess_exec.py`, `docker_exec.py`, `executor.py`, and `builtin/shell.py` and `python_exec.py`: `run_command` (`cmd.exe /c` or `/bin/sh -c`, as Python's `shell=True`) and `python_exec` (code over stdin to `python -I -`), both side-effecting; the workspace as working directory; Python's environment allowlist, `LC_`/`XDG_` families, `sandbox.env_passthrough`, and credential-name refusal; `limits.tool_timeout_s` (60) with the child in its own process group and the whole tree killed on timeout (`taskkill /T` or a group `SIGKILL`), exit code 124 and `[timed out after Ns]`; text-mode decoding with universal newlines; and the opt-in Docker backend (`--rm`, `--memory`, `--cpus`, `--pids-limit 256`, `--network none` unless enabled, `/workspace` bind mount, named containers killed on timeout), falling back to the subprocess sandbox with Python's `sandbox:` note when Docker is unavailable
+- Added `web_fetch`, ported from `tools/builtin/web.py`: read-only; http(s) only; every hop (the URL and each redirect, followed manually up to 5) resolved and refused if any address is unspecified, loopback, link-local, private, multicast, or reserved, with Python 3.12 `ipaddress` semantics including unwrapping IPv4-mapped, 6to4, and Teredo addresses (checked against stdlib `ipaddress`); connections pinned to the vetted addresses; a 2 MB body cap before decoding; textual content types only; charset decoding; Python's regex HTML reducer (checked against a mirror of it); `[tools] web_allow_private`, `web_user_agent`, and `web_max_chars` (8000)
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **161 passed on Windows** (46 unit, 10 compatibility, 18 provider integration, 25 CLI end-to-end, 13 tools, 11 write tools and approvals, 11 exec tools, 2 difflib, 2 guardrails, 19 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **172 passed on Windows** (46 unit, 10 compatibility, 18 provider integration, 25 CLI end-to-end, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 19 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live `web_fetch` check (2026-10-26, `openrouter:openai/gpt-4o-mini`): the model fetched https://example.com and reported its heading, and a fetch of `http://169.254.169.254/latest/meta-data/` was refused before any connection
 - Live sandbox check (2026-10-26, `openrouter:openai/gpt-4o-mini`, `run --yes`): the model ran `python_exec` (sum of squares, 385) and `run_command` (`ls`) in one step and reported both correctly
 - Live file-writing check (2026-10-26, `openrouter:openai/gpt-4o-mini`, `run --yes` in a throwaway directory): the model called `edit_file` and `write_file` in one step, and both files on disk were correct
 - Live agent-loop check (2026-10-26, `openrouter:openai/gpt-4o-mini`): asked to inspect this repository, the model called `list_dir`, then `read_file README.md` and `list_dir tests` in one parallel step, and answered correctly (3 steps, 3 tools, about 2.7k input tokens)
@@ -81,7 +83,6 @@ The project is **not yet a usable agent**. It currently has no:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
-- `web_fetch`
 - Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
 - Guardrails, approvals, or sandbox executors
 - Session persistence, memory, or tracing
@@ -105,7 +106,7 @@ The project is **not yet a usable agent**. It currently has no:
 
 ### Known loop differences from Python
 
-- `web_fetch` is not offered yet. Python also offers memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
+- Python also offers memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
 - The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
 - Tool-call arguments are not egress-scanned; Python only records those findings in its flight recorder, which is not ported.
 - There is no cancellation (Ctrl-C ends the process), no flight recorder, and no session persistence.
@@ -123,6 +124,13 @@ The project is **not yet a usable agent**. It currently has no:
 
 - `python_exec` runs the `python` (Windows) or `python3` (elsewhere) found on PATH; Python runs its own interpreter (`sys.executable`).
 - On Windows, a child's working directory is passed without the `\\?\` verbatim prefix, which `cmd.exe` cannot use.
+
+### Known `web_fetch` differences from Python
+
+- HTML is reduced with Python's regex fallback. Python uses BeautifulSoup instead when its optional `web` extra is installed, which extracts text differently.
+- Connections go to the addresses that were vetted, so a DNS answer that changes between the check and the connection cannot redirect the fetch; Python resolves twice.
+- The default User-Agent names this repository and version.
+- Charsets are decoded with `encoding_rs` (WHATWG labels), except Latin-1, which is decoded as true ISO-8859-1 as in Python. Transport error text differs from httpx's.
 
 ### Known tool differences from Python
 

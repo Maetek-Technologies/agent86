@@ -20,7 +20,7 @@ The Python implementation remains the reference. This repository starts with a s
 - A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-`run` is a working agent for the current directory: the model can list, read, write, and edit files, run shell commands, and run Python snippets there, see the results, and keep going until it answers. Commands run in a sandbox (workspace as the working directory, an environment with secrets removed, a timeout that kills the whole process tree, and capped output), or in a throwaway Docker container with `[sandbox] mode = "docker"`. Every write, command, and snippet needs your approval: at a terminal `run` asks `[y/N]` for each one; piped or in CI it declines them unless you pass `--yes` (or set `--approval auto`). Python's guardrails apply too: the goal is scanned for prompt injection and personal data, answers for leaked secrets and personal data (`[guardrails] egress = "redact"` rewrites them), and tool output that looks like injected instructions is marked as untrusted before the model sees it. There is no web fetching, MCP, persistent sessions, or interactive REPL yet.
+`run` is a working agent for the current directory: the model can list, read, write, and edit files, run shell commands, run Python snippets, and fetch public web pages, see the results, and keep going until it answers. Commands run in a sandbox (workspace as the working directory, an environment with secrets removed, a timeout that kills the whole process tree, and capped output), or in a throwaway Docker container with `[sandbox] mode = "docker"`. Every write, command, and snippet needs your approval: at a terminal `run` asks `[y/N]` for each one; piped or in CI it declines them unless you pass `--yes` (or set `--approval auto`). Python's guardrails apply too: the goal is scanned for prompt injection and personal data, answers for leaked secrets and personal data (`[guardrails] egress = "redact"` rewrites them), and tool output that looks like injected instructions is marked as untrusted before the model sees it. `web_fetch` refuses private, loopback, and cloud-metadata addresses at every redirect. There is no MCP, persistent sessions, or interactive REPL yet.
 
 ## Why Rust?
 
@@ -52,6 +52,7 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Approvals and file-writing tools (`write_file`, `edit_file`)
 - [x] Guardrails (ingress, egress, observation scanning)
 - [x] Sandboxed command and Python execution (subprocess, or Docker)
+- [x] `web_fetch` with SSRF protection
 - [ ] Sessions, memory, and observability
 - [ ] MCP transports and lifecycle behavior
 - [ ] Interactive terminal interface

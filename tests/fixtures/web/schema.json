@@ -1,0 +1,1 @@
+{"properties": {"url": {"description": "Absolute http(s) URL to fetch.", "title": "Url", "type": "string"}}, "required": ["url"], "type": "object"}

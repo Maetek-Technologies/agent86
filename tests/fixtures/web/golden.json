@@ -1,0 +1,91 @@
+{
+ "classify": {
+  "8.8.8.8": null,
+  "93.184.216.34": null,
+  "1.1.1.1": null,
+  "0.0.0.0": "unspecified address 0.0.0.0",
+  "0.1.2.3": "private address 0.1.2.3",
+  "127.0.0.1": "loopback address 127.0.0.1",
+  "127.255.0.1": "loopback address 127.255.0.1",
+  "10.1.2.3": "private address 10.1.2.3",
+  "172.16.0.1": "private address 172.16.0.1",
+  "172.31.255.255": "private address 172.31.255.255",
+  "172.32.0.1": null,
+  "192.168.1.1": "private address 192.168.1.1",
+  "169.254.169.254": "link-local (cloud metadata range) address 169.254.169.254",
+  "100.64.0.1": null,
+  "192.0.0.1": "private address 192.0.0.1",
+  "192.0.0.9": null,
+  "192.0.0.10": null,
+  "192.0.0.170": "private address 192.0.0.170",
+  "192.0.2.5": "private address 192.0.2.5",
+  "198.18.0.1": "private address 198.18.0.1",
+  "198.51.100.7": "private address 198.51.100.7",
+  "203.0.113.9": "private address 203.0.113.9",
+  "224.0.0.1": "multicast address 224.0.0.1",
+  "239.255.255.250": "multicast address 239.255.255.250",
+  "240.0.0.1": "private address 240.0.0.1",
+  "255.255.255.255": "private address 255.255.255.255",
+  "::": "unspecified address ::",
+  "::1": "loopback address ::1",
+  "fe80::1": "link-local (cloud metadata range) address fe80::1",
+  "fc00::1": "private address fc00::1",
+  "fd12:3456::1": "private address fd12:3456::1",
+  "ff02::1": "multicast address ff02::1",
+  "2001:db8::1": "private address 2001:db8::1",
+  "2606:4700:4700::1111": null,
+  "2001:4860:4860::8888": null,
+  "::ffff:169.254.169.254": "link-local (cloud metadata range) address 169.254.169.254 via ::ffff:a9fe:a9fe",
+  "::ffff:8.8.8.8": null,
+  "2002:a9fe:a9fe::": "link-local (cloud metadata range) address 169.254.169.254 via 2002:a9fe:a9fe::",
+  "2002:0808:0808::1": null,
+  "2001:0:4136:e378:8000:63bf:3fff:fdd2": "private address 192.0.2.45 via 2001:0:4136:e378:8000:63bf:3fff:fdd2",
+  "2001:1::1": null,
+  "2001:2::1": "private address 2001:2::1",
+  "2001:3::1": null,
+  "2001:20::1": null,
+  "64:ff9b:1::1": "private address 64:ff9b:1::1",
+  "64:ff9b::808:808": "reserved address 64:ff9b::808:808",
+  "100::1": "private address 100::1",
+  "200::1": "reserved address 200::1",
+  "4000::1": "reserved address 4000::1",
+  "fe00::1": "reserved address fe00::1",
+  "fec0::1": null,
+  "::8.8.8.8": "reserved address ::808:808",
+  "2001:4:112::1": null
+ },
+ "html": [
+  {
+   "html": "<html><head><title>T</title><style>p{}</style></head><body><nav>Home | About</nav><main><h1>Hello</h1>\n<p>First &amp; second.</p><script>var x = '</p>';</script><p>Fact<sup>[1]</sup> here.</p></main><footer>(c) 2026</footer></body></html>",
+   "text": "Hello\nFirst & second.   Fact  here."
+  },
+  {
+   "html": "<article class='post'><p>Article body</p><TABLE><tr><td>skip</td></tr></table><p>after &lt;table&gt;</p></article>",
+   "text": "Article body   after <table>"
+  },
+  {
+   "html": "<div id=\"mw-content-text\"><p>Wiki text</p><Script>bad()</SCRIPT><p>More&nbsp;text</p></div>",
+   "text": "Wiki text   More text"
+  },
+  {
+   "html": "<body><p>No main region</p>\n\n\n<aside>side</aside><p>Last</p></body>",
+   "text": "No main region\nLast"
+  },
+  {
+   "html": "<p>Unclosed <script>never closed <p>still here</p>",
+   "text": "Unclosed  never closed  still here"
+  },
+  {
+   "html": "<nav><table>nested</table> nav text</nav><p>kept</p><table><nav>inner</nav> t</table><p>end</p>",
+   "text": "kept   end"
+  },
+  {
+   "html": "<header>top</header><tablet>not a table</tablet><navx>x</navx>",
+   "text": "not a table  x"
+  },
+  {
+   "html": "plain text, no tags",
+   "text": "plain text, no tags"
+  }
+ ]
+}

@@ -45,6 +45,10 @@ docker_cpus = "1"
 docker_network = false
 env_passthrough = []
 
+[tools]
+web_allow_private = false
+web_max_chars = 8000
+
 [guardrails]
 approval = "ask"
 ingress = "warn"
@@ -80,6 +84,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub sandbox: SandboxConfig,
     pub guardrails: GuardrailsConfig,
+    pub tools: ToolsConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -109,6 +114,18 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
     pub tool_timeout_s: u64,
+}
+
+/// Tool settings (`[tools]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ToolsConfig {
+    /// Let `web_fetch` reach private, loopback, and link-local addresses.
+    pub web_allow_private: bool,
+    /// The User-Agent `web_fetch` sends; defaults to agent86's own.
+    #[serde(default = "crate::tools::web::default_user_agent")]
+    pub web_user_agent: String,
+    /// Characters of page text `web_fetch` returns at most; `0` disables the cap.
+    pub web_max_chars: usize,
 }
 
 /// Safety settings (`[guardrails]`).
