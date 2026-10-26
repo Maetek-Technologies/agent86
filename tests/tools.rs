@@ -305,7 +305,7 @@ fn unknown_tools_name_the_available_ones() {
 
 #[test]
 fn duplicate_registration_is_refused() {
-    let mut registry = builtin_registry();
+    let registry = builtin_registry();
     let error = registry
         .register(Box::new(agent86::tools::files::ReadFileTool))
         .unwrap_err();

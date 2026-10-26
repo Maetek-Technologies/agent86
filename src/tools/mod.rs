@@ -5,8 +5,6 @@
 //! arguments, policy violations, and I/O failures all come back as a
 //! [`ToolResult`] with `ok = false` that the model can correct itself from;
 //! nothing a tool does can crash the agent loop.
-//!
-//! Only read-only workspace tools exist so far.
 
 pub mod exec;
 pub mod files;
@@ -17,6 +15,7 @@ use crate::types::{ToolCall, ToolResult, ToolSpec};
 use sandbox::Executor;
 use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Default cap on a tool's output, in characters (Python's `max_output_bytes`).
@@ -217,6 +216,52 @@ impl<'a> Arguments<'a> {
         })
     }
 
+    /// An optional `dict[str, str]` field (default `{}`), each bad value reported
+    /// under its own key, as pydantic does.
+    pub fn string_map(&mut self, field: &str) -> Map<String, Value> {
+        match self.args.get(field) {
+            None => Map::new(),
+            Some(Value::Object(map)) => {
+                for (key, value) in map {
+                    if !value.is_string() {
+                        self.errors
+                            .push(format!("{field}.{key}: Input should be a valid string"));
+                    }
+                }
+                map.clone()
+            }
+            Some(_) => {
+                self.errors
+                    .push(format!("{field}: Input should be a valid dictionary"));
+                Map::new()
+            }
+        }
+    }
+
+    /// A required `Literal[...]` string field.
+    pub fn choice(&mut self, field: &str, choices: &[&str]) -> String {
+        match self.args.get(field) {
+            Some(Value::String(value)) if choices.contains(&value.as_str()) => value.clone(),
+            None => {
+                self.errors.push(format!("{field}: Field required"));
+                String::new()
+            }
+            Some(_) => {
+                let quoted: Vec<String> =
+                    choices.iter().map(|choice| format!("'{choice}'")).collect();
+                let listed = match quoted.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        format!("{} or {last}", rest.join(", "))
+                    }
+                    _ => quoted.concat(),
+                };
+                self.errors
+                    .push(format!("{field}: Input should be {listed}"));
+                String::new()
+            }
+        }
+    }
+
     /// `Err` with every collected error, or `Ok` when all fields were valid.
     pub fn finish(self) -> Result<(), ToolError> {
         if self.errors.is_empty() {
@@ -374,12 +419,21 @@ impl ToolContext {
 }
 
 /// Holds every available tool, exposes their specs, and dispatches calls.
-#[derive(Default)]
+///
+/// Cloning shares the same tools: the MCP manager keeps a clone so it can take a
+/// dropped server's tools out, and put them back on reconnect, while the agent
+/// loop is using the registry, as Python's lock-guarded `ToolRegistry` allows.
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
+    inner: Arc<RwLock<RegistryInner>>,
+}
+
+#[derive(Default)]
+struct RegistryInner {
     /// In registration order, which is the order specs are advertised in.
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     /// Names dropped by [`ToolRegistry::try_register`] because something already owned them.
-    pub collisions: Vec<String>,
+    collisions: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -387,44 +441,86 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<(), String> {
-        if self.get(tool.name()).is_some() {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, RegistryInner> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, RegistryInner> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn register(&self, tool: Box<dyn Tool>) -> Result<(), String> {
+        let mut inner = self.write();
+        if inner.tools.iter().any(|known| known.name() == tool.name()) {
             return Err(format!("Tool '{}' is already registered.", tool.name()));
         }
-        self.tools.push(tool);
+        inner.tools.push(Arc::from(tool));
         Ok(())
     }
 
     /// Register `tool` unless its name is taken, recording the clash if it is. The
     /// lenient path for mounting MCP tools, where one collision must not abort the run.
-    pub fn try_register(&mut self, tool: Box<dyn Tool>) -> bool {
-        if self.get(tool.name()).is_some() {
-            self.collisions.push(tool.name().to_owned());
+    pub fn try_register(&self, tool: Arc<dyn Tool>) -> bool {
+        let mut inner = self.write();
+        if inner.tools.iter().any(|known| known.name() == tool.name()) {
+            inner.collisions.push(tool.name().to_owned());
             return false;
         }
-        self.tools.push(tool);
+        inner.tools.push(tool);
         true
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
+    /// Remove `tool` only if it is the object registered under its name, so a dropped
+    /// MCP tool that lost a name collision never takes the winner out with it.
+    pub fn unregister_tool(&self, tool: &Arc<dyn Tool>) -> bool {
+        let mut inner = self.write();
+        let before = inner.tools.len();
+        inner.tools.retain(|known| !same_tool(known, tool));
+        inner.tools.len() != before
+    }
+
+    /// Is this exact tool object registered (not merely one with the same name)?
+    pub fn contains_tool(&self, tool: &Arc<dyn Tool>) -> bool {
+        self.read().tools.iter().any(|known| same_tool(known, tool))
+    }
+
+    /// Names [`ToolRegistry::try_register`] refused, in the order they were refused.
+    pub fn collisions(&self) -> Vec<String> {
+        self.read().collisions.clone()
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.read()
+            .tools
             .iter()
             .find(|tool| tool.name() == name)
-            .map(Box::as_ref)
+            .cloned()
     }
 
     /// Tool names, sorted.
-    pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.tools.iter().map(|tool| tool.name()).collect();
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .read()
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
         names.sort_unstable();
         names
     }
 
     /// Specs in registration order.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|tool| tool.spec()).collect()
+        let tools: Vec<Arc<dyn Tool>> = self.read().tools.clone();
+        tools.iter().map(|tool| tool.spec()).collect()
     }
 
+    /// Run `call`. The lock is released before the tool runs, so a long call never
+    /// blocks the MCP manager from updating the registry.
     pub fn dispatch(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
         match self.get(&call.name) {
             Some(tool) => tool.run(call, ctx),
@@ -443,9 +539,13 @@ impl ToolRegistry {
     }
 }
 
+fn same_tool(a: &Arc<dyn Tool>, b: &Arc<dyn Tool>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
+}
+
 /// Python's built-in tools, in its registration order.
 pub fn builtin_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     for tool in [
         Box::new(files::ReadFileTool) as Box<dyn Tool>,
         Box::new(files::WriteFileTool),

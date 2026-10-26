@@ -1,5 +1,5 @@
 //! The MCP client: config, result rendering, the prompt section, and a real
-//! stdio server (`tests/fixtures/mcp/server.py`, stdlib-only Python).
+//! server over each transport (`tests/fixtures/mcp/server.py`, stdlib-only Python).
 
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::mcp::{
@@ -10,9 +10,14 @@ use agent86::secrets::SecretStore;
 use agent86::tools::{builtin_registry, Tool, ToolContext};
 use agent86::types::ToolCall;
 use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use support::fixture;
+
+mod support;
 
 struct TempDir(PathBuf);
 
@@ -283,26 +288,122 @@ fn nothing_starts_when_mcp_is_off_or_unconfigured() {
     assert!(McpManager::start(&disabled).is_none());
 }
 
+fn tool(tools: &[Arc<dyn Tool>], name: &str) -> Arc<dyn Tool> {
+    tools
+        .iter()
+        .find(|tool| tool.name() == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no tool {name}"))
+}
+
+/// Poll `condition` for up to `seconds`.
+fn wait_until(seconds: u64, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    condition()
+}
+
+const REMOTE_TOOLS: [&str; 12] = [
+    "mcp__test__echo",
+    "mcp__test__add",
+    "mcp__test__secret",
+    "mcp__test__fail",
+    "mcp__test__media",
+    "mcp__test__slow",
+    "mcp__test__big",
+    "mcp__test__bad_name_with_spaces",
+    "mcp__test__die",
+    "mcp__test__change",
+    "mcp__test__progress",
+    "mcp__test__headers",
+];
+
+const CAPABILITY_TOOLS: [&str; 8] = [
+    "mcp__test__list_resources",
+    "mcp__test__read_resource",
+    "mcp__test__list_resource_templates",
+    "mcp__test__subscribe_resource",
+    "mcp__test__unsubscribe_resource",
+    "mcp__test__list_prompts",
+    "mcp__test__get_prompt",
+    "mcp__test__complete",
+];
+
+/// The fixture server in `http` or `sse` mode, on a free local port.
+struct HttpServer {
+    child: Child,
+    port: u16,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl HttpServer {
+    fn start(mode: &str) -> Option<Self> {
+        let mut child = Command::new(python()?)
+            .args([server_script().as_str(), mode])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = BufReader::new(child.stdout.take()?);
+        let mut line = String::new();
+        stdout.read_line(&mut line).ok()?;
+        let port = line.trim().strip_prefix("PORT ")?.parse().ok()?;
+        Some(Self {
+            child,
+            port,
+            stdout,
+        })
+    }
+
+    /// Everything the server has logged since the port line, after stopping it.
+    fn stop(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut rest = String::new();
+        let _ = self.stdout.read_to_string(&mut rest);
+        rest
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[test]
 fn failures_become_notes() {
     let dir = TempDir::new("notes");
     let config = config_from(
         &dir.0,
-        "[mcp.servers.web]\nurl = 'https://example.com/mcp'\n\n\
+        "[mcp.servers.web]\nurl = 'http://127.0.0.1:1/mcp'\nconnect_timeout_s = 10\n\n\
          [mcp.servers.missing]\ncommand = 'agent86-no-such-mcp-server'\n",
     )
     .unwrap();
     let manager = McpManager::start(&config).unwrap();
     assert!(manager.tools().is_empty());
-    assert_eq!(manager.notes.len(), 2);
-    assert_eq!(
-        manager.notes[0],
-        "MCP server 'web' failed to start: the http transport is not supported by the Rust port yet"
+    let notes = manager.notes();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].starts_with("MCP server 'web' failed to start: "),
+        "{}",
+        notes[0]
     );
     assert!(
-        manager.notes[1].starts_with("MCP server 'missing' failed to start: "),
+        !notes[0].contains("did not finish connecting"),
         "{}",
-        manager.notes[1]
+        notes[0]
+    );
+    assert!(
+        notes[1].starts_with("MCP server 'missing' failed to start: "),
+        "{}",
+        notes[1]
     );
 }
 
@@ -313,15 +414,16 @@ fn a_server_that_exits_reports_its_stderr() {
         return;
     };
     let manager = McpManager::start(&config).unwrap();
-    assert_eq!(manager.notes.len(), 1);
-    let note = &manager.notes[0];
+    let notes = manager.notes();
+    assert_eq!(notes.len(), 1);
     assert!(
-        note.starts_with(
+        notes[0].starts_with(
             "MCP server 'broken' failed to start: Connection closed\nThe server process exited during startup. \
              Its stderr (last lines):\n  Traceback (most recent call last):\n  \
              ModuleNotFoundError: No module named 'imaginary_server'\nCheck this server's command/args"
         ),
-        "{note}"
+        "{}",
+        notes[0]
     );
 }
 
@@ -333,7 +435,7 @@ fn a_hung_server_times_out_connecting() {
     };
     let manager = McpManager::start(&config).unwrap();
     assert_eq!(
-        manager.notes,
+        manager.notes(),
         ["MCP server 'stuck' failed to start: MCP server 'stuck' did not finish connecting within 0.5s \
           (connect_timeout_s); if it is slow rather than hung, raise connect_timeout_s under [mcp.servers.stuck]."]
     );
@@ -351,28 +453,28 @@ fn tools_are_listed_called_and_deferred() {
         return;
     };
     let manager = McpManager::start(&config).unwrap();
-    assert!(manager.notes.is_empty(), "{:?}", manager.notes);
+    assert!(manager.notes().is_empty(), "{:?}", manager.notes());
     let tools = manager.tools();
     let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    // Both pages, in listing order; the server's mid-listing ping was answered.
-    assert_eq!(
-        names,
-        [
-            "mcp__test__echo",
-            "mcp__test__add",
-            "mcp__test__secret",
-            "mcp__test__fail",
-            "mcp__test__media",
-            "mcp__test__slow",
-            "mcp__test__big",
-            "mcp__test__bad_name_with_spaces",
-        ]
-    );
-    let echo = &tools[0];
+    // The server's own tools in listing order (its ping before answering was
+    // handled), then the capability tools its declared capabilities entitle it to.
+    let expected: Vec<&str> = REMOTE_TOOLS
+        .iter()
+        .chain(&CAPABILITY_TOOLS)
+        .copied()
+        .collect();
+    assert_eq!(names, expected);
+    let echo = tool(&tools, "mcp__test__echo");
     assert_eq!(echo.description(), "Echo the text back. (MCP: test)");
     assert!(echo.side_effecting());
-    assert!(!tools[1].side_effecting(), "readOnlyHint relaxes the gate");
-    assert_eq!(tools[2].description(), "secret (MCP: test)");
+    assert!(
+        !tool(&tools, "mcp__test__add").side_effecting(),
+        "readOnlyHint relaxes the gate"
+    );
+    assert_eq!(
+        tool(&tools, "mcp__test__secret").description(),
+        "secret (MCP: test)"
+    );
 
     // Deferred: an empty schema until first use, then the real one.
     let spec = echo.spec();
@@ -382,13 +484,13 @@ fn tools_are_listed_called_and_deferred() {
     );
     assert_eq!(spec.parameters, json!({"type": "object", "properties": {}}));
     assert_eq!(
-        tools[2].spec().description,
-        "secret (MCP: test)",
-        "nothing to defer"
+        tool(&tools, "mcp__test__secret").spec().description,
+        "secret (MCP: test)"
     );
 
     let ctx = ToolContext::new(&dir.0).unwrap();
-    let first = echo.run(&call("mcp__test__echo", json!({})), &ctx);
+    let run = |name: &str, arguments: Value| tool(&tools, name).run(&call(name, arguments), &ctx);
+    let first = run("mcp__test__echo", json!({}));
     assert!(!first.ok);
     assert_eq!(
         first.error.as_deref(),
@@ -403,50 +505,70 @@ fn tools_are_listed_called_and_deferred() {
     );
     assert_eq!(echo.spec().parameters["required"], json!(["text"]));
 
-    let echoed = echo.run(&call("mcp__test__echo", json!({"text": "hello"})), &ctx);
+    let echoed = run("mcp__test__echo", json!({"text": "hello"}));
     assert!(echoed.ok, "{echoed:?}");
     assert_eq!(echoed.content, "hello");
     assert_eq!(echoed.call_id, "call_1");
     assert_eq!(echoed.metadata, Map::new());
 
-    let added = tools[1].run(&call("mcp__test__add", json!({"a": 2, "b": 3})), &ctx);
-    assert_eq!(added.content, "5");
+    assert_eq!(run("mcp__test__add", json!({"a": 2, "b": 3})).content, "5");
+    assert_eq!(
+        run("mcp__test__secret", json!({})).content,
+        "token=abc123 leaked=<unset>"
+    );
 
-    let secret = tools[2].run(&call("mcp__test__secret", json!({})), &ctx);
-    assert_eq!(secret.content, "token=abc123 leaked=<unset>");
-
-    let failed = tools[3].run(&call("mcp__test__fail", json!({})), &ctx);
+    let failed = run("mcp__test__fail", json!({}));
     assert!(
         failed.ok,
         "a tool-level error is content, not a failed call"
     );
     assert_eq!(failed.content, "ERROR: it broke");
 
-    let media = tools[4].run(&call("mcp__test__media", json!({})), &ctx);
     assert_eq!(
-        media.content,
+        run("mcp__test__media", json!({})).content,
         "[image content: mime_type=image/png base64_len=8 — not inlined]\n\
          [embedded resource uri=file:///a.txt mime_type=text/plain]\ninside\n\
          [resource link uri=file:///b name=b mime_type=unknown size=unknown]"
     );
-
-    let big = tools[6].run(&call("mcp__test__big", json!({})), &ctx);
+    let big = run("mcp__test__big", json!({}));
     assert!(
         big.content
             .starts_with(&format!("{}\n…[truncated 50 chars", "x".repeat(300))),
         "{}",
         big.content
     );
-
-    let unknown = tools[7].run(&call("mcp__test__bad_name_with_spaces", json!({})), &ctx);
     assert_eq!(
-        unknown.error.as_deref(),
+        run("mcp__test__bad_name_with_spaces", json!({}))
+            .error
+            .as_deref(),
         Some("MCP call failed: Unknown tool: bad.name/with spaces")
     );
-
-    let slow = tools[5].run(&call("mcp__test__slow", json!({})), &ctx);
+    // Each call carries a progress token; the server's reports are recorded and noted.
+    let progressed = run("mcp__test__progress", json!({}));
+    assert!(
+        progressed.content.starts_with("progressed token="),
+        "{}",
+        progressed.content
+    );
+    assert_ne!(progressed.content, "progressed token=null");
+    assert!(wait_until(5, || manager.last_progress("test")
+        == Some((2.0, Some(2.0), Some("done".to_owned())))));
+    let (_, notes) = manager.notes_since(0);
+    assert!(
+        notes.contains(&"MCP server 'test': progress 1/2 — half way".to_owned()),
+        "{notes:?}"
+    );
+    assert!(
+        notes.contains(&"MCP server 'test': progress 2/2 — done".to_owned()),
+        "{notes:?}"
+    );
+    assert!(
+        manager.notes().is_empty(),
+        "progress notes are live-only: {:?}",
+        manager.notes()
+    );
     assert_eq!(
-        slow.error.as_deref(),
+        run("mcp__test__slow", json!({})).error.as_deref(),
         Some(
             "MCP call failed: MCP server 'test' did not answer 'slow' within 1s (call_timeout_s); if it is \
              slow rather than hung, raise call_timeout_s under [mcp.servers.test]."
@@ -455,17 +577,163 @@ fn tools_are_listed_called_and_deferred() {
 }
 
 #[test]
-fn mounting_registers_tools_and_builds_the_prompt_section() {
-    let dir = TempDir::new("mount");
+fn capability_tools_match_python() {
+    let dir = TempDir::new("capabilities");
     let Some(config) = server_config(&dir.0, "test", "normal", "") else {
         return;
     };
     let manager = McpManager::start(&config).unwrap();
-    let mut registry = builtin_registry();
+    let tools = manager.tools();
+    let golden: Value = serde_json::from_str(&fixture("mcp/capability_schemas.json")).unwrap();
+    let schemas = &golden["schemas"];
+    for (name, schema) in [
+        ("mcp__test__list_resources", "empty"),
+        ("mcp__test__read_resource", "uri"),
+        ("mcp__test__list_resource_templates", "empty"),
+        ("mcp__test__subscribe_resource", "uri"),
+        ("mcp__test__unsubscribe_resource", "uri"),
+        ("mcp__test__list_prompts", "empty"),
+        ("mcp__test__get_prompt", "get_prompt"),
+        ("mcp__test__complete", "complete"),
+    ] {
+        let spec = tool(&tools, name).spec();
+        assert_eq!(spec.parameters, schemas[schema], "{name}");
+        assert_eq!(
+            serde_json::to_string(&spec.parameters).unwrap(),
+            serde_json::to_string(&schemas[schema]).unwrap(),
+            "{name}: key order"
+        );
+        assert!(
+            spec.description.ends_with(" (MCP: test)"),
+            "{}",
+            spec.description
+        );
+        assert_eq!(spec.side_effecting, name.contains("subscribe"), "{name}");
+    }
+
+    let ctx = ToolContext::new(&dir.0).unwrap();
+    let run = |name: &str, arguments: Value| tool(&tools, name).run(&call(name, arguments), &ctx);
+
+    // Validation errors are pydantic's, case by case.
+    for case in golden["errors"].as_array().unwrap() {
+        let name = match case["model"].as_str().unwrap() {
+            "uri" => "mcp__test__read_resource",
+            "prompt" => "mcp__test__get_prompt",
+            _ => "mcp__test__complete",
+        };
+        let result = run(name, case["input"].clone());
+        assert_eq!(
+            result.error,
+            Some(format!(
+                "Invalid arguments for '{name}': {}",
+                case["error"].as_str().unwrap()
+            )),
+            "{case}"
+        );
+    }
+
+    let resources = run("mcp__test__list_resources", json!({}));
+    assert_eq!(
+        resources.content,
+        "uri | name | mime_type | description\n\
+         file:///notes.txt | notes | text/plain | Some notes here\n\
+         file:///logo.png | logo | unknown | "
+    );
+    assert_eq!(
+        resources.metadata,
+        json!({"count": 2}).as_object().unwrap().clone()
+    );
+    assert_eq!(
+        run("mcp__test__list_resource_templates", json!({})).content,
+        "uri_template | name | mime_type | description\nfile:///{name} | file | unknown | "
+    );
+    let read = run(
+        "mcp__test__read_resource",
+        json!({"uri": "file:///notes.txt"}),
+    );
+    assert_eq!(read.content, "note text");
+    assert_eq!(
+        read.metadata,
+        json!({"uri": "file:///notes.txt"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    let binary = run(
+        "mcp__test__read_resource",
+        json!({"uri": "file:///logo.png"}),
+    );
+    assert_eq!(
+        binary.content,
+        "[binary resource uri=file:///logo.png mime_type=image/png base64_len=4 — not inlined]"
+    );
+    assert_eq!(
+        Value::Object(binary.metadata),
+        json!({"uri": "file:///logo.png", "binary": [{"uri": "file:///logo.png", "mime_type": "image/png", "base64_len": 4}]})
+    );
+    let subscribed = run(
+        "mcp__test__subscribe_resource",
+        json!({"uri": "file:///notes.txt"}),
+    );
+    assert_eq!(
+        subscribed.content,
+        "Subscribed to file:///notes.txt. Note: resource update notifications are not delivered to \
+         the model yet (tracked as MCP-24), so this records intent on the server only."
+    );
+    assert_eq!(
+        Value::Object(subscribed.metadata),
+        json!({"uri": "file:///notes.txt", "subscribed": true})
+    );
+    assert!(run("mcp__test__unsubscribe_resource", json!({"uri": "x"}))
+        .content
+        .starts_with("Unsubscribed from x."));
+
+    assert_eq!(
+        run("mcp__test__list_prompts", json!({})).content,
+        "name | arguments | description\ngreet | who*, tone | Say hello.\n\
+         (* = required argument; pass them to get_prompt as the `arguments` object)"
+    );
+    let prompt = run(
+        "mcp__test__get_prompt",
+        json!({"name": "greet", "arguments": {"who": "Ada"}}),
+    );
+    assert_eq!(
+        prompt.content,
+        "A greeting.\n\n[user]: Greet Ada\n[assistant]: [non-text content block: ImageContent — not inlined]"
+    );
+    assert_eq!(
+        Value::Object(prompt.metadata),
+        json!({"prompt": "greet", "non_text_blocks": [{"index": 1, "role": "assistant", "type": "ImageContent"}]})
+    );
+    let completed = run(
+        "mcp__test__complete",
+        json!({"ref_type": "prompt", "ref": "greet", "argument_name": "who", "argument_value": "al"}),
+    );
+    assert_eq!(completed.content, "alice\nalbert");
+    assert_eq!(
+        Value::Object(completed.metadata),
+        json!({"ref_type": "prompt", "ref": "greet", "argument": "who", "count": 2, "total": 2, "has_more": false})
+    );
+    let none = run(
+        "mcp__test__complete",
+        json!({"ref_type": "resource", "ref": "file:///{name}", "argument_name": "name", "argument_value": "zz"}),
+    );
+    assert_eq!(none.content, "(no suggestions)");
+}
+
+#[test]
+fn attaching_registers_tools_and_builds_the_prompt_section() {
+    let dir = TempDir::new("attach");
+    let Some(config) = server_config(&dir.0, "test", "normal", "") else {
+        return;
+    };
+    let manager = McpManager::start(&config).unwrap();
+    let registry = builtin_registry();
     let builtins = registry.specs().len();
-    let section = manager.mount(&mut registry);
-    assert_eq!(registry.specs().len(), builtins + 8);
-    assert!(registry.collisions.is_empty());
+    manager.attach(&registry);
+    assert_eq!(registry.specs().len(), builtins + 20);
+    assert!(registry.collisions().is_empty());
+    let section = manager.prompt_section();
     assert!(
         section.starts_with("MCP servers (every tool listed is callable now"),
         "{section}"
@@ -475,14 +743,179 @@ fn mounting_registers_tools_and_builds_the_prompt_section() {
         "{section}"
     );
     assert!(
+        section.contains("mcp__test__headers, mcp__test__list_resources, "),
+        "{section}"
+    );
+    assert!(
         section.ends_with("    Prefer echo for greetings.\n\n    Never call slow."),
         "{section}"
     );
 
-    // A second mount of the same tools collides instead of shadowing.
-    let again = manager.mount(&mut registry);
-    assert_eq!(registry.collisions.len(), 8);
-    assert!(again.contains("- test: (no tools)"), "{again}");
+    // Attaching again collides instead of shadowing.
+    manager.attach(&registry);
+    assert_eq!(registry.collisions().len(), 20);
+}
+
+#[test]
+fn a_dropped_server_reconnects_and_its_tools_come_back() {
+    let dir = TempDir::new("reconnect");
+    let Some(config) = server_config(&dir.0, "test", "normal", "") else {
+        return;
+    };
+    let manager = McpManager::start(&config).unwrap();
+    let registry = builtin_registry();
+    manager.attach(&registry);
+    let ctx = ToolContext::new(&dir.0).unwrap();
+
+    let died = registry.dispatch(&call("mcp__test__die", json!({})), &ctx);
+    assert!(!died.ok);
+    let error = died.error.unwrap();
+    assert!(
+        error.starts_with("MCP call failed: MCP server 'test' "),
+        "{error}"
+    );
+
+    // The supervisor takes the tools out, then reconnects and puts fresh ones back.
+    assert!(wait_until(15, || manager.notes().contains(
+        &"MCP server 'test' reconnected; 20 tool(s) re-registered.".to_owned()
+    )));
+    let notes = manager.notes();
+    assert!(
+        notes[0].starts_with(
+            "MCP server 'test' disconnected (the transport closed); its 20 tool(s) were unregistered."
+        ),
+        "{notes:?}"
+    );
+    assert!(
+        notes[0].contains("Last server stderr: dying on request"),
+        "{notes:?}"
+    );
+    assert_eq!(
+        notes[1],
+        "MCP server 'test' disconnected (the transport closed); reconnecting (attempt 1 of 5)."
+    );
+    assert_eq!(manager.server_status("test"), None);
+    let echoed = registry.dispatch(&call("mcp__test__echo", json!({"text": "back"})), &ctx);
+    assert_eq!(echoed.content, "back", "{echoed:?}");
+    assert!(registry.collisions().is_empty());
+}
+
+#[test]
+fn list_changed_notifications_update_the_registry() {
+    let dir = TempDir::new("changed");
+    let Some(config) = server_config(&dir.0, "test", "normal", "") else {
+        return;
+    };
+    let manager = McpManager::start(&config).unwrap();
+    let registry = builtin_registry();
+    manager.attach(&registry);
+    let ctx = ToolContext::new(&dir.0).unwrap();
+    let echo_before = registry.get("mcp__test__echo").unwrap();
+
+    assert_eq!(
+        registry
+            .dispatch(&call("mcp__test__change", json!({})), &ctx)
+            .content,
+        "changed"
+    );
+    assert!(wait_until(5, || registry.get("mcp__test__added").is_some()));
+    assert!(registry.get("mcp__test__big").is_none());
+    assert!(
+        Arc::ptr_eq(&echo_before, &registry.get("mcp__test__echo").unwrap()),
+        "an unchanged tool keeps its object"
+    );
+    assert!(manager.notes().contains(
+        &"MCP server 'test' changed its tool list (tools/list_changed): added mcp__test__added; \
+          removed mcp__test__big."
+            .to_owned()
+    ));
+    assert!(manager.prompt_section().contains("mcp__test__added"));
+    assert_eq!(
+        registry
+            .dispatch(&call("mcp__test__added", json!({})), &ctx)
+            .content,
+        "new tool"
+    );
+}
+
+#[test]
+fn streamable_http_servers_work() {
+    let Some(server) = HttpServer::start("http") else {
+        return;
+    };
+    let dir = TempDir::new("http");
+    let config = config_from(
+        &dir.0,
+        &format!(
+            "[mcp.servers.test]\nurl = 'http://127.0.0.1:{}/mcp'\nheaders = {{ Authorization = 'Bearer abc' }}\n",
+            server.port
+        ),
+    )
+    .unwrap();
+    let manager = McpManager::start(&config).unwrap();
+    assert!(manager.notes().is_empty(), "{:?}", manager.notes());
+    let registry = builtin_registry();
+    manager.attach(&registry);
+    assert_eq!(manager.tools().len(), 20);
+    let ctx = ToolContext::new(&dir.0).unwrap();
+    let dispatch = |name: &str, arguments: Value| registry.dispatch(&call(name, arguments), &ctx);
+
+    assert_eq!(
+        dispatch("mcp__test__echo", json!({"text": "over http"})).content,
+        "over http"
+    );
+    // The configured header, the session id from initialize, and the negotiated version.
+    let headers: Value =
+        serde_json::from_str(&dispatch("mcp__test__headers", json!({})).content).unwrap();
+    assert_eq!(
+        headers,
+        json!({"authorization": "Bearer abc", "mcp-protocol-version": "2025-11-25", "mcp-session-id": "sess-1"})
+    );
+    // A response sent as an SSE stream, with progress notifications before it.
+    assert!(dispatch("mcp__test__progress", json!({}))
+        .content
+        .starts_with("progressed token="));
+    assert!(wait_until(5, || manager.last_progress("test").is_some()));
+    // A notification on the GET stream.
+    dispatch("mcp__test__change", json!({}));
+    assert!(wait_until(5, || registry.get("mcp__test__added").is_some()));
+
+    drop(registry);
+    drop(manager);
+    assert!(
+        server.stop().contains("DELETE sess-1"),
+        "the session is terminated on close"
+    );
+}
+
+#[test]
+fn legacy_sse_servers_work() {
+    let Some(server) = HttpServer::start("sse") else {
+        return;
+    };
+    let dir = TempDir::new("sse");
+    let config = config_from(
+        &dir.0,
+        &format!(
+            "[mcp.servers.test]\nurl = 'http://127.0.0.1:{}/sse'\ntransport = 'sse'\n",
+            server.port
+        ),
+    )
+    .unwrap();
+    let manager = McpManager::start(&config).unwrap();
+    assert!(manager.notes().is_empty(), "{:?}", manager.notes());
+    let registry = builtin_registry();
+    manager.attach(&registry);
+    let ctx = ToolContext::new(&dir.0).unwrap();
+    assert_eq!(
+        registry
+            .dispatch(&call("mcp__test__echo", json!({"text": "over sse"})), &ctx)
+            .content,
+        "over sse"
+    );
+    registry.dispatch(&call("mcp__test__change", json!({})), &ctx);
+    assert!(wait_until(5, || registry.get("mcp__test__added").is_some()));
+    drop(server);
 }
 
 #[test]
@@ -544,5 +977,5 @@ fn the_cli_lists_servers_and_their_tools() {
         lines[1].ends_with(" Echo the text back. (MCP: test)"),
         "{stdout}"
     );
-    assert_eq!(lines.len(), 9);
+    assert_eq!(lines.len(), 21);
 }

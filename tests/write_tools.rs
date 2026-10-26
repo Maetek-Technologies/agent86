@@ -65,7 +65,7 @@ fn error_of(result: &ToolResult) -> &str {
 fn preview(ctx: &ToolContext, name: &str, arguments: Value) -> Option<String> {
     let registry = builtin_registry();
     let tool = registry.get(name).unwrap();
-    build_preview(tool, &call(name, arguments), ctx).detail
+    build_preview(tool.as_ref(), &call(name, arguments), ctx).detail
 }
 
 /// `text` as Python's `write_text` puts it on disk on this platform.
@@ -414,22 +414,23 @@ fn the_gate_follows_the_approval_mode() {
     let write_call = call("write_file", json!({"path": "x.txt", "content": "hi"}));
     let read_call = call("read_file", json!({"path": "x.txt"}));
 
-    let reason = |gate: &ApprovalGate, tool, call: &ToolCall| {
-        let decision = gate.decide(tool, call, &ctx);
-        (decision.approved, decision.reason)
-    };
+    let reason =
+        |gate: &ApprovalGate, tool: &std::sync::Arc<dyn agent86::tools::Tool>, call: &ToolCall| {
+            let decision = gate.decide(tool.as_ref(), call, &ctx);
+            (decision.approved, decision.reason)
+        };
 
     let ask = ApprovalGate::new(ApprovalMode::Ask, None);
-    assert_eq!(reason(&ask, read, &read_call), (true, "read-only"));
+    assert_eq!(reason(&ask, &read, &read_call), (true, "read-only"));
     assert_eq!(
-        reason(&ask, write, &write_call),
+        reason(&ask, &write, &write_call),
         (false, "approval required but no prompt available")
     );
     let auto = ApprovalGate::new(ApprovalMode::Auto, None);
-    assert_eq!(reason(&auto, write, &write_call), (true, "auto-approved"));
+    assert_eq!(reason(&auto, &write, &write_call), (true, "auto-approved"));
     let deny = ApprovalGate::new(ApprovalMode::Deny, None);
     assert_eq!(
-        reason(&deny, write, &write_call),
+        reason(&deny, &write, &write_call),
         (false, "blocked by approval policy (deny)")
     );
 
@@ -444,7 +445,7 @@ fn the_gate_follows_the_approval_mode() {
     });
     let asking = ApprovalGate::new(ApprovalMode::Ask, Some(prompt));
     assert_eq!(
-        reason(&asking, write, &write_call),
+        reason(&asking, &write, &write_call),
         (false, "declined by user")
     );
     let seen = seen.lock().unwrap();

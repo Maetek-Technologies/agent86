@@ -43,7 +43,7 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// A value in `[0, 1)` from the standard library's randomly seeded hasher.
-fn jitter_fraction() -> f64 {
+pub(crate) fn jitter_fraction() -> f64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(0);
     (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
