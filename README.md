@@ -6,7 +6,7 @@ The Python implementation remains the reference. This repository starts with a s
 
 ## Status
 
-**One-shot text stage — not yet a usable agent.** The repository currently contains:
+**A working agent, short of Python's full feature set.** The repository currently contains:
 
 - Provider-neutral roles, phases, stop reasons, messages, tool calls, completions, steps, and usage accounting
 - `provider:model` parsing
@@ -17,10 +17,13 @@ The Python implementation remains the reference. This repository starts with a s
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
 - Python's system prompt (identity plus environment line), checked against text extracted from the Python source
 - API keys from the provider's environment variable or, failing that, the OS keyring (service `agent86`, account = provider name), compatible with keys stored by the Python implementation
-- A one-shot, text-only CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
+- A one-shot CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
+- An interactive REPL (`agent86` with no subcommand): Python's plain `agent86>` loop with its slash commands, `@file` mentions, shared prompt history, and Ctrl+C to cancel a turn
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
-`run` is a working agent for the current directory: the model can list, read, write, and edit files, run shell commands, run Python snippets, and fetch public web pages, see the results, and keep going until it answers. Commands run in a sandbox (workspace as the working directory, an environment with secrets removed, a timeout that kills the whole process tree, and capped output), or in a throwaway Docker container with `[sandbox] mode = "docker"`. Every write, command, and snippet needs your approval: at a terminal `run` asks `[y/N]` for each one; piped or in CI it declines them unless you pass `--yes` (or set `--approval auto`). Python's guardrails apply too: the goal is scanned for prompt injection and personal data, answers for leaked secrets and personal data (`[guardrails] egress = "redact"` rewrites them), and tool output that looks like injected instructions is marked as untrusted before the model sees it. `web_fetch` refuses private, loopback, and cloud-metadata addresses at every redirect. Every run is saved as a session in `~/.agent86/memory.db` (the same database and format as the Python implementation); `run --session <id>` continues one. A redacted flight recorder logs every turn, model call, tool call, and guardrail hit to `~/.agent86/traces/trace.jsonl`; `agent86 trace show` and `agent86 trace export` (JSONL, JSON, or OTLP JSON) read it back. MCP servers (`[mcp.servers.<name>]`: a local `command` over stdio, or a `url` over streamable HTTP or the legacy SSE transport) are started for each run and their tools offered alongside the built-ins, behind the same approvals, plus resource, prompt, and completion tools for servers that declare them; a server that drops is reconnected, and `tools/list_changed` updates the tool list mid-run. `agent86 mcp list` and `agent86 mcp tools` show what is configured and what each server exposes. There is no long-term memory or interactive REPL yet.
+`run` is a working agent for the current directory: the model can list, read, write, and edit files, run shell commands, run Python snippets, and fetch public web pages, see the results, and keep going until it answers. Commands run in a sandbox (workspace as the working directory, an environment with secrets removed, a timeout that kills the whole process tree, and capped output), or in a throwaway Docker container with `[sandbox] mode = "docker"`. Every write, command, and snippet needs your approval: at a terminal `run` asks `[y/N]` for each one; piped or in CI it declines them unless you pass `--yes` (or set `--approval auto`). Python's guardrails apply too: the goal is scanned for prompt injection and personal data, answers for leaked secrets and personal data (`[guardrails] egress = "redact"` rewrites them), and tool output that looks like injected instructions is marked as untrusted before the model sees it. `web_fetch` refuses private, loopback, and cloud-metadata addresses at every redirect. Every run is saved as a session in `~/.agent86/memory.db` (the same database and format as the Python implementation); `run --session <id>` continues one. A redacted flight recorder logs every turn, model call, tool call, and guardrail hit to `~/.agent86/traces/trace.jsonl`; `agent86 trace show` and `agent86 trace export` (JSONL, JSON, or OTLP JSON) read it back. MCP servers (`[mcp.servers.<name>]`: a local `command` over stdio, or a `url` over streamable HTTP or the legacy SSE transport) are started for each run and their tools offered alongside the built-ins, behind the same approvals, plus resource, prompt, and completion tools for servers that declare them; a server that drops is reconnected, and `tools/list_changed` updates the tool list mid-run. `agent86 mcp list` and `agent86 mcp tools` show what is configured and what each server exposes.
+
+Run `agent86` with no subcommand for the interactive REPL, the same agent over a conversation. Type `/help` for its commands (`/model`, `/mode`, `/cost`, `/sessions`, `/resume`, `/clear`, and more). `@path` puts a file (or a directory listing) from the workspace straight into your message. Ctrl+C stops a running turn at the next safe point and keeps what happened so far. `agent86 --resume <id>` reopens a saved session. Prompts are remembered in `~/.agent86/history`, shared with the Python implementation. This is Python's plain REPL; its full-screen interface is not ported yet, and neither is long-term memory.
 
 ## Why Rust?
 
@@ -57,7 +60,8 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Flight recorder (`agent86 trace path|show|export`)
 - [ ] Episodic and semantic memory
 - [x] MCP client: stdio, streamable HTTP, and SSE transports, reconnects, `list_changed`, progress, and resource/prompt/completion tools (`agent86 mcp list|tools`)
-- [ ] Interactive terminal interface
+- [x] Interactive REPL (Python's plain loop, slash commands, `@file` mentions, history, Ctrl+C cancellation)
+- [ ] Full-screen terminal interface
 - [ ] Local embedding options
 
 Each stage should be dogfooded against the Python version before the next becomes the default path.
@@ -83,6 +87,7 @@ Then run:
 ```bash
 cargo run -- --model openrouter:<model> run "Say hello"
 cargo run -- --model openrouter:<model> run --json "Say hello"
+cargo run -- --model openrouter:<model>                  # the interactive REPL
 ```
 
 Any `[providers.<name>]` block with a `base_url` is treated as OpenAI-compatible; add `api_key_env` if the endpoint needs a key.

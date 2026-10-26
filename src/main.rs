@@ -1,36 +1,23 @@
-use agent86::agent::{Harness, HarnessError};
-use agent86::approval::{terminal_prompt_if_interactive, ApprovalGate};
+use agent86::agent::HarnessError;
+use agent86::approval::terminal_prompt_if_interactive;
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
-use agent86::guardrails::Guardrails;
 use agent86::keys;
 use agent86::mcp::McpManager;
 use agent86::observability::{
-    otlp_document, parse_since, python_repr_value, read_trace, trace_generations, Recorder,
-    TraceFilter, SPAN_KINDS,
+    otlp_document, parse_since, python_repr_value, read_trace, trace_generations, TraceFilter,
+    SPAN_KINDS,
 };
 use agent86::pricing::PriceTable;
-use agent86::prompt::build_system_prompt;
-use agent86::provider::provider_for_ref;
 use agent86::pyjson::{python_json_dumps, python_json_dumps_indented};
+use agent86::repl::run_repl;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::session::{expand_home, AgentState, SessionStore};
-use agent86::tools::sandbox::build_executor;
-use agent86::tools::web::WebSettings;
-use agent86::tools::{builtin_registry, ToolContext};
+use agent86::setup::{assemble, SetupError, MODEL_HELP};
 use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
-use agent86::types::ModelRef;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
-use std::time::Duration;
-
-/// What to do next when a model cannot be built: a bad ref, an unknown provider, a missing key.
-///
-/// Python points at `agent86 models`, which is not ported yet.
-const MODEL_HELP: &str = "Pick an OpenAI-compatible provider with `--model provider:model` \
-                          (e.g. `openrouter:openai/gpt-4o-mini`) and set its API key environment variable \
-                          or store the key in the OS keyring.";
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +36,14 @@ struct Cli {
     /// HITL mode: auto|ask|deny.
     #[arg(long)]
     approval: Option<String>,
+
+    /// Resume a prior session by id (REPL).
+    #[arg(short, long)]
+    resume: Option<String>,
+
+    /// Force the plain REPL (no status line / spinner / hotkeys).
+    #[arg(long)]
+    plain: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -196,11 +191,11 @@ fn main() -> ExitCode {
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
         None => {
-            eprintln!(
-                "agent86: the interactive REPL is not implemented yet in the Rust port; \
-                 use `agent86 run <goal>`"
-            );
-            ExitCode::from(2)
+            // `--plain` is accepted for Python's sake: the plain loop is the only
+            // surface until the full-screen interface is ported.
+            let _ = cli.plain;
+            run_repl(config, cli.resume.as_deref(), Box::new(OsKeyring));
+            ExitCode::SUCCESS
         }
     }
 }
@@ -212,24 +207,23 @@ fn run(
     session: Option<&str>,
     stderr: &Stderr,
 ) -> ExitCode {
-    let provider = ModelRef::parse(&config.model.default)
-        .map_err(|error| error.to_string())
-        .and_then(|reference| {
-            provider_for_ref(&reference, config)
-                .map(|provider| (provider, reference))
-                .map_err(|error| error.to_string())
-        });
-    let (provider, reference) = match provider {
-        Ok(built) => built,
-        Err(message) => {
+    // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
+    // there is no prompt, so `ask` declines them unless --yes was given.
+    let assembly = match assemble(config, terminal_prompt_if_interactive()) {
+        Ok(assembly) => assembly,
+        Err(SetupError::Model(message)) => {
             stderr.error(&message);
             stderr.dim(MODEL_HELP);
             return ExitCode::from(1);
         }
+        Err(SetupError::Workspace(message)) => {
+            stderr.error(&message);
+            return ExitCode::from(1);
+        }
     };
-
-    let max_tokens = config.max_output_tokens_for(&reference.provider);
-    let priced = PriceTable::from_config(config).is_priced(&reference.to_string());
+    let harness = assembly.harness;
+    let store = assembly.store;
+    let priced = PriceTable::from_config(config).is_priced(&assembly.model_ref.to_string());
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -242,42 +236,13 @@ fn run(
         }
     };
 
-    // Tools are jailed to the directory `agent86` runs in, as in Python.
-    let mut context = match std::env::current_dir().and_then(|dir| ToolContext::new(&dir)) {
-        Ok(context) => context,
-        Err(error) => {
-            stderr.error(&format!("could not open the workspace: {error}"));
-            return ExitCode::from(1);
+    if !as_json {
+        if let Some(note) = &assembly.memory_note {
+            stderr.dim(&format!("memory: {note}"));
         }
-    };
-    context.policy.timeout = Duration::from_secs(config.limits.tool_timeout_s);
-    context.policy.env_passthrough = config.sandbox.env_passthrough.clone();
-    context.web = WebSettings {
-        allow_private: config.tools.web_allow_private,
-        user_agent: config.tools.web_user_agent.clone(),
-        max_chars: config.tools.web_max_chars,
-    };
-    let (executor, sandbox_note) = build_executor(&config.sandbox);
-    context.executor = executor;
-
-    // Sessions live in the memory database; if it cannot be opened, run statelessly.
-    let store = if config.memory.enabled {
-        match SessionStore::open(&expand_home(&config.memory.path)) {
-            Ok(store) => Some(store),
-            Err(error) => {
-                if !as_json {
-                    stderr.dim(&format!(
-                        "memory: unavailable, running without recall or session history. {error}"
-                    ));
-                }
-                None
-            }
+        if let Some(note) = &assembly.sandbox_note {
+            stderr.warn(&format!("sandbox: {note}"));
         }
-    } else {
-        None
-    };
-    if let Some(note) = sandbox_note.filter(|_| !as_json) {
-        stderr.warn(&format!("sandbox: {note}"));
     }
 
     // Resume the named session, or start a new one (also when the id is unknown).
@@ -298,26 +263,6 @@ fn run(
             persist(store.as_ref(), &state, as_json, stderr);
             state
         }
-    };
-    // MCP servers that fail to start contribute no tools; `agent86 mcp tools` says why.
-    let registry = builtin_registry();
-    let mcp = McpManager::start(config).map(std::sync::Arc::new);
-    if let Some(manager) = &mcp {
-        manager.attach(&registry);
-    }
-    let harness = Harness {
-        provider: provider.as_ref(),
-        registry,
-        context,
-        limits: config.limits.clone(),
-        system: build_system_prompt(config),
-        max_tokens,
-        // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
-        // there is no prompt, so `ask` declines them unless --yes was given.
-        gate: ApprovalGate::new(config.guardrails.approval, terminal_prompt_if_interactive()),
-        guardrails: Guardrails::new(&config.guardrails),
-        recorder: Recorder::from_config(&config.observability),
-        mcp,
     };
 
     let mut stdout = std::io::stdout().lock();

@@ -36,6 +36,35 @@ pub enum ApprovalMode {
     Deny,
 }
 
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// A mode name from `/mode`, as Python's `parse_mode`: trimmed, any case.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "ask" => Some(Self::Ask),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    /// The next mode in Python's cycle: ask, auto, deny, ask.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Ask => Self::Auto,
+            Self::Auto => Self::Deny,
+            Self::Deny => Self::Ask,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {

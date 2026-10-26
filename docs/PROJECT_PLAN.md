@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the interactive terminal interface (stage 9) next, with episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; Python's full-screen terminal interface (stage 9, part 2) next, with episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -65,15 +65,17 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added the flight recorder (stage 7, part 2), ported from `observability/recorder.py`, `observability/redact.py`, and the `trace` commands in `cli.py`: Python's events and fields (`turn_start`, `guardrail` at the `ingress_input`, `egress`, `egress_tool_args`, and `observation` stages, `model_call`, `tool_call` for dispatched calls, `continuation`, and `turn_end` with `done`, `blocked`, or `error` and Python's reasons) written as `json.dumps` lines to `[observability] path`/`trace.jsonl`; every event redacted (the guardrail secret patterns and key shapes become `***REDACTED***`, and `arguments`, `task`, `content`, `error`, and `outcome` are clipped to `max_field_chars`); rotation at `max_trace_bytes` keeping `keep_traces` generations; `agent86 trace path`, `trace show` (`-s`, `-n`, `-k`, `--since`), and `trace export` (`jsonl`, `json`, `otlp-json`, `-o`), with the OTLP reconstruction matching Python's output byte for byte
 - Added the MCP client over stdio (stage 8, part 1), ported from `tools/mcp_client.py`, `tools/mcp_content.py`, the `${VAR}` expansion in `secrets.py`, `render_mcp_section` in `cognitive/prompt.py`, and the `mcp` commands in `cli.py`: `[mcp] enabled` and `[mcp.servers.<name>]`/`[mcp_servers.<name>]` with Python's fields, defaults, and transport validation messages; a hand-written newline-delimited JSON-RPC client (`initialize` with protocol `2025-06-18`, `notifications/initialized`, paginated `tools/list`, `tools/call`, `ping` answered) for a server started with the scrubbed tool environment plus its own `env`, with `${VAR}` in `args`, `env`, `url`, and `headers` resolved from the environment and then the keyring; `connect_timeout_s`, `call_timeout_s`, and `max_result_chars` with Python's messages; start failures as notes, including the server's redacted stderr tail; tools named `mcp__<server>__<tool>` (sanitized, 64 characters), described `<description> (MCP: <server>)`, side-effecting unless `readOnlyHint`, with the argument schema deferred until first use (ADR 0003) and Python's missing-argument error; Python's content rendering (text, image, audio, embedded resources, resource links); name collisions skipped rather than shadowing; the MCP section of the system message; and `agent86 mcp list` and `agent86 mcp tools`. Tests run a stdlib-only Python MCP server fixture
 - Completed the MCP client (stage 8, part 2): the streamable HTTP transport (POSTed messages answered as JSON or an SSE stream, the `Mcp-Session-Id` and `MCP-Protocol-Version` headers, the optional GET stream for server messages, and a session `DELETE` on close) and the legacy SSE transport (the `endpoint` event, same-origin check, responses on the stream), both with configured `headers`; protocol revision `2025-11-25`, as the Python SDK negotiates; a supervisor per server that, on a mid-session drop, unregisters the server's tools with Python's note (including the stderr tail), reconnects with Python's backoff (5 attempts, 0.5-30 s equal jitter), and re-registers them, with Python's unavailable, reconnecting, and give-up messages; `tools/list_changed` (and the resource and prompt variants) re-listing the tools mid-run, keeping unchanged tool objects and their materialised schemas; progress tokens on `tools/call` and throttled progress notes; resource-update notes; a bounded note log with listeners for a future REPL; the synthetic `list_resources`, `read_resource`, `list_resource_templates`, `subscribe_resource`, `unsubscribe_resource`, `list_prompts`, `get_prompt`, and `complete` tools, gated on the server's declared capabilities, with pydantic's schemas and validation messages (`tests/fixtures/mcp/capability_schemas.json`, from a pydantic mirror of the Python models) and Python's renderings; the MCP section of the system message rebuilt for every request; and the tool registry made shareable (lock-guarded, identity-checked removal) so the manager can update it during a run, as Python's is. As in Python, `tools/list` reads one page
+- Added the interactive REPL (stage 9, part 1), ported from `ui/repl.py` (the plain loop), `ui/history.py`, `tui/mentions.py`, and the surface-shared registry in `tui/commands.py`: `agent86` with no subcommand, plus `--resume`/`-r` and `--plain`; the `agent86> ` prompt, the `agent86 ` answer label, dim harness notices, `(no response)`, `error:` lines that leave the loop running, the per-turn summary line, `bye` at end of input or `/exit`/`/quit`; Python's banner (a Rich rounded panel, checked against Rich's own rendering) when stdout is a terminal; startup notes (resume, memory, MCP, tool-name collisions, sandbox, session id) and MCP notes polled before each prompt; `/help` (checked against Rich), `/config`, `/config model`, `/config mcp`, `/models`, `/model`, `/tools` (with each disconnected MCP server's status), `/skills`, `/memory`, `/mode` (Python's ask, auto, deny cycle), `/cost`, `/sessions`, `/resume` (by id or unique prefix), and `/clear`, with Python's messages; the approval prompt on stdout at a terminal; `@path` mentions jailed to the workspace and inlined as fenced blocks (Python's pattern, size cap `[tools] mention_max_bytes`, binary refusal, directory listings, and refusals shown and sent), with the trace recording the typed line; the prompt history file (`[ui] history_file`, `history_size`) with bash's rules and Python's escaping, shared with Python; `[ui]` (including the legacy `status_line` key), `[model] router`, and `[model.route]` read. Turns can be cancelled, ported from `Harness.cancel()` and its safe points: before each model call, while a response streams (a stalled stream is woken), and between tool calls, never inside one; a cancelled turn shows `[cancelled]`, keeps the partial exchange, is saved in the `error` phase, and records `turn_end` with status and reason `cancelled`. In the REPL, Ctrl+C cancels the running turn and starts a fresh line at the prompt
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **214 passed on Windows** (49 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 21 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **243 passed on Windows** (64 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 24 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
+- Live REPL check (2026-10-26, `openrouter:openai/gpt-4o-mini`, piped input): a turn mentioning `@shopping.txt` sent the file inline (the saved session holds the fenced block, titled with the typed text), the model answered with three items, and `/cost` and `/tools` reported the session; Ctrl+C at a real terminal is left to manual testing
 - Live MCP-over-HTTP check (2026-10-26, `openrouter:openai/gpt-4o-mini`): with the test server in streamable HTTP mode, `mcp tools` listed its tools, and in a `run` the model called `get_prompt` and described the prompt, including its non-text block; the server logged a session `DELETE` from each agent86 process
 - Live MCP check (2026-10-26, `openrouter:openai/gpt-4o-mini`): with the test MCP server configured, `mcp tools` listed its eight tools; in a `run`, the model first called `mcp__test__add` with no arguments (its schema was still deferred), got the missing-argument error, called it again with both numbers, and reported 5555 (3 steps)
 - Live flight-recorder check (2026-10-26): after a `run` that listed a directory, `trace show` listed the turn's five events with local times, token counts, and details
@@ -87,23 +89,22 @@ Local validation completed successfully:
 
 ### Not implemented
 
-The project is **not yet a usable agent**. It currently has no:
+The agent works end to end, but it does not yet have:
 
-- Config sections other than `[model]`, `[limits]`, `[sandbox] mode`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
+- Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory] enabled`/`path`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Anthropic, Ollama, and llama.cpp providers
-- Side-effecting tools (`write_file`, `edit_file`, `run_command`, `python_exec`), `web_fetch`, memory, skills, and delegation tools
-- Guardrails, approvals, or sandbox executors
-- Episodic and semantic memory, or OpenTelemetry span export (`[observability] otel`)
-- Interactive terminal interface
+- Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
+- Context-window fitting and compaction of long conversations
+- Memory, skills, and delegation tools, and skills themselves
+- Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
+- Python's full-screen terminal interface (Textual): the status footer, key bindings, the command palette, mention completion, and the model, MCP, session, and approval screens
 - Local embedding backend
 
 ### Known `run` differences from Python
 
-- No tools are offered. The system prompt is the identity plus the environment line, which is what Python sends when no skills are installed, no MCP servers are configured, and episodic memory has nothing to recall. Those three optional sections are not ported.
+- The system prompt is the identity, the environment line, and the MCP section when servers are live. Python also adds installed skills and an episodic recall note, which are not ported.
 - The environment line reports the Rust crate version (`agent86 v0.1.0`), not Python's (`v1.0.0`).
-- Answers cut off by `max_tokens` are not continued automatically, and the egress guardrail is not applied.
-- The session id is ephemeral and is not persisted; `--session`/`-s`, `--yes`, `--sandbox`, `--approval`, `--resume`, and `--plain` are not accepted yet.
-- With no subcommand, Python opens the REPL; Rust prints a not-implemented message and exits 2.
+- `--sandbox` is not accepted (`AGENT86_SANDBOX` and `[sandbox] mode` are).
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
 - `agent86 keys` has no Python CLI equivalent; Python stores keys from its interactive `/config model` screen. Re-saving an account on Windows does not leave Python's stale `<account>@agent86` copy of the old key behind.
 - The missing-key error names the keyring entry to create (service `agent86`, account `<provider>`) instead of pointing at `/config model`.
@@ -111,17 +112,29 @@ The project is **not yet a usable agent**. It currently has no:
 - The model-error hint suggests `--model` and an API key instead of the `agent86 models` command, which is not ported. The malformed-config hint does not mention `agent86 config path` for the same reason.
 - Rich wraps stderr at 80 columns when it is not a terminal; Rust does not wrap. stdout, including `--json` output (2-space indent, non-ASCII unescaped), is unaffected.
 
+### Known REPL differences from Python
+
+- The plain loop is the only surface. Python opens its full-screen Textual app when `[ui] tui` is on and stdin and stdout are terminals, and falls back to the plain loop otherwise; `--plain`, `AGENT86_PLAIN`, and `[ui] tui` are accepted but change nothing yet, and no "TUI unavailable" note is printed.
+- Ctrl+C during a turn cancels it at the next safe point (`[cancelled]`, saved, traced as cancelled), which is what Python's full-screen app does with its cancel key. Python's plain loop instead raises `KeyboardInterrupt`, prints `interrupted`, and abandons the turn without closing or saving it. A running tool is never interrupted: the cancel takes effect when it finishes.
+- Ctrl+C at an approval prompt does not decline; the prompt waits for an answer and the turn stops before the next call. Python declines.
+- A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
+- `/config` prints the merged TOML layers (built-in defaults for the modelled sections, the config files, and overrides) as JSON, not Python's full pydantic dump with every default.
+- `/config model` and `/config mcp` say the full-screen interface is not ported and point at `/model`, `agent86 keys`, and `agent86 mcp list`; Python's plain loop points at its full-screen app.
+- `/skills` always reports `no skills discovered`, and `/memory`'s episode and fact counts stay at whatever Python wrote, because neither is ported.
+- `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
+- `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
+- Answers are printed as plain text, as in Python's plain loop; the Markdown rendering behind `[ui] markdown` belongs to the full-screen app.
+
 ### Known loop differences from Python
 
 - Python also offers memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
 - The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
-- Tool-call arguments are not egress-scanned; Python only records those findings in its flight recorder, which is not ported.
-- There is no cancellation (Ctrl-C ends the process).
+- A cancel also wakes a response that has stopped streaming; Python checks only as each delta arrives.
 
 ### Known approval differences from Python
 
 - The approval prompt is written to stderr; Python writes it to stdout, which would corrupt `run --json` output when a terminal is attached. The preview is shown as plain text, without Rich's syntax highlighting.
-- Ctrl+C at the prompt ends the process; Python treats it as declining.
+- Ctrl+C at the `run` prompt ends the process; Python treats it as declining.
 
 ### Known guardrail differences from Python
 
