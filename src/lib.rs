@@ -9,6 +9,7 @@ pub mod agent;
 pub mod approval;
 pub mod config;
 pub mod difflib;
+pub mod guardrails;
 pub mod keys;
 pub mod pricing;
 pub mod prompt;

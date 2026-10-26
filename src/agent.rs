@@ -8,11 +8,15 @@
 //!
 //! Side-effecting calls pass through the approval gate before they run.
 //!
-//! Not ported yet: guardrails, context-window fitting and compaction, cancellation, sub-agents, and
+//! Guardrails scan the goal, each answer, and each tool observation.
+//!
+//! Not ported yet: context-window fitting and compaction, cancellation, sub-agents, and
 //! persistence.
 
 use crate::approval::ApprovalGate;
+use crate::config::EgressMode;
 use crate::config::LimitsConfig;
+use crate::guardrails::Guardrails;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
 use crate::tools::{ToolContext, ToolRegistry};
@@ -137,6 +141,8 @@ pub struct Harness<'a> {
     pub max_tokens: u32,
     /// Decides whether side-effecting calls may run.
     pub gate: ApprovalGate,
+    /// Ingress, egress, and observation scanning.
+    pub guardrails: Guardrails,
 }
 
 impl Harness<'_> {
@@ -154,8 +160,36 @@ impl Harness<'_> {
             on_text(text);
         };
 
-        let mut breaker = CircuitBreaker::new(&self.limits);
         let mut summary = TurnSummary::default();
+
+        // Ingress guardrail on the user's input.
+        let report = self.guardrails.inspect_ingress(goal);
+        if report.flagged() {
+            if self.guardrails.should_block(&report) {
+                emit(&format!(
+                    "Refused: input tripped the ingress guardrail ({}).",
+                    report.summary()
+                ));
+                summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
+                return Ok(RunOutput {
+                    session_id: new_session_id(),
+                    output,
+                    steps: 0,
+                    usage: Usage::default(),
+                    turn: Some(summary),
+                });
+            }
+            emit(&format!(
+                "[guardrail] input flagged: {}\n",
+                report.summary()
+            ));
+        }
+
+        // Redact mode cannot stream: text inspected only after it was shown has
+        // already leaked. Each step's text is held back and replayed redacted.
+        let buffering = self.guardrails.egress == EgressMode::Redact;
+
+        let mut breaker = CircuitBreaker::new(&self.limits);
         let mut messages = vec![message(Role::User, goal)];
         let mut steps = 0u64;
         let mut usage = Usage::default();
@@ -182,7 +216,7 @@ impl Harness<'_> {
                 let mut completion = None;
                 while let Some(delta) = stream.next().await {
                     let delta = delta?;
-                    if !delta.text.is_empty() {
+                    if !delta.text.is_empty() && !buffering {
                         emit(&delta.text);
                     }
                     if delta.done && delta.completion.is_some() {
@@ -199,7 +233,24 @@ impl Harness<'_> {
             summary.steps = u64::from(breaker.steps());
             summary.add_usage(&completion.usage);
             let step_usage = completion.usage;
-            let text = completion.text;
+
+            // Egress guardrail on the model's text. In redact mode the redacted copy
+            // is what everything downstream sees: the output and the history.
+            let (egress, redacted) = self.guardrails.inspect_egress(&completion.text);
+            let text = if buffering {
+                if !redacted.is_empty() {
+                    emit(&redacted);
+                }
+                redacted
+            } else {
+                completion.text
+            };
+            if egress.flagged() {
+                emit(&format!(
+                    "\n[guardrail] output flagged: {}\n",
+                    egress.summary()
+                ));
+            }
             let tool_calls = completion.tool_calls;
             messages.push(Message {
                 tool_calls: tool_calls.clone(),
@@ -247,7 +298,7 @@ impl Harness<'_> {
                 messages.push(Message {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
-                    ..message(Role::Tool, &observation(result))
+                    ..message(Role::Tool, &self.guardrails.observe(observation(result)))
                 });
                 emit(&format!("[tool] {} -> {}\n", call.name, summarize(result)));
                 breaker.record_tool_result(result.ok)?;

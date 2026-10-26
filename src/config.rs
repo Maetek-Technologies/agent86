@@ -41,6 +41,9 @@ mode = "subprocess"
 
 [guardrails]
 approval = "ask"
+ingress = "warn"
+egress = "warn"
+scan_observations = true
 
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
@@ -100,11 +103,39 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
 }
 
-/// Safety settings (`[guardrails]`). Only `approval` is read so far.
+/// Safety settings (`[guardrails]`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GuardrailsConfig {
     /// What happens before a side-effecting tool runs: `auto`, `ask`, or `deny`.
     pub approval: ApprovalMode,
+    /// Scanning of user input for injection and PII.
+    pub ingress: IngressMode,
+    /// Scanning of model output for secrets and PII.
+    pub egress: EgressMode,
+    /// Wrap tool output that looks like injected instructions as untrusted data.
+    pub scan_observations: bool,
+}
+
+/// `[guardrails] ingress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressMode {
+    Off,
+    /// Scan and report findings.
+    Warn,
+    /// Also refuse turns carrying prompt injection.
+    Block,
+}
+
+/// `[guardrails] egress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressMode {
+    Off,
+    /// Scan and report findings.
+    Warn,
+    /// Also rewrite secrets and PII out of the text.
+    Redact,
 }
 
 /// Where tool code runs (`[sandbox]`). Only `mode` is read so far.
