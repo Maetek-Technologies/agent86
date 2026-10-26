@@ -119,3 +119,127 @@ mod tests {
         }
     }
 }
+
+/// Format `value` exactly as Python's `json.dumps(value, ensure_ascii=...)` does.
+///
+/// Python's defaults: `", "` and `": "` separators, keys in insertion order
+/// (preserved by `serde_json`'s `preserve_order` feature), floats via `repr()`,
+/// and with `ensure_ascii` every non-ASCII character escaped as `\uXXXX`
+/// (UTF-16 surrogate pairs above the Basic Multilingual Plane).
+pub fn python_json_dumps(value: &serde_json::Value, ensure_ascii: bool) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value, ensure_ascii);
+    out
+}
+
+fn write_value(out: &mut String, value: &serde_json::Value, ensure_ascii: bool) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => match (number.as_i64(), number.as_u64(), number.as_f64()) {
+            (Some(int), _, _) => out.push_str(&int.to_string()),
+            (None, Some(int), _) => out.push_str(&int.to_string()),
+            (None, None, Some(float)) if float.is_finite() => {
+                out.push_str(&python_float_repr(float));
+            }
+            _ => out.push_str(&number.to_string()),
+        },
+        Value::String(text) => write_string(out, text, ensure_ascii),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_value(out, item, ensure_ascii);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_string(out, key, ensure_ascii);
+                out.push_str(": ");
+                write_value(out, item, ensure_ascii);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_string(out: &mut String, text: &str, ensure_ascii: bool) {
+    const BACKSLASH: char = '\x5c';
+    out.push('"');
+    for ch in text.chars() {
+        // Python's short escapes; everything else below 0x20 (and, with
+        // ensure_ascii, everything non-ASCII) becomes a 4-digit hex escape.
+        let short = match ch {
+            '"' => Some('"'),
+            BACKSLASH => Some(BACKSLASH),
+            '\x0a' => Some('n'),
+            '\x0d' => Some('r'),
+            '\x09' => Some('t'),
+            '\x08' => Some('b'),
+            '\x0c' => Some('f'),
+            _ => None,
+        };
+        if let Some(letter) = short {
+            out.push(BACKSLASH);
+            out.push(letter);
+        } else if (ch as u32) < 0x20 || (ensure_ascii && !ch.is_ascii()) {
+            let mut units = [0u16; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                out.push(BACKSLASH);
+                out.push_str(&format!("u{unit:04x}"));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('"');
+}
+
+#[cfg(test)]
+mod dumps_tests {
+    use super::python_json_dumps;
+    use serde_json::json;
+
+    /// `|` stands for a backslash, keeping escape sequences out of the source.
+    fn esc(text: &str) -> String {
+        text.replace('|', "\x5c")
+    }
+
+    #[test]
+    fn dumps_matches_python_json_dumps() {
+        // Expected strings were produced by CPython's json.dumps.
+        let value = json!({
+            "path": "caf\u{e9}/\u{fc}.txt",
+            "n": 1,
+            "x": 1.5e-05,
+            "list": [true, null],
+            "tab": "a\tb\u{1}",
+            "quote": "say \"hi\" \x5c",
+        });
+        assert_eq!(
+            python_json_dumps(&value, false),
+            esc(
+                r#"{"path": "café/ü.txt", "n": 1, "x": 1.5e-05, "list": [true, null], "tab": "a|tb|u0001", "quote": "say |"hi|" ||"}"#
+            )
+        );
+        assert_eq!(
+            python_json_dumps(&value, true),
+            esc(
+                r#"{"path": "caf|u00e9/|u00fc.txt", "n": 1, "x": 1.5e-05, "list": [true, null], "tab": "a|tb|u0001", "quote": "say |"hi|" ||"}"#
+            )
+        );
+        assert_eq!(
+            python_json_dumps(&json!({"e": "\u{1f600}"}), true),
+            esc(r#"{"e": "|ud83d|ude00"}"#)
+        );
+        assert_eq!(python_json_dumps(&json!({}), false), "{}");
+    }
+}

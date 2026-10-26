@@ -5,7 +5,7 @@ mod support;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use support::{fixture, MockServer, Reply};
+use support::{fixture, sse_text, sse_tool_calls, MockServer, Reply};
 
 const TEST_KEY: &str = "sk-test-0123456789abcdefghij";
 
@@ -141,23 +141,24 @@ async fn run_json_emits_exactly_one_object_with_the_contract_fields() {
     let raw = stdout(&output);
     let document: Value = serde_json::from_str(&raw).unwrap();
 
+    // serde_json's preserve_order keeps document order, so this checks Python's order.
     let keys: Vec<&String> = document.as_object().unwrap().keys().collect();
-    let mut expected = ["session_id", "output", "steps", "usage", "turn"];
-    expected.sort_unstable();
-    assert_eq!(keys, expected, "serde_json sorts keys; this checks the set");
-    let positions: Vec<usize> = [
-        "\"session_id\"",
-        "\"output\"",
-        "\"steps\"",
-        "\"usage\"",
-        "\"turn\"",
-    ]
-    .iter()
-    .map(|key| raw.find(key).unwrap())
-    .collect();
-    assert!(
-        positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "key order: {raw}"
+    assert_eq!(keys, ["session_id", "output", "steps", "usage", "turn"]);
+    let turn_keys: Vec<&String> = document["turn"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        turn_keys,
+        [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "cost_usd",
+            "steps",
+            "tool_calls",
+            "duration_s",
+            "compactions",
+            "continuations",
+        ]
     );
 
     let session_id = document["session_id"].as_str().unwrap();
@@ -533,5 +534,54 @@ fn keys_set_rejects_empty_and_repeated_pastes() {
     assert!(
         !errors.contains(key),
         "the key must never be echoed: {errors}"
+    );
+}
+
+#[tokio::test]
+async fn run_uses_workspace_tools_and_reports_them_inline() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("call_1", "list_dir", "{}")]),
+        sse_text("There is a config folder.", "stop"),
+        sse_tool_calls(&[("call_1", "list_dir", "{}")]),
+        sse_text("There is a config folder.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("tools", &server);
+
+    let text = workspace.run(&["run", "What is here?"]).await;
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert_eq!(
+        stdout(&text),
+        "\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\nThere is a config folder.\n"
+    );
+    assert!(
+        stderr(&text).starts_with("— 2 steps · 1 tool · "),
+        "{}",
+        stderr(&text)
+    );
+
+    let json = workspace.run(&["run", "--json", "What is here?"]).await;
+    let document: Value = serde_json::from_str(&stdout(&json)).unwrap();
+    // As in Python, the JSON output carries the tool notices too.
+    assert_eq!(
+        document["output"],
+        "\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\nThere is a config folder."
+    );
+    assert_eq!(document["steps"], 2);
+    assert_eq!(document["turn"]["tool_calls"], 1);
+}
+
+#[tokio::test]
+async fn a_tripped_circuit_exits_1_without_the_model_hint() {
+    let server = MockServer::start(vec![sse_tool_calls(&[("call_1", "list_dir", "{}")])]).await;
+    let workspace = Workspace::with_mock_provider("circuit", &server);
+    workspace.append_project_config("\n[limits]\nmax_steps = 1\n");
+
+    let output = workspace.run(&["run", "loop"]).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        "\nerror: Circuit tripped: step budget reached (1 steps)\n"
     );
 }

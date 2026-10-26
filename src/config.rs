@@ -28,7 +28,12 @@ const DEFAULTS: &str = r#"
 default = "anthropic:claude-opus-4-8"
 
 [limits]
+max_steps = 40
+max_cost_usd = 5.0
+max_wall_clock_s = 900
+max_consecutive_errors = 3
 max_output_tokens = 8192
+parallel_tools = true
 
 [sandbox]
 mode = "subprocess"
@@ -77,7 +82,17 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LimitsConfig {
+    /// Model calls one turn may make before the circuit trips.
+    pub max_steps: u32,
+    /// Cumulative cost (USD) at which the circuit trips; `0` disables the cap.
+    pub max_cost_usd: f64,
+    /// Seconds one turn may run before the circuit trips; `0` disables the limit.
+    pub max_wall_clock_s: u64,
+    /// Failed tool results tolerated in a row; one more trips the circuit.
+    pub max_consecutive_errors: u32,
     pub max_output_tokens: u32,
+    /// Run a step's read-only tool calls concurrently.
+    pub parallel_tools: bool,
 }
 
 /// Where tool code runs (`[sandbox]`). Only `mode` is read so far.

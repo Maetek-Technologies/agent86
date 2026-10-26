@@ -75,6 +75,49 @@ impl MockServer {
     }
 }
 
+/// An OpenAI-style SSE reply that streams `text` and ends with `finish_reason`.
+pub fn sse_text(text: &str, finish_reason: &str) -> Reply {
+    let chunks = [
+        serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
+        serde_json::json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
+    ];
+    Reply::Sse(sse_body(&chunks))
+}
+
+/// An OpenAI-style SSE reply asking for tool calls, each `(id, name, raw arguments)`.
+pub fn sse_tool_calls(calls: &[(&str, &str, &str)]) -> Reply {
+    let fragments: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            serde_json::json!({
+                "index": index,
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        })
+        .collect();
+    let chunks = [
+        serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": fragments}, "finish_reason": null}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        serde_json::json!({"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 8}}),
+    ];
+    Reply::Sse(sse_body(&chunks))
+}
+
+fn sse_body(chunks: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for chunk in chunks {
+        body.push_str("data: ");
+        body.push_str(&chunk.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
 /// Read a fixture from `tests/fixtures`.
 pub fn fixture(path: &str) -> String {
     let full = format!("{}/tests/fixtures/{path}", env!("CARGO_MANIFEST_DIR"));
