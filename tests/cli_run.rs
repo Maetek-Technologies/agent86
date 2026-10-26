@@ -1000,3 +1000,78 @@ fn trace_commands_handle_empty_traces_and_bad_options() {
     assert_eq!(format.status.code(), Some(2));
     assert!(stderr(&format).contains("unknown format 'xml' (jsonl | json | otlp-json)"));
 }
+
+/// `python3` or `python`, whichever runs.
+fn python() -> Option<&'static str> {
+    ["python3", "python"].into_iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+}
+
+#[tokio::test]
+async fn run_offers_and_calls_mcp_tools() {
+    let Some(python) = python() else {
+        return;
+    };
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("call_1", "mcp__test__add", r#"{"a": 2, "b": 3}"#)]),
+        sse_text("It is 5.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("mcp", &server);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("mcp")
+        .join("server.py");
+    workspace.append_project_config(&format!(
+        "
+[mcp.servers.test]
+command = '{python}'
+args = ['{}']
+",
+        script.display()
+    ));
+
+    let output = workspace.run(&["run", "What is 2 + 3?"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).ends_with("It is 5.\n"),
+        "{}",
+        stdout(&output)
+    );
+
+    let requests = server.requests();
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains(
+            "Sandbox: subprocess.
+
+MCP servers (every tool listed is callable now;"
+        ),
+        "{system}"
+    );
+    assert!(
+        system.contains("- test: mcp__test__echo, mcp__test__add,"),
+        "{system}"
+    );
+    let add = |request: usize| {
+        requests[request].body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "mcp__test__add")
+            .unwrap()["function"]
+            .clone()
+    };
+    // Deferred in the first request, materialised by the call for the next.
+    assert_eq!(add(0)["parameters"]["properties"], serde_json::json!({}));
+    assert_eq!(
+        add(1)["parameters"]["required"],
+        serde_json::json!(["a", "b"])
+    );
+    assert_eq!(requests[1].body["messages"][3]["content"], "5");
+}

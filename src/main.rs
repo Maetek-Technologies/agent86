@@ -3,6 +3,7 @@ use agent86::approval::{terminal_prompt_if_interactive, ApprovalGate};
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::guardrails::Guardrails;
 use agent86::keys;
+use agent86::mcp::McpManager;
 use agent86::observability::{
     otlp_document, parse_since, python_repr_value, read_trace, trace_generations, Recorder,
     TraceFilter, SPAN_KINDS,
@@ -15,7 +16,7 @@ use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::session::{expand_home, AgentState, SessionStore};
 use agent86::tools::sandbox::build_executor;
 use agent86::tools::web::WebSettings;
-use agent86::tools::{builtin_registry, ToolContext};
+use agent86::tools::{builtin_registry, Tool, ToolContext};
 use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
 use agent86::types::ModelRef;
@@ -80,6 +81,19 @@ enum Command {
     /// Store or delete provider API keys in the OS keyring.
     #[command(subcommand)]
     Keys(KeysCommand),
+
+    /// Manage MCP servers.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// List configured MCP servers.
+    List,
+
+    /// Start configured MCP servers and list the tools they expose.
+    Tools,
 }
 
 #[derive(Subcommand)]
@@ -180,6 +194,7 @@ fn main() -> ExitCode {
         }
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
+        Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
         None => {
             eprintln!(
                 "agent86: the interactive REPL is not implemented yet in the Rust port; \
@@ -284,12 +299,26 @@ fn run(
             state
         }
     };
+    // MCP servers that fail to start contribute no tools; `agent86 mcp tools` says why.
+    let mut registry = builtin_registry();
+    let mut system = build_system_prompt(config);
+    if let Some(manager) = McpManager::start(config) {
+        let section = manager.mount(&mut registry);
+        if !section.is_empty() {
+            system.content = format!(
+                "{}
+
+{section}",
+                system.content
+            );
+        }
+    }
     let harness = Harness {
         provider: provider.as_ref(),
-        registry: builtin_registry(),
+        registry,
         context,
         limits: config.limits.clone(),
-        system: build_system_prompt(config),
+        system,
         max_tokens,
         // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
         // there is no prompt, so `ask` declines them unless --yes was given.
@@ -348,6 +377,97 @@ fn run(
         }
     }
     ExitCode::SUCCESS
+}
+
+fn mcp_command(config: &Config, command: McpCommand, stderr: &Stderr) -> ExitCode {
+    match command {
+        McpCommand::List => {
+            if config.mcp_servers.is_empty() {
+                stdout_dim(
+                    "No MCP servers configured. Add an `[mcp_servers.<name>]` block to your                      config file.",
+                    stderr,
+                );
+                return ExitCode::SUCCESS;
+            }
+            let rows: Vec<Vec<String>> = config
+                .mcp_servers
+                .iter()
+                .map(|(name, server)| {
+                    let endpoint = server.url.clone().unwrap_or_else(|| {
+                        std::iter::once(server.command.clone().unwrap_or_default())
+                            .chain(server.args.iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .trim()
+                            .to_owned()
+                    });
+                    vec![
+                        name.clone(),
+                        server.transport().to_owned(),
+                        if server.enabled { "yes" } else { "no" }.to_owned(),
+                        endpoint,
+                    ]
+                })
+                .collect();
+            print_table(&["Name", "Transport", "Enabled", "Endpoint"], &rows);
+        }
+        McpCommand::Tools => {
+            let Some(manager) = McpManager::start(config) else {
+                stdout_dim(
+                    "No MCP servers configured (or MCP disabled). `agent86 mcp list` shows what                      is configured and whether each is enabled.",
+                    stderr,
+                );
+                return ExitCode::SUCCESS;
+            };
+            // One line per failed server, so none is skimmed past.
+            for note in &manager.notes {
+                stderr.warn(note);
+            }
+            let rows: Vec<Vec<String>> = manager
+                .tools()
+                .iter()
+                .map(|tool| vec![tool.name().to_owned(), tool.description().to_owned()])
+                .collect();
+            if rows.is_empty() {
+                stdout_dim("No MCP tools discovered.", stderr);
+            } else {
+                print_table(&["Tool", "Description"], &rows);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// A plain left-aligned table; Python renders the same columns as a Rich table.
+fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let render = |cells: Vec<&str>| {
+        let last = cells.len() - 1;
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                if index == last {
+                    (*cell).to_owned()
+                } else {
+                    format!("{cell:<width$}", width = widths[index])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    println!("{}", render(headers.to_vec()));
+    for row in rows {
+        println!("{}", render(row.iter().map(String::as_str).collect()));
+    }
 }
 
 fn trace_command(config: &Config, command: TraceCommand, stderr: &Stderr) -> ExitCode {

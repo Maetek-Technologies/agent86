@@ -378,6 +378,8 @@ impl ToolContext {
 pub struct ToolRegistry {
     /// In registration order, which is the order specs are advertised in.
     tools: Vec<Box<dyn Tool>>,
+    /// Names dropped by [`ToolRegistry::try_register`] because something already owned them.
+    pub collisions: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -391,6 +393,17 @@ impl ToolRegistry {
         }
         self.tools.push(tool);
         Ok(())
+    }
+
+    /// Register `tool` unless its name is taken, recording the clash if it is. The
+    /// lenient path for mounting MCP tools, where one collision must not abort the run.
+    pub fn try_register(&mut self, tool: Box<dyn Tool>) -> bool {
+        if self.get(tool.name()).is_some() {
+            self.collisions.push(tool.name().to_owned());
+            return false;
+        }
+        self.tools.push(tool);
+        true
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

@@ -11,6 +11,7 @@ pub mod config;
 pub mod difflib;
 pub mod guardrails;
 pub mod keys;
+pub mod mcp;
 pub mod observability;
 pub mod pricing;
 pub mod prompt;
