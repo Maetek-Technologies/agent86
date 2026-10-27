@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with part 2 (the inline base) next, and episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with part 2 (the inline base) done and part 3 (the `/` and `@` menus and the pickers) next, and episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -66,12 +66,28 @@ The Python implementation remains the reference and compatibility oracle. This p
 - Added the MCP client over stdio (stage 8, part 1), ported from `tools/mcp_client.py`, `tools/mcp_content.py`, the `${VAR}` expansion in `secrets.py`, `render_mcp_section` in `cognitive/prompt.py`, and the `mcp` commands in `cli.py`: `[mcp] enabled` and `[mcp.servers.<name>]`/`[mcp_servers.<name>]` with Python's fields, defaults, and transport validation messages; a hand-written newline-delimited JSON-RPC client (`initialize` with protocol `2025-06-18`, `notifications/initialized`, paginated `tools/list`, `tools/call`, `ping` answered) for a server started with the scrubbed tool environment plus its own `env`, with `${VAR}` in `args`, `env`, `url`, and `headers` resolved from the environment and then the keyring; `connect_timeout_s`, `call_timeout_s`, and `max_result_chars` with Python's messages; start failures as notes, including the server's redacted stderr tail; tools named `mcp__<server>__<tool>` (sanitized, 64 characters), described `<description> (MCP: <server>)`, side-effecting unless `readOnlyHint`, with the argument schema deferred until first use (ADR 0003) and Python's missing-argument error; Python's content rendering (text, image, audio, embedded resources, resource links); name collisions skipped rather than shadowing; the MCP section of the system message; and `agent86 mcp list` and `agent86 mcp tools`. Tests run a stdlib-only Python MCP server fixture
 - Completed the MCP client (stage 8, part 2): the streamable HTTP transport (POSTed messages answered as JSON or an SSE stream, the `Mcp-Session-Id` and `MCP-Protocol-Version` headers, the optional GET stream for server messages, and a session `DELETE` on close) and the legacy SSE transport (the `endpoint` event, same-origin check, responses on the stream), both with configured `headers`; protocol revision `2025-11-25`, as the Python SDK negotiates; a supervisor per server that, on a mid-session drop, unregisters the server's tools with Python's note (including the stderr tail), reconnects with Python's backoff (5 attempts, 0.5-30 s equal jitter), and re-registers them, with Python's unavailable, reconnecting, and give-up messages; `tools/list_changed` (and the resource and prompt variants) re-listing the tools mid-run, keeping unchanged tool objects and their materialised schemas; progress tokens on `tools/call` and throttled progress notes; resource-update notes; a bounded note log with listeners for a future REPL; the synthetic `list_resources`, `read_resource`, `list_resource_templates`, `subscribe_resource`, `unsubscribe_resource`, `list_prompts`, `get_prompt`, and `complete` tools, gated on the server's declared capabilities, with pydantic's schemas and validation messages (`tests/fixtures/mcp/capability_schemas.json`, from a pydantic mirror of the Python models) and Python's renderings; the MCP section of the system message rebuilt for every request; and the tool registry made shareable (lock-guarded, identity-checked removal) so the manager can update it during a run, as Python's is. As in Python, `tools/list` reads one page
 - Added the interactive REPL (stage 9, part 1), ported from `ui/repl.py` (the plain loop), `ui/history.py`, `tui/mentions.py`, and the surface-shared registry in `tui/commands.py`: `agent86` with no subcommand, plus `--resume`/`-r` and `--plain`; the `agent86> ` prompt, the `agent86 ` answer label, dim harness notices, `(no response)`, `error:` lines that leave the loop running, the per-turn summary line, `bye` at end of input or `/exit`/`/quit`; Python's banner (a Rich rounded panel, checked against Rich's own rendering) when stdout is a terminal; startup notes (resume, memory, MCP, tool-name collisions, sandbox, session id) and MCP notes polled before each prompt; `/help` (checked against Rich), `/config`, `/config model`, `/config mcp`, `/models`, `/model`, `/tools` (with each disconnected MCP server's status), `/skills`, `/memory`, `/mode` (Python's ask, auto, deny cycle), `/cost`, `/sessions`, `/resume` (by id or unique prefix), and `/clear`, with Python's messages; the approval prompt on stdout at a terminal; `@path` mentions jailed to the workspace and inlined as fenced blocks (Python's pattern, size cap `[tools] mention_max_bytes`, binary refusal, directory listings, and refusals shown and sent), with the trace recording the typed line; the prompt history file (`[ui] history_file`, `history_size`) with bash's rules and Python's escaping, shared with Python; `[ui]` (including the legacy `status_line` key), `[model] router`, and `[model.route]` read. Turns can be cancelled, ported from `Harness.cancel()` and its safe points: before each model call, while a response streams (a stalled stream is woken), and between tool calls, never inside one; a cancelled turn shows `[cancelled]`, keeps the partial exchange, is saved in the `error` phase, and records `turn_end` with status and reason `cancelled`. In the REPL, Ctrl+C cancels the running turn and starts a fresh line at the prompt
+- Added the inline interactive interface (stage 9, part 2; [ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), the default for `agent86` at a terminal. It reworks Python's full-screen `tui/app.py` to render in Claude Code's style: the conversation goes into the terminal's own scrollback, and only a live region at the bottom is redrawn. It has:
+  - the compact banner (version and model) and the startup notes
+  - a bordered multi-line input box: Enter sends, Shift+Enter or Ctrl+J adds a line, Up and Down walk the shared history from the edge lines, and Escape clears; it is disabled while a turn runs, as in Python
+  - the user's line echoed as `> ...`
+  - the reply streamed under a `⏺` marker, word-wrapped and committed a paragraph at a time (Python's 2,000-character tail limit)
+  - harness notices, dim, on their own line
+  - each tool call shown while it runs, then committed as `⏺ name(args)` and `⎿ summary` when its result lands (Python's 72- and 100-character previews; red when the call failed)
+  - a spinner line with the phase (`thinking`, `running <tool>`, `cancelling`) and the elapsed time
+  - Python's status line (model, context gauge, tokens, cost, sandbox, approval mode, `[Shift+Tab]`), which drops the hint, then the tokens, then the gauge as the terminal narrows
+  - side-effecting calls asked in an approval panel in place of the input box: the tool name, the argument summary, and the tool's detail, such as the diff; answered with `y`, `n`, Escape, or the arrows and Enter
+  - Escape or Ctrl+C cancelling a running turn at its next safe point, and Shift+Tab cycling the approval mode, even mid-turn
+  - MCP notes shown as they arrive, Python's error line with the `see agent86 trace show -s <id>` hint, and the turn summary
+  - slash commands run through the same registry as the plain loop; `/clear` clears the screen
+  - Python's surface selection: `--plain`, `AGENT86_PLAIN`, `[ui] tui = false`, or a non-terminal stdin or stdout selects the plain loop. A terminal that can't host the interface falls back to it with Python's `TUI could not start (...)` note; the main case is Git Bash's mintty, whose pipes are not consoles.
+  - The harness now reports structured turn events (text, tool call, tool result) alongside the text it streams.
+  - The status line's context window comes from a port of Python's `context_window_for`, with `[model.context_window]` overrides.
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **243 passed on Windows** (64 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 24 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **277 passed on Windows** (97 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -97,7 +113,7 @@ The agent works end to end, but it does not yet have:
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
 - Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
-- The interactive interface that replaces Python's full-screen Textual app: the status line, key bindings, the command menu, mention completion, Markdown replies, and the model, provider, key, MCP, session, and approval screens. It is planned in [docs/INTERFACE.md](INTERFACE.md).
+- The rest of the interactive interface (stage 9, parts 3 to 6, planned in [docs/INTERFACE.md](INTERFACE.md)): the `/` command menu, `@` path completion, the mode, model, and session pickers, rebuilding the transcript on `/resume`, Markdown replies, coloured diffs, the Ctrl+O transcript view, and the model, provider, key, and MCP management screens
 - Local embedding backend
 
 ### Known `run` differences from Python
@@ -114,8 +130,7 @@ The agent works end to end, but it does not yet have:
 
 ### Known REPL differences from Python
 
-- The interactive interface will render inline, in Claude Code's style, rather than as Python's full-screen Textual app ([ADR 0001](adr/0001-inline-terminal-interface.md)). Its commands, messages, approvals, files, and cancellation stay Python's. The differences it introduces are planned in [docs/INTERFACE.md](INTERFACE.md) and will be listed here as each slice lands.
-- The plain loop is the only surface so far. Python opens its full-screen Textual app when `[ui] tui` is on and stdin and stdout are terminals, and falls back to the plain loop otherwise; `--plain`, `AGENT86_PLAIN`, and `[ui] tui` are accepted but change nothing yet, and no "TUI unavailable" note is printed.
+- These apply to the plain loop (`--plain`, piped input, or a terminal that cannot host the interface). The interface's own differences are listed in the next section.
 - Ctrl+C during a turn cancels it at the next safe point (`[cancelled]`, saved, traced as cancelled), which is what Python's full-screen app does with its cancel key. Python's plain loop instead raises `KeyboardInterrupt`, prints `interrupted`, and abandons the turn without closing or saving it. A running tool is never interrupted: the cancel takes effect when it finishes.
 - Ctrl+C at an approval prompt does not decline; the prompt waits for an answer and the turn stops before the next call. Python declines.
 - A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
@@ -125,6 +140,28 @@ The agent works end to end, but it does not yet have:
 - `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
 - `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
 - Answers are printed as plain text, as in Python's plain loop; the Markdown rendering behind `[ui] markdown` belongs to the full-screen app.
+
+### Known interface differences from Python
+
+- **Inline, not full-screen** ([ADR 0001](adr/0001-inline-terminal-interface.md)): the interface renders in Claude Code's style rather than as Python's full-screen Textual app, though the text of every message, note, error, and summary is Python's. Differences that follow from that:
+  - The conversation stays in the terminal's scrollback after exit.
+  - Replies and tool calls are marked `⏺` and `⎿`.
+  - The prompt is a bordered box.
+  - The approval request is a numbered panel, not a modal with buttons.
+- **Running tool calls:** a running tool call is shown in the live region until its result lands; Python shows nothing for it until then.
+- **Ctrl+C and Ctrl+D:**
+  - When idle, Ctrl+C clears a draft. On an empty prompt it asks `Press Ctrl+C again to exit` for two seconds; Python quits on the first press.
+  - Ctrl+D on an empty prompt quits.
+  - Ctrl+C while an approval panel is open declines the call and cancels the turn. Python cancels the turn and leaves the modal open until it is answered.
+- **Pasting:** where the terminal delivers a paste as keystrokes (Windows), an Enter with more keys already waiting behind it counts as part of the paste. It adds a line instead of sending the draft.
+- **Not yet ported (planned for parts 3 to 6):**
+  - the `/` and `@` menus
+  - the pickers that a bare `/mode`, `/model`, `/resume`, `/config model`, or `/config mcp` opens; until then these commands behave as in the plain loop
+  - rebuilding the transcript on `/resume`
+  - Markdown replies (answers are plain text)
+  - the Ctrl+O expansion of tool calls
+  - the model, provider, key, and MCP screens
+- **Context window:** the status line doesn't ask OpenRouter's models endpoint for the model's context length, as Python does. Overrides, Ollama's `num_ctx`, and Python's table apply.
 
 ### Known loop differences from Python
 
@@ -266,7 +303,7 @@ Each stage should produce a usable vertical slice and be compared with the Pytho
 Stage 9 is delivered in parts, one PR each. The details and acceptance tests for parts 2 to 6 are in [docs/INTERFACE.md](INTERFACE.md), section 10.
 
 - [x] Part 1: the plain REPL, commands, mentions, history, and turn cancellation
-- [ ] Part 2: the inline base: input box, streaming transcript, tool blocks, spinner, status line, approval panel, cancel and quit keys, and the plain-loop fallback
+- [x] Part 2: the inline base: input box, streaming transcript, tool blocks, spinner, status line, approval panel, cancel and quit keys, and the plain-loop fallback
 - [ ] Part 3: the `/` command menu, `@` path completion, and the mode, model, and session pickers
 - [ ] Part 4: Markdown replies, coloured diffs, and the Ctrl+O transcript view
 - [ ] Part 5: model catalogs, the provider manager, key entry, the connection test, and comment-preserving config write-back

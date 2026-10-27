@@ -33,7 +33,7 @@ The Rust options considered:
 
 ## Decision
 
-**Ruling:** The stage 9 interface renders inline, with ratatui and crossterm, in Claude Code's visual style. It keeps Python's behavior and covers every screen of Python's full-screen app in stages.
+**Ruling:** The stage 9 interface renders inline, on crossterm, in Claude Code's visual style. It keeps Python's behavior and covers every screen of Python's full-screen app in stages.
 
 What stays Python's (the compatibility contract):
 
@@ -69,6 +69,7 @@ Where the interface can't run, it falls back to the plain loop with Python's not
 - **The scrollback is the terminal's.** Its search, selection, and copy work, and the conversation stays on screen after exit. The cost: text already in scrollback is not re-wrapped by the interface when the window is resized (the terminal reflows it or not), and `/clear` clears the screen rather than editing history.
 - **The harness gains a structured turn-event stream.** It covers text, tool start, tool result, notice, and phase. It sits next to the existing text `emit`, so the interface doesn't need to parse `[tool] ...` lines the way Python's `turn_bridge` does. `run` and the plain loop keep printing exactly what they print now.
 - **More code than Textual gives Python for free:** a multi-line input editor, menus, panels, a Markdown-to-terminal renderer, and a full-screen transcript view. `tui-textarea` targets ratatui 0.29, so the editor is our own.
-- **Dependencies:** `ratatui` 0.30 (its MSRV is 1.88, the same as ours), `crossterm` 0.29, and `pulldown-cmark` 0.13; `toml_edit` arrives with config write-back. All of them build on the current MSRV.
-- **Testing:** the interface is built so that its state machine and rendering can be tested without a terminal. Rendering is tested with ratatui's `TestBackend`, and the app is driven by synthetic key events against the mock provider. What only a real terminal shows is covered by a manual checklist per slice.
+- **Dependencies:** `crossterm` 0.29 and `unicode-width` 0.2 (part 2), then `pulldown-cmark` 0.13 (part 4) and `toml_edit` (part 5). All of them build on the current MSRV.
+- **The live region is drawn by our own renderer, not ratatui (decided in part 2).** It works the way Ink draws: it erases the rows it drew last and redraws, then prints finished lines above. A ratatui inline viewport has a fixed height, but the region has to grow and shrink with menus and panels. ratatui 0.30 (MSRV 1.88) remains an option for the full-screen transcript view.
+- **Testing:** the interface is built so that its state machine and rendering can be tested without a terminal. Rendering is tested as text at fixed widths, and the app is driven by synthetic key and turn events. What only a real terminal shows is covered by a manual checklist per slice.
 - **Design and slicing:** `docs/INTERFACE.md` holds the design and the slice plan.

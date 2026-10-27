@@ -3,7 +3,7 @@
 
 mod support;
 
-use agent86::agent::{CancelToken, Harness, HarnessError, CONTINUE_PROMPT};
+use agent86::agent::{CancelToken, Harness, HarnessError, TurnEvent, CONTINUE_PROMPT};
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
 use agent86::config::{EgressMode, IngressMode, LimitsConfig, ObservabilityConfig, RedactMode};
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
@@ -248,6 +248,66 @@ async fn parallel_calls_are_observed_in_call_order() {
     assert_eq!(messages[3]["tool_call_id"], "a");
     assert_eq!(messages[3]["content"], "remember the milk\n");
     assert_eq!(messages[4]["tool_call_id"], "b");
+}
+
+#[tokio::test]
+async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[
+            ("a", "read_file", r#"{"path": "notes.txt"}"#),
+            ("b", "read_file", r#"{"path": "missing.txt"}"#),
+        ]),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("events");
+    let harness = Harness {
+        provider: Box::new(provider(&server)),
+        registry: builtin_registry(),
+        context: ToolContext::new(&workspace.root).unwrap(),
+        limits: limits(),
+        system: system(),
+        max_tokens: 1024,
+        gate: ask_gate(),
+        guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
+        recorder: Recorder::disabled(),
+        mcp: None,
+        cancel: Default::default(),
+    };
+    let mut state = AgentState::new();
+    let mut seen = Vec::new();
+    let mut streamed = String::new();
+    let output = harness
+        .run_turn_events(&mut state, "read both", "read both", |event| {
+            streamed.push_str(event.text());
+            seen.push(match event {
+                TurnEvent::Text(text) => format!("text {text:?}"),
+                TurnEvent::ToolCall { call, .. } => format!("call {} {}", call.id, call.name),
+                TurnEvent::ToolResult {
+                    call,
+                    result,
+                    observation,
+                    ..
+                } => format!("result {} ok={} {observation:?}", call.id, result.ok),
+            });
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        streamed, output,
+        "the events carry exactly the streamed text"
+    );
+    assert_eq!(
+        seen,
+        [
+            "call a read_file",
+            "call b read_file",
+            r#"result a ok=true "remember the milk\n""#,
+            r#"result b ok=false "No such file: missing.txt""#,
+            r#"text "done""#,
+        ]
+    );
 }
 
 #[tokio::test]

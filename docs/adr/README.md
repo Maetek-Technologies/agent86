@@ -17,4 +17,4 @@ When an ADR departs from Python, add the difference to the matching "Known ... d
 
 | ADR | Ruling |
 |---|---|
-| [0001 — The interactive interface renders inline, in Claude Code's style](0001-inline-terminal-interface.md) | Stage 9's interface renders inline (native scrollback plus a live region at the bottom) with ratatui and crossterm, in Claude Code's visual style. It keeps Python's commands, messages, approvals, files, and cancellation, and covers every Python screen in stages. |
+| [0001 — The interactive interface renders inline, in Claude Code's style](0001-inline-terminal-interface.md) | Stage 9's interface renders inline (native scrollback plus a live region at the bottom), on crossterm, in Claude Code's visual style. It keeps Python's commands, messages, approvals, files, and cancellation, and covers every Python screen in stages. |

@@ -63,10 +63,13 @@ pub enum Style {
     Green,
     Yellow,
     Red,
+    BoldRed,
+    DimRed,
+    DimYellow,
 }
 
 impl Style {
-    fn ansi(self) -> &'static str {
+    pub(crate) fn ansi(self) -> &'static str {
         match self {
             Self::Plain => "",
             Self::Dim => "\x1b[2m",
@@ -76,6 +79,9 @@ impl Style {
             Self::Green => "\x1b[32m",
             Self::Yellow => "\x1b[33m",
             Self::Red => "\x1b[31m",
+            Self::BoldRed => "\x1b[1;31m",
+            Self::DimRed => "\x1b[2;31m",
+            Self::DimYellow => "\x1b[2;33m",
         }
     }
 }
@@ -105,6 +111,11 @@ impl Text {
     pub fn append(&mut self, other: Text) -> &mut Self {
         self.spans.extend(other.spans);
         self
+    }
+
+    /// The styled pieces, in order.
+    pub fn spans(&self) -> &[(Style, String)] {
+        &self.spans
     }
 
     /// The text without styling.
@@ -169,7 +180,7 @@ fn table(title: &str, headers: &[&str], rows: &[Vec<(Style, String)>]) -> Text {
 /// The startup identity panel, as Python's `banner(cfg, compact=False)`: a Rich
 /// rounded panel titled `agent86`.
 pub fn banner(config: &Config, version: &str) -> Text {
-    let rows: [Vec<(Style, String)>; 4] = [
+    panel(vec![
         vec![
             (Style::Plain, "version  ".into()),
             (Style::Cyan, version.into()),
@@ -187,7 +198,26 @@ pub fn banner(config: &Config, version: &str) -> Text {
             (Style::Cyan, config.guardrails.approval.as_str().into()),
         ],
         vec![(Style::Dim, "Type /help for commands, /exit to quit.".into())],
-    ];
+    ])
+}
+
+/// The full-screen interface's banner, as Python's `banner(cfg)` (`compact=True`):
+/// the version and the model; the status line reports the rest live.
+pub fn compact_banner(config: &Config, version: &str) -> Text {
+    panel(vec![
+        vec![
+            (Style::Plain, "version  ".into()),
+            (Style::Cyan, version.into()),
+        ],
+        vec![
+            (Style::Plain, "model    ".into()),
+            (Style::Cyan, config.model.default.clone()),
+        ],
+    ])
+}
+
+/// A Rich rounded panel titled `agent86`, as wide as its widest row.
+fn panel(rows: Vec<Vec<(Style, String)>>) -> Text {
     let width = rows
         .iter()
         .map(|row| {
@@ -536,7 +566,7 @@ pub struct Repl {
     /// Built on first use, so constructing a `Repl` never reads the history file.
     history: Option<PromptHistory>,
     /// How far the MCP note log has been shown.
-    mcp_cursor: u64,
+    pub(crate) mcp_cursor: u64,
     /// Launch notes: resume, memory, MCP, collisions, sandbox, and the session id.
     pub startup_notes: Vec<String>,
 }
@@ -636,14 +666,20 @@ impl Repl {
     }
 
     /// Save the session; a failure is not fatal (the conversation goes on unsaved).
-    fn persist(&self, state: &AgentState) {
+    pub(crate) fn persist(&self, state: &AgentState) {
         if let Some(store) = &self.store {
             let _ = store.persist(state);
         }
     }
 
-    fn priced(&self) -> bool {
+    /// Whether the current model has a known price, so a dollar figure means something.
+    pub(crate) fn priced(&self) -> bool {
         self.prices.is_priced(&self.model_ref)
+    }
+
+    /// The current model's `provider:model` ref.
+    pub(crate) fn model_ref(&self) -> &str {
+        &self.model_ref
     }
 
     /// The prompt history both surfaces record into (`[ui] history_file`).
@@ -733,16 +769,16 @@ impl Repl {
     }
 
     fn set_mode(&mut self, arg: &str) -> String {
-        let gate = &mut self.harness.gate;
+        let gate = &self.harness.gate;
         if arg.is_empty() {
-            gate.mode = gate.mode.cycle();
+            gate.set_mode(gate.mode().cycle());
         } else {
             match ApprovalMode::parse(arg) {
-                Some(mode) => gate.mode = mode,
+                Some(mode) => gate.set_mode(mode),
                 None => return format!("unknown mode '{arg}' (ask|auto|deny)"),
             }
         }
-        format!("approval mode: {}", gate.mode.as_str())
+        format!("approval mode: {}", gate.mode().as_str())
     }
 
     fn tools_render(&self) -> String {
@@ -1011,23 +1047,41 @@ impl Console {
     }
 }
 
-/// The entry point: build the session, then run the plain loop on it.
+/// The plain loop's entry point: build the session, then run the loop on it.
 pub fn run_repl(config: Config, resume: Option<&str>, secrets: Box<dyn SecretStore>) {
-    let console = Console::new();
-    // Ask for approvals at the terminal; piped input has nobody to ask, so `ask` declines.
+    if let Some(repl) = start_repl(config, resume, secrets) {
+        plain_loop(repl);
+    }
+}
+
+/// Build the session both surfaces run on, or say why it cannot start.
+///
+/// Approvals are asked at the terminal; piped input has nobody to ask, so `ask`
+/// declines. The full-screen interface replaces the prompt with its own panel.
+pub fn start_repl(
+    config: Config,
+    resume: Option<&str>,
+    secrets: Box<dyn SecretStore>,
+) -> Option<Repl> {
     let prompt = std::io::stdin()
         .is_terminal()
         .then(|| Box::new(stdout_prompt) as ApprovalPrompt);
-    let mut repl = match Repl::new(config, resume, prompt, secrets) {
-        Ok(repl) => repl,
+    match Repl::new(config, resume, prompt, secrets) {
+        Ok(repl) => Some(repl),
         Err(SetupError::Model(message) | SetupError::Workspace(message)) => {
+            let console = Console::new();
             let mut text = Text::styled(Style::Red, "Cannot start:");
             text.push(Style::Plain, format!(" {message}"));
             console.print(&text);
             console.line(Style::Dim, MODEL_HELP);
-            return;
+            None
         }
-    };
+    }
+}
+
+/// Python's plain `input()` loop over an already-built session.
+pub fn plain_loop(mut repl: Repl) {
+    let console = Console::new();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

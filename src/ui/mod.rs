@@ -1,0 +1,436 @@
+//! The interactive interface: Python's full-screen app reworked to render inline,
+//! in Claude Code's style ([ADR 0001](../../docs/adr/0001-inline-terminal-interface.md)).
+//!
+//! The conversation is printed into the terminal's own scrollback; only a live
+//! region at the bottom (the streaming reply, running tools, a spinner, the input
+//! box or an approval panel, and the status line) is redrawn. The commands,
+//! messages, approvals, files, and cancellation are Python's, shared with the plain
+//! loop through [`Repl`].
+//!
+//! Surface selection follows Python's `run_repl`: the session is built once, then
+//! this interface runs on it unless `--plain`, `AGENT86_PLAIN`, `[ui] tui = false`,
+//! or a non-terminal stdin or stdout says otherwise. A terminal that cannot host it
+//! (Git Bash's mintty without winpty) falls back to the plain loop with a note.
+
+mod app;
+mod input;
+mod screen;
+pub mod status;
+mod text;
+
+use crate::agent::Harness;
+use crate::config::Config;
+use crate::mentions::expand_mentions;
+use crate::provider::capabilities::context_window_for;
+use crate::repl::{
+    compact_banner, find_command_for_line, plain_loop, start_repl, Action, Repl, Style,
+};
+use crate::secrets::SecretStore;
+use app::{App, Effect, Request, UiEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use screen::Screen;
+use status::StatusState;
+use std::collections::VecDeque;
+use std::io::{self, IsTerminal};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// How long the event loop waits for a key before redrawing anyway.
+const FRAME: Duration = Duration::from_millis(50);
+
+/// `agent86` with no subcommand: this interface, or the plain loop.
+pub fn run_interactive(
+    config: Config,
+    resume: Option<&str>,
+    plain: bool,
+    secrets: Box<dyn SecretStore>,
+) {
+    let wanted = wants_interface(&config, plain);
+    let Some(mut repl) = start_repl(config, resume, secrets) else {
+        return;
+    };
+    if !wanted {
+        return plain_loop(repl);
+    }
+    let terminal = match Terminal::start() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let mut note = crate::repl::Text::styled(
+                Style::Dim,
+                format!("TUI could not start ({error}); using plain REPL."),
+            );
+            note.push(Style::Plain, "\n");
+            print!("{}", note.render(color_allowed()));
+            return plain_loop(repl);
+        }
+    };
+    let outcome = run(&mut repl);
+    drop(terminal);
+    if let Err(error) = outcome {
+        eprintln!("error: the interface stopped: {error}");
+    }
+}
+
+/// Python's `_use_tui`: not when asked for the plain loop, and only at a terminal.
+fn wants_interface(config: &Config, plain: bool) -> bool {
+    interface_wanted(
+        config.ui.tui,
+        plain || std::env::var_os("AGENT86_PLAIN").is_some_and(|value| !value.is_empty()),
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    )
+}
+
+fn interface_wanted(tui: bool, plain: bool, terminal: bool) -> bool {
+    tui && !plain && terminal
+}
+
+fn color_allowed() -> bool {
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
+/// Raw mode and the terminal features the interface uses, undone on drop (and on
+/// a panic, so a crash never leaves the shell unusable).
+struct Terminal {
+    keyboard_enhanced: bool,
+}
+
+impl Terminal {
+    fn start() -> io::Result<Self> {
+        #[cfg(windows)]
+        windows_console()?;
+        crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        let _ = crossterm::execute!(stdout, event::EnableBracketedPaste);
+        // Lets terminals that support it report Shift+Enter. Windows reports it anyway.
+        let keyboard_enhanced = !cfg!(windows)
+            && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+            && crossterm::execute!(
+                stdout,
+                event::PushKeyboardEnhancementFlags(
+                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )
+            .is_ok();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal(keyboard_enhanced);
+            previous(info);
+        }));
+        Ok(Self { keyboard_enhanced })
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        // The panic hook stays installed: restoring a terminal that is already
+        // restored does nothing.
+        restore_terminal(self.keyboard_enhanced);
+    }
+}
+
+fn restore_terminal(keyboard_enhanced: bool) {
+    let mut stdout = io::stdout();
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(stdout, event::PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(
+        stdout,
+        event::DisableBracketedPaste,
+        crossterm::cursor::Show
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// The interface reads keys from the console and draws with VT sequences. Under
+/// mintty, stdin is a pipe that Rust reports as a terminal but no console reads
+/// from, so that case is refused here and the plain loop is used instead.
+#[cfg(windows)]
+fn windows_console() -> io::Result<()> {
+    use crossterm_winapi::{ConsoleMode, Handle};
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    ConsoleMode::from(Handle::input_handle()?)
+        .mode()
+        .map_err(|_| io::Error::other("stdin is not a console"))?;
+    let output = ConsoleMode::from(Handle::output_handle()?);
+    let mode = output
+        .mode()
+        .map_err(|_| io::Error::other("stdout is not a console"))?;
+    output
+        .set_mode(mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        .map_err(|_| io::Error::other("the console does not support VT sequences"))
+}
+
+/// What the status line shows for the session as it stands.
+fn status_from(repl: &Repl) -> StatusState {
+    let usage = &repl.state.usage;
+    StatusState {
+        model: repl.harness.provider.model().to_owned(),
+        used_tokens: repl
+            .state
+            .steps
+            .last()
+            .map_or(0, |step| step.usage.input_tokens),
+        window: context_window_for(repl.model_ref(), &repl.config),
+        output_tokens: usage.output_tokens,
+        cost_usd: usage.cost_usd,
+        priced: repl.priced(),
+        sandbox: repl.config.sandbox.mode.as_str().to_owned(),
+        approval: repl.harness.gate.mode().as_str().to_owned(),
+        working: false,
+        phase: String::new(),
+        hotkey_hint: "Shift+Tab".to_owned(),
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+    }
+}
+
+fn run(repl: &mut Repl) -> io::Result<()> {
+    let (width, height) = crossterm::terminal::size()?;
+    let mut screen = Screen::new(io::stdout(), color_allowed(), usize::from(width));
+    let (events, inbox) = mpsc::channel::<UiEvent>();
+
+    // Approvals become a panel. The turn's thread waits for the answer; if the
+    // interface goes away first, the dropped sender reads as a decline.
+    let approvals = events.clone();
+    repl.harness.gate.prompt = Some(Box::new(move |tool, preview| {
+        let (reply, answer) = mpsc::channel();
+        let request = UiEvent::Approval {
+            tool: tool.to_owned(),
+            preview: preview.clone(),
+            reply,
+        };
+        approvals.send(request).is_ok() && answer.recv().unwrap_or(false)
+    }));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let mut app = App::new(
+        status_from(repl),
+        repl.state.session_id.clone(),
+        repl.config.ui.spinner,
+    );
+    app.set_size(usize::from(width), usize::from(height));
+    app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+    for note in &repl.startup_notes {
+        app.note(Style::Dim, note);
+    }
+
+    loop {
+        let history = repl.history().entries().to_vec();
+        let request = pump(
+            &mut app,
+            &mut screen,
+            &inbox,
+            &repl.harness,
+            &mut repl.mcp_cursor,
+            &history,
+        )?;
+        let text = match request {
+            Request::Exit => break,
+            Request::TurnDone => continue,
+            Request::Submit(text) => text,
+        };
+        let line = text.trim().to_owned();
+        repl.history().append(&line);
+        app.echo_user(&line);
+        let result = repl.handle_command(&line);
+        match result.action {
+            Action::Exit => break,
+            Action::Noop => {}
+            Action::Handled => {
+                if find_command_for_line(&line).is_some_and(|(entry, _)| entry.name == "/clear") {
+                    // The old exchange is gone from the session, so it leaves the screen too.
+                    app.take_committed();
+                    screen.clear_all()?;
+                    app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+                } else if let Some(render) = &result.render {
+                    app.commit_text(render);
+                }
+            }
+            Action::Turn => {
+                if run_turn(
+                    &mut app,
+                    &mut screen,
+                    repl,
+                    &inbox,
+                    &events,
+                    &runtime,
+                    &line,
+                )? == Request::Exit
+                {
+                    break;
+                }
+            }
+        }
+        app.status = status_from(repl);
+        app.session_id = repl.state.session_id.clone();
+        app.mark_dirty();
+    }
+    let (live, _) = app.live();
+    screen.frame(&app.take_committed(), &live, None)?;
+    screen.clear_live()
+}
+
+/// Run one turn on a worker thread while the interface keeps drawing and taking keys.
+fn run_turn(
+    app: &mut App,
+    screen: &mut Screen<io::Stdout>,
+    repl: &mut Repl,
+    inbox: &mpsc::Receiver<UiEvent>,
+    events: &mpsc::Sender<UiEvent>,
+    runtime: &tokio::runtime::Runtime,
+    line: &str,
+) -> io::Result<Request> {
+    // `@path` mentions are inlined for the model; refusals are shown and sent along.
+    let mentions = expand_mentions(
+        line,
+        &repl.harness.context.policy,
+        repl.config.tools.mention_max_bytes,
+    );
+    for problem in &mentions.errors {
+        app.note(Style::DimYellow, problem);
+    }
+    app.start_turn();
+    let outcome = std::thread::scope(|scope| {
+        let Repl {
+            harness,
+            state,
+            mcp_cursor,
+            ..
+        } = &mut *repl;
+        let harness: &Harness = harness;
+        let worker_events = events.clone();
+        let prompt = mentions.prompt;
+        scope.spawn(move || {
+            let result = runtime.block_on(harness.run_turn_events(state, &prompt, line, |event| {
+                let _ = worker_events.send(event.into());
+            }));
+            let error = result
+                .err()
+                .map(|error| (error.python_type().to_owned(), error.to_string()));
+            let _ = worker_events.send(UiEvent::Finished(error));
+        });
+        let outcome = pump(app, screen, inbox, harness, mcp_cursor, &[]);
+        if outcome.is_err() {
+            // The screen failed mid-turn: stop the turn and decline anything it waits
+            // on, so the worker can finish and the scope can end.
+            harness.cancel.cancel();
+            app.abandon();
+            while let Ok(event) = inbox.recv() {
+                if matches!(event, UiEvent::Finished(_)) {
+                    break;
+                }
+            }
+        }
+        outcome
+    });
+    // Saved whether the turn finished, failed, or was cancelled.
+    repl.persist(&repl.state);
+    // Shown on the error and cancel paths too: a turn that failed halfway still spent tokens.
+    if let Some(summary) = repl.turn_summary_line() {
+        app.note(Style::Dim, &summary);
+    }
+    outcome
+}
+
+/// Draw and take input until the interface has a request: a line to dispatch, the
+/// end of a turn, or the end of the session.
+fn pump(
+    app: &mut App,
+    screen: &mut Screen<io::Stdout>,
+    inbox: &mpsc::Receiver<UiEvent>,
+    harness: &Harness,
+    mcp_cursor: &mut u64,
+    history: &[String],
+) -> io::Result<Request> {
+    loop {
+        while let Ok(event) = inbox.try_recv() {
+            app.on_turn_event(event);
+        }
+        // MCP notes arrive at any time, idle or not, as in Python's `on_mcp_note`.
+        if let Some(mcp) = &harness.mcp {
+            let (seq, notes) = mcp.notes_since(*mcp_cursor);
+            *mcp_cursor = seq;
+            for note in notes {
+                app.note(Style::Yellow, &format!("mcp: {note}"));
+            }
+        }
+        let mode = harness.gate.mode().as_str();
+        if app.status.approval != mode {
+            app.status.approval = mode.to_owned();
+            app.mark_dirty();
+        }
+        let request = app.take_request();
+        if request.is_some() || app.needs_frame() {
+            let (live, caret) = app.live();
+            screen.frame(&app.take_committed(), &live, caret)?;
+        }
+        if let Some(request) = request {
+            return Ok(request);
+        }
+
+        let mut queue = VecDeque::new();
+        if event::poll(FRAME)? {
+            queue.push_back(event::read()?);
+        }
+        while let Some(event) = queue.pop_front() {
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let key = paste_aware(key, &mut queue)?;
+                    match app.on_key(key, history) {
+                        Effect::None => {}
+                        Effect::Cancel => harness.cancel.cancel(),
+                        Effect::CycleMode => harness.gate.set_mode(harness.gate.mode().cycle()),
+                    }
+                }
+                Event::Paste(text) => app.on_paste(&text),
+                Event::Resize(width, height) => {
+                    screen.resize(usize::from(width));
+                    app.set_size(usize::from(width), usize::from(height));
+                }
+                _ => {}
+            }
+        }
+        app.tick();
+    }
+}
+
+/// Terminals without bracketed paste (Windows) deliver a paste as keystrokes, so a
+/// pasted newline arrives as Enter. An Enter with more keys already waiting behind
+/// it is part of a paste and becomes a newline instead of sending the draft.
+fn paste_aware(key: KeyEvent, queue: &mut VecDeque<Event>) -> io::Result<KeyEvent> {
+    if key.code != KeyCode::Enter || !key.modifiers.is_empty() {
+        return Ok(key);
+    }
+    while event::poll(Duration::ZERO)? {
+        queue.push_back(event::read()?);
+    }
+    let burst = queue
+        .iter()
+        .any(|event| matches!(event, Event::Key(next) if next.kind != KeyEventKind::Release));
+    Ok(if burst {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    } else {
+        key
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_plain_loop_is_used_when_asked_for_or_without_a_terminal() {
+        assert!(interface_wanted(true, false, true));
+        assert!(!interface_wanted(false, false, true), "[ui] tui = false");
+        assert!(
+            !interface_wanted(true, true, true),
+            "--plain or AGENT86_PLAIN"
+        );
+        assert!(
+            !interface_wanted(true, false, false),
+            "piped stdin or stdout"
+        );
+    }
+}

@@ -137,6 +137,10 @@ pub struct ModelConfig {
     /// `off` or `triage`. Only reported: triage routing is not ported.
     pub router: RouterMode,
     pub route: ModelRoute,
+    /// `[model.context_window]`: tokens of context per `provider:model` ref or bare
+    /// model id, overriding the built-in table.
+    #[serde(default)]
+    pub context_window: BTreeMap<String, u64>,
 }
 
 /// `[model] router`.
