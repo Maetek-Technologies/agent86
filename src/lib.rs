@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod approval;
 pub mod config;
+pub mod config_writer;
 pub mod difflib;
 pub mod guardrails;
 pub mod history;

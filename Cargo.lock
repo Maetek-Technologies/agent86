@@ -37,6 +37,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "unicode-width",
  "url",
  "windows-native-keyring-store",
@@ -2345,6 +2346,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

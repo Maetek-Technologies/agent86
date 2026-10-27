@@ -26,6 +26,7 @@ serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha1_smol = "1.0.1"
 thiserror = "2"
 tokio = { version = "1.54.1", features = ["macros", "rt", "signal", "sync", "time"] }
+toml_edit = "0.25"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "preserve_order", "serde"] }
 unicode-width = "0.2"
 url = "2.5.8"

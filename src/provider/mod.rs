@@ -6,7 +6,9 @@
 //! on the final text.
 
 pub mod capabilities;
+pub mod catalog;
 pub mod openai;
+pub mod remote_windows;
 pub mod retry;
 
 use crate::config::{Config, ProviderConfig};
@@ -44,6 +46,27 @@ pub fn provider_for_ref_with_store(
     config: &Config,
     store: &dyn SecretStore,
 ) -> Result<Box<dyn Provider>, ProviderError> {
+    build_provider(reference, config, |name, section| {
+        resolve_api_key(name, section.api_key_env.as_deref(), store)
+    })
+}
+
+/// [`provider_for_ref`] with a key that was typed but not stored yet: the
+/// connection test sends it as it is, skipping the environment and the keyring,
+/// as Python's `provider_for_ref(..., api_key=key)` does.
+pub fn provider_for_ref_with_key(
+    reference: &ModelRef,
+    config: &Config,
+    api_key: &str,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    build_provider(reference, config, |_, _| Some(api_key.to_owned()))
+}
+
+fn build_provider(
+    reference: &ModelRef,
+    config: &Config,
+    api_key: impl FnOnce(&str, &ProviderConfig) -> Option<String>,
+) -> Result<Box<dyn Provider>, ProviderError> {
     let name = reference.provider.as_str();
     let section = config.providers.get(name).cloned().unwrap_or_default();
 
@@ -62,7 +85,7 @@ pub fn provider_for_ref_with_store(
         }
     };
 
-    let api_key = resolve_api_key(name, section.api_key_env.as_deref(), store);
+    let api_key = api_key(name, &section);
     let openai_config = openai_config(name, &section, require_key)?;
     let provider = OpenAiProvider::new(reference.model.clone(), openai_config, api_key)?
         .with_pricing(PriceTable::from_config(config), reference.to_string());

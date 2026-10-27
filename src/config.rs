@@ -119,7 +119,7 @@ pub struct Config {
     #[serde(default)]
     pub mcp_servers: indexmap::IndexMap<String, McpServerConfig>,
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    pub providers: indexmap::IndexMap<String, ProviderConfig>,
     #[serde(default)]
     pub pricing: PricingConfig,
     pub ui: UiConfig,

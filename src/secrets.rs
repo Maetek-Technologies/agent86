@@ -28,6 +28,12 @@ pub trait SecretStore {
     fn delete_password(&self, _service: &str, _account: &str) -> Result<bool, SecretStoreError> {
         Err(SecretStoreError::read_only())
     }
+
+    /// Whether keys can be kept here at all, as Python's `keyring_available`; it
+    /// tells "no backend" apart from "no key stored".
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// The keyring refused to store or delete a secret.
@@ -75,6 +81,10 @@ pub struct NoSecretStore;
 impl SecretStore for NoSecretStore {
     fn get_password(&self, _service: &str, _account: &str) -> Option<String> {
         None
+    }
+
+    fn available(&self) -> bool {
+        false
     }
 }
 

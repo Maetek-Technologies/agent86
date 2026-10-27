@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with parts 2 (the inline base), 3 (the `/` and `@` menus and the pickers), and 4 (Markdown, diffs, and the transcript view) done and part 5 (model catalogs, providers, keys, and config write-back) next, and episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with parts 2 (the inline base), 3 (the `/` and `@` menus and the pickers), 4 (Markdown, diffs, and the transcript view), and 5 (model catalogs, providers, keys, and config write-back) done and part 6 (MCP management) next, and episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -93,12 +93,20 @@ The Python implementation remains the reference and compatibility oracle. This p
   - the tools' `preview_lexer` (`diff` for `write_file` and `edit_file`, `bash` for `run_command`, `python` for `python_exec`), carried on the approval preview; the approval panel colours a diff (additions, removals, hunk headers)
   - the Ctrl+O transcript view: the session's transcript on the alternate screen, with every tool call expanded as Python's `body_lines` (the arguments as indented JSON, the result capped at 200 lines); `a` or Ctrl+Shift+O collapses or expands them all, the arrows, PgUp/PgDn, Home, and End scroll, and Escape, `q`, or Ctrl+O returns with the screen as it was. It can be opened during a turn, and an approval request closes it
   - the decision not to add a syntax highlighter for now (see [design](INTERFACE.md), section 6)
+- Added model and provider management to the interface (stage 9, part 5), ported from `cognitive/catalog.py`, `cognitive/remote_windows.py`, `config_writer.py`, `tui/screens/provider_manager.py`, `key_entry.py`, `connection_test.py`, `save_diff.py`, `model_picker.py`, and the chains in `tui/app.py`:
+  - live model catalogs in all three of Python's shapes (OpenAI-compatible `/v1/models`, Anthropic, and Ollama's `/api/tags`; llama.cpp reports none), with Python's messages for every failure, fetched on a worker and cached per provider for the session. A bare `/model` opens the picker once the active provider's catalog is in: the role slots, then the catalog without repeats
+  - a typed `/model <id>` that fails and looks like a bare model id is retried as `<active provider>:<id>` when that provider's catalog lists it exactly (`resolved to …`), with Python's queueing while the catalog is fetched; a ref naming a real provider gets its own error at once
+  - `/config model`: the provider list in config order with each key's status (never the key), masked key entry when a provider has none, the catalog picker (type to filter; Python's free-text fallback when nothing or several match, or there is no catalog), a live one-token connection test capped at 15 seconds with "Save anyway" after a failure, then the save panel. A typed key is held in memory and stored in the keyring only after the test passes or the user saves anyway; a passing test switches the model at once
+  - comment-preserving config write-back (`toml_edit`): `plan_edit` and `apply_edit`, the user and project scopes, Python's secret guard (secret-shaped keys only as pure `${VAR}` references), the unified diff shown before anything is written, atomic writes, and a reload from the files and the environment
+  - the status line's context window from OpenRouter's own `context_length`, memoized and cached for 24 hours in `~/.agent86/cache/model_context_windows.json` (Python's file), with a 3-second fetch; every failure falls back to the table
+  - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
+  - the plain loop's `/config model` now gives Python's wording
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **307 passed on Windows** (127 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **331 passed on Windows** (148 unit, 10 compatibility, 18 provider integration, 3 catalog, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -124,7 +132,7 @@ The agent works end to end, but it does not yet have:
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
 - Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
-- The rest of the interactive interface (stage 9, parts 5 and 6, planned in [docs/INTERFACE.md](INTERFACE.md)): model catalogs in the model picker, and the model, provider, key, and MCP management screens
+- The rest of the interactive interface (stage 9, part 6, planned in [docs/INTERFACE.md](INTERFACE.md)): the MCP management screens
 - Local embedding backend
 
 ### Known `run` differences from Python
@@ -133,7 +141,7 @@ The agent works end to end, but it does not yet have:
 - The environment line reports the Rust crate version (`agent86 v0.1.0`), not Python's (`v1.0.0`).
 - `--sandbox` is not accepted (`AGENT86_SANDBOX` and `[sandbox] mode` are).
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
-- `agent86 keys` has no Python CLI equivalent; Python stores keys from its interactive `/config model` screen. Re-saving an account on Windows does not leave Python's stale `<account>@agent86` copy of the old key behind.
+- `agent86 keys` has no Python CLI equivalent; Python stores keys only from its interactive `/config model` screen (which the interface here also has). Re-saving an account on Windows does not leave Python's stale `<account>@agent86` copy of the old key behind.
 - The missing-key error names the keyring entry to create (service `agent86`, account `<provider>`) instead of pointing at `/config model`.
 - Reading keys that Python stored is verified on Windows against the `keyring` package's source, and live on 2026-10-26: a key saved with Python's `keyring set agent86 openrouter` was read by Rust and accepted by OpenRouter. On macOS and Linux the attribute layouts match by inspection but have not been tested against entries Python wrote. `tests/os_keyring.rs` is an opt-in check for any platform.
 - The model-error hint suggests `--model` and an API key instead of the `agent86 models` command, which is not ported. The malformed-config hint does not mention `agent86 config path` for the same reason.
@@ -146,7 +154,7 @@ The agent works end to end, but it does not yet have:
 - Ctrl+C at an approval prompt does not decline; the prompt waits for an answer and the turn stops before the next call. Python declines.
 - A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
 - `/config` prints the merged TOML layers (built-in defaults for the modelled sections, the config files, and overrides) as JSON, not Python's full pydantic dump with every default.
-- `/config model` and `/config mcp` say the full-screen interface is not ported and point at `/model`, `agent86 keys`, and `agent86 mcp list`; Python's plain loop points at its full-screen app.
+- `/config mcp` says the full-screen interface is not ported and points at `agent86 mcp list`; Python's plain loop points at its full-screen app. `/config model` gives Python's wording.
 - `/skills` always reports `no skills discovered`, and `/memory`'s episode and fact counts stay at whatever Python wrote, because neither is ported.
 - `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
 - `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
@@ -177,10 +185,14 @@ The agent works end to end, but it does not yet have:
   - The look is our own, not Rich's: `⏺` before the reply rather than an `agent86` label, `•` bullets, a gutter for code, a box-drawn rule under a table's header.
   - Fenced code is not syntax-highlighted; Python highlights it with Pygments. A command or snippet in the approval panel is shown plain; a diff is coloured.
 - **Expanding tool calls:** Ctrl+O opens a full-screen transcript view with every tool call expanded, rather than expanding the last block in place; Ctrl+Shift+O (or `a`) toggles them all in that view.
-- **Not yet ported (planned for parts 5 and 6):**
-  - model catalogs: the model picker offers only the configured role slots, and a typed `/model <bare id>` is not resolved against the provider's catalog
-  - the model, provider, key, and MCP screens: a bare `/config model` or `/config mcp` prints the plain loop's message
-- **Context window:** the status line doesn't ask OpenRouter's models endpoint for the model's context length, as Python does. Overrides, Ollama's `num_ctx`, and Python's table apply.
+- **Model management:**
+  - The typed `/model <id>` fallback asks the catalog of the active provider's config section. Python's asks the adapter's name, which is `openai` for every OpenAI-compatible gateway, so on OpenRouter it fetched OpenAI's catalog with OpenRouter's key; its bare `/model` picker already uses the section, as this does. Python should get the same fix.
+  - The catalog picker has one box: Enter with nothing typed picks the highlighted model, and a highlight moved with the arrows is picked as it is. Python's filter box takes Enter as submitting the typed text (nothing typed cancels).
+  - A long model list (more than nine choices) can be narrowed by typing, and its rows are not numbered; Python's model picker has no filter. PgUp, PgDn, Home, and End move through any picker.
+  - The connection test, key entry, and save steps are panels in place of the input box, with numbered choices; the save panel switches scope with the arrows or Tab and scrolls the diff with the arrows. A catalog that arrives during a turn or while a panel is open waits until both are done.
+  - The key entry shows one dot per character; Python's password field does the same.
+  - The OS keyring is always reported as available, so key entry never says the key will only be used for the test.
+- **Not yet ported (planned for part 6):** the MCP screens: a bare `/config mcp` prints the plain loop's message
 
 ### Known loop differences from Python
 
@@ -325,7 +337,7 @@ Stage 9 is delivered in parts, one PR each. The details and acceptance tests for
 - [x] Part 2: the inline base: input box, streaming transcript, tool blocks, spinner, status line, approval panel, cancel and quit keys, and the plain-loop fallback
 - [x] Part 3: the `/` command menu, `@` path completion, and the mode, model, and session pickers
 - [x] Part 4: Markdown replies, coloured diffs, and the Ctrl+O transcript view
-- [ ] Part 5: model catalogs, the provider manager, key entry, the connection test, and comment-preserving config write-back
+- [x] Part 5: model catalogs, the provider manager, key entry, the connection test, and comment-preserving config write-back
 - [ ] Part 6: MCP server management (add, edit, remove, enable or disable, test) with live mounting
 
 ## 6. Compatibility strategy
