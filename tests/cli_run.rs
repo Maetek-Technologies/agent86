@@ -1012,6 +1012,24 @@ fn python() -> Option<&'static str> {
 }
 
 #[tokio::test]
+async fn mcp_commands_without_servers_say_where_to_add_one() {
+    let workspace = Workspace::new("mcp-none");
+    let list = workspace.run(&["mcp", "list"]).await;
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert_eq!(
+        stdout(&list),
+        "No MCP servers configured. Add one with `/config mcp` in the REPL, or an \
+         `[mcp_servers.<name>]` block in your config file.\n"
+    );
+    let tools = workspace.run(&["mcp", "tools"]).await;
+    assert_eq!(
+        stdout(&tools),
+        "No MCP servers configured (or MCP disabled). `agent86 mcp list` shows what is \
+         configured and whether each is enabled.\n"
+    );
+}
+
+#[tokio::test]
 async fn run_offers_and_calls_mcp_tools() {
     let Some(python) = python() else {
         return;

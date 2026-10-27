@@ -12,8 +12,12 @@ use super::diff::detail_line;
 use super::entries::{view_lines, Entry, ToolEntry, ARG_PREVIEW_LIMIT};
 use super::input::Editor;
 use super::markdown;
+use super::mcp_config::McpDraft;
+use super::mcp_panels::{McpAction, McpForm, McpList, McpTest, McpTestOutcome};
 use super::menu::{mention_text, Menu, MenuKind};
-use super::panels::{ConnectionTest, KeyEntry, SaveDiff, TestOutcome, TestResult};
+use super::panels::{
+    ConnectionTest, KeyEntry, KeyPurpose, SaveDiff, SavePurpose, TestOutcome, TestResult,
+};
 use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
 use super::status::{fit_status_line, StatusState};
@@ -79,6 +83,11 @@ pub enum UiEvent {
         id: u64,
         result: TestResult,
     },
+    /// The MCP test with this id finished: the server's tools, or why it failed.
+    McpTested {
+        id: u64,
+        result: Result<Vec<(String, String)>, String>,
+    },
 }
 
 /// What a catalog was fetched for, as Python's `CatalogReady.purpose`.
@@ -124,7 +133,7 @@ fn pretty_arguments(arguments: &Map<String, Value>) -> String {
 }
 
 /// What the interface wants its driver to do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Dispatch this line: a command or a turn.
     Submit(String),
@@ -134,11 +143,17 @@ pub enum Request {
     /// A picker was answered.
     Picked(PickerKind, String),
     /// The key entry was answered: the key, or `None` for nothing entered.
-    Key(Option<String>),
+    Key(KeyPurpose, Option<String>),
     /// The connection test ended.
     Tested(TestOutcome),
     /// The save panel was answered: the edit to apply, or `None` for a cancel.
-    Saved(Option<ConfigEdit>),
+    Saved(SavePurpose, Option<ConfigEdit>),
+    /// Something was chosen in the MCP server list.
+    Mcp(McpAction),
+    /// The MCP form was completed with a valid server.
+    McpForm(Box<McpDraft>),
+    /// The MCP test ended.
+    McpTested(McpTestOutcome),
     /// A catalog arrived. Held until no turn runs and no panel is open.
     Catalog {
         provider: String,
@@ -153,6 +168,9 @@ pub enum Panel {
     Key(KeyEntry),
     Test(ConnectionTest),
     Save(SaveDiff),
+    McpList(McpList),
+    McpForm(Box<McpForm>),
+    McpTest(McpTest),
 }
 
 /// What a key asks of the harness while a turn runs.
@@ -542,6 +560,13 @@ impl App {
                 result,
                 purpose,
             }),
+            UiEvent::McpTested { id, result } => {
+                if let Some(Panel::McpTest(test)) = &mut self.panel {
+                    if test.id == id {
+                        test.finish(result);
+                    }
+                }
+            }
             UiEvent::Tested { id, result } => {
                 // A late answer for a test already closed is dropped.
                 if let Some(Panel::Test(test)) = &mut self.panel {
@@ -741,7 +766,8 @@ impl App {
             self.approval_key(key);
             return Effect::None;
         }
-        if key.code == KeyCode::BackTab {
+        // In the MCP form, Shift+Tab moves between fields instead.
+        if key.code == KeyCode::BackTab && !matches!(self.panel, Some(Panel::McpForm(_))) {
             return Effect::CycleMode;
         }
         if self.view.is_some() {
@@ -766,7 +792,7 @@ impl App {
                 },
                 Panel::Key(entry) => match entry.on_key(key) {
                     None => return Effect::None,
-                    Some(answer) => Some(Request::Key(answer)),
+                    Some(answer) => Some(Request::Key(entry.purpose, answer)),
                 },
                 Panel::Test(test) => match test.on_key(key) {
                     None => return Effect::None,
@@ -774,7 +800,19 @@ impl App {
                 },
                 Panel::Save(save) => match save.on_key(key) {
                     None => return Effect::None,
-                    Some(edit) => Some(Request::Saved(edit)),
+                    Some(edit) => Some(Request::Saved(save.purpose, edit)),
+                },
+                Panel::McpList(list) => match list.on_key(key) {
+                    None => return Effect::None,
+                    Some(action) => action.map(Request::Mcp),
+                },
+                Panel::McpForm(form) => match form.on_key(key) {
+                    None => return Effect::None,
+                    Some(draft) => draft.map(|draft| Request::McpForm(Box::new(draft))),
+                },
+                Panel::McpTest(test) => match test.on_key(key) {
+                    None => return Effect::None,
+                    Some(outcome) => Some(Request::McpTested(outcome)),
                 },
             };
             self.panel = None;
@@ -858,6 +896,9 @@ impl App {
     pub fn on_paste(&mut self, text: &str) {
         if let Some(Panel::Key(entry)) = &mut self.panel {
             entry.on_paste(text);
+            self.dirty = true;
+        } else if let Some(Panel::McpForm(form)) = &mut self.panel {
+            form.on_paste(text);
             self.dirty = true;
         } else if self.running.is_none() && self.panel.is_none() {
             self.editor.insert(&text.replace("\r\n", "\n"));
@@ -1030,6 +1071,9 @@ impl App {
                 Panel::Key(entry) => entry.render(width),
                 Panel::Test(test) => test.render(width, SPINNER[4]),
                 Panel::Save(save) => save.render(width),
+                Panel::McpList(list) => list.render(width),
+                Panel::McpForm(form) => form.render(width),
+                Panel::McpTest(test) => test.render(width, SPINNER[4]),
             });
             caret_base = 0;
         } else {
@@ -1637,7 +1681,11 @@ mod tests {
         assert!(matches!(app.take_request(), Some(Request::Tested(outcome)) if outcome.ok));
 
         // A pasted key goes to the key panel, never the draft, and is never drawn.
-        app.open_panel(Panel::Key(KeyEntry::new("groq", true)));
+        app.open_panel(Panel::Key(KeyEntry::new(
+            KeyPurpose::Provider,
+            "groq",
+            true,
+        )));
         app.on_paste("gsk_pasted_secret");
         let (live, _) = app.live();
         assert!(!live.iter().any(|line| line.plain_text().contains("pasted")));
@@ -1645,7 +1693,10 @@ mod tests {
         app.on_key(key(KeyCode::Enter), &[]);
         assert_eq!(
             app.take_request(),
-            Some(Request::Key(Some("gsk_pasted_secret".into())))
+            Some(Request::Key(
+                KeyPurpose::Provider,
+                Some("gsk_pasted_secret".into())
+            ))
         );
     }
 

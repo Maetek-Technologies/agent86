@@ -360,11 +360,10 @@ pub const COMMANDS: [CommandEntry; 15] = [
         description: "Manage MCP servers: add, test, enable/disable, remove",
         needs_choice: Some(Choice::ConfigMcp),
         handler: |_, _| {
-            CommandResult::message(
-                "The MCP manager is part of the full-screen interface, which the Rust port \
-                 does not have yet. Edit `[mcp_servers.<name>]` in config.toml; \
-                 `agent86 mcp list` shows the servers.",
-            )
+            let mut text = Text::plain("The MCP manager is a TUI surface — press / and pick ");
+            text.push(Style::Cyan, "/config mcp");
+            text.push(Style::Plain, ", or run agent86 without --plain.");
+            CommandResult::handled(text)
         },
     },
     CommandEntry {
@@ -792,6 +791,20 @@ impl Repl {
         let ui = &self.config.ui;
         self.history
             .get_or_insert_with(|| PromptHistory::from_config(ui))
+    }
+
+    /// The live MCP manager, made (empty, and attached to the tool registry) when
+    /// the session started without one, so the first server can be added mid-session
+    /// (Python's `ensure_mcp`).
+    pub fn ensure_mcp(&mut self) -> std::sync::Arc<crate::mcp::McpManager> {
+        if let Some(mcp) = &self.harness.mcp {
+            return std::sync::Arc::clone(mcp);
+        }
+        let mcp = std::sync::Arc::new(crate::mcp::McpManager::empty(&self.config));
+        mcp.attach(&self.harness.registry);
+        self.mcp_cursor = 0;
+        self.harness.mcp = Some(std::sync::Arc::clone(&mcp));
+        mcp
     }
 
     /// MCP notes recorded since the last call, `mcp: `-prefixed. A repeat outage is

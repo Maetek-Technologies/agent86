@@ -51,8 +51,9 @@ pub enum Scope {
 #[error("{0}")]
 pub struct ConfigWriteError(pub String);
 
-/// One change: set the value at a key path.
-pub type Change = (Vec<String>, Value);
+/// One change: set the value at a key path, or with `None` remove it (Python's
+/// `DELETE`), so one edit can remove one server and set a key on another.
+pub type Change = (Vec<String>, Option<Value>);
 
 /// A prepared, not yet written change to one config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +110,10 @@ pub fn plan_edit(
         let Some((leaf, parents)) = key_path.split_last() else {
             return Err(ConfigWriteError("empty key path in changes".to_owned()));
         };
+        let Some(value) = value else {
+            delete(&mut doc, parents, leaf);
+            continue;
+        };
         if FORBIDDEN_LEAF_KEYS.contains(&leaf.to_lowercase().as_str()) && !is_var_ref(value) {
             return Err(ConfigWriteError(format!(
                 "refusing to write '{}' to config: secrets belong in the OS keyring or a \
@@ -140,6 +145,80 @@ pub fn plan_edit(
         after_text,
         diff,
     })
+}
+
+/// Remove `parents.leaf`; a path that is not there is left alone, so removing a
+/// server already deleted by hand shows "No changes." rather than failing.
+///
+/// Comments written above a removed table stay in the file, as with Python's
+/// `tomlkit`, which keeps them with the table before it: they move onto the next
+/// table, or to the end of the file.
+fn delete(doc: &mut DocumentMut, parents: &[String], leaf: &str) {
+    let mut node: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for part in parents {
+        match node.get_mut(part).and_then(Item::as_table_like_mut) {
+            Some(next) => node = next,
+            None => return,
+        }
+    }
+    let Some(Item::Table(table)) = node.remove(leaf) else {
+        return;
+    };
+    let comments = prefix_of(&table);
+    if comments.trim().is_empty() {
+        return;
+    }
+    let position = table.position().unwrap_or(isize::MAX);
+    let mut nearest = None;
+    next_table(doc.as_table(), position, &mut Vec::new(), &mut nearest);
+    match nearest.and_then(|(_, path)| table_at(doc.as_table_mut(), &path)) {
+        Some(next) => {
+            let existing = prefix_of(next);
+            next.decor_mut().set_prefix(format!("{comments}{existing}"));
+        }
+        None => {
+            let trailing = doc.trailing().as_str().unwrap_or_default().to_owned();
+            doc.set_trailing(format!("{trailing}{comments}"));
+        }
+    }
+}
+
+fn prefix_of(table: &Table) -> String {
+    table
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The key path of the table drawn first after `position`, at any depth.
+fn next_table(
+    table: &Table,
+    position: isize,
+    path: &mut Vec<String>,
+    nearest: &mut Option<(isize, Vec<String>)>,
+) {
+    for (key, item) in table.iter() {
+        let Item::Table(child) = item else {
+            continue;
+        };
+        path.push(key.to_owned());
+        if let Some(own) = child.position().filter(|&own| own > position) {
+            if !child.is_implicit() && nearest.as_ref().is_none_or(|(best, _)| own < *best) {
+                *nearest = Some((own, path.clone()));
+            }
+        }
+        next_table(child, position, path, nearest);
+        path.pop();
+    }
+}
+
+fn table_at<'a>(table: &'a mut Table, path: &[String]) -> Option<&'a mut Table> {
+    match path.split_first() {
+        None => Some(table),
+        Some((first, rest)) => table_at(table.get_mut(first)?.as_table_mut()?, rest),
+    }
 }
 
 /// Set `parents.leaf = value`, creating missing tables. A value replacing another
@@ -227,7 +306,7 @@ mod tests {
     fn change(path: &str, value: &str) -> Change {
         (
             path.split('.').map(str::to_owned).collect(),
-            Value::from(value),
+            Some(Value::from(value)),
         )
     }
 
@@ -350,6 +429,53 @@ mod tests {
             "a decoy reference does not excuse a key"
         );
         assert!(!paths.project.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn servers_are_removed_with_their_comments_kept_and_lists_written() {
+        let (root, paths) = workspace("delete");
+        std::fs::create_dir_all(paths.project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &paths.project,
+            "# servers\n[mcp.servers.fs]\ncommand = \"npx\"\n\n\
+             # the backup one\n[mcp.servers.old]\nurl = \"http://x/mcp\"\n\n\
+             [mcp.servers.old.headers]\nX-Trace = \"1\"\n\n\
+             # sandbox\n[sandbox]\nmode = \"subprocess\"\n",
+        )
+        .unwrap();
+        let path = |text: &str| text.split('.').map(str::to_owned).collect::<Vec<_>>();
+        let args = Value::Array(["-y", "server"].into_iter().collect());
+        let edit = plan_edit(
+            Scope::Project,
+            &paths,
+            &[
+                (path("mcp.servers.gh.command"), Some(Value::from("npx"))),
+                (path("mcp.servers.gh.args"), Some(args)),
+                (path("mcp.servers.gh.enabled"), Some(Value::from(true))),
+                (path("mcp.servers.old"), None),
+                (path("mcp.servers.never"), None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            edit.after_text,
+            "# servers\n[mcp.servers.fs]\ncommand = \"npx\"\n\n\
+             [mcp.servers.gh]\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\nenabled = true\n\n\
+             # the backup one\n\n# sandbox\n[sandbox]\nmode = \"subprocess\"\n"
+        );
+        let config = apply_edit(&edit, &paths).unwrap();
+        assert!(!config.mcp_servers.contains_key("old"));
+        assert_eq!(config.mcp_servers["gh"].args, ["-y", "server"]);
+
+        // The last table's comments move to the end of the file.
+        let edit = plan_edit(Scope::Project, &paths, &[(path("sandbox"), None)]).unwrap();
+        assert!(
+            edit.after_text
+                .ends_with("enabled = true\n\n# the backup one\n\n# sandbox\n"),
+            "{}",
+            edit.after_text
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

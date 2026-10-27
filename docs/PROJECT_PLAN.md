@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with parts 2 (the inline base), 3 (the `/` and `@` menus and the pickers), 4 (Markdown, diffs, and the transcript view), and 5 (model catalogs, providers, keys, and config write-back) done and part 6 (MCP management) next, and episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -101,12 +101,21 @@ The Python implementation remains the reference and compatibility oracle. This p
   - the status line's context window from OpenRouter's own `context_length`, memoized and cached for 24 hours in `~/.agent86/cache/model_context_windows.json` (Python's file), with a 3-second fetch; every failure falls back to the table
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
+- Added MCP server management to the interface (stage 9, part 6), ported from `tui/screens/mcp_manager.py`, `mcp_test.py`, the MCP chain in `tui/app.py`, and the harness's `ensure_mcp`, `add_mcp_server`, and `remove_mcp_server`:
+  - `/config mcp`: the configured servers (config facts only, so opening it starts nothing) with Enter to edit, `d` to remove, and `t` to enable or disable, plus "Add from JSON" and "Add manually"
+  - the form: a pasted JSON block in either README shape (a bare server, or `{"mcpServers": {...}}` / `{"servers": {...}}`, with `type` and `disabled` understood), or the fields (the command line split as Python's `shlex` does on each platform, `KEY=value` lists for env and headers, the URL, and http or sse). The config model's own message shows as it validates, and Continue waits until the server parses
+  - a masked prompt for each `${VAR}` that neither the environment nor the keyring supplies; a typed value is used for the test and stored in the keyring under the variable's name only after the test passes or the user saves anyway, while the config keeps the reference
+  - the MCP test: the server is really started (30-second budget) and its tools are listed, with "Save anyway" after a failure; then the save panel, and the tools are mounted at once, with name collisions reported. A cancelled add stops the server its test started
+  - removing and disabling go through the save panel and unmount the server's tools at once; re-enabling is tested like an add
+  - the config writer removes tables (comments written above a removed table stay in the file, as with Python's `tomlkit`) and writes lists and booleans
+  - `McpManager` gained `start_server`, `mount`, and `remove_server`, and an empty manager is made for the first server added mid-session
+  - the plain loop's `/config mcp`, the disconnected-server message, and `mcp list`'s empty hint now point at `/config mcp`, as Python's do; a run of stray spaces in two `agent86 mcp` messages is gone
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **331 passed on Windows** (148 unit, 10 compatibility, 18 provider integration, 3 catalog, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **344 passed on Windows** (159 unit, 10 compatibility, 18 provider integration, 3 catalog, 33 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -132,7 +141,6 @@ The agent works end to end, but it does not yet have:
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
 - Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
-- The rest of the interactive interface (stage 9, part 6, planned in [docs/INTERFACE.md](INTERFACE.md)): the MCP management screens
 - Local embedding backend
 
 ### Known `run` differences from Python
@@ -154,7 +162,7 @@ The agent works end to end, but it does not yet have:
 - Ctrl+C at an approval prompt does not decline; the prompt waits for an answer and the turn stops before the next call. Python declines.
 - A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
 - `/config` prints the merged TOML layers (built-in defaults for the modelled sections, the config files, and overrides) as JSON, not Python's full pydantic dump with every default.
-- `/config mcp` says the full-screen interface is not ported and points at `agent86 mcp list`; Python's plain loop points at its full-screen app. `/config model` gives Python's wording.
+- `/config model` and `/config mcp` give Python's wording, pointing at the interface.
 - `/skills` always reports `no skills discovered`, and `/memory`'s episode and fact counts stay at whatever Python wrote, because neither is ported.
 - `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
 - `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
@@ -192,7 +200,13 @@ The agent works end to end, but it does not yet have:
   - The connection test, key entry, and save steps are panels in place of the input box, with numbered choices; the save panel switches scope with the arrows or Tab and scrolls the diff with the arrows. A catalog that arrives during a turn or while a panel is open waits until both are done.
   - The key entry shows one dot per character; Python's password field does the same.
   - The OS keyring is always reported as available, so key entry never says the key will only be used for the test.
-- **Not yet ported (planned for part 6):** the MCP screens: a bare `/config mcp` prints the plain loop's message
+- **MCP management:**
+  - Editing a server in place keeps it running with its new settings after the save. Python's edit stops the server its test just started (it removes the "original" even when the name is unchanged), so the edited server reports `0 tools live` until the next launch. Python should get the same fix.
+  - A test closed before the server finished connecting stops the server once it does, and a test closed after connecting stops it too; Python leaves such a server running, unmounted, for the rest of the session. A failed save also stops the server its test started.
+  - The 30-second budget is the connect's own deadline, so a server that never answers reports Python's `did not finish connecting within 30s (connect_timeout_s)` message rather than the test modal's `Timed out after 30s — no response.`
+  - JSON syntax errors and wrong field types are reported with `serde_json`'s wording, not Python's `json` and pydantic messages; the validator's own messages (a missing command or URL, both set, an unknown transport) are Python's.
+  - The form is a panel: Tab, Shift+Tab, or the arrows move between fields, Enter in a one-line field continues (as in Python), Enter in the JSON box adds a line, and Left or Right switches the transport. Shift+Tab in the form does not cycle the approval mode.
+  - Errors written to the transcript after a failed test have key-shaped tokens redacted; Python redacts only the copy in the test modal.
 
 ### Known loop differences from Python
 
@@ -230,14 +244,12 @@ The agent works end to end, but it does not yet have:
 ### Known MCP differences from Python
 
 - The JSON-RPC client and transports are hand-written rather than the MCP Python SDK, so transport-level error wording (connection failures, HTTP errors) differs; the user-facing messages for start failures, timeouts, drops, reconnects, and unavailable servers follow Python's.
-- A server that stays disconnected after its reconnect attempts reports that its tools are unavailable until agent86 is restarted; Python points at `/config mcp`, which is not ported.
 - A streamable HTTP server is never detected as dropped (requests simply fail), which matches the SDK in practice; stdio and SSE drops are detected when the process exits or the stream ends.
 - A reconnect failure's cause is the first line of the start-failure message rather than the SDK's exception text. A drop's cause never carries Python's `after <last transport error>` suffix, because a malformed line is skipped without being recorded.
 - `notifications/message` (server logging) is ignored; Python sends it to its logger, which `run` does not show. Live notes (progress, resource updates, list changes) are recorded for a future REPL, and `run` prints none, as in Python.
 - The `initialize` request names the client `agent86` with the crate version; the Python SDK sends its own client info.
 - On Windows a bare `command` is looked up on PATH with `PATHEXT`, so `npx` finds `npx.cmd`, as the Python SDK does.
-- `mcp list` and `mcp tools` print plain aligned tables with the same columns as Python's Rich tables, and the no-servers hint does not mention `/config mcp`.
-- Adding, removing, or restarting servers mid-session (`/config mcp`, `add_mcp_server`) belongs to the interactive interface and is not ported.
+- `mcp list` and `mcp tools` print plain aligned tables with the same columns as Python's Rich tables, and the no-servers hint names "your config file" rather than `agent86 config path`, which is not ported.
 
 ### Known flight-recorder differences from Python
 
@@ -338,7 +350,7 @@ Stage 9 is delivered in parts, one PR each. The details and acceptance tests for
 - [x] Part 3: the `/` command menu, `@` path completion, and the mode, model, and session pickers
 - [x] Part 4: Markdown replies, coloured diffs, and the Ctrl+O transcript view
 - [x] Part 5: model catalogs, the provider manager, key entry, the connection test, and comment-preserving config write-back
-- [ ] Part 6: MCP server management (add, edit, remove, enable or disable, test) with live mounting
+- [x] Part 6: MCP server management (add, edit, remove, enable or disable, test) with live mounting
 
 ## 6. Compatibility strategy
 
