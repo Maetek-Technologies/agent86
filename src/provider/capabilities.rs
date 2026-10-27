@@ -1,5 +1,8 @@
 //! Per-model API capability facts, matching the Python `capabilities.py`.
 
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
 /// Model-id prefixes (provider prefix stripped, lowercased) that reject
 /// `temperature`, `top_p`, and `top_k`; those parameters must be omitted.
 const NO_SAMPLING_FAMILIES: &[&str] = &[
@@ -17,12 +20,55 @@ pub fn normalize_model(model: &str) -> String {
     ident.trim().to_lowercase()
 }
 
+/// The request parameters that were removed together.
+const SAMPLING_PARAMS: &[&str] = &["temperature", "top_p", "top_k"];
+
+/// Words an API uses when it refuses a parameter outright.
+const REJECTION_WORDS: &[&str] = &[
+    "deprecat",
+    "unsupported",
+    "not supported",
+    "not permitted",
+    "unexpected",
+    "removed",
+    "cannot be used",
+    "no longer",
+];
+
+/// Models that refused a sampling parameter during this process, so a model
+/// released after [`NO_SAMPLING_FAMILIES`] was written corrects itself after one
+/// rejected request. Session-scoped, as in Python: no disk cache.
+fn learned_no_sampling() -> &'static Mutex<HashSet<String>> {
+    static LEARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LEARNED.get_or_init(Mutex::default)
+}
+
 /// False when `model` rejects sampling parameters and they must be omitted.
 pub fn supports_sampling_params(model: &str) -> bool {
     let ident = normalize_model(model);
+    if learned_no_sampling()
+        .lock()
+        .is_ok_and(|learned| learned.contains(&ident))
+    {
+        return false;
+    }
     !NO_SAMPLING_FAMILIES
         .iter()
         .any(|family| ident.starts_with(family))
+}
+
+/// Record, for this process, that `model` rejected a sampling parameter.
+pub fn mark_sampling_unsupported(model: &str) {
+    if let Ok(mut learned) = learned_no_sampling().lock() {
+        learned.insert(normalize_model(model));
+    }
+}
+
+/// True when an API error text says a sampling parameter was refused.
+pub fn is_sampling_rejection(message: &str) -> bool {
+    let low = message.to_lowercase();
+    SAMPLING_PARAMS.iter().any(|param| low.contains(param))
+        && REJECTION_WORDS.iter().any(|word| low.contains(word))
 }
 
 /// The window assumed for a model nobody knows anything about.
@@ -155,5 +201,18 @@ mod tests {
         assert!(!supports_sampling_params("anthropic:Claude-Sonnet-5"));
         assert!(supports_sampling_params("gpt-4o-mini"));
         assert!(supports_sampling_params("claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn a_rejected_sampling_parameter_is_learned_for_the_session() {
+        assert!(is_sampling_rejection(
+            "Error code: 400 - `temperature` is deprecated for this model."
+        ));
+        assert!(!is_sampling_rejection("temperature must be at most 1"));
+        assert!(!is_sampling_rejection("model is unsupported"));
+
+        assert!(supports_sampling_params("anthropic:claude-test-learned-9"));
+        mark_sampling_unsupported("anthropic:Claude-Test-Learned-9");
+        assert!(!supports_sampling_params("claude-test-learned-9"));
     }
 }

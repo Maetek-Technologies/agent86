@@ -116,6 +116,69 @@ async fn run_works_against_ollama_and_local_models_cost_nothing() {
 }
 
 #[tokio::test]
+async fn run_works_against_anthropic_and_prices_cached_tokens() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("anthropic/text.sse"))]).await;
+    let workspace = Workspace::new("anthropic");
+    // The key comes from the environment, so the keyring is never consulted.
+    workspace.write_project_config(&format!(
+        "[model]\ndefault = \"anthropic:claude-sonnet-4-6\"\n\n[providers.anthropic]\n\
+         base_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\n",
+        server.base_url
+    ));
+
+    let output = workspace.run(&["run", "Say hello"]).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Hello, world\n");
+    let summary = stderr(&output);
+    assert!(
+        summary.starts_with("— 1 step · 0 tools · 120 in / 3 out (100 cached) · $0.0001 · "),
+        "{summary}"
+    );
+    let sent = &server.requests()[0];
+    assert_eq!(sent.request_line, "POST /v1/messages HTTP/1.1");
+    // The harness's output cap, and Python's system prompt split out of the messages,
+    // long enough to be marked for the prompt cache.
+    assert_eq!(sent.body["max_tokens"], 8192);
+    assert_eq!(
+        sent.body["system"][0]["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert_eq!(sent.body["messages"][0]["role"], "user");
+}
+
+#[tokio::test]
+async fn run_works_against_llamacpp_without_a_key_at_no_cost() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
+    let workspace = Workspace::new("llamacpp");
+    // A base_url without /v1, as the built-in section has it.
+    workspace.write_project_config(&format!(
+        "[model]\ndefault = \"llamacpp:qwen3\"\n\n[providers.llamacpp]\nbase_url = \"{}\"\n",
+        server.base_url
+    ));
+
+    let output = workspace.run(&["run", "Say hello"]).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Hello, world\n");
+    let summary = stderr(&output);
+    assert!(
+        summary.starts_with("— 1 step · 0 tools · 12 in / 3 out (4 cached) · $0.0000 · "),
+        "{summary}"
+    );
+    let sent = &server.requests()[0];
+    assert_eq!(sent.request_line, "POST /v1/chat/completions HTTP/1.1");
+    assert_eq!(sent.body["model"], "qwen3");
+    assert!(
+        !sent
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+        "no key is sent to a local server"
+    );
+}
+
+#[tokio::test]
 async fn run_streams_the_answer_to_stdout_and_the_summary_to_stderr() {
     let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
     let workspace = Workspace::with_mock_provider("text", &server);
@@ -273,18 +336,8 @@ fn malformed_model_refs_use_the_python_message() {
 }
 
 #[test]
-fn unported_and_unknown_providers_are_explained() {
+fn unknown_providers_are_explained() {
     let workspace = Workspace::new("providers");
-
-    // The built-in default model is Anthropic, which has no Rust adapter yet.
-    let default = workspace.command(&["run", "hi"]).output().unwrap();
-    assert_eq!(default.status.code(), Some(1));
-    assert!(
-        stderr(&default)
-            .contains("The 'anthropic' provider is not available in the Rust port yet."),
-        "{}",
-        stderr(&default)
-    );
 
     let unknown = workspace
         .command(&["-m", "nowhere:model", "run", "hi"])
