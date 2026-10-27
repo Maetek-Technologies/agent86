@@ -245,6 +245,10 @@ impl Tool for WriteFileTool {
         })
     }
 
+    fn preview_lexer(&self) -> Option<&'static str> {
+        Some("diff")
+    }
+
     fn preview(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {
         let path = string_arg(args, &["path"])?;
         let content = string_arg(args, &["content"])?;
@@ -362,6 +366,10 @@ impl Tool for EditFileTool {
             "required": ["path", "old_string", "new_string"],
             "type": "object",
         })
+    }
+
+    fn preview_lexer(&self) -> Option<&'static str> {
+        Some("diff")
     }
 
     fn preview(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {

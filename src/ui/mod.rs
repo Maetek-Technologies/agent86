@@ -13,7 +13,10 @@
 //! (Git Bash's mintty without winpty) falls back to the plain loop with a note.
 
 mod app;
+mod diff;
+mod entries;
 mod input;
+mod markdown;
 mod menu;
 mod picker;
 mod screen;
@@ -216,6 +219,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     );
     app.set_size(usize::from(width), usize::from(height));
     app.workspace = Some(repl.harness.context.policy.workspace().to_path_buf());
+    app.markdown = repl.config.ui.markdown;
     app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
     for note in &repl.startup_notes {
         app.note(Style::Dim, note);
@@ -268,6 +272,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
         app.mark_dirty();
     }
     let (live, _) = app.live();
+    screen.leave_alternate()?;
     screen.frame(&app.take_committed(), &live, None)?;
     screen.clear_live()
 }
@@ -298,7 +303,7 @@ fn dispatch(
         Action::Handled => {
             if result.clears_transcript {
                 // The old exchange is gone from the session, so it leaves the screen too.
-                app.take_committed();
+                app.clear_transcript();
                 screen.clear_all()?;
                 app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
             } else if let Some(render) = &result.render {
@@ -357,7 +362,7 @@ fn resume_picked(
     match repl.switch_session(session_id) {
         Err(message) => app.note(Style::Dim, &message),
         Ok(note) => {
-            app.take_committed();
+            app.clear_transcript();
             screen.clear_all()?;
             app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
             app.replay(&repl.state.messages);
@@ -457,9 +462,19 @@ fn pump(
             app.mark_dirty();
         }
         let request = app.take_request();
-        if request.is_some() || app.needs_frame() {
-            let (live, caret) = app.live();
-            screen.frame(&app.take_committed(), &live, caret)?;
+        if app.view_open() {
+            // The transcript view is on the alternate screen; what is committed
+            // meanwhile waits and is printed into scrollback on the way back.
+            screen.enter_alternate()?;
+            if request.is_some() || app.needs_frame() {
+                screen.page(&app.view_page())?;
+            }
+        } else {
+            screen.leave_alternate()?;
+            if request.is_some() || app.needs_frame() {
+                let (live, caret) = app.live();
+                screen.frame(&app.take_committed(), &live, caret)?;
+            }
         }
         if let Some(request) = request {
             return Ok(request);

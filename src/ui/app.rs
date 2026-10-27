@@ -3,11 +3,15 @@
 //! it is driven directly in tests; `mod.rs` owns the terminal and the turn thread.
 //!
 //! The behavior follows Python's `tui/app.py`: the streamed reply is committed a
-//! paragraph at a time, a tool call becomes one block when its result lands, the
-//! approval request takes the place of the input box, and Escape or Ctrl+C cancels
-//! a running turn at its next safe point.
+//! block at a time (rendered as Markdown with `[ui] markdown`), a tool call becomes
+//! one block when its result lands, the approval request takes the place of the
+//! input box, and Escape or Ctrl+C cancels a running turn at its next safe point.
+//! Everything printed is also kept as [`Entry`]s for the Ctrl+O transcript view.
 
+use super::diff::detail_line;
+use super::entries::{view_lines, Entry, ToolEntry, ARG_PREVIEW_LIMIT};
 use super::input::Editor;
+use super::markdown;
 use super::menu::{mention_text, Menu, MenuKind};
 use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
@@ -15,20 +19,17 @@ use super::status::{fit_status_line, StatusState};
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
-use crate::pyjson::python_json_dumps;
+use crate::pyjson::{python_json_dumps, python_json_dumps_indented};
 use crate::repl::{notice_text, Style, Text};
 use crate::types::{Message, Role};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// How much of the argument JSON fits on a tool block's first line.
-pub const ARG_PREVIEW_LIMIT: usize = 72;
-/// How much of the result summary fits on a tool block's second line.
-pub const SUMMARY_LIMIT: usize = 100;
-/// The longest reply tail held back without a paragraph break, as Python's
+/// The longest reply tail held back without a block boundary, as Python's
 /// `_STREAM_TAIL_LIMIT`; past it the tail is committed at its last newline.
 pub const STREAM_TAIL_LIMIT: usize = 2000;
 /// How long the "press Ctrl+C again" offer stays open.
@@ -42,13 +43,18 @@ pub enum UiEvent {
     ToolCall {
         id: String,
         name: String,
+        /// The arguments on one line, for the collapsed block.
         preview: String,
+        /// The arguments as indented JSON, for the transcript view.
+        args: String,
     },
     ToolResult {
         id: String,
         name: String,
         ok: bool,
         summary: String,
+        /// What the model was given back.
+        result: String,
     },
     /// The gate asks whether a side-effecting call may run; the worker waits for
     /// the answer on `reply`. Dropping `reply` unanswered declines.
@@ -69,15 +75,27 @@ impl From<TurnEvent<'_>> for UiEvent {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 preview: preview_arguments(&call.arguments),
+                args: pretty_arguments(&call.arguments),
             },
-            TurnEvent::ToolResult { call, result, .. } => Self::ToolResult {
+            TurnEvent::ToolResult {
+                call,
+                result,
+                observation,
+                ..
+            } => Self::ToolResult {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 ok: result.ok,
                 summary: summarize(result),
+                result: observation.to_owned(),
             },
         }
     }
+}
+
+/// The arguments as Python's `pretty_json` writes them (two-space indent).
+fn pretty_arguments(arguments: &Map<String, Value>) -> String {
+    python_json_dumps_indented(&Value::Object(arguments.clone()), false, 2)
 }
 
 /// What the interface wants its driver to do next.
@@ -102,12 +120,6 @@ pub enum Effect {
     CycleMode,
 }
 
-struct PendingTool {
-    id: String,
-    name: String,
-    preview: String,
-}
-
 struct Running {
     started: Instant,
     cancel_requested: bool,
@@ -123,6 +135,16 @@ struct ApprovalPanel {
     selected: usize,
 }
 
+/// The Ctrl+O transcript view's position.
+struct View {
+    /// The first line shown.
+    top: usize,
+    /// Stay at the bottom as the transcript grows.
+    follow: bool,
+    /// Tool calls shown in full.
+    expanded: bool,
+}
+
 pub struct App {
     pub editor: Editor,
     pub status: StatusState,
@@ -130,21 +152,28 @@ pub struct App {
     pub session_id: String,
     /// The `[ui] spinner` setting: animate the working indicator.
     spinner: bool,
+    /// The `[ui] markdown` setting: render replies as Markdown.
+    pub markdown: bool,
     /// Lines finished since the last frame, waiting to be printed into scrollback.
     committed: Vec<Line>,
+    /// Everything printed since the screen was last cleared, for the transcript view.
+    entries: Vec<Entry>,
     /// The reply's tail: text streamed but not yet committed.
     stream: String,
     /// The current reply has committed its first chunk (with the `⏺` marker).
     reply_started: bool,
-    /// The tail was split off at a paragraph break, so a blank line comes first.
+    /// The tail was split off at a block boundary, so a blank line comes first.
     blank_before_chunk: bool,
-    tools: Vec<PendingTool>,
+    /// Tool calls announced and still running, by call id.
+    tools: Vec<(String, ToolEntry)>,
     running: Option<Running>,
     approval: Option<ApprovalPanel>,
     /// A picker a bare `needs_choice` command opened.
     picker: Option<Picker>,
     /// The `/` or `@` completion menu under the input box.
     menu: Option<Menu>,
+    /// The Ctrl+O transcript view, when open.
+    view: Option<View>,
     /// Where `@` paths are completed from: the workspace.
     pub workspace: Option<PathBuf>,
     exit_armed: Option<Instant>,
@@ -162,7 +191,9 @@ impl App {
             status,
             session_id,
             spinner,
+            markdown: true,
             committed: Vec::new(),
+            entries: Vec::new(),
             stream: String::new(),
             reply_started: false,
             blank_before_chunk: false,
@@ -171,6 +202,7 @@ impl App {
             approval: None,
             picker: None,
             menu: None,
+            view: None,
             workspace: None,
             exit_armed: None,
             request: None,
@@ -195,6 +227,13 @@ impl App {
 
     pub fn take_committed(&mut self) -> Vec<Line> {
         std::mem::take(&mut self.committed)
+    }
+
+    /// Forget what was printed, as the screen is about to be cleared.
+    pub fn clear_transcript(&mut self) {
+        self.committed.clear();
+        self.entries.clear();
+        self.dirty = true;
     }
 
     /// Whether a frame should be drawn: something changed, or the spinner moved.
@@ -238,15 +277,14 @@ impl App {
                         self.finish_reply();
                     }
                     for call in &message.tool_calls {
+                        // Python's `compact_json`: nothing at all for no arguments.
                         let preview = if call.arguments.is_empty() {
                             String::new()
                         } else {
-                            python_json_dumps(
-                                &serde_json::Value::Object(call.arguments.clone()),
-                                false,
-                            )
+                            python_json_dumps(&Value::Object(call.arguments.clone()), false)
                         };
-                        let summary = results.get(call.id.as_str()).map(|content| {
+                        let result = results.get(call.id.as_str()).copied();
+                        let summary = result.map(|content| {
                             content
                                 .trim()
                                 .lines()
@@ -254,12 +292,14 @@ impl App {
                                 .unwrap_or("(no output)")
                                 .to_owned()
                         });
-                        let block = self.tool_block(
-                            &call.name,
-                            &preview,
-                            summary.as_deref().map(|summary| (true, summary)),
-                        );
-                        self.commit(block);
+                        self.commit_tool(ToolEntry {
+                            name: call.name.clone(),
+                            preview,
+                            args: pretty_arguments(&call.arguments),
+                            summary,
+                            result: result.unwrap_or_default().to_owned(),
+                            ok: true,
+                        });
                     }
                 }
                 Role::System | Role::Tool => {}
@@ -271,7 +311,16 @@ impl App {
 
     /// Print harness-owned lines.
     pub fn commit(&mut self, lines: impl IntoIterator<Item = Line>) {
-        self.committed.extend(lines);
+        let lines: Vec<Line> = lines.into_iter().collect();
+        self.committed.extend(lines.iter().cloned());
+        self.entries.push(Entry::Lines(lines));
+        self.dirty = true;
+    }
+
+    /// Print a tool call, collapsed; the transcript view can show it in full.
+    fn commit_tool(&mut self, tool: ToolEntry) {
+        self.committed.extend(tool.collapsed(self.width));
+        self.entries.push(Entry::Tool(tool));
         self.dirty = true;
     }
 
@@ -330,35 +379,57 @@ impl App {
                 }
                 self.stream.push_str(&sanitize(&text));
                 self.status.phase = "thinking".into();
-                self.drain_paragraphs();
+                self.drain_blocks();
             }
-            UiEvent::ToolCall { id, name, preview } => {
+            UiEvent::ToolCall {
+                id,
+                name,
+                preview,
+                args,
+            } => {
                 self.finish_reply();
                 self.status.phase = format!("running {name}");
-                self.tools.push(PendingTool { id, name, preview });
+                let tool = ToolEntry {
+                    name,
+                    preview,
+                    args,
+                    summary: None,
+                    result: String::new(),
+                    ok: true,
+                };
+                self.tools.push((id, tool));
             }
             UiEvent::ToolResult {
                 id,
                 name,
                 ok,
                 summary,
+                result,
             } => {
                 let index = self
                     .tools
                     .iter()
-                    .position(|tool| tool.id == id)
-                    .or_else(|| self.tools.iter().position(|tool| tool.name == name));
-                let preview = index
-                    .map(|index| self.tools.remove(index).preview)
-                    .unwrap_or_default();
-                let block = self.tool_block(&name, &preview, Some((ok, &summary)));
-                self.commit(block);
+                    .position(|(pending, _)| *pending == id)
+                    .or_else(|| self.tools.iter().position(|(_, tool)| tool.name == name));
+                let mut tool = index.map_or_else(
+                    || ToolEntry {
+                        name,
+                        ..ToolEntry::default()
+                    },
+                    |index| self.tools.remove(index).1,
+                );
+                tool.ok = ok;
+                tool.summary = Some(summary);
+                tool.result = result;
+                self.commit_tool(tool);
             }
             UiEvent::Approval {
                 tool,
                 preview,
                 reply,
             } => {
+                // The question has to be seen: the transcript view gives way to it.
+                self.view = None;
                 self.approval = Some(ApprovalPanel {
                     tool,
                     preview,
@@ -369,9 +440,8 @@ impl App {
             UiEvent::Finished(error) => {
                 self.finish_reply();
                 // Announced but never observed (a cancel mid-batch): shown, not dropped.
-                for tool in std::mem::take(&mut self.tools) {
-                    let block = self.tool_block(&tool.name, &tool.preview, None);
-                    self.commit(block);
+                for (_, tool) in std::mem::take(&mut self.tools) {
+                    self.commit_tool(tool);
                 }
                 if let Some((kind, message)) = error {
                     let message = sanitize(&message);
@@ -405,32 +475,17 @@ impl App {
         }
     }
 
-    /// The two lines of one tool call: `⏺ name(args)` and `⎿ summary`.
-    fn tool_block(&self, name: &str, preview: &str, outcome: Option<(bool, &str)>) -> Vec<Line> {
-        let (ok, summary) = outcome.unwrap_or((true, "(no result)"));
-        let marker = if ok { Style::Green } else { Style::Red };
-        let head = Line::styled(marker, "⏺ ")
-            .push(Style::Bold, sanitize(name))
-            .push(
-                Style::Plain,
-                format!("({})", ellipsize(&sanitize(preview), ARG_PREVIEW_LIMIT)),
-            );
-        let body = Line::styled(Style::Dim, "  ⎿  ").push(
-            if ok { Style::Dim } else { Style::DimRed },
-            ellipsize(&sanitize(summary), SUMMARY_LIMIT),
-        );
-        vec![
-            Line::default(),
-            head.truncate(self.width),
-            body.truncate(self.width),
-        ]
-    }
-
-    /// Commit whole paragraphs of the reply, keeping the unfinished tail live.
-    fn drain_paragraphs(&mut self) {
+    /// Commit the complete blocks of the reply, keeping the unfinished tail live:
+    /// Markdown blocks with `[ui] markdown`, otherwise paragraphs.
+    fn drain_blocks(&mut self) {
         loop {
-            if let Some(at) = self.stream.rfind("\n\n") {
-                let tail = self.stream.split_off(at + 2);
+            let boundary = if self.markdown {
+                markdown::commit_point(&self.stream)
+            } else {
+                self.stream.rfind("\n\n").map(|at| at + 2)
+            };
+            if let Some(at) = boundary {
+                let tail = self.stream.split_off(at);
                 let head = std::mem::replace(&mut self.stream, tail);
                 self.commit_chunk(&head);
                 self.blank_before_chunk = true;
@@ -439,7 +494,8 @@ impl App {
             if self.stream.chars().count() <= STREAM_TAIL_LIMIT {
                 return;
             }
-            // One runaway paragraph: break at the last newline, or anywhere.
+            // One runaway block: break at the last newline, or anywhere. A code block
+            // cut in two is closed and reopened, so both halves still render as code.
             let at = match self.stream.rfind('\n') {
                 Some(at) => at + 1,
                 None => self
@@ -448,14 +504,19 @@ impl App {
                     .nth(STREAM_TAIL_LIMIT)
                     .map_or(self.stream.len(), |(at, _)| at),
             };
-            let tail = self.stream.split_off(at);
-            let head = std::mem::replace(&mut self.stream, tail);
+            let (head, tail) = if self.markdown {
+                markdown::split_inside(&self.stream, at)
+            } else {
+                let tail = self.stream.split_off(at);
+                (std::mem::take(&mut self.stream), tail)
+            };
+            self.stream = tail;
             self.commit_chunk(&head);
             self.blank_before_chunk = false;
         }
     }
 
-    /// Commit one chunk of the reply, word-wrapped under the `⏺` marker.
+    /// Commit one chunk of the reply under the `⏺` marker.
     fn commit_chunk(&mut self, chunk: &str) {
         let mut body = chunk.trim_end_matches('\n');
         if !self.reply_started {
@@ -464,17 +525,27 @@ impl App {
         if body.trim().is_empty() {
             return;
         }
+        let width = self.width.saturating_sub(2).max(1);
+        let rows: Vec<Line> = if self.markdown {
+            markdown::render(body, width)
+        } else {
+            body.split('\n')
+                .flat_map(|line| wrap_words(line, width))
+                .map(Line::plain)
+                .collect()
+        };
         let mut lines = Vec::new();
         if !self.reply_started || self.blank_before_chunk {
             lines.push(Line::default());
         }
-        for (index, row) in self.reply_rows(body).into_iter().enumerate() {
-            let lead = if index == 0 && !self.reply_started {
-                Line::styled(Style::Plain, "⏺ ")
+        for (index, row) in rows.into_iter().enumerate() {
+            let mut line = if index == 0 && !self.reply_started {
+                Line::plain("⏺ ")
             } else {
                 Line::plain("  ")
             };
-            lines.push(lead.push(Style::Plain, row));
+            line.spans.extend(row.spans);
+            lines.push(line);
         }
         self.reply_started = true;
         self.blank_before_chunk = false;
@@ -496,12 +567,92 @@ impl App {
         self.blank_before_chunk = false;
     }
 
+    // ---- the transcript view ---------------------------------------------
+
+    pub fn view_open(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// The transcript view's page: as much of the transcript as fits, with every
+    /// tool call expanded (unless toggled), and a key hint on the last row.
+    pub fn view_page(&mut self) -> Vec<Line> {
+        let width = self.width;
+        let rows = self.height.saturating_sub(1).max(1);
+        let Some(view) = &mut self.view else {
+            return Vec::new();
+        };
+        let lines = view_lines(&self.entries, width, view.expanded);
+        let bottom = lines.len().saturating_sub(rows);
+        if view.follow || view.top >= bottom {
+            view.top = bottom;
+            view.follow = true;
+        }
+        let mut page: Vec<Line> = lines[view.top..lines.len().min(view.top + rows)].to_vec();
+        page.resize(rows, Line::default());
+        let hint = if view.expanded {
+            "a to collapse tool calls"
+        } else {
+            "a to expand tool calls"
+        };
+        page.push(
+            Line::styled(
+                Style::Dim,
+                format!("  transcript · esc to return · {hint} · ↑↓ PgUp PgDn Home End to scroll"),
+            )
+            .truncate(width),
+        );
+        page
+    }
+
+    fn view_key(&mut self, key: KeyEvent) {
+        let page = self.height.saturating_sub(2).max(1);
+        let Some(view) = &mut self.view else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.view = None;
+                // Back on the main screen, the live region is drawn again.
+                self.dirty = true;
+            }
+            KeyCode::Char('o' | 'O') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                view.expanded = !view.expanded;
+            }
+            KeyCode::Char('o') if ctrl => {
+                self.view = None;
+                self.dirty = true;
+            }
+            KeyCode::Char('a') => view.expanded = !view.expanded,
+            KeyCode::Up | KeyCode::Char('k') => {
+                view.top = view.top.saturating_sub(1);
+                view.follow = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => view.top += 1,
+            KeyCode::PageUp => {
+                view.top = view.top.saturating_sub(page);
+                view.follow = false;
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => view.top += page,
+            KeyCode::Home | KeyCode::Char('g') => {
+                view.top = 0;
+                view.follow = false;
+            }
+            KeyCode::End | KeyCode::Char('G') => view.follow = true,
+            _ => {}
+        }
+    }
+
     // ---- keys -------------------------------------------------------------
 
     /// Handle one key press; `history` is the shared prompt history.
     pub fn on_key(&mut self, key: KeyEvent, history: &[String]) -> Effect {
         self.dirty = true;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') && self.view.take().is_some() {
+            // Ctrl+C in the transcript view returns to the conversation first.
+            return Effect::None;
+        }
         if ctrl && key.code == KeyCode::Char('c') && self.picker.is_none() {
             return self.interrupt();
         }
@@ -511,6 +662,18 @@ impl App {
         }
         if key.code == KeyCode::BackTab {
             return Effect::CycleMode;
+        }
+        if self.view.is_some() {
+            self.view_key(key);
+            return Effect::None;
+        }
+        if ctrl && key.code == KeyCode::Char('o') && self.picker.is_none() {
+            self.view = Some(View {
+                top: 0,
+                follow: true,
+                expanded: true,
+            });
+            return Effect::None;
         }
         if let Some(picker) = &mut self.picker {
             match picker.on_key(key) {
@@ -735,7 +898,7 @@ impl App {
                 }
                 top.extend(rows);
             }
-            for tool in &self.tools {
+            for (_, tool) in &self.tools {
                 top.push(Line::default());
                 top.push(
                     Line::styled(Style::Dim, "⏺ ")
@@ -839,8 +1002,8 @@ fn approval_panel(panel: &ApprovalPanel, width: usize, budget: usize) -> Vec<Lin
     }
     if let Some(detail) = &panel.preview.detail {
         content.push(Line::default());
-        for row in sanitize(detail).split('\n').take(APPROVAL_DETAIL_LINES) {
-            content.push(Line::styled(Style::Dim, row));
+        for row in detail.split('\n').take(APPROVAL_DETAIL_LINES) {
+            content.push(detail_line(row, panel.preview.lexer));
         }
     }
     let mut rows: Vec<Line> = content
@@ -995,6 +1158,7 @@ mod tests {
             id: "c1".into(),
             name: "list_dir".into(),
             preview: r#"{"path": "."}"#.into(),
+            args: "{\n  \"path\": \".\"\n}".into(),
         });
         assert_eq!(committed_text(&mut app), ["", "⏺ Let me look."]);
         assert!(live_text(&mut app).contains(&r#"⏺ list_dir({"path": "."})"#.to_owned()));
@@ -1004,6 +1168,7 @@ mod tests {
             name: "list_dir".into(),
             ok: false,
             summary: "error: No such directory".into(),
+            result: "Error: No such directory: .".into(),
         });
         assert_eq!(
             committed_text(&mut app),
@@ -1013,6 +1178,104 @@ mod tests {
                 "  ⎿  error: No such directory"
             ]
         );
+    }
+
+    #[test]
+    fn markdown_replies_commit_whole_blocks() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(UiEvent::Text(
+            "Steps:\n\n```sh\ncargo build\n\ncargo test\n".into(),
+        ));
+        assert_eq!(committed_text(&mut app), ["", "⏺ Steps:"]);
+        app.on_turn_event(UiEvent::Text("```\n\n- **done**".into()));
+        assert_eq!(
+            committed_text(&mut app),
+            ["", "  │ cargo build", "  │ ", "  │ cargo test"],
+            "the code block waited for its closing fence"
+        );
+        app.on_turn_event(UiEvent::Finished(None));
+        let lines = app.take_committed();
+        assert_eq!(lines[1].plain_text(), "  • done");
+        assert!(lines[1].spans.contains(&(Style::Bold, "done".to_owned())));
+
+        let mut plain = self::app();
+        plain.markdown = false;
+        plain.start_turn();
+        plain.on_turn_event(UiEvent::Text("- **raw**".into()));
+        plain.on_turn_event(UiEvent::Finished(None));
+        assert_eq!(committed_text(&mut plain), ["", "⏺ - **raw**"]);
+    }
+
+    #[test]
+    fn the_transcript_view_shows_tool_calls_in_full() {
+        let mut app = app();
+        app.set_size(61, 12);
+        app.echo_user("look");
+        app.start_turn();
+        app.on_turn_event(UiEvent::ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            preview: r#"{"path": "a.txt"}"#.into(),
+            args: "{\n  \"path\": \"a.txt\"\n}".into(),
+        });
+        app.on_turn_event(UiEvent::ToolResult {
+            id: "c1".into(),
+            name: "read_file".into(),
+            ok: true,
+            summary: "one".into(),
+            result: "one\ntwo\nthree".into(),
+        });
+        app.on_key(ctrl('o'), &[]);
+        assert!(app.view_open());
+        let page: Vec<String> = app.view_page().iter().map(Line::plain_text).collect();
+        assert_eq!(page.len(), 12);
+        assert!(page.contains(&"    three".to_owned()), "{page:?}");
+        assert!(page.last().unwrap().contains("esc to return"));
+
+        app.on_key(key(KeyCode::Char('a')), &[]);
+        let collapsed: Vec<String> = app.view_page().iter().map(Line::plain_text).collect();
+        assert!(!collapsed.contains(&"    three".to_owned()));
+        app.on_key(key(KeyCode::Home), &[]);
+        assert_eq!(app.view_page()[1].plain_text(), "> look");
+
+        // An approval needs an answer: the view gives way to it.
+        let (reply, _answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Approval {
+            tool: "write_file".into(),
+            preview: ApprovalPreview {
+                summary: "{}".into(),
+                detail: None,
+                lexer: None,
+            },
+            reply,
+        });
+        assert!(!app.view_open());
+    }
+
+    #[test]
+    fn the_approval_panel_colours_a_diff() {
+        let mut app = app_running();
+        let (reply, _answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Approval {
+            tool: "edit_file".into(),
+            preview: ApprovalPreview {
+                summary: "{}".into(),
+                detail: Some("--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-old\n+new".into()),
+                lexer: Some("diff"),
+            },
+            reply,
+        });
+        let (live, _) = app.live();
+        let style_of = |text: &str| {
+            live.iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|(_, piece)| piece == text)
+                .map(|(style, _)| *style)
+        };
+        assert_eq!(style_of("+new"), Some(Style::Green));
+        assert_eq!(style_of("-old"), Some(Style::Red));
+        assert_eq!(style_of("@@ -1 +1 @@"), Some(Style::Cyan));
     }
 
     #[test]
@@ -1095,6 +1358,7 @@ mod tests {
             preview: ApprovalPreview {
                 summary: r#"{"path": "a.txt"}"#.into(),
                 detail: Some("--- a.txt\n+++ a.txt\n+hello".into()),
+                lexer: Some("diff"),
             },
             reply,
         });
@@ -1115,6 +1379,7 @@ mod tests {
             preview: ApprovalPreview {
                 summary: "{}".into(),
                 detail: None,
+                lexer: None,
             },
             reply,
         });
@@ -1127,6 +1392,7 @@ mod tests {
             preview: ApprovalPreview {
                 summary: "{}".into(),
                 detail: None,
+                lexer: None,
             },
             reply,
         });
@@ -1144,6 +1410,7 @@ mod tests {
             preview: ApprovalPreview {
                 summary: "{}".into(),
                 detail: Some(detail.join("\n")),
+                lexer: Some("diff"),
             },
             reply,
         });
