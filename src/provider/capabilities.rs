@@ -52,16 +52,30 @@ const CONTEXT_WINDOWS: &[(&str, u64)] = &[
     ("phi", 16_384),
 ];
 
+/// [`context_window_with`] without asking any server, for callers that must not
+/// touch the network.
+pub fn context_window_for(model_ref: &str, config: &crate::config::Config) -> u64 {
+    context_window_with(model_ref, config, |_, _| None)
+}
+
 /// Tokens of context the model behind `model_ref` can hold, as Python's
 /// `context_window_for`: a `[model.context_window]` override (by the full ref, then
-/// the bare id), then the server's own setting for Ollama and llama.cpp, then the
-/// table, then [`DEFAULT_CONTEXT_WINDOW`].
-///
-/// Python also asks OpenRouter's models endpoint; that lookup is not ported yet.
-pub fn context_window_for(model_ref: &str, config: &crate::config::Config) -> u64 {
+/// the bare id), then what `discover(provider, model)` reports (OpenRouter's own
+/// figure, see [`super::remote_windows`]), then the server's own setting for Ollama
+/// and llama.cpp, then the table, then [`DEFAULT_CONTEXT_WINDOW`].
+pub fn context_window_with(
+    model_ref: &str,
+    config: &crate::config::Config,
+    discover: impl FnOnce(&str, &str) -> Option<u64>,
+) -> u64 {
     let (provider, model) = model_ref.split_once(':').unwrap_or(("", model_ref));
     for key in [model_ref, model] {
         if let Some(&window) = config.model.context_window.get(key).filter(|&&w| w > 0) {
+            return window;
+        }
+    }
+    if !provider.is_empty() {
+        if let Some(window) = discover(provider, model).filter(|&window| window > 0) {
             return window;
         }
     }
@@ -109,6 +123,14 @@ mod tests {
         assert_eq!(context_window_for("local:mystery", &config), 8_192);
         assert_eq!(context_window_for("ollama:llama3.1", &config), 8_192);
         assert_eq!(context_window_for("llamacpp:qwen3", &config), 8_192);
+        assert_eq!(
+            context_window_with("openrouter:qwen/qwen3.7-max", &config, |provider, model| {
+                assert_eq!((provider, model), ("openrouter", "qwen/qwen3.7-max"));
+                Some(262_144)
+            }),
+            262_144,
+            "a server's own figure beats the table"
+        );
         config
             .model
             .context_window

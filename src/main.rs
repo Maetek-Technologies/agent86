@@ -193,6 +193,7 @@ fn main() -> ExitCode {
         None => {
             run_interactive(
                 config,
+                ConfigPaths::discover(),
                 cli.resume.as_deref(),
                 cli.plain,
                 Box::new(OsKeyring),

@@ -158,7 +158,8 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 | `src/ui/menu.rs` | The `/` command menu and `@` path completion (`complete_mentions` itself lives in `src/mentions.rs`) |
 | `src/ui/picker.rs` | The mode, model, and session pickers (part 3): a list panel with optional type-to-filter |
 | `src/ui/status.rs` | A port of `ui/status.py` and `fit_status_line`. Shared, so `/cost` and the plain loop could use the same numbers |
-| `src/ui/panels/*.rs` (parts 5 and 6) | One file per remaining Python screen: `provider_manager` (with the catalog picker), `key_entry`, `connection_test`, `save_diff`, `mcp_manager` (with the server form), `mcp_test`. The approval panel is in `app.rs` |
+| `src/ui/panels.rs` (part 5) | The key entry, connection test, and save-diff panels (Python's `KeyEntryModal`, `ConnectionTestModal`, `SaveDiffModal`) and the frame every panel is drawn in. The provider list and the catalog picker are pickers (`picker.rs`); the approval panel is in `app.rs`. Part 6 adds the MCP manager, the server form, and the MCP test |
+| `src/ui/manage.rs` (part 5) | The catalog cache and the `/config model` chain, as the catalog and model-manager parts of Python's `tui/app.py`: the bare `/model` picker, the typed `/model <id>` fallback, and the chain from the provider list to the save |
 | `src/repl.rs` | Unchanged role: the command registry, `Repl`, and the plain loop. Command handlers already return `CommandResult`s, which both surfaces draw |
 
 ### Threads and events
@@ -234,7 +235,7 @@ Each slice is one PR to `main`. Each passes `cargo test --all-targets`, `cargo f
 ### Slice 4 (stage 9, part 5): models, providers, and keys
 
 - **Model catalogs:**
-  - A port of `cognitive/catalog.py` (the OpenAI-compatible `/v1/models` shape; providers that aren't ported report the catalog as unavailable). It is cached per session and fetched on a worker.
+  - A port of `cognitive/catalog.py`, cached per session and fetched on a worker. **Done in part 5** with all three of Python's shapes (OpenAI-compatible, Anthropic, Ollama): listing models needs no provider adapter, and a model picked for a provider that isn't ported fails its connection test with the usual message.
   - Catalog entries in the model picker.
   - The typed `/model <bare id>` fallback, which resolves against the active provider's catalog, with Python's queueing rules.
   - The OpenRouter context-length lookup, cached for 24 hours under `~/.agent86/cache`.

@@ -13,7 +13,7 @@
 
 use crate::agent::Harness;
 use crate::approval::{stdout_prompt, ApprovalPrompt};
-use crate::config::Config;
+use crate::config::{Config, ConfigPaths};
 use crate::history::PromptHistory;
 use crate::mentions::expand_mentions;
 use crate::pricing::{format_cost, PriceTable, UNPRICED_LABEL};
@@ -348,10 +348,10 @@ pub const COMMANDS: [CommandEntry; 15] = [
         description: "Manage providers & models: add, key, test, switch, save",
         needs_choice: Some(Choice::ConfigModel),
         handler: |_, _| {
-            CommandResult::message(
-                "The model manager is part of the full-screen interface, which the Rust port \
-                 does not have yet. Use /model, `--model provider:model`, and `agent86 keys`.",
-            )
+            let mut text = Text::plain("The model manager is a TUI surface — press / and pick ");
+            text.push(Style::Cyan, "/config model");
+            text.push(Style::Plain, ", or run agent86 without --plain.");
+            CommandResult::handled(text)
         },
     },
     CommandEntry {
@@ -590,10 +590,12 @@ pub fn session_label(info: &SessionInfo, now: f64) -> String {
     )
 }
 
-/// The model picker's choices, as Python's `model_choices` without a catalog: the
-/// three role slots, deduplicated by ref, with roles that share a ref named
-/// together (`default, route.frontier — openai:gpt-4o`). Each is (label, ref).
-pub fn model_choices(config: &Config) -> Vec<(String, String)> {
+/// The model picker's choices, as Python's `model_choices`: the three role slots,
+/// deduplicated by ref, with roles that share a ref named together
+/// (`default, route.frontier — openai:gpt-4o`), then `extra`, the active
+/// provider's catalog as (ref, label) with full refs, minus what is already listed.
+/// Each choice is (label, ref).
+pub fn model_choices(config: &Config, extra: &[(String, String)]) -> Vec<(String, String)> {
     let roles = [
         ("default", &config.model.default),
         ("route.cheap", &config.model.route.cheap),
@@ -612,7 +614,7 @@ pub fn model_choices(config: &Config) -> Vec<(String, String)> {
             None => order.push((reference, vec![role])),
         }
     }
-    order
+    let mut choices: Vec<(String, String)> = order
         .into_iter()
         .map(|(reference, names)| {
             (
@@ -620,7 +622,13 @@ pub fn model_choices(config: &Config) -> Vec<(String, String)> {
                 reference.to_owned(),
             )
         })
-        .collect()
+        .collect();
+    for (reference, label) in extra {
+        if !choices.iter().any(|(_, listed)| listed == reference) {
+            choices.push((label.clone(), reference.clone()));
+        }
+    }
+    choices
 }
 
 pub(crate) fn now() -> f64 {
@@ -651,13 +659,19 @@ pub struct Repl {
     model_ref: String,
     prices: PriceTable,
     /// Where `/models` looks for stored keys.
-    secrets: Box<dyn SecretStore>,
+    pub(crate) secrets: Box<dyn SecretStore>,
     /// Built on first use, so constructing a `Repl` never reads the history file.
     history: Option<PromptHistory>,
     /// How far the MCP note log has been shown.
     pub(crate) mcp_cursor: u64,
     /// Launch notes: resume, memory, MCP, collisions, sandbox, and the session id.
     pub startup_notes: Vec<String>,
+    /// Where the configuration came from, so the interface can write it back and
+    /// reload it; `None` when there is nowhere to write (tests).
+    pub config_paths: Option<ConfigPaths>,
+    /// Counts successful `/model` switches. Python tells a switch from a refusal by
+    /// the provider object changing; this is the same signal.
+    pub(crate) model_switches: u64,
 }
 
 impl Repl {
@@ -713,6 +727,8 @@ impl Repl {
             history: None,
             mcp_cursor: 0,
             startup_notes: Vec::new(),
+            config_paths: None,
+            model_switches: 0,
         };
         repl.state = match resumed {
             Some(state) => state,
@@ -839,6 +855,7 @@ impl Repl {
                 self.harness.max_tokens = self.config.max_output_tokens_for(&reference.provider);
                 self.harness.provider = provider;
                 self.model_ref = reference.to_string();
+                self.model_switches += 1;
                 format!(
                     "model: {}:{}",
                     self.harness.provider.name(),
@@ -1390,7 +1407,7 @@ mod tests {
         config.model.route.cheap = "ollama:llama3.1".into();
         config.model.route.frontier = "openai:gpt-4o".into();
         assert_eq!(
-            model_choices(&config),
+            model_choices(&config, &[]),
             [
                 (
                     "default, route.frontier — openai:gpt-4o".to_owned(),
@@ -1402,10 +1419,21 @@ mod tests {
                 ),
             ]
         );
+        // Catalog entries follow, without repeating a role slot's ref.
+        let catalog = [
+            ("openai:gpt-4o".to_owned(), "openai:gpt-4o".to_owned()),
+            ("openai:o3".to_owned(), "o3 (reasoning)".to_owned()),
+        ];
+        let choices = model_choices(&config, &catalog);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(
+            choices[2],
+            ("o3 (reasoning)".to_owned(), "openai:o3".to_owned())
+        );
         config.model.default.clear();
         config.model.route.cheap.clear();
         config.model.route.frontier.clear();
-        assert!(model_choices(&config).is_empty());
+        assert!(model_choices(&config, &[]).is_empty());
     }
 
     #[test]

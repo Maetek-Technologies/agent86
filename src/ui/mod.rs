@@ -16,8 +16,10 @@ mod app;
 mod diff;
 mod entries;
 mod input;
+mod manage;
 mod markdown;
 mod menu;
+mod panels;
 mod picker;
 mod screen;
 pub mod status;
@@ -25,15 +27,18 @@ mod text;
 
 use crate::agent::Harness;
 use crate::config::Config;
+use crate::config::ConfigPaths;
 use crate::mentions::expand_mentions;
-use crate::provider::capabilities::context_window_for;
+use crate::provider::capabilities::context_window_with;
+use crate::provider::remote_windows::{cache_path, openrouter_context_window};
 use crate::repl::{
-    compact_banner, find_command_for_line, model_choices, now, plain_loop, session_label,
-    start_repl, Action, Choice, Repl, Style, NO_MEMORY_NOTE,
+    compact_banner, find_command_for_line, now, plain_loop, session_label, start_repl, Action,
+    Choice, Repl, Style, NO_MEMORY_NOTE,
 };
 use crate::secrets::SecretStore;
 use app::{App, Effect, Request, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use manage::Manager;
 use picker::{Picker, PickerKind};
 use screen::Screen;
 use status::StatusState;
@@ -46,8 +51,12 @@ use std::time::Duration;
 const FRAME: Duration = Duration::from_millis(50);
 
 /// `agent86` with no subcommand: this interface, or the plain loop.
+///
+/// `paths` is where the configuration was read from, for `/config model` to write
+/// it back.
 pub fn run_interactive(
     config: Config,
+    paths: ConfigPaths,
     resume: Option<&str>,
     plain: bool,
     secrets: Box<dyn SecretStore>,
@@ -56,6 +65,7 @@ pub fn run_interactive(
     let Some(mut repl) = start_repl(config, resume, secrets) else {
         return;
     };
+    repl.config_paths = Some(paths);
     if !wanted {
         return plain_loop(repl);
     }
@@ -170,6 +180,20 @@ fn windows_console() -> io::Result<()> {
 /// What the status line shows for the session as it stands.
 fn status_from(repl: &Repl) -> StatusState {
     let usage = &repl.state.usage;
+    // OpenRouter is asked for its models' windows, cached beside the user config.
+    let cache = repl
+        .config_paths
+        .as_ref()
+        .and_then(|paths| paths.user.as_deref()?.parent().map(cache_path));
+    let window = context_window_with(repl.model_ref(), &repl.config, |provider, model| {
+        openrouter_context_window(
+            provider,
+            model,
+            &repl.config,
+            cache.as_deref(),
+            &*repl.secrets,
+        )
+    });
     StatusState {
         model: repl.harness.provider.model().to_owned(),
         used_tokens: repl
@@ -177,7 +201,7 @@ fn status_from(repl: &Repl) -> StatusState {
             .steps
             .last()
             .map_or(0, |step| step.usage.input_tokens),
-        window: context_window_for(repl.model_ref(), &repl.config),
+        window,
         output_tokens: usage.output_tokens,
         cost_usd: usage.cost_usd,
         priced: repl.priced(),
@@ -212,6 +236,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
         .enable_all()
         .build()?;
 
+    let mut manager = Manager::new(events.clone());
     let mut app = App::new(
         status_from(repl),
         repl.state.session_id.clone(),
@@ -244,28 +269,57 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             Request::Submit(text) => {
                 let line = text.trim().to_owned();
                 repl.history().append(&line);
-                line
+                Some(line)
             }
-            Request::Picked(PickerKind::Mode, mode) => format!("/mode {mode}"),
-            Request::Picked(PickerKind::Model, reference) => format!("/model {reference}"),
+            Request::Picked(PickerKind::Mode, mode) => Some(format!("/mode {mode}")),
+            Request::Picked(PickerKind::Model, reference) => Some(format!("/model {reference}")),
             Request::Picked(PickerKind::Session, session_id) => {
                 resume_picked(&mut app, &mut screen, repl, &session_id)?;
-                app.status = status_from(repl);
-                app.session_id = repl.state.session_id.clone();
-                continue;
+                None
+            }
+            Request::Picked(PickerKind::Provider, name) => {
+                manager.on_provider(&mut app, repl, &name);
+                None
+            }
+            Request::Picked(PickerKind::Catalog, reference) => {
+                manager.on_catalog_picked(&mut app, repl, &reference);
+                None
+            }
+            Request::Key(key) => {
+                manager.on_key_entered(&mut app, repl, key);
+                None
+            }
+            // A passing test switches the model at once, as a dispatched line.
+            Request::Tested(outcome) => manager.on_tested(&mut app, repl, outcome),
+            Request::Saved(edit) => {
+                Manager::on_saved(&mut app, repl, edit);
+                None
+            }
+            Request::Catalog {
+                provider,
+                result,
+                purpose,
+            } => {
+                for full in manager.on_catalog(&mut app, repl, &provider, result, purpose) {
+                    Manager::retry_model(&mut app, repl, &full);
+                }
+                None
             }
         };
-        let carry_on = dispatch(
-            &mut app,
-            &mut screen,
-            repl,
-            &inbox,
-            &events,
-            &runtime,
-            &line,
-        )?;
-        if !carry_on {
-            break;
+        if let Some(line) = line {
+            let carry_on = dispatch(
+                &mut app,
+                &mut screen,
+                repl,
+                &mut manager,
+                &inbox,
+                &events,
+                &runtime,
+                &line,
+            )?;
+            if !carry_on {
+                break;
+            }
         }
         app.status = status_from(repl);
         app.session_id = repl.state.session_id.clone();
@@ -279,10 +333,12 @@ fn run(repl: &mut Repl) -> io::Result<()> {
 
 /// Run one line, as Python's `_dispatch_line`: echo it, open a picker for a bare
 /// `needs_choice` command, else run the command or the turn. False means quit.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     app: &mut App,
     screen: &mut Screen<io::Stdout>,
     repl: &mut Repl,
+    manager: &mut Manager,
     inbox: &mpsc::Receiver<UiEvent>,
     events: &mpsc::Sender<UiEvent>,
     runtime: &tokio::runtime::Runtime,
@@ -291,9 +347,14 @@ fn dispatch(
     app.echo_user(line);
     if let Some((entry, arg)) = find_command_for_line(line) {
         if let (Some(choice), true) = (entry.needs_choice, arg.is_empty()) {
-            if open_choice(app, repl, choice) {
+            if open_choice(app, repl, manager, choice) {
                 return Ok(true);
             }
+        }
+        // A typed model id may be resolved against the provider's catalog.
+        if entry.name == "/model" && !arg.is_empty() {
+            manager.dispatch_model(app, repl, &arg);
+            return Ok(true);
         }
     }
     let result = repl.handle_command(line);
@@ -320,18 +381,12 @@ fn dispatch(
 
 /// Open the picker a bare command asks for, as Python's `_run_or_chain`. False
 /// when this surface has no picker for it yet, so the command's handler runs.
-fn open_choice(app: &mut App, repl: &Repl, choice: Choice) -> bool {
+fn open_choice(app: &mut App, repl: &Repl, manager: &mut Manager, choice: Choice) -> bool {
     match choice {
         Choice::Mode => app.open_picker(Picker::mode(repl.harness.gate.mode().as_str())),
-        Choice::Model => {
-            let choices = model_choices(&repl.config);
-            if choices.is_empty() {
-                // Nothing configured to offer: start the typed form instead.
-                app.editor.set_text("/model ");
-            } else {
-                app.open_picker(Picker::model(choices));
-            }
-        }
+        // The picker opens once the active provider's catalog is in.
+        Choice::Model => manager.model_picker(app, repl),
+        Choice::ConfigModel => manager.open_provider_manager(app, repl),
         // A picker offering nothing is a dead end, so the empty cases are notes.
         Choice::Resume => match repl.recent_sessions(20) {
             None => app.note(Style::Dim, NO_MEMORY_NOTE),
@@ -345,8 +400,8 @@ fn open_choice(app: &mut App, repl: &Repl, choice: Choice) -> bool {
                 app.open_picker(Picker::sessions(choices));
             }
         },
-        // The provider and MCP managers come with stage 9, parts 5 and 6.
-        Choice::ConfigModel | Choice::ConfigMcp => return false,
+        // The MCP manager comes with stage 9, part 6.
+        Choice::ConfigMcp => return false,
     }
     true
 }

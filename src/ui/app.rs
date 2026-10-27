@@ -13,18 +13,21 @@ use super::entries::{view_lines, Entry, ToolEntry, ARG_PREVIEW_LIMIT};
 use super::input::Editor;
 use super::markdown;
 use super::menu::{mention_text, Menu, MenuKind};
+use super::panels::{ConnectionTest, KeyEntry, SaveDiff, TestOutcome, TestResult};
 use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
 use super::status::{fit_status_line, StatusState};
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
+use crate::config_writer::ConfigEdit;
+use crate::provider::catalog::CatalogEntry;
 use crate::pyjson::{python_json_dumps, python_json_dumps_indented};
 use crate::repl::{notice_text, Style, Text};
 use crate::types::{Message, Role};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -65,6 +68,28 @@ pub enum UiEvent {
     },
     /// The turn ended: `None`, or the Python exception name and the message.
     Finished(Option<(String, String)>),
+    /// A model catalog fetch finished: the entries, or why there are none.
+    Catalog {
+        provider: String,
+        result: Result<Vec<CatalogEntry>, String>,
+        purpose: CatalogPurpose,
+    },
+    /// The connection test with this id finished.
+    Tested {
+        id: u64,
+        result: TestResult,
+    },
+}
+
+/// What a catalog was fetched for, as Python's `CatalogReady.purpose`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogPurpose {
+    /// A bare `/model`: open the model picker with it.
+    ModelPicker,
+    /// A typed `/model <id>` that failed: see whether the catalog vouches for it.
+    ModelFallback,
+    /// `/config model`: open the catalog picker.
+    Manager,
 }
 
 impl From<TurnEvent<'_>> for UiEvent {
@@ -108,6 +133,26 @@ pub enum Request {
     TurnDone,
     /// A picker was answered.
     Picked(PickerKind, String),
+    /// The key entry was answered: the key, or `None` for nothing entered.
+    Key(Option<String>),
+    /// The connection test ended.
+    Tested(TestOutcome),
+    /// The save panel was answered: the edit to apply, or `None` for a cancel.
+    Saved(Option<ConfigEdit>),
+    /// A catalog arrived. Held until no turn runs and no panel is open.
+    Catalog {
+        provider: String,
+        result: Result<Vec<CatalogEntry>, String>,
+        purpose: CatalogPurpose,
+    },
+}
+
+/// What takes the input box's place until it is answered.
+pub enum Panel {
+    Picker(Picker),
+    Key(KeyEntry),
+    Test(ConnectionTest),
+    Save(SaveDiff),
 }
 
 /// What a key asks of the harness while a turn runs.
@@ -168,8 +213,8 @@ pub struct App {
     tools: Vec<(String, ToolEntry)>,
     running: Option<Running>,
     approval: Option<ApprovalPanel>,
-    /// A picker a bare `needs_choice` command opened.
-    picker: Option<Picker>,
+    /// A picker or a `/config model` panel.
+    panel: Option<Panel>,
     /// The `/` or `@` completion menu under the input box.
     menu: Option<Menu>,
     /// The Ctrl+O transcript view, when open.
@@ -178,6 +223,8 @@ pub struct App {
     pub workspace: Option<PathBuf>,
     exit_armed: Option<Instant>,
     request: Option<Request>,
+    /// Requests from workers that wait for a quiet moment (no turn, no panel).
+    deferred: VecDeque<Request>,
     width: usize,
     height: usize,
     /// Something changed since the last frame.
@@ -200,12 +247,13 @@ impl App {
             tools: Vec::new(),
             running: None,
             approval: None,
-            picker: None,
+            panel: None,
             menu: None,
             view: None,
             workspace: None,
             exit_armed: None,
             request: None,
+            deferred: VecDeque::new(),
             width: 80,
             height: 24,
             dirty: true,
@@ -222,6 +270,9 @@ impl App {
     }
 
     pub fn take_request(&mut self) -> Option<Request> {
+        if self.request.is_none() && self.running.is_none() && self.panel.is_none() {
+            self.request = self.deferred.pop_front();
+        }
         self.request.take()
     }
 
@@ -252,9 +303,19 @@ impl App {
 
     /// Show a picker in place of the input box until it is answered or cancelled.
     pub fn open_picker(&mut self, picker: Picker) {
+        self.open_panel(Panel::Picker(picker));
+    }
+
+    /// Show a panel in place of the input box until it is answered.
+    pub fn open_panel(&mut self, panel: Panel) {
         self.menu = None;
-        self.picker = Some(picker);
+        self.panel = Some(panel);
         self.dirty = true;
+    }
+
+    #[cfg(test)]
+    pub fn panel(&self) -> Option<&Panel> {
+        self.panel.as_ref()
     }
 
     /// Print a saved conversation, as Python's `_entries_for`: user prompts, replies,
@@ -472,6 +533,26 @@ impl App {
                     Request::TurnDone
                 });
             }
+            UiEvent::Catalog {
+                provider,
+                result,
+                purpose,
+            } => self.deferred.push_back(Request::Catalog {
+                provider,
+                result,
+                purpose,
+            }),
+            UiEvent::Tested { id, result } => {
+                // A late answer for a test already closed is dropped.
+                if let Some(Panel::Test(test)) = &mut self.panel {
+                    if test.id == id {
+                        if let Some(outcome) = test.finish(result) {
+                            self.panel = None;
+                            self.request = Some(Request::Tested(outcome));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -653,7 +734,7 @@ impl App {
             // Ctrl+C in the transcript view returns to the conversation first.
             return Effect::None;
         }
-        if ctrl && key.code == KeyCode::Char('c') && self.picker.is_none() {
+        if ctrl && key.code == KeyCode::Char('c') && self.panel.is_none() {
             return self.interrupt();
         }
         if self.approval.is_some() {
@@ -667,7 +748,7 @@ impl App {
             self.view_key(key);
             return Effect::None;
         }
-        if ctrl && key.code == KeyCode::Char('o') && self.picker.is_none() {
+        if ctrl && key.code == KeyCode::Char('o') && self.panel.is_none() {
             self.view = Some(View {
                 top: 0,
                 follow: true,
@@ -675,15 +756,29 @@ impl App {
             });
             return Effect::None;
         }
-        if let Some(picker) = &mut self.picker {
-            match picker.on_key(key) {
-                PickerOutcome::Open => {}
-                PickerOutcome::Cancelled => self.picker = None,
-                PickerOutcome::Picked(kind, value) => {
-                    self.picker = None;
-                    self.request = Some(Request::Picked(kind, value));
-                }
-            }
+        if let Some(panel) = &mut self.panel {
+            let answer = match panel {
+                Panel::Picker(picker) => match picker.on_key(key) {
+                    PickerOutcome::Open => return Effect::None,
+                    // Python's pickers answer `None`, and nothing follows.
+                    PickerOutcome::Cancelled => None,
+                    PickerOutcome::Picked(kind, value) => Some(Request::Picked(kind, value)),
+                },
+                Panel::Key(entry) => match entry.on_key(key) {
+                    None => return Effect::None,
+                    Some(answer) => Some(Request::Key(answer)),
+                },
+                Panel::Test(test) => match test.on_key(key) {
+                    None => return Effect::None,
+                    Some(outcome) => Some(Request::Tested(outcome)),
+                },
+                Panel::Save(save) => match save.on_key(key) {
+                    None => return Effect::None,
+                    Some(edit) => Some(Request::Saved(edit)),
+                },
+            };
+            self.panel = None;
+            self.request = answer;
             return Effect::None;
         }
         if let Some(running) = &mut self.running {
@@ -761,7 +856,10 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: &str) {
-        if self.running.is_none() && self.picker.is_none() {
+        if let Some(Panel::Key(entry)) = &mut self.panel {
+            entry.on_paste(text);
+            self.dirty = true;
+        } else if self.running.is_none() && self.panel.is_none() {
             self.editor.insert(&text.replace("\r\n", "\n"));
             self.sync_menu();
             self.dirty = true;
@@ -926,8 +1024,13 @@ impl App {
                 .saturating_sub(top.len().min(self.height / 2) + 4);
             bottom.extend(approval_panel(panel, width, budget));
             caret_base = 0;
-        } else if let Some(picker) = &self.picker {
-            bottom.extend(picker.render(width));
+        } else if let Some(panel) = &self.panel {
+            bottom.extend(match panel {
+                Panel::Picker(picker) => picker.render(width),
+                Panel::Key(entry) => entry.render(width),
+                Panel::Test(test) => test.render(width, SPINNER[4]),
+                Panel::Save(save) => save.render(width),
+            });
             caret_base = 0;
         } else {
             let (lines, (row, col)) = self.editor.render(width, self.running.is_none());
@@ -1502,6 +1605,51 @@ mod tests {
     }
 
     #[test]
+    fn worker_answers_reach_the_right_panel_at_a_quiet_moment() {
+        let mut app = app();
+        // A catalog arriving mid-turn waits for the turn to end.
+        app.start_turn();
+        app.on_turn_event(UiEvent::Catalog {
+            provider: "groq".into(),
+            result: Ok(Vec::new()),
+            purpose: CatalogPurpose::Manager,
+        });
+        assert_eq!(app.take_request(), None);
+        app.on_turn_event(UiEvent::Finished(None));
+        assert_eq!(app.take_request(), Some(Request::TurnDone));
+        assert!(matches!(
+            app.take_request(),
+            Some(Request::Catalog { provider, .. }) if provider == "groq"
+        ));
+
+        // A test's answer closes only the panel it belongs to.
+        app.open_panel(Panel::Test(ConnectionTest::new(2, "groq:llama")));
+        app.on_turn_event(UiEvent::Tested {
+            id: 1,
+            result: TestResult::Passed,
+        });
+        assert!(app.panel.is_some(), "a stale answer is dropped");
+        app.on_turn_event(UiEvent::Tested {
+            id: 2,
+            result: TestResult::Passed,
+        });
+        assert!(app.panel.is_none());
+        assert!(matches!(app.take_request(), Some(Request::Tested(outcome)) if outcome.ok));
+
+        // A pasted key goes to the key panel, never the draft, and is never drawn.
+        app.open_panel(Panel::Key(KeyEntry::new("groq", true)));
+        app.on_paste("gsk_pasted_secret");
+        let (live, _) = app.live();
+        assert!(!live.iter().any(|line| line.plain_text().contains("pasted")));
+        assert!(app.editor.is_empty());
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(
+            app.take_request(),
+            Some(Request::Key(Some("gsk_pasted_secret".into())))
+        );
+    }
+
+    #[test]
     fn a_picker_takes_the_input_box_s_place_and_answers_once() {
         let mut app = app();
         app.open_picker(Picker::mode("ask"));
@@ -1518,11 +1666,11 @@ mod tests {
             app.take_request(),
             Some(Request::Picked(PickerKind::Mode, "auto".into()))
         );
-        assert!(app.picker.is_none());
+        assert!(app.panel.is_none());
 
         app.open_picker(Picker::mode("ask"));
         app.on_key(ctrl('c'), &[]);
-        assert!(app.picker.is_none(), "Ctrl+C cancels the picker");
+        assert!(app.panel.is_none(), "Ctrl+C cancels the picker");
         assert_eq!(app.take_request(), None);
     }
 

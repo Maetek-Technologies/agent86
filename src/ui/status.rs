@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 const SHED_ORDER: [&str; 3] = ["hint", "tok", "ctx"];
 
 /// What the status line reports, as Python's `StatusState`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusState {
     /// The bare model id.
     pub model: String,
