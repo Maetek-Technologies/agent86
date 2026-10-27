@@ -11,7 +11,10 @@
 //! user saves anyway); the config file only ever names the environment variable.
 
 use super::app::{App, CatalogPurpose, Panel, UiEvent};
-use super::panels::{ConnectionTest, KeyEntry, SaveDiff, TestOutcome, TestResult};
+use super::manage_mcp::McpFlow;
+use super::panels::{
+    ConnectionTest, KeyEntry, KeyPurpose, SaveDiff, SavePurpose, TestOutcome, TestResult,
+};
 use super::picker::Picker;
 use super::text::sanitize;
 use crate::config::ConfigPaths;
@@ -126,6 +129,8 @@ fn line(app: &mut App, text: Text) {
 /// The catalog cache and the state of the `/config model` chain in flight.
 pub struct Manager {
     events: mpsc::Sender<UiEvent>,
+    /// The `/config mcp` chain.
+    pub mcp: McpFlow,
     catalogs: HashMap<String, Vec<CatalogEntry>>,
     /// Typed `/model` lines waiting for a catalog: (arg, the strict error, the
     /// provider that was active when it was typed).
@@ -142,6 +147,7 @@ pub struct Manager {
 impl Manager {
     pub fn new(events: mpsc::Sender<UiEvent>) -> Self {
         Self {
+            mcp: McpFlow::new(events.clone()),
             events,
             catalogs: HashMap::new(),
             pending_model: Vec::new(),
@@ -388,6 +394,7 @@ impl Manager {
             self.request_catalog(app, repl, &row.name, key, CatalogPurpose::Manager);
         } else {
             app.open_panel(Panel::Key(KeyEntry::new(
+                KeyPurpose::Provider,
                 &row.name,
                 repl.secrets.available(),
             )));
@@ -478,7 +485,11 @@ impl Manager {
             .config_paths
             .clone()
             .unwrap_or_else(ConfigPaths::discover);
-        app.open_panel(Panel::Save(SaveDiff::new(self.persist_changes(), paths)));
+        app.open_panel(Panel::Save(SaveDiff::new(
+            SavePurpose::Model,
+            self.persist_changes(),
+            paths,
+        )));
         let reference = self.reference.clone().unwrap_or_default();
         outcome.ok.then(|| format!("/model {reference}"))
     }
@@ -488,19 +499,19 @@ impl Manager {
         let path = |parts: &[&str]| parts.iter().map(|part| (*part).to_owned()).collect();
         let mut changes: Vec<Change> = vec![(
             path(&["model", "default"]),
-            self.reference.clone().unwrap_or_default().into(),
+            Some(self.reference.clone().unwrap_or_default().into()),
         )];
         if let Some(row) = &self.row {
             if !row.keyless && row.api_key_env.is_none() {
                 changes.push((
                     path(&["providers", &row.name, "api_key_env"]),
-                    format!("{}_API_KEY", row.name.to_uppercase()).into(),
+                    Some(format!("{}_API_KEY", row.name.to_uppercase()).into()),
                 ));
             }
             if let Some(base_url) = &row.base_url {
                 changes.push((
                     path(&["providers", &row.name, "base_url"]),
-                    base_url.clone().into(),
+                    Some(base_url.clone().into()),
                 ));
             }
         }
@@ -808,7 +819,7 @@ mod tests {
         let changes: Vec<(String, String)> = manager
             .persist_changes()
             .into_iter()
-            .map(|(path, value)| (path.join("."), value.as_str().unwrap().to_owned()))
+            .map(|(path, value)| (path.join("."), value.unwrap().as_str().unwrap().to_owned()))
             .collect();
         assert_eq!(
             changes,

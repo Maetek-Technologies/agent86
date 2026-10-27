@@ -325,7 +325,8 @@ fn mcp_command(config: &Config, command: McpCommand, stderr: &Stderr) -> ExitCod
         McpCommand::List => {
             if config.mcp_servers.is_empty() {
                 stdout_dim(
-                    "No MCP servers configured. Add an `[mcp_servers.<name>]` block to your                      config file.",
+                    "No MCP servers configured. Add one with `/config mcp` in the REPL, or an \
+                     `[mcp_servers.<name>]` block in your config file.",
                     stderr,
                 );
                 return ExitCode::SUCCESS;
@@ -355,7 +356,8 @@ fn mcp_command(config: &Config, command: McpCommand, stderr: &Stderr) -> ExitCod
         McpCommand::Tools => {
             let Some(manager) = McpManager::start(config) else {
                 stdout_dim(
-                    "No MCP servers configured (or MCP disabled). `agent86 mcp list` shows what                      is configured and whether each is enabled.",
+                    "No MCP servers configured (or MCP disabled). `agent86 mcp list` shows what \
+                     is configured and whether each is enabled.",
                     stderr,
                 );
                 return ExitCode::SUCCESS;

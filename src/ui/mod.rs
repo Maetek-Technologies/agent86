@@ -17,7 +17,10 @@ mod diff;
 mod entries;
 mod input;
 mod manage;
+mod manage_mcp;
 mod markdown;
+mod mcp_config;
+mod mcp_panels;
 mod menu;
 mod panels;
 mod picker;
@@ -39,6 +42,7 @@ use crate::secrets::SecretStore;
 use app::{App, Effect, Request, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use manage::Manager;
+use panels::{KeyPurpose, SavePurpose};
 use picker::{Picker, PickerKind};
 use screen::Screen;
 use status::StatusState;
@@ -285,14 +289,38 @@ fn run(repl: &mut Repl) -> io::Result<()> {
                 manager.on_catalog_picked(&mut app, repl, &reference);
                 None
             }
-            Request::Key(key) => {
+            Request::Key(KeyPurpose::Provider, key) => {
                 manager.on_key_entered(&mut app, repl, key);
+                None
+            }
+            Request::Key(KeyPurpose::McpVar, value) => {
+                manager.mcp.on_var(&mut app, repl, value);
+                None
+            }
+            Request::Mcp(action) => {
+                manager.mcp.on_action(&mut app, repl, action);
+                None
+            }
+            Request::McpForm(draft) => {
+                manager.mcp.on_form(&mut app, repl, *draft);
+                None
+            }
+            Request::McpTested(outcome) => {
+                manager.mcp.on_tested(&mut app, repl, outcome);
                 None
             }
             // A passing test switches the model at once, as a dispatched line.
             Request::Tested(outcome) => manager.on_tested(&mut app, repl, outcome),
-            Request::Saved(edit) => {
+            Request::Saved(SavePurpose::Model, edit) => {
                 Manager::on_saved(&mut app, repl, edit);
+                None
+            }
+            Request::Saved(SavePurpose::McpServer, edit) => {
+                manager.mcp.on_saved(&mut app, repl, edit);
+                None
+            }
+            Request::Saved(SavePurpose::McpUnmount, edit) => {
+                manager.mcp.on_unmount_saved(&mut app, repl, edit);
                 None
             }
             Request::Catalog {
@@ -400,8 +428,7 @@ fn open_choice(app: &mut App, repl: &Repl, manager: &mut Manager, choice: Choice
                 app.open_picker(Picker::sessions(choices));
             }
         },
-        // The MCP manager comes with stage 9, part 6.
-        Choice::ConfigMcp => return false,
+        Choice::ConfigMcp => manager.mcp.open(app, repl),
     }
     true
 }

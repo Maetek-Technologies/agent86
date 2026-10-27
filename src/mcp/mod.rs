@@ -29,7 +29,7 @@ use crate::types::{ToolCall, ToolResult, ToolSpec};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -81,10 +81,24 @@ pub fn reconnect_backoff(attempt: u32) -> Duration {
 /// Substitute every `${VAR}` in `text`: the environment variable first, then the
 /// OS keyring account of the same name. Fails on the first name found nowhere.
 pub fn expand_var_refs(text: &str, store: &dyn SecretStore) -> Result<String, String> {
+    expand_var_refs_with(text, &HashMap::new(), store)
+}
+
+/// [`expand_var_refs`] where `overrides` (values typed this session, not stored
+/// yet) win over the environment and the keyring.
+fn expand_var_refs_with(
+    text: &str,
+    overrides: &HashMap<String, String>,
+    store: &dyn SecretStore,
+) -> Result<String, String> {
     let mut missing = None;
     let expanded = VAR_REF.replace_all(text, |captures: &regex::Captures<'_>| {
         let name = &captures[1];
-        match resolve_api_key(name, Some(name), store) {
+        let value = overrides
+            .get(name)
+            .cloned()
+            .or_else(|| resolve_api_key(name, Some(name), store));
+        match value {
             Some(value) => value,
             None => {
                 missing.get_or_insert_with(|| name.to_owned());
@@ -106,24 +120,59 @@ pub fn expand_var_refs(text: &str, store: &dyn SecretStore) -> Result<String, St
 /// reuse the result.
 fn resolve_server_secrets(
     config: &McpServerConfig,
+    overrides: &HashMap<String, String>,
     store: &dyn SecretStore,
 ) -> Result<McpServerConfig, String> {
+    let expand = |text: &str| expand_var_refs_with(text, overrides, store);
     let mut resolved = config.clone();
     resolved.args = config
         .args
         .iter()
-        .map(|arg| expand_var_refs(arg, store))
+        .map(|arg| expand(arg))
         .collect::<Result<_, _>>()?;
     for value in resolved.env.values_mut() {
-        *value = expand_var_refs(value, store)?;
+        *value = expand(value)?;
     }
     if let Some(url) = &config.url {
-        resolved.url = Some(expand_var_refs(url, store)?);
+        resolved.url = Some(expand(url)?);
     }
     for value in resolved.headers.values_mut() {
-        *value = expand_var_refs(value, store)?;
+        *value = expand(value)?;
     }
     Ok(resolved)
+}
+
+/// Every `${VAR}` name in `text`, in order (repeats kept).
+pub fn var_ref_names(text: &str) -> Vec<String> {
+    VAR_REF
+        .captures_iter(text)
+        .map(|captures| captures[1].to_owned())
+        .collect()
+}
+
+/// Every `${VAR}` in a server's `args`, `env` values, `url`, and `headers` values
+/// that neither `overrides`, the environment, nor `store` can supply, sorted, as
+/// Python's `unresolved_var_refs`: the interface asks for each in turn.
+pub fn unresolved_var_refs(
+    config: &McpServerConfig,
+    overrides: &HashMap<String, String>,
+    store: &dyn SecretStore,
+) -> Vec<String> {
+    let texts = config
+        .args
+        .iter()
+        .chain(config.env.values())
+        .chain(config.url.iter())
+        .chain(config.headers.values());
+    let mut names: Vec<String> = texts.flat_map(|text| var_ref_names(text)).collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| {
+            !overrides.contains_key(name) && resolve_api_key(name, Some(name), store).is_none()
+        })
+        .collect()
 }
 
 /// The environment a stdio server gets: the scrubbed tool environment plus the
@@ -353,8 +402,8 @@ struct Notes {
 
 struct Inner {
     passthrough: Vec<String>,
-    /// The enabled servers named in config, started or not.
-    configured: Vec<String>,
+    /// The enabled servers named in config, started or not, plus any mounted since.
+    configured: Mutex<Vec<String>>,
     slots: Mutex<IndexMap<String, Slot>>,
     notes: Mutex<Notes>,
     registry: Mutex<Option<ToolRegistry>>,
@@ -385,17 +434,11 @@ impl McpManager {
         if enabled.is_empty() {
             return None;
         }
-        let manager = Self {
-            inner: Arc::new(Inner {
-                passthrough: config.sandbox.env_passthrough.clone(),
-                configured: enabled.iter().map(|(name, _)| (*name).clone()).collect(),
-                slots: Mutex::new(IndexMap::new()),
-                notes: Mutex::new(Notes::default()),
-                registry: Mutex::new(None),
-            }),
-        };
+        let manager = Self::empty(config);
+        *lock(&manager.inner.configured) =
+            enabled.iter().map(|(name, _)| (*name).clone()).collect();
         for (name, server) in enabled {
-            if let Err(reason) = manager.start_server(name, server) {
+            if let Err(reason) = manager.launch(name, server, &HashMap::new(), &OsKeyring, None) {
                 manager.inner.add_note(
                     format!("MCP server '{name}' failed to start: {reason}"),
                     true,
@@ -405,11 +448,114 @@ impl McpManager {
         Some(manager)
     }
 
-    fn start_server(&self, name: &str, config: &McpServerConfig) -> Result<(), String> {
-        let resolved = resolve_server_secrets(config, &OsKeyring)?;
+    /// A manager with no servers, for adding the first one mid-session (Python's
+    /// `ensure_mcp`). Nothing runs until a server is started.
+    pub fn empty(config: &Config) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                passthrough: config.sandbox.env_passthrough.clone(),
+                configured: Mutex::new(Vec::new()),
+                slots: Mutex::new(IndexMap::new()),
+                notes: Mutex::new(Notes::default()),
+                registry: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Start one server and return its tools as (name, description), without
+    /// registering them: the interface's connection test, Python's `start_server`.
+    /// A server already running under `name` is removed first. `overrides` are
+    /// `${VAR}` values typed this session; `timeout_s` replaces `connect_timeout_s`
+    /// for this first connect only.
+    pub fn start_server(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+        overrides: &HashMap<String, String>,
+        store: &dyn SecretStore,
+        timeout_s: f64,
+    ) -> Result<Vec<(String, String)>, String> {
+        if lock(&self.inner.slots).contains_key(name) {
+            self.remove_server(name);
+        }
+        self.launch(name, config, overrides, store, Some(timeout_s))?;
+        Ok(lock(&self.inner.slots)
+            .get(name)
+            .map(|slot| {
+                slot.tools()
+                    .iter()
+                    .map(|tool| (tool.name().to_owned(), tool.description().to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Register a started server's tools, as Python's `add_mcp_server`. A taken
+    /// name is reported, not dropped silently: (mounted, collisions).
+    pub fn mount(&self, name: &str) -> (Vec<String>, Vec<String>) {
+        let tools = lock(&self.inner.slots)
+            .get(name)
+            .map(Slot::tools)
+            .unwrap_or_default();
+        {
+            let mut configured = lock(&self.inner.configured);
+            if !configured.iter().any(|known| known == name) {
+                configured.push(name.to_owned());
+            }
+        }
+        let Some(registry) = self.inner.registry() else {
+            return (Vec::new(), Vec::new());
+        };
+        let (mut mounted, mut collisions) = (Vec::new(), Vec::new());
+        for tool in tools {
+            let tool_name = tool.name().to_owned();
+            if registry.register_shared(tool) {
+                mounted.push(tool_name);
+            } else {
+                collisions.push(tool_name);
+            }
+        }
+        (mounted, collisions)
+    }
+
+    /// Unregister a server's tools and shut it down, as Python's
+    /// `remove_mcp_server`; a removed server's tools must not stay callable. Safe
+    /// for a name that never started.
+    pub fn remove_server(&self, name: &str) {
+        lock(&self.inner.configured).retain(|known| known != name);
+        let Some(mut slot) = lock(&self.inner.slots).shift_remove(name) else {
+            return;
+        };
+        if let Some(registry) = self.inner.registry() {
+            for tool in slot.tools() {
+                registry.unregister_tool(&tool);
+            }
+        }
+        slot.session = None;
+        if let Some(control) = slot.control.take() {
+            let _ = control.send(Control::Stop);
+        }
+        if let Some(supervisor) = slot.supervisor.take() {
+            let _ = supervisor.join();
+        }
+    }
+
+    fn launch(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+        overrides: &HashMap<String, String>,
+        store: &dyn SecretStore,
+        timeout_s: Option<f64>,
+    ) -> Result<(), String> {
+        let resolved = resolve_server_secrets(config, overrides, store)?;
+        let mut first = resolved.clone();
+        if let Some(timeout_s) = timeout_s {
+            first.connect_timeout_s = timeout_s;
+        }
         let (control, events) = mpsc::channel();
         let weak = Arc::downgrade(&self.inner);
-        let session = connect(&weak, name, &resolved, &self.inner.passthrough, 1, &control)?;
+        let session = connect(&weak, name, &first, &self.inner.passthrough, 1, &control)?;
         lock(&self.inner.slots).insert(
             name.to_owned(),
             Slot {
@@ -495,7 +641,7 @@ impl McpManager {
     /// Every known server that is not connected, sorted by name, with its status, as
     /// Python's `server_statuses`. A server that never started is `not connected`.
     pub fn server_statuses(&self) -> Vec<(String, String)> {
-        let mut names: Vec<String> = self.inner.configured.clone();
+        let mut names: Vec<String> = lock(&self.inner.configured).clone();
         names.extend(lock(&self.inner.slots).keys().cloned());
         names.sort();
         names.dedup();
@@ -707,7 +853,7 @@ impl Inner {
             ),
             (State::Disconnected, _) => format!(
                 "MCP server '{server}' disconnected ({reason}); its tools are unavailable until \
-                 agent86 is restarted."
+                 it is restarted from /config mcp."
             ),
             (State::Connected, Some(cause)) => format!(
                 "MCP server '{server}' closed the connection during the call ({}).",

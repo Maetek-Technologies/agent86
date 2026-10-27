@@ -258,7 +258,7 @@ Each slice is one PR to `main`. Each passes `cargo test --all-targets`, `cargo f
   - A cancelled add stops the server that its test started.
 - **Command wording:** `/config mcp` in the plain loop changes to Python's wording.
 
-Stage 9 is complete after slice 5, and then the README roadmap item is ticked.
+Stage 9 is complete after slice 5, and then the README roadmap item is ticked. **Done in part 6.** The chain lives in `src/ui/manage_mcp.rs`, the panels in `src/ui/mcp_panels.rs`, and the pure helpers (rows, the JSON shapes, the manual fields, `shlex`, the save's changes) in `src/ui/mcp_config.rs`.
 
 ## 11. Testing
 

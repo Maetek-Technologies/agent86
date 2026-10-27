@@ -4,12 +4,13 @@
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::mcp::{
     content_to_text, expand_var_refs, render_content_block, render_mcp_section, sanitize,
-    truncate_result, McpManager, DEFERRED_NOTE,
+    truncate_result, unresolved_var_refs, McpManager, DEFERRED_NOTE,
 };
 use agent86::secrets::SecretStore;
 use agent86::tools::{builtin_registry, Tool, ToolContext};
 use agent86::types::ToolCall;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -754,6 +755,62 @@ fn attaching_registers_tools_and_builds_the_prompt_section() {
     // Attaching again collides instead of shadowing.
     manager.attach(&registry);
     assert_eq!(registry.collisions().len(), 20);
+}
+
+#[test]
+fn servers_start_mount_and_stop_mid_session() {
+    let dir = TempDir::new("runtime");
+    let Some(config) = server_config(
+        &dir.0,
+        "live",
+        "normal",
+        "[mcp.servers.live.env]\nTOKEN_X = '${AGENT86_TEST_TYPED_ONLY}'\n",
+    ) else {
+        return;
+    };
+    let server = config.mcp_servers["live"].clone();
+    let manager = McpManager::empty(&config);
+    let registry = builtin_registry();
+    let builtins = registry.specs().len();
+    manager.attach(&registry);
+
+    let mut typed = HashMap::new();
+    assert_eq!(
+        unresolved_var_refs(&server, &typed, &FakeStore),
+        ["AGENT86_TEST_TYPED_ONLY"]
+    );
+    assert!(manager
+        .start_server("live", &server, &typed, &FakeStore, 30.0)
+        .unwrap_err()
+        .contains("'${AGENT86_TEST_TYPED_ONLY}' is not set"));
+    typed.insert("AGENT86_TEST_TYPED_ONLY".to_owned(), "typed".to_owned());
+    assert!(unresolved_var_refs(&server, &typed, &FakeStore).is_empty());
+
+    // The test starts the server without registering anything.
+    let tools = manager
+        .start_server("live", &server, &typed, &FakeStore, 30.0)
+        .unwrap();
+    assert_eq!(tools.len(), 20);
+    assert_eq!(tools[0].0, "mcp__live__echo");
+    assert_eq!(registry.specs().len(), builtins);
+
+    let (mounted, collisions) = manager.mount("live");
+    assert_eq!((mounted.len(), collisions.len()), (20, 0));
+    assert_eq!(registry.specs().len(), builtins + 20);
+    assert!(registry.collisions().is_empty());
+
+    // Starting it again replaces the running one and takes its tools out first.
+    manager
+        .start_server("live", &server, &typed, &FakeStore, 30.0)
+        .unwrap();
+    assert_eq!(registry.specs().len(), builtins);
+    manager.mount("live");
+
+    manager.remove_server("live");
+    assert_eq!(registry.specs().len(), builtins);
+    assert!(manager.tools().is_empty());
+    assert!(manager.server_statuses().is_empty());
+    manager.remove_server("never-started");
 }
 
 #[test]

@@ -482,6 +482,17 @@ impl ToolRegistry {
 
     /// Remove `tool` only if it is the object registered under its name, so a dropped
     /// MCP tool that lost a name collision never takes the winner out with it.
+    /// Register a shared tool unless its name is taken, without recording a
+    /// collision: for a change the user asked for, which reports its own.
+    pub fn register_shared(&self, tool: Arc<dyn Tool>) -> bool {
+        let mut inner = self.write();
+        if inner.tools.iter().any(|known| known.name() == tool.name()) {
+            return false;
+        }
+        inner.tools.push(tool);
+        true
+    }
+
     pub fn unregister_tool(&self, tool: &Arc<dyn Tool>) -> bool {
         let mut inner = self.write();
         let before = inner.tools.len();

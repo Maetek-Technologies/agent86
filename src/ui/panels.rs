@@ -57,18 +57,40 @@ fn is_cancel(key: &KeyEvent) -> bool {
 
 // ---- key entry -------------------------------------------------------------
 
+/// Which chain a key entry belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPurpose {
+    /// A provider's API key (`/config model`).
+    Provider,
+    /// A `${VAR}` an MCP server needs (`/config mcp`).
+    McpVar,
+}
+
+/// Which chain a save belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavePurpose {
+    /// `/config model`.
+    Model,
+    /// An MCP server added, edited, or re-enabled.
+    McpServer,
+    /// An MCP server removed or disabled.
+    McpUnmount,
+}
+
 /// Masked entry of one API key. The key is never drawn: only one dot per
 /// character. It goes back to the caller and is held in memory until the
 /// connection test passes.
 pub struct KeyEntry {
+    pub purpose: KeyPurpose,
     pub provider: String,
     keyring_ok: bool,
     text: String,
 }
 
 impl KeyEntry {
-    pub fn new(provider: &str, keyring_ok: bool) -> Self {
+    pub fn new(purpose: KeyPurpose, provider: &str, keyring_ok: bool) -> Self {
         Self {
+            purpose,
             provider: provider.to_owned(),
             keyring_ok,
             text: String::new(),
@@ -255,6 +277,7 @@ pub enum TestResult {
 /// is chosen first, the project one is a key away. Nothing touches the disk here;
 /// the driver applies the edit this answers with.
 pub struct SaveDiff {
+    pub purpose: SavePurpose,
     changes: Vec<Change>,
     paths: ConfigPaths,
     scope: Scope,
@@ -265,8 +288,9 @@ pub struct SaveDiff {
 }
 
 impl SaveDiff {
-    pub fn new(changes: Vec<Change>, paths: ConfigPaths) -> Self {
+    pub fn new(purpose: SavePurpose, changes: Vec<Change>, paths: ConfigPaths) -> Self {
         let mut panel = Self {
+            purpose,
             changes,
             paths,
             scope: Scope::User,
@@ -391,7 +415,7 @@ mod tests {
 
     #[test]
     fn a_key_is_never_drawn_and_an_empty_one_is_no_answer() {
-        let mut entry = KeyEntry::new("groq", true);
+        let mut entry = KeyEntry::new(KeyPurpose::Provider, "groq", true);
         assert!(text(&entry.render(70)).contains("paste key (never shown)"));
         entry.on_paste("gsk_secret\r\n");
         entry.on_key(key(KeyCode::Char('9')));
@@ -403,7 +427,7 @@ mod tests {
             entry.on_key(key(KeyCode::Enter)),
             Some(Some("gsk_secret9".to_owned()))
         );
-        let mut blank = KeyEntry::new("groq", false);
+        let mut blank = KeyEntry::new(KeyPurpose::Provider, "groq", false);
         assert!(text(&blank.render(80)).contains("OS keyring unavailable"));
         blank.on_key(key(KeyCode::Char(' ')));
         assert_eq!(blank.on_key(key(KeyCode::Enter)), Some(None));
@@ -471,9 +495,9 @@ mod tests {
         std::fs::write(&paths.project, "[model]\ndefault = \"a:b\"\n").unwrap();
         let changes = vec![(
             vec!["model".to_owned(), "default".to_owned()],
-            toml_edit::Value::from("a:b"),
+            Some(toml_edit::Value::from("a:b")),
         )];
-        let mut panel = SaveDiff::new(changes, paths.clone());
+        let mut panel = SaveDiff::new(SavePurpose::Model, changes, paths.clone());
         let drawn = text(&panel.render(300));
         assert!(drawn.contains("(•) user"), "{drawn}");
         assert!(drawn.contains("+default = \"a:b\""));
@@ -488,9 +512,9 @@ mod tests {
 
         let refused = vec![(
             vec!["providers".to_owned(), "x".to_owned(), "token".to_owned()],
-            toml_edit::Value::from("plain"),
+            Some(toml_edit::Value::from("plain")),
         )];
-        let mut panel = SaveDiff::new(refused, paths);
+        let mut panel = SaveDiff::new(SavePurpose::Model, refused, paths);
         assert!(text(&panel.render(70)).contains("refusing to write 'providers.x.token'"));
         assert_eq!(panel.on_key(key(KeyCode::Enter)), None, "Save is disabled");
         let _ = std::fs::remove_dir_all(root);
