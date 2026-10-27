@@ -103,10 +103,10 @@ Text from users, models, tools, MCP servers, and file names is never interpreted
 
 | Key | Python's full-screen app | Here |
 |---|---|---|
-| Enter | Submit (or pick from the open menu) | Same |
+| Enter | Submit (or pick from the open menu) | Same; a command typed in full is the one highlighted |
 | Shift+Enter, Ctrl+J | Newline | Same; Shift+Enter needs a terminal that reports it (crossterm keyboard enhancement), and Ctrl+J always works |
 | Up / Down | History, only from the first or last line; menu navigation when a menu is open | Same |
-| Tab | Moves focus away from the prompt | Accept the highlighted menu item; on a directory, accept and keep completing (Python's "a second Tab descends") |
+| Tab | Moves focus away from the prompt | Accept the highlighted menu item: a command is written out for its argument, a path replaces the `@` token, and a directory keeps completing inside it (Python's "a second Tab descends") |
 | Escape | Close the menu; else cancel a running turn; else clear the draft | Same order |
 | Ctrl+C | Cancel a running turn; when idle or already cancelling, quit | Cancel a running turn. When idle, the first press clears a draft, and on an empty prompt it shows `Press Ctrl+C again to exit` for two seconds, as Claude Code does. A second press quits. **Known difference** |
 | Ctrl+D | — (Textual) | On an empty prompt, quit (the plain loop's end-of-input) |
@@ -150,12 +150,13 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 | `src/ui/app.rs` | `App`, the state machine: what has been committed, the reply tail, running tools, the approval panel, and what each key and `UiEvent` does. It never touches the terminal, so tests drive it directly |
 | `src/ui/screen.rs` | The inline renderer: frames of committed lines and the live region, the caret, and row accounting across resizes |
 | `src/ui/text.rs` | Styled `Line`s, wrapping in terminal cells, truncation, and `sanitize` for untrusted text |
-| `src/ui/entries.rs` (part 3) | The transcript entry model: `User`, `Reply`, `Tool`, `Notice`, `Error`, `Raw`. It is kept for the transcript view and for rebuilding a resumed session (Python's `_entries_for`) |
+| `src/ui/entries.rs` (part 4) | The transcript entry model: `User`, `Reply`, `Tool`, `Notice`, `Error`, `Raw`, kept for the transcript view. Part 3 rebuilds a resumed session (Python's `_entries_for`) straight from its messages with `App::replay` |
 | `src/ui/render/` (part 4) | `markdown.rs` and `diff.rs`; the full-screen transcript view may use ratatui |
 | `src/ui/input.rs` | The multi-line editor: cursor, editing keys, word movement, paste, and history navigation over `PromptHistory` |
-| `src/ui/menu.rs` | The `/` command menu and `@` path completion (a port of `complete_mentions`) |
+| `src/ui/menu.rs` | The `/` command menu and `@` path completion (`complete_mentions` itself lives in `src/mentions.rs`) |
+| `src/ui/picker.rs` | The mode, model, and session pickers (part 3): a list panel with optional type-to-filter |
 | `src/ui/status.rs` | A port of `ui/status.py` and `fit_status_line`. Shared, so `/cost` and the plain loop could use the same numbers |
-| `src/ui/panels/*.rs` | One file per Python screen: `approval`, `mode_picker`, `model_picker`, `session_picker`, `provider_manager` (with the catalog picker), `key_entry`, `connection_test`, `save_diff`, `mcp_manager` (with the server form), `mcp_test` |
+| `src/ui/panels/*.rs` (parts 5 and 6) | One file per remaining Python screen: `provider_manager` (with the catalog picker), `key_entry`, `connection_test`, `save_diff`, `mcp_manager` (with the server form), `mcp_test`. The approval panel is in `app.rs` |
 | `src/repl.rs` | Unchanged role: the command registry, `Repl`, and the plain loop. Command handlers already return `CommandResult`s, which both surfaces draw |
 
 ### Threads and events
@@ -217,6 +218,7 @@ Each slice is one PR to `main`. Each passes `cargo test --all-targets`, `cargo f
   - The mode picker.
   - The model picker, with the configured role slots (`model.default`, `model.route.cheap`, `model.route.frontier`).
   - The session picker, with type-to-filter and Python's labels.
+  - Until slice 4 the model picker lists only the role slots, and a bare `/config model` or `/config mcp` prints the plain loop's message.
 - **Resume:**
   - Resuming rebuilds the transcript: the screen is cleared, the banner is printed, then the session's entries and the `resumed session <id> (<n> messages) - <title>` note.
 

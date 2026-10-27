@@ -14,6 +14,8 @@
 
 mod app;
 mod input;
+mod menu;
+mod picker;
 mod screen;
 pub mod status;
 mod text;
@@ -23,11 +25,13 @@ use crate::config::Config;
 use crate::mentions::expand_mentions;
 use crate::provider::capabilities::context_window_for;
 use crate::repl::{
-    compact_banner, find_command_for_line, plain_loop, start_repl, Action, Repl, Style,
+    compact_banner, find_command_for_line, model_choices, now, plain_loop, session_label,
+    start_repl, Action, Choice, Repl, Style, NO_MEMORY_NOTE,
 };
 use crate::secrets::SecretStore;
 use app::{App, Effect, Request, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use picker::{Picker, PickerKind};
 use screen::Screen;
 use status::StatusState;
 use std::collections::VecDeque;
@@ -211,6 +215,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
         repl.config.ui.spinner,
     );
     app.set_size(usize::from(width), usize::from(height));
+    app.workspace = Some(repl.harness.context.policy.workspace().to_path_buf());
     app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
     for note in &repl.startup_notes {
         app.note(Style::Dim, note);
@@ -226,42 +231,37 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             &mut repl.mcp_cursor,
             &history,
         )?;
-        let text = match request {
+        // A picker's answer is dispatched as the command it stands for, as
+        // Python's `_on_mode_picked` and `_on_model_picked` do; it is not typed, so
+        // it stays out of the history.
+        let line = match request {
             Request::Exit => break,
             Request::TurnDone => continue,
-            Request::Submit(text) => text,
+            Request::Submit(text) => {
+                let line = text.trim().to_owned();
+                repl.history().append(&line);
+                line
+            }
+            Request::Picked(PickerKind::Mode, mode) => format!("/mode {mode}"),
+            Request::Picked(PickerKind::Model, reference) => format!("/model {reference}"),
+            Request::Picked(PickerKind::Session, session_id) => {
+                resume_picked(&mut app, &mut screen, repl, &session_id)?;
+                app.status = status_from(repl);
+                app.session_id = repl.state.session_id.clone();
+                continue;
+            }
         };
-        let line = text.trim().to_owned();
-        repl.history().append(&line);
-        app.echo_user(&line);
-        let result = repl.handle_command(&line);
-        match result.action {
-            Action::Exit => break,
-            Action::Noop => {}
-            Action::Handled => {
-                if find_command_for_line(&line).is_some_and(|(entry, _)| entry.name == "/clear") {
-                    // The old exchange is gone from the session, so it leaves the screen too.
-                    app.take_committed();
-                    screen.clear_all()?;
-                    app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
-                } else if let Some(render) = &result.render {
-                    app.commit_text(render);
-                }
-            }
-            Action::Turn => {
-                if run_turn(
-                    &mut app,
-                    &mut screen,
-                    repl,
-                    &inbox,
-                    &events,
-                    &runtime,
-                    &line,
-                )? == Request::Exit
-                {
-                    break;
-                }
-            }
+        let carry_on = dispatch(
+            &mut app,
+            &mut screen,
+            repl,
+            &inbox,
+            &events,
+            &runtime,
+            &line,
+        )?;
+        if !carry_on {
+            break;
         }
         app.status = status_from(repl);
         app.session_id = repl.state.session_id.clone();
@@ -270,6 +270,101 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     let (live, _) = app.live();
     screen.frame(&app.take_committed(), &live, None)?;
     screen.clear_live()
+}
+
+/// Run one line, as Python's `_dispatch_line`: echo it, open a picker for a bare
+/// `needs_choice` command, else run the command or the turn. False means quit.
+fn dispatch(
+    app: &mut App,
+    screen: &mut Screen<io::Stdout>,
+    repl: &mut Repl,
+    inbox: &mpsc::Receiver<UiEvent>,
+    events: &mpsc::Sender<UiEvent>,
+    runtime: &tokio::runtime::Runtime,
+    line: &str,
+) -> io::Result<bool> {
+    app.echo_user(line);
+    if let Some((entry, arg)) = find_command_for_line(line) {
+        if let (Some(choice), true) = (entry.needs_choice, arg.is_empty()) {
+            if open_choice(app, repl, choice) {
+                return Ok(true);
+            }
+        }
+    }
+    let result = repl.handle_command(line);
+    match result.action {
+        Action::Exit => return Ok(false),
+        Action::Noop => {}
+        Action::Handled => {
+            if result.clears_transcript {
+                // The old exchange is gone from the session, so it leaves the screen too.
+                app.take_committed();
+                screen.clear_all()?;
+                app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+            } else if let Some(render) = &result.render {
+                app.commit_text(render);
+            }
+        }
+        Action::Turn => {
+            let outcome = run_turn(app, screen, repl, inbox, events, runtime, line)?;
+            return Ok(outcome != Request::Exit);
+        }
+    }
+    Ok(true)
+}
+
+/// Open the picker a bare command asks for, as Python's `_run_or_chain`. False
+/// when this surface has no picker for it yet, so the command's handler runs.
+fn open_choice(app: &mut App, repl: &Repl, choice: Choice) -> bool {
+    match choice {
+        Choice::Mode => app.open_picker(Picker::mode(repl.harness.gate.mode().as_str())),
+        Choice::Model => {
+            let choices = model_choices(&repl.config);
+            if choices.is_empty() {
+                // Nothing configured to offer: start the typed form instead.
+                app.editor.set_text("/model ");
+            } else {
+                app.open_picker(Picker::model(choices));
+            }
+        }
+        // A picker offering nothing is a dead end, so the empty cases are notes.
+        Choice::Resume => match repl.recent_sessions(20) {
+            None => app.note(Style::Dim, NO_MEMORY_NOTE),
+            Some(sessions) if sessions.is_empty() => app.note(Style::Dim, "no saved sessions yet"),
+            Some(sessions) => {
+                let now = now();
+                let choices = sessions
+                    .iter()
+                    .map(|info| (session_label(info, now), info.session_id.clone()))
+                    .collect();
+                app.open_picker(Picker::sessions(choices));
+            }
+        },
+        // The provider and MCP managers come with stage 9, parts 5 and 6.
+        Choice::ConfigModel | Choice::ConfigMcp => return false,
+    }
+    true
+}
+
+/// Make the picked session the live one and rebuild the screen from it, as
+/// Python's `load_session`: the banner, the conversation, then the resumed note.
+fn resume_picked(
+    app: &mut App,
+    screen: &mut Screen<io::Stdout>,
+    repl: &mut Repl,
+    session_id: &str,
+) -> io::Result<()> {
+    match repl.switch_session(session_id) {
+        Err(message) => app.note(Style::Dim, &message),
+        Ok(note) => {
+            app.take_committed();
+            screen.clear_all()?;
+            app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+            app.replay(&repl.state.messages);
+            app.note(Style::Dim, &note);
+        }
+    }
+    Ok(())
 }
 
 /// Run one turn on a worker thread while the interface keeps drawing and taking keys.
