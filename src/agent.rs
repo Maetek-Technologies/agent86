@@ -94,6 +94,33 @@ impl CancelToken {
     }
 }
 
+/// One thing a running turn reports. Each event carries the text that `run` and the
+/// plain REPL stream for it, so every surface sees the same output.
+#[derive(Debug, Clone, Copy)]
+pub enum TurnEvent<'a> {
+    /// The model's answer, or a notice from the harness (`[cancelled]`, `[guardrail] ...`).
+    Text(&'a str),
+    /// A tool call, announced before its batch runs; `text` is its `[tool] name(...)` line.
+    ToolCall { call: &'a ToolCall, text: &'a str },
+    /// A call's result, in call order. `observation` is what the model is shown, after
+    /// the observation guardrail; `text` is the `[tool] name -> summary` line.
+    ToolResult {
+        call: &'a ToolCall,
+        result: &'a ToolResult,
+        observation: &'a str,
+        text: &'a str,
+    },
+}
+
+impl<'a> TurnEvent<'a> {
+    /// The text this event adds to the turn's output.
+    pub fn text(&self) -> &'a str {
+        match *self {
+            Self::Text(text) | Self::ToolCall { text, .. } | Self::ToolResult { text, .. } => text,
+        }
+    }
+}
+
 /// A turn could not be completed.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum HarnessError {
@@ -109,6 +136,17 @@ pub enum HarnessError {
         python_repr(model)
     )]
     NoFinalCompletion { provider: String, model: String },
+}
+
+impl HarnessError {
+    /// The name of the exception Python raises for this failure, which its
+    /// full-screen interface shows (`error: ProviderError: ...`).
+    pub fn python_type(&self) -> &'static str {
+        match self {
+            Self::Provider(_) => "ProviderError",
+            Self::CircuitTripped(_) | Self::NoFinalCompletion { .. } => "HarnessError",
+        }
+    }
 }
 
 /// Bounds one turn: steps, cumulative cost, wall-clock time, and the tool-error streak.
@@ -248,14 +286,30 @@ impl Harness {
         state: &mut AgentState,
         user_text: &str,
         display_text: &str,
-        on_text: impl FnMut(&str),
+        mut on_text: impl FnMut(&str),
+    ) -> Result<String, HarnessError> {
+        self.run_turn_events(state, user_text, display_text, |event| {
+            on_text(event.text())
+        })
+        .await
+    }
+
+    /// [`Harness::run_turn_as`] reporting [`TurnEvent`]s, so an interface can show
+    /// tool calls without parsing the `[tool] ...` lines. Every event carries the text
+    /// the other entry points stream, in the same order.
+    pub async fn run_turn_events(
+        &self,
+        state: &mut AgentState,
+        user_text: &str,
+        display_text: &str,
+        on_event: impl FnMut(TurnEvent<'_>),
     ) -> Result<String, HarnessError> {
         // A cancel requested while no turn was running must not kill this one.
         self.cancel.clear();
         let started = Instant::now();
         let mut summary = TurnSummary::default();
         let result = self
-            .turn(state, user_text, display_text, &mut summary, on_text)
+            .turn(state, user_text, display_text, &mut summary, on_event)
             .await;
         summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
         state.last_turn = Some(summary);
@@ -285,12 +339,12 @@ impl Harness {
         goal: &str,
         display_text: &str,
         summary: &mut TurnSummary,
-        mut on_text: impl FnMut(&str),
+        mut on_event: impl FnMut(TurnEvent<'_>),
     ) -> Result<String, HarnessError> {
         let mut output = String::new();
-        let mut emit = |text: &str| {
-            output.push_str(text);
-            on_text(text);
+        let mut emit = |event: TurnEvent<'_>| {
+            output.push_str(event.text());
+            on_event(event);
         };
 
         let sid = state.session_id.clone();
@@ -318,13 +372,13 @@ impl Harness {
                 state.phase = AgentPhase::Error;
                 self.recorder
                     .event(&sid, "turn_end", vec![("status", json!("blocked"))]);
-                emit(&refusal);
+                emit(TurnEvent::Text(&refusal));
                 return Ok(output);
             }
-            emit(&format!(
+            emit(TurnEvent::Text(&format!(
                 "[guardrail] input flagged: {}\n",
                 report.summary()
-            ));
+            )));
         }
 
         // Redact mode cannot stream: text inspected only after it was shown has
@@ -375,7 +429,7 @@ impl Harness {
                         if buffering {
                             buffered.push_str(&delta.text);
                         } else {
-                            emit(&delta.text);
+                            emit(TurnEvent::Text(&delta.text));
                         }
                     }
                     if delta.done && delta.completion.is_some() {
@@ -387,7 +441,7 @@ impl Harness {
                     // Whatever was held back still belongs to the user: redacted, then shown.
                     let partial = self.guardrails.inspect_egress(&buffered).1;
                     if !partial.is_empty() {
-                        emit(&partial);
+                        emit(TurnEvent::Text(&partial));
                     }
                     self.cancelled(state, breaker.steps(), &mut emit);
                     return Ok(output);
@@ -425,7 +479,7 @@ impl Harness {
             let (egress, redacted) = self.guardrails.inspect_egress(&completion.text);
             let text = if buffering {
                 if !redacted.is_empty() {
-                    emit(&redacted);
+                    emit(TurnEvent::Text(&redacted));
                 }
                 redacted
             } else {
@@ -440,10 +494,10 @@ impl Harness {
                         ("findings", json!(egress.summary())),
                     ],
                 );
-                emit(&format!(
+                emit(TurnEvent::Text(&format!(
                     "\n[guardrail] output flagged: {}\n",
                     egress.summary()
-                ));
+                )));
             }
             let tool_calls = completion.tool_calls;
             self.scan_tool_arguments(&tool_calls, &sid);
@@ -483,7 +537,7 @@ impl Harness {
                             ),
                         ],
                     );
-                    emit(&continuation_notice(summary.continuations));
+                    emit(TurnEvent::Text(&continuation_notice(summary.continuations)));
                     continue;
                 }
                 if let Some(start) = continuation_start {
@@ -532,11 +586,12 @@ impl Harness {
 
             // The whole batch is announced up front, then observed strictly in call order.
             for call in &tool_calls {
-                emit(&format!(
+                let text = format!(
                     "\n[tool] {}({})\n",
                     call.name,
                     preview_arguments(&call.arguments)
-                ));
+                );
+                emit(TurnEvent::ToolCall { call, text: &text });
             }
             let results = self.execute_batch(&tool_calls, &sid);
             for (call, result) in tool_calls.iter().zip(results) {
@@ -553,12 +608,17 @@ impl Harness {
                         ],
                     );
                 }
+                emit(TurnEvent::ToolResult {
+                    call,
+                    result: &result,
+                    observation: &content,
+                    text: &format!("[tool] {} -> {}\n", call.name, summarize(&result)),
+                });
                 state.messages.push(Message {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     ..message(Role::Tool, &content)
                 });
-                emit(&format!("[tool] {} -> {}\n", call.name, summarize(&result)));
                 let ok = result.ok;
                 step.results.push(result);
                 if let Err(tripped) = breaker.record_tool_result(ok) {
@@ -579,7 +639,7 @@ impl Harness {
     /// Close out a cancelled turn and say so, as Python's `_cancelled`. The partial
     /// exchange is kept: the user stopped the agent, they did not undo it. The phase
     /// is `error`; "cancelled" is carried by the trace's `status` and `reason`.
-    fn cancelled(&self, state: &mut AgentState, steps: u32, emit: &mut impl FnMut(&str)) {
+    fn cancelled(&self, state: &mut AgentState, steps: u32, emit: &mut impl FnMut(TurnEvent<'_>)) {
         state.phase = AgentPhase::Error;
         self.recorder.event(
             &state.session_id,
@@ -590,7 +650,7 @@ impl Harness {
                 ("steps", json!(steps)),
             ],
         );
-        emit(CANCELLED_NOTICE);
+        emit(TurnEvent::Text(CANCELLED_NOTICE));
     }
 
     /// Run a step's tool calls and return their results in call order.

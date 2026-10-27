@@ -46,7 +46,13 @@ Every change to a contract row is a bug. A change to a presentation row is allow
 
 ## 3. Layout
 
-The terminal has two parts. **Scrollback** is everything above the live region: the terminal's normal history, written once and never redrawn. The **live region** is a ratatui inline viewport at the bottom, redrawn on every change. Its height varies with what it holds: it grows for menus and panels and shrinks back afterwards.
+The terminal has two parts. **Scrollback** is everything above the live region: the terminal's normal history, written once and never redrawn. The **live region** is at the bottom, redrawn on every change. It is drawn the way Ink, which Claude Code is built on, draws (`src/ui/screen.rs`):
+
+- On each frame the renderer moves back to the top of the region and clears down.
+- It prints any newly finished lines, which scroll up into history like ordinary output.
+- Then it prints the region again.
+
+The region's height varies with what it holds: it grows for menus and panels and shrinks back afterwards. Every live row is wrapped by us to one cell less than the terminal width, so the row count is always exact: some consoles wrap a row that reaches the last column at once.
 
 ```
 ╭─ agent86 ──────────────────────────╮        ┐
@@ -140,11 +146,12 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 
 | Path | Holds |
 |---|---|
-| `src/ui/mod.rs` | `run_interactive`: surface selection, then the full interface or the plain loop on the same `Repl` |
-| `src/ui/app.rs` | `App`, the state machine: the entry model, mode (idle, turn running, cancelling, panel open, transcript view), and the reducer from `UiEvent` to state changes and effects |
-| `src/ui/terminal.rs` | The crossterm/ratatui terminal: raw mode, the inline viewport, `insert_before` for committed lines, resize, a panic hook and a drop guard that restore the terminal |
-| `src/ui/entries.rs` | The transcript entry model: `User`, `Reply`, `Tool`, `Notice`, `Error`, `Raw`. It is kept for the transcript view and for rebuilding a resumed session (Python's `_entries_for`) |
-| `src/ui/render/` | Pure functions from entries to `ratatui::text::Line`s at a given width, plus `markdown.rs` and `diff.rs` |
+| `src/ui/mod.rs` | `run_interactive`: surface selection, then the full interface or the plain loop on the same `Repl`. It also holds the terminal guard (raw mode, bracketed paste, keyboard enhancement, Windows console checks, and a panic hook that restores the terminal), the event pump, and the turn worker |
+| `src/ui/app.rs` | `App`, the state machine: what has been committed, the reply tail, running tools, the approval panel, and what each key and `UiEvent` does. It never touches the terminal, so tests drive it directly |
+| `src/ui/screen.rs` | The inline renderer: frames of committed lines and the live region, the caret, and row accounting across resizes |
+| `src/ui/text.rs` | Styled `Line`s, wrapping in terminal cells, truncation, and `sanitize` for untrusted text |
+| `src/ui/entries.rs` (part 3) | The transcript entry model: `User`, `Reply`, `Tool`, `Notice`, `Error`, `Raw`. It is kept for the transcript view and for rebuilding a resumed session (Python's `_entries_for`) |
+| `src/ui/render/` (part 4) | `markdown.rs` and `diff.rs`; the full-screen transcript view may use ratatui |
 | `src/ui/input.rs` | The multi-line editor: cursor, editing keys, word movement, paste, and history navigation over `PromptHistory` |
 | `src/ui/menu.rs` | The `/` command menu and `@` path completion (a port of `complete_mentions`) |
 | `src/ui/status.rs` | A port of `ui/status.py` and `fit_status_line`. Shared, so `/cost` and the plain loop could use the same numbers |
@@ -175,7 +182,7 @@ Python's `_use_tui` decides, then the start is attempted:
 - **macOS and Linux terminals:** supported. Keyboard enhancement (the kitty protocol) is enabled where the terminal supports it.
 - **Git Bash's mintty without winpty:** falls back to the plain loop with the note. `winpty agent86` or Windows Terminal gives the full interface.
 - **Resize:** the live region is redrawn at the new width. Scrollback is the terminal's, and it reflows it or not.
-- **Wide characters and emoji:** measured with `unicode-width`, which ratatui uses as well.
+- **Wide characters and emoji:** measured with `unicode-width`.
 
 ## 10. Slices
 
@@ -251,10 +258,10 @@ Stage 9 is complete after slice 5, and then the README roadmap item is ticked.
 ## 11. Testing
 
 - **Pure units:** status segments and shedding (checked against Python's numbers), the context window lookup, `/` menu filtering, `complete_mentions`, editor operations and history navigation, tool block text and truncation, Markdown block splitting, and the commit rule.
-- **Rendering:** entries and panels are rendered with ratatui's `TestBackend` at fixed widths, and the resulting buffers are compared with expected text. These tests compare text, not styles, except where the style is the contract (an error is red; a failed tool is red).
-- **App:** the `App` reducer is driven with synthetic key events and `UiEvent`s against the mock provider (`tests/support`), with no real terminal. These tests cover a full turn, an approval answered yes and no, cancellation by Escape and Ctrl+C, shutdown with a pending approval, `/clear`, `/resume`, and the menus.
+- **Rendering:** the live region and committed lines are rendered at fixed widths and compared as text, as is the renderer's output (its cursor movement and clearing). Styles are checked only where the style is the contract, such as an error or a failed tool being red.
+- **App:** the `App` reducer is driven with synthetic key events and `UiEvent`s, with no real terminal. These tests cover a full turn, an approval answered yes and no, cancellation by Escape and Ctrl+C, shutdown with a pending approval, `/clear`, `/resume`, and the menus.
 - **Harness:** tests check that the turn observer's events match the text `emit` (the same calls, results, and order, including in parallel batches) and that `run`'s output is unchanged.
-- **Plain loop:** `tests/repl.rs` keeps running the plain loop through piped stdin. A new test checks that `AGENT86_PLAIN` and `[ui] tui = false` select it.
+- **Plain loop:** `tests/repl.rs` keeps running the plain loop through piped stdin. A unit test checks the selection rule (`--plain`, `AGENT86_PLAIN`, `[ui] tui = false`, no terminal).
 - **Manual checklist per slice:** Windows Terminal, the VS Code terminal, and conhost on Windows. Also mintty, where the fallback note should appear, and macOS or Linux where available. Check a live turn with a tool call, an approval, a cancel, a resize, a long answer, and quitting with the terminal restored.
 
 ## 12. Risks

@@ -9,12 +9,12 @@ use agent86::observability::{
 };
 use agent86::pricing::PriceTable;
 use agent86::pyjson::{python_json_dumps, python_json_dumps_indented};
-use agent86::repl::run_repl;
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::session::{expand_home, AgentState, SessionStore};
 use agent86::setup::{assemble, SetupError, MODEL_HELP};
 use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
+use agent86::ui::run_interactive;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
@@ -191,10 +191,12 @@ fn main() -> ExitCode {
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
         None => {
-            // `--plain` is accepted for Python's sake: the plain loop is the only
-            // surface until the full-screen interface is ported.
-            let _ = cli.plain;
-            run_repl(config, cli.resume.as_deref(), Box::new(OsKeyring));
+            run_interactive(
+                config,
+                cli.resume.as_deref(),
+                cli.plain,
+                Box::new(OsKeyring),
+            );
             ExitCode::SUCCESS
         }
     }

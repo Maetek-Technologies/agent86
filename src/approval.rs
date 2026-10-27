@@ -11,6 +11,7 @@ use crate::tools::{Tool, ToolContext};
 use crate::types::{ApprovalMode, ToolCall};
 use serde_json::Value;
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::{Mutex, PoisonError};
 
 /// The one-line argument summary is capped at this many characters.
 pub const SUMMARY_LIMIT: usize = 300;
@@ -37,13 +38,26 @@ pub struct ApprovalDecision {
 
 /// Decides whether a call may run, asking a human when the mode says so.
 pub struct ApprovalGate {
-    pub mode: ApprovalMode,
+    /// Behind a lock, so the interactive interface can switch it (Shift+Tab) while a
+    /// turn holds the harness; the next call is decided under the new mode, as in Python.
+    mode: Mutex<ApprovalMode>,
     pub prompt: Option<ApprovalPrompt>,
 }
 
 impl ApprovalGate {
     pub fn new(mode: ApprovalMode, prompt: Option<ApprovalPrompt>) -> Self {
-        Self { mode, prompt }
+        Self {
+            mode: Mutex::new(mode),
+            prompt,
+        }
+    }
+
+    pub fn mode(&self) -> ApprovalMode {
+        *self.mode.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_mode(&self, mode: ApprovalMode) {
+        *self.mode.lock().unwrap_or_else(PoisonError::into_inner) = mode;
     }
 
     pub fn decide(&self, tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> ApprovalDecision {
@@ -51,7 +65,7 @@ impl ApprovalGate {
         if !tool.side_effecting() {
             return decision(true, "read-only");
         }
-        match self.mode {
+        match self.mode() {
             ApprovalMode::Auto => decision(true, "auto-approved"),
             ApprovalMode::Deny => decision(false, "blocked by approval policy (deny)"),
             ApprovalMode::Ask => match &self.prompt {
