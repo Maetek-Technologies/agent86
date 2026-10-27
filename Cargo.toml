@@ -30,6 +30,7 @@ toml_edit = "0.25"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "preserve_order", "serde"] }
 unicode-width = "0.2"
 url = "2.5.8"
+md5 = "0.8.1"
 
 [lints.rust]
 unsafe_code = "forbid"

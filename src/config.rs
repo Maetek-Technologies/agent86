@@ -64,6 +64,11 @@ keep_traces = 5
 [memory]
 enabled = true
 path = "~/.agent86/memory.db"
+embeddings = "sentence-transformers:all-MiniLM-L6-v2"
+hf_offline = true
+retention_max_episodes = 1000
+retention_max_sessions = 500
+retention_max_age_days = 0.0
 
 [tools]
 web_allow_private = false
@@ -321,12 +326,23 @@ pub enum RedactMode {
     None,
 }
 
-/// Memory settings (`[memory]`). Only session persistence uses them so far.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Memory settings (`[memory]`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MemoryConfig {
     pub enabled: bool,
     /// The SQLite database, shared with the Python implementation; `~` expands.
     pub path: String,
+    /// The embedder spec: `hash:<dim>`, or `sentence-transformers:<model>`, which
+    /// falls back to `hash:256` until it is ported.
+    pub embeddings: String,
+    /// Skip the Hugging Face update check for a cached model (unused until the
+    /// model is ported).
+    pub hf_offline: bool,
+    /// Retention caps for the episode and session log, applied when the harness
+    /// starts; 0 disables a cap. Curated facts are never pruned automatically.
+    pub retention_max_episodes: i64,
+    pub retention_max_sessions: i64,
+    pub retention_max_age_days: f64,
 }
 
 /// Tool settings (`[tools]`).

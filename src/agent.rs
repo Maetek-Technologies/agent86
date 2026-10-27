@@ -243,14 +243,18 @@ pub struct Harness {
     /// Live MCP servers; their section of the system message is rebuilt for every
     /// request, because servers drop, reconnect, and change their tools mid-turn.
     pub mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
+    /// Long-term memory: past episodes are recalled into each turn's system
+    /// message and every finished turn is recorded; `None` runs statelessly.
+    pub memory: Option<crate::session::SessionStore>,
     /// Stops the running turn at its next safe point.
     pub cancel: CancelToken,
 }
 
 impl Harness {
     /// The system message for the next request: the prompt plus, when MCP servers
-    /// are live, their section, as Python's `_system_content`.
-    fn system_message(&self) -> Message {
+    /// are live, their section, then the turn's recall note, as Python's
+    /// `_system_content`.
+    fn system_message(&self, extra: Option<&str>) -> Message {
         let mut system = self.system.clone();
         if let Some(section) = self
             .mcp
@@ -259,6 +263,9 @@ impl Harness {
             .filter(|section| !section.is_empty())
         {
             system.content = format!("{}\n\n{section}", system.content);
+        }
+        if let Some(extra) = extra.filter(|extra| !extra.is_empty()) {
+            system.content = format!("{}\n\n{extra}", system.content);
         }
         system
     }
@@ -385,6 +392,11 @@ impl Harness {
         // already leaked. Each step's text is held back and replayed redacted.
         let buffering = self.guardrails.egress == EgressMode::Redact;
 
+        // What happened last time a task like this came up.
+        let recall_note = self
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.recall_note(goal));
         state.messages.push(message(Role::User, goal));
         let mut breaker = CircuitBreaker::new(&self.limits);
         // Where the first partial answer went, and the pieces collected so far.
@@ -402,7 +414,7 @@ impl Harness {
 
             let completion = {
                 let mut request_messages = Vec::with_capacity(state.messages.len() + 1);
-                request_messages.push(self.system_message());
+                request_messages.push(self.system_message(recall_note.as_deref()));
                 request_messages.extend(state.messages.iter().cloned());
                 let request = CompletionRequest {
                     model: self.provider.model().to_owned(),
@@ -548,6 +560,7 @@ impl Harness {
                     state.messages.push(message(Role::Assistant, &joined));
                     step.thought = joined;
                 }
+                let outcome = step.thought.clone();
                 record_step(state, step);
                 state.phase = AgentPhase::Done;
                 self.recorder.event(
@@ -559,6 +572,10 @@ impl Harness {
                         ("continuations", json!(summary.continuations)),
                     ],
                 );
+                if let Some(memory) = &self.memory {
+                    // A failed write loses one episode, never the turn.
+                    let _ = memory.add_episode(&sid, goal, &outcome, &Default::default());
+                }
                 return Ok(output);
             }
 

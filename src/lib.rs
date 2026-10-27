@@ -14,6 +14,7 @@ pub mod guardrails;
 pub mod history;
 pub mod keys;
 pub mod mcp;
+pub mod memory;
 pub mod mentions;
 pub mod observability;
 pub mod pricing;

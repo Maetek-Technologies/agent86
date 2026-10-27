@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory with the hashing embedder (stage 10, part 1) done; the sentence-transformers embedder (stage 10, part 2) next
 
 ## 1. Purpose
 
@@ -102,6 +102,14 @@ The Python implementation remains the reference and compatibility oracle. This p
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
 - Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
+- Added long-term memory (stage 10, part 1), ported from `memory/store.py` (episodes, facts, ranking, pruning, retention), `episodic.py`, `semantic.py`, `system.py`, `embeddings.py` (the hashing embedder), `tools/builtin/memory.py`, the memory wiring in `orchestration/loop.py`, and the `agent86 memory` commands in `cli.py`:
+  - episodes: every finished turn is recorded (task and answer) in the shared database; before a turn starts, past episodes scoring at least 0.35 (compactions excluded) are added to the system message as Python's "Relevant past experience" note, the task quoted as Python's `repr` and the outcome collapsed and cut at 200 characters
+  - facts: `remember` and `recall` (not side-effecting, registered after the built-ins only when memory is on; `Memory is disabled.` otherwise), with Python's schemas, a `k` clamped to 1..20 and parsed with pydantic's lax `int` rules, the 0.30 floor, and `- <fact>  [score 0.62]` lines
+  - the store: `float32` BLOBs as Python's `array("f")` writes them, a brute-force cosine scan (summed as Python 3.12's compensated `sum`, so scores are bit-identical), rows of another dimension skipped, and a stable sort
+  - the hashing embedder (`hash:<dim>`), bit-identical to Python's (MD5 buckets and signs over `[a-z0-9]+` tokens), so facts and episodes either implementation writes with it are found by the other. The default `sentence-transformers:all-MiniLM-L6-v2` is not ported yet and falls back to `hash:256` with a note, as Python does when the model cannot load
+  - retention at startup from `[memory] retention_max_episodes` (1000), `retention_max_sessions` (500), and `retention_max_age_days` (0, off), recorded as Python's `retention_prune` trace event; curated facts are never pruned automatically
+  - `agent86 memory stats|sessions|search|prune|forget`, with Python's output, the dry run, and Click's `[y/N]` confirmation (`Aborted!` at end of input)
+  - live check (2026-10-27, local Ollama, `gemma4:12b`, isolated home): asked to remember a preference, the model called `remember`; in a new session it called `recall` and answered from the fact
 - Added the remaining model providers, so every adapter Python has is ported:
   - Anthropic, ported from `cognitive/anthropic_provider.py`: the Messages API event stream (`message_start`, content blocks, `input_json_delta` tool input, `message_delta` usage), the system prompt split out, tool results as `tool_result` blocks and tool calls as `tool_use` blocks, `max_tokens` always sent (the request's, then the section's, then 8192), `temperature` left out for models that removed it and dropped and remembered for the session when the API refuses it, prompt-cache markers on the tools and the system prompt when the prefix reaches the model's floor (`prompt_cache`, on by default), usage counting cached tokens as part of the prompt and pricing them at their own rates, and Python's stop-reason mapping. Python runs it through the `anthropic` SDK, so the SDK's behavior is reproduced too: its retries (408, 409, 429, and 5xx, `x-should-retry`, `retry-after-ms` or `Retry-After` up to a minute, otherwise 0.5 seconds doubling to 8), its fixed timeouts (5 seconds to connect, 600 between chunks), and its error text (`Anthropic API error: Error code: 401 - {...}` with the body as Python prints a dict, `Connection error.`, the timeout text, and `error` events). Failures the SDK leaves unconverted get the message Python's loop gives them
   - llama.cpp and LM Studio, ported from `cognitive/llamacpp_provider.py`: the OpenAI-compatible adapter under the name `llamacpp`, keyless, with `http://localhost:8080/v1` when the section has no `base_url`. Live check (2026-10-27): pointed at a local Ollama's OpenAI-compatible endpoint, `run` with `gemma4:12b` called `list_dir` and named the files, at `$0.0000`
@@ -120,7 +128,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **373 passed on Windows** (169 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 36 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **388 passed on Windows** (171 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 39 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 10 memory, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -140,16 +148,16 @@ Local validation completed successfully:
 
 The agent works end to end, but it does not yet have:
 
-- Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory] enabled`/`path`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
+- Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory]`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
 - Context-window fitting and compaction of long conversations
-- Memory, skills, and delegation tools, and skills themselves
-- Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
-- Local embedding backend
+- Skills and delegation tools, and skills themselves
+- OpenTelemetry span export (`[observability] otel`)
+- The local sentence-transformers embedder (`[memory] embeddings` falls back to the hashing embedder)
 
 ### Known `run` differences from Python
 
-- The system prompt is the identity, the environment line, and the MCP section when servers are live. Python also adds installed skills and an episodic recall note, which are not ported.
+- The system prompt is the identity, the environment line, the MCP section when servers are live, and the turn's episodic recall note. Python also adds installed skills, which are not ported.
 - The environment line reports the Rust crate version (`agent86 v0.1.0`), not Python's (`v1.0.0`).
 - `--sandbox` is not accepted (`AGENT86_SANDBOX` and `[sandbox] mode` are).
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
@@ -167,7 +175,7 @@ The agent works end to end, but it does not yet have:
 - A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
 - `/config` prints the merged TOML layers (built-in defaults for the modelled sections, the config files, and overrides) as JSON, not Python's full pydantic dump with every default.
 - `/config model` and `/config mcp` give Python's wording, pointing at the interface.
-- `/skills` always reports `no skills discovered`, and `/memory`'s episode and fact counts stay at whatever Python wrote, because neither is ported.
+- `/skills` always reports `no skills discovered`, because skills are not ported.
 - `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
 - `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
 - Answers are printed as plain text, as in Python's plain loop; the Markdown rendering behind `[ui] markdown` belongs to the full-screen app.
@@ -214,7 +222,7 @@ The agent works end to end, but it does not yet have:
 
 ### Known loop differences from Python
 
-- Python also offers memory, skill, and delegation tools when those are enabled, so the tool list in each request differs.
+- Python also offers skill and delegation tools when those are enabled, so the tool list in each request differs.
 - The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
 - A cancel also wakes a response that has stopped streaming; Python checks only as each delta arrives.
 
@@ -241,9 +249,18 @@ The agent works end to end, but it does not yet have:
 
 ### Known session differences from Python
 
-- Python records an episode per turn and adds an episodic recall note to the system prompt; neither is ported, because they need embeddings. The `episodes` and `memories` tables are created but not written.
 - `state_json` is valid in both directions but not byte-identical: Rust omits empty lists and nulls that pydantic writes, and writes floats in Python's `json.dumps` style where pydantic uses shortest-decimal notation.
 - A long resumed session is sent in full; Python fits it to the model's context window and compacts it (not ported).
+
+### Known memory differences from Python
+
+- The default embedder, `sentence-transformers:all-MiniLM-L6-v2`, is not ported (stage 10, part 2), so the hashing embedder stands in with the note `sentence-transformers unavailable (not ported to the Rust build yet); using the offline hash embedder.` (Python's names the exception and suggests `pip install "agent86[local]"`). Until then, episodes and facts Python embedded with that model (384 dimensions) are skipped by Rust's searches, and the 256-dimension rows Rust writes are skipped by Python's when it has the model.
+- Search is always the brute-force scan. Python uses `sqlite-vec`'s `vec_distance_cosine` when the extension loads, which computes in `float32`, so its scores can differ from the scan's in the last digits.
+- Scores follow Python 3.12's `sum`; under Python 3.11 (which the reference still supports) the last bit can differ.
+- A `recall` `k` written as an integer literal beyond 64 bits arrives as a float and is refused as too large; pydantic accepts any integer and the clamp makes it 20.
+- Compacted spans are never archived as episodes, because compaction is not ported.
+- The `memory` commands print plain aligned text instead of Rich tables, and stored text is printed as is; Rich would interpret markup in it.
+- `Memory is disabled in config.` does not mention `agent86 config path`, which is not ported. A negative `memory search -k` is a usage error; Python slices from the end.
 
 ### Known MCP differences from Python
 
@@ -350,6 +367,11 @@ All criteria were met on 2026-10-26.
 | 10 | Local embedding options | Model runtime and offline behavior |
 
 Each stage should produce a usable vertical slice and be compared with the Python implementation before the project moves on.
+
+Stage 10 is delivered in two parts:
+
+- [x] Part 1: episodic and semantic memory, the memory tools and commands, and retention, with the hashing embedder
+- [ ] Part 2: the `sentence-transformers` embedder (`all-MiniLM-L6-v2`) as a local Rust model runtime, producing vectors that match Python's so memory is shared both ways
 
 Stage 9 is delivered in parts, one PR each. The details and acceptance tests for parts 2 to 6 are in [docs/INTERFACE.md](INTERFACE.md), section 10.
 

@@ -8,10 +8,11 @@ use agent86::observability::{
     SPAN_KINDS,
 };
 use agent86::pricing::PriceTable;
-use agent86::pyjson::{python_json_dumps, python_json_dumps_indented};
+use agent86::pyjson::{python_float_repr, python_json_dumps, python_json_dumps_indented};
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
-use agent86::session::{expand_home, AgentState, SessionStore};
-use agent86::setup::{assemble, SetupError, MODEL_HELP};
+use agent86::session::{expand_home, AgentState, SessionStore, StoreCounts};
+use agent86::setup::{assemble, open_memory, SetupError, MODEL_HELP};
+use agent86::tools::memory::format_2f;
 use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
 use agent86::ui::run_interactive;
@@ -80,6 +81,66 @@ enum Command {
     /// Manage MCP servers.
     #[command(subcommand)]
     Mcp(McpCommand),
+
+    /// Inspect long-term memory.
+    #[command(subcommand)]
+    Memory(MemoryCommand),
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    /// Show counts of stored sessions, episodes, and facts.
+    Stats,
+
+    /// List recent sessions (most recent first).
+    Sessions {
+        /// Max sessions to show.
+        #[arg(short = 'n', long, default_value_t = 20, allow_negative_numbers = true)]
+        limit: i64,
+    },
+
+    /// Search episodic and semantic memory.
+    Search {
+        /// What to search episodic + semantic memory for.
+        query: String,
+
+        /// Results per store.
+        #[arg(short = 'k', long = "k", default_value_t = 5)]
+        k: usize,
+    },
+
+    /// Trim the flight-recorder log (episodes + sessions) by age and/or count.
+    ///
+    /// Curated semantic facts are left untouched unless --memories is given. With
+    /// no limits, prints current counts and exits (nothing is deleted).
+    Prune {
+        /// Delete log rows older than this many days.
+        #[arg(long, allow_negative_numbers = true)]
+        older_than: Option<f64>,
+
+        /// Keep only the most recent N rows per table.
+        #[arg(long, allow_negative_numbers = true)]
+        keep_last: Option<i64>,
+
+        /// Also prune curated semantic facts (off by default).
+        #[arg(long)]
+        memories: bool,
+
+        /// Show what would be deleted without deleting.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Delete a single semantic fact by id.
+    Forget {
+        /// Id of the semantic memory to delete (see search).
+        #[arg(allow_negative_numbers = true)]
+        mem_id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +251,7 @@ fn main() -> ExitCode {
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
+        Some(Command::Memory(command)) => memory_command(&config, command, &stderr),
         None => {
             run_interactive(
                 config,
@@ -554,6 +616,273 @@ fn trace_command(config: &Config, command: TraceCommand, stderr: &Stderr) -> Exi
     }
 }
 
+/// The memory store for the `memory` commands, as Python's `_open_memory`: a
+/// disabled or unopenable store is an error, and an embedder fallback is noted.
+fn open_memory_store(config: &Config, stderr: &Stderr) -> Option<SessionStore> {
+    if !config.memory.enabled {
+        stderr.warn_lead(
+            "Memory is disabled in config.",
+            "Set `[memory] enabled = true` to turn it on.",
+        );
+        return None;
+    }
+    match open_memory(config) {
+        (Some(store), note) => {
+            if let Some(note) = note {
+                stderr.dim(&format!("memory: {note}"));
+            }
+            Some(store)
+        }
+        (None, note) => {
+            // `open_memory` prefixes the store's error with the REPL's degradation
+            // note; here, as in Python, the store's own message is the error.
+            let note = note.unwrap_or_default();
+            let message = note
+                .strip_prefix("unavailable, running without recall or session history. ")
+                .unwrap_or(&note);
+            stderr.error(message);
+            None
+        }
+    }
+}
+
+fn memory_command(config: &Config, command: MemoryCommand, stderr: &Stderr) -> ExitCode {
+    let style = Styled::stdout(stderr);
+    // Python prints this before it opens the store.
+    if let MemoryCommand::Prune {
+        older_than: None,
+        keep_last: None,
+        ..
+    } = command
+    {
+        style.line(
+            "\x1b[33m",
+            "No retention limit given.",
+            " Pass --older-than and/or --keep-last.",
+        );
+    }
+    let Some(store) = open_memory_store(config, stderr) else {
+        return ExitCode::from(1);
+    };
+    let failed = |error: agent86::session::StoreError| {
+        stderr.error(&error.to_string());
+        ExitCode::from(1)
+    };
+    match command {
+        MemoryCommand::Stats => {
+            let counts = match store.counts() {
+                Ok(counts) => counts,
+                Err(error) => return failed(error),
+            };
+            let rows: Vec<Vec<String>> = [
+                ("sessions", counts.sessions),
+                ("episodes", counts.episodes),
+                ("memories", counts.memories),
+            ]
+            .iter()
+            .map(|(kind, count)| vec![(*kind).to_owned(), count.to_string()])
+            .collect();
+            print_table(&["Kind", "Count"], &rows);
+            println!(
+                "{} {}  {} {}",
+                style.paint("\x1b[2m", "db:"),
+                store.path().display(),
+                style.paint("\x1b[2m", "embedder:"),
+                store.embedder_spec()
+            );
+        }
+        MemoryCommand::Sessions { limit } => {
+            // A negative limit is SQLite's "no limit", as Python passes it through.
+            let sessions = match store.recent_sessions(usize::try_from(limit).unwrap_or(usize::MAX))
+            {
+                Ok(sessions) => sessions,
+                Err(error) => return failed(error),
+            };
+            if sessions.is_empty() {
+                stdout_dim("no sessions yet", stderr);
+            } else {
+                let rows: Vec<Vec<String>> = sessions
+                    .into_iter()
+                    .map(|info| {
+                        let title = info.title.unwrap_or_else(|| style.paint("\x1b[2m", "-"));
+                        vec![info.session_id, title]
+                    })
+                    .collect();
+                print_table(&["Session", "Title"], &rows);
+            }
+        }
+        MemoryCommand::Search { query, k } => {
+            let (episodes, facts) = match (
+                store.search_episodes(&query, k),
+                store.search_memories(&query, k),
+            ) {
+                (Ok(episodes), Ok(facts)) => (episodes, facts),
+                (Err(error), _) | (_, Err(error)) => return failed(error),
+            };
+            println!("{}", style.paint("\x1b[1m", "episodes"));
+            for hit in &episodes {
+                let outcome: String = hit.outcome().chars().take(80).collect();
+                println!(
+                    "  [{}] {}  {}",
+                    format_2f(hit.score),
+                    hit.text,
+                    style.paint("\x1b[2m", &format!("-> {outcome}"))
+                );
+            }
+            if episodes.is_empty() {
+                println!("  {}", style.paint("\x1b[2m", "(none)"));
+            }
+            println!("{}", style.paint("\x1b[1m", "facts"));
+            for hit in &facts {
+                println!("  [{}] {}", format_2f(hit.score), hit.text);
+            }
+            if facts.is_empty() {
+                println!("  {}", style.paint("\x1b[2m", "(none)"));
+            }
+        }
+        MemoryCommand::Prune {
+            older_than,
+            keep_last,
+            memories,
+            dry_run,
+            yes,
+        } => {
+            let counts = |store: &SessionStore| store.counts().map(|counts| counts_repr(&counts));
+            if older_than.is_none() && keep_last.is_none() {
+                return match counts(&store) {
+                    Ok(counts) => {
+                        println!("{counts}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => failed(error),
+                };
+            }
+            let limits = format!(
+                "older_than={}, keep_last={}",
+                older_than.map_or("None".to_owned(), python_float_repr),
+                keep_last.map_or("None".to_owned(), |keep| keep.to_string())
+            );
+            if dry_run {
+                stdout_dim(
+                    &format!(
+                        "dry run — would prune episodes+sessions{} ({limits}). Current counts:",
+                        if memories { " + memories" } else { "" }
+                    ),
+                    stderr,
+                );
+                return match counts(&store) {
+                    Ok(counts) => {
+                        println!("{counts}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => failed(error),
+                };
+            }
+            if !yes {
+                let target = if memories {
+                    "episodes, sessions, memories"
+                } else {
+                    "episodes, sessions"
+                };
+                match confirm(&format!("Prune {target} ({limits})?")) {
+                    Some(true) => {}
+                    Some(false) => {
+                        stdout_dim("aborted", stderr);
+                        return ExitCode::SUCCESS;
+                    }
+                    None => {
+                        // Click's `Abort` on end of input.
+                        eprintln!("Aborted!");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            let removed = match store.prune(older_than, keep_last, memories) {
+                Ok(removed) => removed,
+                Err(error) => return failed(error),
+            };
+            let total: i64 = removed.iter().map(|(_, count)| count).sum();
+            let listed = removed
+                .iter()
+                .map(|(table, count)| format!("'{table}': {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            style.line(
+                "\x1b[32m",
+                &format!("Pruned {total} row(s):"),
+                &format!(" {{{listed}}}"),
+            );
+            match counts(&store) {
+                Ok(counts) => println!("{counts}"),
+                Err(error) => return failed(error),
+            }
+        }
+        MemoryCommand::Forget { mem_id } => match store.delete_memory(mem_id) {
+            Ok(true) => style.line("\x1b[32m", &format!("Deleted memory {mem_id}."), ""),
+            Ok(false) => style.line("\x1b[33m", &format!("No memory with id {mem_id}."), ""),
+            Err(error) => return failed(error),
+        },
+    }
+    ExitCode::SUCCESS
+}
+
+/// The counts as Python prints the dict: `{'sessions': 1, 'episodes': 2, 'memories': 0}`.
+fn counts_repr(counts: &StoreCounts) -> String {
+    format!(
+        "{{'sessions': {}, 'episodes': {}, 'memories': {}}}",
+        counts.sessions, counts.episodes, counts.memories
+    )
+}
+
+/// Click's `confirm` with a `False` default: `Some(answer)`, or `None` at end of
+/// input. Anything but yes or no asks again.
+fn confirm(question: &str) -> Option<bool> {
+    let stdin = std::io::stdin();
+    loop {
+        print!("{question} [y/N]: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::BufRead::read_line(&mut stdin.lock(), &mut line) {
+            Ok(0) | Err(_) => {
+                println!();
+                return None;
+            }
+            Ok(_) => {}
+        }
+        match line.trim().to_lowercase().as_str() {
+            "y" | "yes" => return Some(true),
+            "n" | "no" | "" => return Some(false),
+            _ => eprintln!("Error: invalid input"),
+        }
+    }
+}
+
+/// Rich-style colouring for stdout, only when stdout is a terminal and colour is on.
+struct Styled {
+    color: bool,
+}
+
+impl Styled {
+    fn stdout(stderr: &Stderr) -> Self {
+        Self {
+            color: stderr.color && std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn paint(&self, style: &str, text: &str) -> String {
+        if self.color {
+            format!("{style}{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    }
+
+    /// `[style]lead[/style]rest` on one line.
+    fn line(&self, style: &str, lead: &str, rest: &str) {
+        println!("{}{rest}", self.paint(style, lead));
+    }
+}
+
 /// A dim line on stdout, as Python's `console.print("[dim]...")`.
 fn stdout_dim(message: &str, stderr: &Stderr) {
     if stderr.color && std::io::stdout().is_terminal() {
@@ -771,6 +1100,15 @@ impl Stderr {
     /// An error printed after streamed text, starting on a fresh line.
     fn error_after_stream(&self, message: &str) {
         self.write("\n", "\x1b[31m", "error:", message);
+    }
+
+    /// `[yellow]lead[/yellow] rest`.
+    fn warn_lead(&self, lead: &str, rest: &str) {
+        if self.color {
+            eprintln!("\x1b[33m{lead}\x1b[0m {rest}");
+        } else {
+            eprintln!("{lead} {rest}");
+        }
     }
 
     /// A yellow notice, as Rich's `[yellow]...[/yellow]`.

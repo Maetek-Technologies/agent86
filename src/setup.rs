@@ -6,13 +6,14 @@ use crate::approval::{ApprovalGate, ApprovalPrompt};
 use crate::config::Config;
 use crate::guardrails::Guardrails;
 use crate::mcp::McpManager;
+use crate::memory::embeddings::build_embedder;
 use crate::observability::Recorder;
 use crate::prompt::build_system_prompt;
 use crate::provider::{provider_for_ref, Provider};
 use crate::session::{expand_home, SessionStore};
 use crate::tools::sandbox::build_executor;
 use crate::tools::web::WebSettings;
-use crate::tools::{builtin_registry, ToolContext};
+use crate::tools::{default_registry, ToolContext};
 use crate::types::ModelRef;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,7 +51,8 @@ pub struct Assembly {
     pub model_ref: ModelRef,
     /// The session store, or `None` when memory is off or could not be opened.
     pub store: Option<SessionStore>,
-    /// Why memory is unavailable, as Python's `memory_note`.
+    /// Why memory is unavailable or degraded (an embedder fallback), as Python's
+    /// `memory_note`.
     pub memory_note: Option<String>,
     /// Why the configured sandbox was replaced, as Python's `sandbox_note`.
     pub sandbox_note: Option<String>,
@@ -76,23 +78,17 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     let (executor, sandbox_note) = build_executor(&config.sandbox);
     context.executor = executor;
 
-    // Sessions live in the memory database; if it cannot be opened, run statelessly.
-    let (store, memory_note) = if config.memory.enabled {
-        match SessionStore::open(&expand_home(&config.memory.path)) {
-            Ok(store) => (Some(store), None),
-            Err(error) => (
-                None,
-                Some(format!(
-                    "unavailable, running without recall or session history. {error}"
-                )),
-            ),
-        }
-    } else {
-        (None, None)
-    };
+    // Sessions, episodes, and facts live in the memory database; if it cannot be
+    // opened, run statelessly.
+    let (store, memory_note) = open_memory(config);
+    let recorder = Recorder::from_config(&config.observability);
+    if let Some(store) = &store {
+        enforce_retention(config, store, &recorder);
+    }
+    context.memory = store.clone();
 
     // MCP servers that fail to start contribute no tools; their notes say why.
-    let registry = builtin_registry();
+    let registry = default_registry(store.is_some());
     let mcp = McpManager::start(config).map(Arc::new);
     if let Some(manager) = &mcp {
         manager.attach(&registry);
@@ -107,7 +103,8 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         max_tokens,
         gate: ApprovalGate::new(config.guardrails.approval, prompt),
         guardrails: Guardrails::new(&config.guardrails),
-        recorder: Recorder::from_config(&config.observability),
+        recorder,
+        memory: store.clone(),
         mcp,
         cancel: Default::default(),
     };
@@ -118,4 +115,43 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         memory_note,
         sandbox_note,
     })
+}
+
+/// The memory store for `[memory]`, or `None` with the reason, as Python's
+/// `_auto_memory`: a locked or unwritable database is a reason to run without
+/// recall, not a reason the user cannot talk to a model at all. The note also
+/// carries an embedder fallback.
+pub fn open_memory(config: &Config) -> (Option<SessionStore>, Option<String>) {
+    if !config.memory.enabled {
+        return (None, None);
+    }
+    let (embedder, note) = build_embedder(&config.memory.embeddings);
+    match SessionStore::open_with(&expand_home(&config.memory.path), embedder) {
+        Ok(store) => (Some(store), note),
+        Err(error) => (
+            None,
+            Some(format!(
+                "unavailable, running without recall or session history. {error}"
+            )),
+        ),
+    }
+}
+
+/// Prune the episode and session log to its caps at startup, as Python's
+/// `_enforce_retention`, recording what was removed.
+fn enforce_retention(config: &Config, store: &SessionStore, recorder: &Recorder) {
+    let memory = &config.memory;
+    if let Ok(removed) = store.enforce_retention(
+        memory.retention_max_episodes,
+        memory.retention_max_sessions,
+        memory.retention_max_age_days,
+    ) {
+        if !removed.is_empty() {
+            let fields = removed
+                .into_iter()
+                .map(|(table, count)| (table, serde_json::json!(count)))
+                .collect();
+            recorder.event("memory", "retention_prune", fields);
+        }
+    }
 }

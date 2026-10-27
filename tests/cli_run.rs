@@ -18,8 +18,16 @@ impl Workspace {
     fn new(name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("agent86-cli-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("home").join(".agent86")).unwrap();
         std::fs::create_dir_all(root.join("project").join(".agent86")).unwrap();
+        // The default sentence-transformers embedder is not ported, and its
+        // fallback note would precede every run's output; the hash embedder is
+        // what it falls back to anyway.
+        std::fs::write(
+            root.join("home").join(".agent86").join("config.toml"),
+            "[memory]\nembeddings = \"hash:256\"\n",
+        )
+        .unwrap();
         Self { root }
     }
 
@@ -949,6 +957,230 @@ async fn memory_can_be_turned_off() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!workspace.memory_db().exists());
+    // Without memory, the agent gets no `remember` or `recall`.
+    let tools = server.requests()[0].body["tools"].to_string();
+    assert!(!tools.contains("\"remember\""), "{tools}");
+
+    let stats = workspace.run(&["memory", "stats"]).await;
+    assert_eq!(stats.status.code(), Some(1));
+    assert_eq!(
+        stderr(&stats),
+        "Memory is disabled in config. Set `[memory] enabled = true` to turn it on.\n"
+    );
+}
+
+/// The system message of the `index`th request.
+fn system_of(server: &MockServer, index: usize) -> String {
+    server.requests()[index].body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn finished_turns_are_recalled_into_later_similar_tasks() {
+    let server = MockServer::start(vec![
+        sse_text("README.md and notes.txt", "stop"),
+        sse_text("Still README.md and notes.txt", "stop"),
+        sse_text("Paris", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("recall", &server);
+
+    for goal in [
+        "list the files in this directory",
+        "list the files in this directory please",
+        "what is the capital of France",
+    ] {
+        let output = workspace.run(&["run", goal]).await;
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+
+    // Nothing to recall on the first turn; the second is told what happened.
+    let note = "Relevant past experience (from memory; may help or warn):\n\
+                - task: 'list the files in this directory' -> README.md and notes.txt";
+    assert!(!system_of(&server, 0).contains("Relevant past experience"));
+    assert!(
+        system_of(&server, 1).ends_with(&format!("\n\n{note}")),
+        "{}",
+        system_of(&server, 1)
+    );
+    // An unrelated task recalls nothing.
+    assert!(!system_of(&server, 2).contains("Relevant past experience"));
+
+    // With memory on, the agent can remember and recall facts.
+    let names: Vec<String> = server.requests()[0].body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names[names.len() - 2..], ["remember", "recall"]);
+
+    let search = workspace
+        .run(&["memory", "search", "list the files", "-k", "1"])
+        .await;
+    assert!(search.status.success(), "{}", stderr(&search));
+    let lines: Vec<String> = stdout(&search).lines().map(str::to_owned).collect();
+    assert_eq!(lines[0], "episodes");
+    assert!(
+        lines[1].starts_with("  [0.") && lines[1].contains("] list the files in this directory"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[2..], ["facts", "  (none)"]);
+}
+
+#[tokio::test]
+async fn memory_commands_report_and_prune_the_store() {
+    let server = MockServer::start(vec![sse_text("hello", "stop")]).await;
+    let workspace = Workspace::with_mock_provider("memory-commands", &server);
+    let run = workspace.run(&["run", "--json", "say hi"]).await;
+    let session = serde_json::from_str::<Value>(&stdout(&run)).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let memory = |args: &[&str]| workspace.command(args).output().unwrap();
+
+    let stats = memory(&["memory", "stats"]);
+    assert!(stats.status.success(), "{}", stderr(&stats));
+    assert_eq!(
+        stdout(&stats),
+        format!(
+            "Kind      Count\nsessions  1\nepisodes  1\nmemories  0\ndb: {}  embedder: hash:256\n",
+            workspace.memory_db().display()
+        )
+    );
+
+    let sessions = memory(&["memory", "sessions"]);
+    assert_eq!(
+        stdout(&sessions),
+        format!("Session       Title\n{session}  say hi\n")
+    );
+
+    let counts = "{'sessions': 1, 'episodes': 1, 'memories': 0}\n";
+    let bare = memory(&["memory", "prune"]);
+    assert!(bare.status.success());
+    assert_eq!(
+        stdout(&bare),
+        format!("No retention limit given. Pass --older-than and/or --keep-last.\n{counts}")
+    );
+
+    let dry = memory(&[
+        "memory",
+        "prune",
+        "--keep-last",
+        "0",
+        "--memories",
+        "--dry-run",
+    ]);
+    assert_eq!(
+        stdout(&dry),
+        format!(
+            "dry run — would prune episodes+sessions + memories (older_than=None, keep_last=0). \
+             Current counts:\n{counts}"
+        )
+    );
+
+    // Piped with no answer, the prompt aborts as Click's does; "n" declines.
+    let question = "Prune episodes, sessions (older_than=30.0, keep_last=0)? [y/N]: ";
+    let ended = run_with_stdin(
+        &workspace,
+        &["memory", "prune", "--older-than", "30", "--keep-last", "0"],
+        "",
+    );
+    assert_eq!(ended.status.code(), Some(1));
+    assert_eq!(stdout(&ended), format!("{question}\n"));
+    assert_eq!(stderr(&ended), "Aborted!\n");
+    let declined = run_with_stdin(
+        &workspace,
+        &["memory", "prune", "--older-than", "30", "--keep-last", "0"],
+        "maybe\nn\n",
+    );
+    assert!(declined.status.success());
+    assert_eq!(stdout(&declined), format!("{question}{question}aborted\n"));
+    assert_eq!(stderr(&declined), "Error: invalid input\n");
+
+    let pruned = memory(&[
+        "memory",
+        "prune",
+        "--older-than",
+        "30",
+        "--keep-last",
+        "0",
+        "-y",
+    ]);
+    assert!(pruned.status.success(), "{}", stderr(&pruned));
+    assert_eq!(
+        stdout(&pruned),
+        "Pruned 2 row(s): {'episodes': 1, 'sessions': 1}\n\
+         {'sessions': 0, 'episodes': 0, 'memories': 0}\n"
+    );
+
+    let forget = memory(&["memory", "forget", "7"]);
+    assert!(forget.status.success());
+    assert_eq!(stdout(&forget), "No memory with id 7.\n");
+
+    let empty = memory(&["memory", "sessions"]);
+    assert_eq!(stdout(&empty), "no sessions yet\n");
+
+    // The default embedder is not ported; the fallback is said, as Python says it.
+    workspace.append_project_config(
+        "\n[memory]\nembeddings = \"sentence-transformers:all-MiniLM-L6-v2\"\n",
+    );
+    let fallback = memory(&["memory", "stats"]);
+    assert!(fallback.status.success());
+    assert!(
+        stderr(&fallback).starts_with("memory: sentence-transformers unavailable"),
+        "{}",
+        stderr(&fallback)
+    );
+    assert!(stdout(&fallback).contains("embedder: hash:256"));
+}
+
+#[tokio::test]
+async fn retention_caps_prune_the_log_at_startup_and_are_traced() {
+    let server = MockServer::start(vec![
+        sse_text("one", "stop"),
+        sse_text("two", "stop"),
+        sse_text("three", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("retention", &server);
+    workspace.append_project_config(
+        "\n[memory]\nretention_max_episodes = 1\nretention_max_sessions = 2\n",
+    );
+
+    for goal in ["first", "second", "third"] {
+        let output = workspace.run(&["run", goal]).await;
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+
+    // The third run started with two of each: one episode over its cap.
+    let trace = std::fs::read_to_string(
+        workspace
+            .root
+            .join("home")
+            .join(".agent86")
+            .join("traces")
+            .join("trace.jsonl"),
+    )
+    .unwrap();
+    let prunes: Vec<Value> = trace
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["kind"] == "retention_prune")
+        .collect();
+    assert_eq!(prunes.len(), 1, "{prunes:?}");
+    assert_eq!(prunes[0]["session"], "memory");
+    assert_eq!(prunes[0]["episodes"], 1);
+    assert!(prunes[0].get("sessions").is_none());
+
+    let stats = workspace.command(&["memory", "stats"]).output().unwrap();
+    assert!(
+        stdout(&stats).contains("sessions  3\nepisodes  2\n"),
+        "{}",
+        stdout(&stats)
+    );
 }
 
 #[tokio::test]

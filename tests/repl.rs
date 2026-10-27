@@ -18,8 +18,15 @@ impl Workspace {
     fn new(name: &str, server: &MockServer) -> Self {
         let root = std::env::temp_dir().join(format!("agent86-repl-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("home").join(".agent86")).unwrap();
         std::fs::create_dir_all(root.join("project").join(".agent86")).unwrap();
+        // The default sentence-transformers embedder is not ported; its fallback
+        // note would open every transcript.
+        std::fs::write(
+            root.join("home").join(".agent86").join("config.toml"),
+            "[memory]\nembeddings = \"hash:256\"\n",
+        )
+        .unwrap();
         let workspace = Self { root };
         workspace.write_config(&format!(
             "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n",
@@ -305,7 +312,7 @@ async fn tools_model_and_config_commands_report_the_session() {
 
     assert!(
         text.contains(
-            "agent86> tools: edit_file, list_dir, python_exec, read_file, run_command, web_fetch, write_file\n"
+            "agent86> tools: edit_file, list_dir, python_exec, read_file, recall, remember, run_command, web_fetch, write_file\n"
         ),
         "{text}"
     );
