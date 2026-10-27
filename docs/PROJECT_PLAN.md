@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -101,6 +101,7 @@ The Python implementation remains the reference and compatibility oracle. This p
   - the status line's context window from OpenRouter's own `context_length`, memoized and cached for 24 hours in `~/.agent86/cache/model_context_windows.json` (Python's file), with a 3-second fetch; every failure falls back to the table
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
+- Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
 - Added MCP server management to the interface (stage 9, part 6), ported from `tui/screens/mcp_manager.py`, `mcp_test.py`, the MCP chain in `tui/app.py`, and the harness's `ensure_mcp`, `add_mcp_server`, and `remove_mcp_server`:
   - `/config mcp`: the configured servers (config facts only, so opening it starts nothing) with Enter to edit, `d` to remove, and `t` to enable or disable, plus "Add from JSON" and "Add manually"
   - the form: a pasted JSON block in either README shape (a bare server, or `{"mcpServers": {...}}` / `{"servers": {...}}`, with `type` and `disabled` understood), or the fields (the command line split as Python's `shlex` does on each platform, `KEY=value` lists for env and headers, the URL, and http or sse). The config model's own message shows as it validates, and Continue waits until the server parses
@@ -115,7 +116,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **344 passed on Windows** (159 unit, 10 compatibility, 18 provider integration, 3 catalog, 33 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **355 passed on Windows** (162 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 3 catalog, 34 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -136,7 +137,7 @@ Local validation completed successfully:
 The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory] enabled`/`path`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
-- Anthropic, Ollama, and llama.cpp providers
+- Anthropic and llama.cpp providers
 - Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
@@ -264,6 +265,8 @@ The agent works end to end, but it does not yet have:
 - The jail has no extra allowed roots yet; Python adds skill directories, which are not ported.
 
 ### Known provider differences from Python
+
+- Ollama: a stream cut short reports the transport error's text from `reqwest` rather than httpx's `<ExceptionName>: <message>`, and a malformed NDJSON line names `serde_json`'s parse error rather than Python's `JSONDecodeError` text; the rest of each message is Python's. A thinking model's `thinking` field is ignored, as in Python, so a model that spends its whole turn thinking answers with nothing.
 
 - `Retry-After` HTTP-date values are not parsed; they fall back to exponential backoff. Delta-seconds values are honoured.
 - Python retries only `ConnectError`, `ConnectTimeout`, and `RemoteProtocolError`. `reqwest` does not expose the same classes, so Rust retries any transport failure other than a read timeout, still only before text has been emitted.
