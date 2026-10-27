@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -102,6 +102,10 @@ The Python implementation remains the reference and compatibility oracle. This p
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
 - Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
+- Added the remaining model providers, so every adapter Python has is ported:
+  - Anthropic, ported from `cognitive/anthropic_provider.py`: the Messages API event stream (`message_start`, content blocks, `input_json_delta` tool input, `message_delta` usage), the system prompt split out, tool results as `tool_result` blocks and tool calls as `tool_use` blocks, `max_tokens` always sent (the request's, then the section's, then 8192), `temperature` left out for models that removed it and dropped and remembered for the session when the API refuses it, prompt-cache markers on the tools and the system prompt when the prefix reaches the model's floor (`prompt_cache`, on by default), usage counting cached tokens as part of the prompt and pricing them at their own rates, and Python's stop-reason mapping. Python runs it through the `anthropic` SDK, so the SDK's behavior is reproduced too: its retries (408, 409, 429, and 5xx, `x-should-retry`, `retry-after-ms` or `Retry-After` up to a minute, otherwise 0.5 seconds doubling to 8), its fixed timeouts (5 seconds to connect, 600 between chunks), and its error text (`Anthropic API error: Error code: 401 - {...}` with the body as Python prints a dict, `Connection error.`, the timeout text, and `error` events). Failures the SDK leaves unconverted get the message Python's loop gives them
+  - llama.cpp and LM Studio, ported from `cognitive/llamacpp_provider.py`: the OpenAI-compatible adapter under the name `llamacpp`, keyless, with `http://localhost:8080/v1` when the section has no `base_url`. Live check (2026-10-27): pointed at a local Ollama's OpenAI-compatible endpoint, `run` with `gemma4:12b` called `list_dir` and named the files, at `$0.0000`
+  - the session-scoped memory of models that refused a sampling parameter, from `capabilities.py`, which the OpenAI-compatible adapter now consults too
 - Added MCP server management to the interface (stage 9, part 6), ported from `tui/screens/mcp_manager.py`, `mcp_test.py`, the MCP chain in `tui/app.py`, and the harness's `ensure_mcp`, `add_mcp_server`, and `remove_mcp_server`:
   - `/config mcp`: the configured servers (config facts only, so opening it starts nothing) with Enter to edit, `d` to remove, and `t` to enable or disable, plus "Add from JSON" and "Add manually"
   - the form: a pasted JSON block in either README shape (a bare server, or `{"mcpServers": {...}}` / `{"servers": {...}}`, with `type` and `disabled` understood), or the fields (the command line split as Python's `shlex` does on each platform, `KEY=value` lists for env and headers, the URL, and http or sse). The config model's own message shows as it validates, and Continue waits until the server parses
@@ -116,7 +120,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **355 passed on Windows** (162 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 3 catalog, 34 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **373 passed on Windows** (169 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 36 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -137,7 +141,6 @@ Local validation completed successfully:
 The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory] enabled`/`path`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
-- Anthropic and llama.cpp providers
 - Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
@@ -265,6 +268,8 @@ The agent works end to end, but it does not yet have:
 - The jail has no extra allowed roots yet; Python adds skill directories, which are not ported.
 
 ### Known provider differences from Python
+
+- Anthropic: the adapter speaks the HTTP API rather than going through the SDK. A stream cut short reports `ReadError:` with the transport error's text from `reqwest` (Python's loop names httpx's exception, usually `RemoteProtocolError`), and a malformed event names `serde_json`'s parse error after `JSONDecodeError:`. Tool input that is not valid JSON when its block ends is carried raw under `__invalid_json__`, as the other adapters do, where the SDK would keep whatever its partial-JSON parser salvaged. A `Retry-After` HTTP date falls back to backoff. The SDK's own request headers (`user-agent`, `x-stainless-*`) are not sent.
 
 - Ollama: a stream cut short reports the transport error's text from `reqwest` rather than httpx's `<ExceptionName>: <message>`, and a malformed NDJSON line names `serde_json`'s parse error rather than Python's `JSONDecodeError` text; the rest of each message is Python's. A thinking model's `thinking` field is ignored, as in Python, so a model that spends its whole turn thinking answers with nothing.
 

@@ -51,6 +51,9 @@ pub struct OpenAiConfig {
     pub api_key_env: Option<String>,
     /// The config section name, which is also the keyring account for its key.
     pub config_name: String,
+    /// The adapter's name, which Python's messages start with: `openai`, or
+    /// `llamacpp` for its thin specialization.
+    pub adapter: &'static str,
     /// Whether construction fails without an API key. Keyless local endpoints set this to false.
     pub require_key: bool,
     /// Standing output cap, used when the request does not set one.
@@ -67,6 +70,7 @@ impl Default for OpenAiConfig {
             base_url: None,
             api_key_env: None,
             config_name: "openai".to_owned(),
+            adapter: "openai",
             require_key: true,
             max_tokens: None,
             connect_timeout: Duration::from_secs(10),
@@ -235,7 +239,7 @@ impl OpenAiProvider {
 
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
-        "openai"
+        self.config.adapter
     }
 
     fn model(&self) -> &str {

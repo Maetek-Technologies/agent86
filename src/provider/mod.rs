@@ -5,6 +5,7 @@
 //! authoritative result. Streamed and non-streamed calls therefore always agree
 //! on the final text.
 
+pub mod anthropic;
 pub mod capabilities;
 pub mod catalog;
 pub mod ollama;
@@ -16,6 +17,7 @@ use crate::config::{Config, ProviderConfig};
 use crate::pricing::PriceTable;
 use crate::secrets::{resolve_api_key, OsKeyring, SecretStore};
 use crate::types::{Completion, CompletionDelta, CompletionRequest, ModelRef};
+use anthropic::{AnthropicConfig, AnthropicProvider};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{BoxStream, StreamExt};
 use ollama::{OllamaConfig, OllamaProvider};
@@ -23,8 +25,8 @@ use openai::{OpenAiConfig, OpenAiProvider};
 use std::time::Duration;
 use thiserror::Error;
 
-/// Providers with a dedicated adapter in Python that the Rust port does not have yet.
-const NOT_PORTED: &[&str] = &["anthropic", "llamacpp"];
+/// llama.cpp's server; LM Studio is `:1234/v1`.
+const LLAMACPP_DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
 
 /// Construct the provider that serves `reference`, e.g. `openrouter:openai/gpt-4o-mini`.
 ///
@@ -72,6 +74,27 @@ fn build_provider(
     let name = reference.provider.as_str();
     let section = config.providers.get(name).cloned().unwrap_or_default();
 
+    if name == "anthropic" {
+        // Python leaves the section's timeouts to the SDK's own (see anthropic.rs).
+        let provider = AnthropicProvider::new(
+            reference.model.clone(),
+            AnthropicConfig {
+                base_url: section.base_url.clone(),
+                api_key_env: section
+                    .api_key_env
+                    .clone()
+                    .unwrap_or_else(|| anthropic::DEFAULT_API_KEY_ENV.to_owned()),
+                max_tokens: section.max_tokens,
+                prompt_cache: section.prompt_cache,
+                max_retries: section.max_retries,
+                ..AnthropicConfig::default()
+            },
+            api_key(name, &section),
+        )?
+        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        return Ok(Box::new(provider));
+    }
+
     // Ollama has its own adapter (and no key), whatever its section says.
     if name == "ollama" {
         let seconds = durations(name);
@@ -89,13 +112,26 @@ fn build_provider(
         return Ok(Box::new(provider));
     }
 
+    // llama.cpp and LM Studio serve the OpenAI-compatible API locally, so this is
+    // the OpenAI adapter under its own name, with a local default and no key.
+    if name == "llamacpp" {
+        let mut section = section;
+        section
+            .base_url
+            .get_or_insert_with(|| LLAMACPP_DEFAULT_BASE_URL.to_owned());
+        let mut openai_config = openai_config(name, &section, false)?;
+        openai_config.adapter = "llamacpp";
+        let provider = OpenAiProvider::new(
+            reference.model.clone(),
+            openai_config,
+            api_key(name, &section),
+        )?
+        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        return Ok(Box::new(provider));
+    }
+
     let require_key = match name {
         "openai" | "openai-compatible" => true,
-        _ if NOT_PORTED.contains(&name) => {
-            return Err(ProviderError::NotPorted {
-                provider: name.to_owned(),
-            })
-        }
         _ if section.base_url.is_some() => section.api_key_env.is_some(),
         _ => {
             return Err(ProviderError::UnknownProvider {
@@ -121,6 +157,7 @@ fn openai_config(
         base_url: section.base_url.clone(),
         api_key_env: section.api_key_env.clone(),
         config_name: name.to_owned(),
+        adapter: "openai",
         require_key,
         max_tokens: section.max_tokens,
         connect_timeout: seconds("connect_timeout_s", section.connect_timeout_s)?,
@@ -207,12 +244,6 @@ pub enum ProviderError {
     )]
     UnknownProvider { provider: String },
 
-    #[error(
-        "The '{provider}' provider is not available in the Rust port yet. \
-         Use an OpenAI-compatible provider such as openrouter, openai, or groq."
-    )]
-    NotPorted { provider: String },
-
     #[error("Invalid [providers.{provider}] setting: {detail}")]
     InvalidSetting { provider: String, detail: String },
 
@@ -267,7 +298,38 @@ pub enum ProviderError {
         detail: String,
     },
 
-    /// A message already worded as Python's adapter words it (Ollama's).
+    /// A message already worded as Python's adapter words it (Ollama's, Anthropic's).
     #[error("{0}")]
     Message(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{load_config, ConfigPaths, Overrides};
+    use crate::secrets::NoSecretStore;
+
+    fn builtin_config() -> Config {
+        let paths = ConfigPaths {
+            user: None,
+            project: std::path::PathBuf::from("no-such-dir/config.toml"),
+        };
+        load_config(&paths, &Overrides::default()).unwrap()
+    }
+
+    #[test]
+    fn llamacpp_is_the_openai_adapter_under_its_own_name_without_a_key() {
+        let mut config = builtin_config();
+        let reference = ModelRef::parse("llamacpp:qwen3").unwrap();
+        let provider = provider_for_ref_with_store(&reference, &config, &NoSecretStore).unwrap();
+        assert_eq!((provider.name(), provider.model()), ("llamacpp", "qwen3"));
+
+        // No base_url falls back to the local server, and a named key variable
+        // with nothing behind it is still not required.
+        let section = config.providers.get_mut("llamacpp").unwrap();
+        section.base_url = None;
+        section.api_key_env = Some("AGENT86_TEST_UNSET_LLAMACPP_KEY".to_owned());
+        let provider = provider_for_ref_with_store(&reference, &config, &NoSecretStore).unwrap();
+        assert_eq!(provider.name(), "llamacpp");
+    }
 }

@@ -13,6 +13,8 @@ The Python implementation remains the reference. This repository starts with a s
 - Serde-based JSON representations and initial compatibility tests
 - An async provider interface and an OpenAI-compatible streaming (SSE) provider for OpenAI, OpenRouter, and other compatible endpoints, with retries, timeouts, and secret redaction
 - An Ollama provider for local models (`--model ollama:<model>`), streaming from `/api/chat` with tool calls, at no cost
+- An Anthropic provider (`--model anthropic:<model>`) on the Messages API, with tool use, prompt caching, and the SDK's retries and error messages
+- A llama.cpp and LM Studio provider (`--model llamacpp:<model>`), keyless and free, through the OpenAI-compatible adapter
 - Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
 - Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
@@ -58,6 +60,7 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] OpenAI-compatible streaming provider
 - [ ] Differential test harness against the Python implementation
 - [x] Ollama streaming provider
+- [x] Anthropic and llama.cpp providers
 - [x] Text-only one-shot `run` and `run --json`
 - [x] Read-only workspace tools (`read_file`, `list_dir`)
 - [x] ReAct loop with circuit breakers and continuations
