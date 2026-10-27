@@ -8,13 +8,19 @@
 //! a running turn at its next safe point.
 
 use super::input::Editor;
+use super::menu::{mention_text, Menu, MenuKind};
+use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
 use super::status::{fit_status_line, StatusState};
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
+use crate::pyjson::python_json_dumps;
 use crate::repl::{notice_text, Style, Text};
+use crate::types::{Message, Role};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +88,8 @@ pub enum Request {
     Exit,
     /// The running turn finished.
     TurnDone,
+    /// A picker was answered.
+    Picked(PickerKind, String),
 }
 
 /// What a key asks of the harness while a turn runs.
@@ -133,6 +141,12 @@ pub struct App {
     tools: Vec<PendingTool>,
     running: Option<Running>,
     approval: Option<ApprovalPanel>,
+    /// A picker a bare `needs_choice` command opened.
+    picker: Option<Picker>,
+    /// The `/` or `@` completion menu under the input box.
+    menu: Option<Menu>,
+    /// Where `@` paths are completed from: the workspace.
+    pub workspace: Option<PathBuf>,
     exit_armed: Option<Instant>,
     request: Option<Request>,
     width: usize,
@@ -155,6 +169,9 @@ impl App {
             tools: Vec::new(),
             running: None,
             approval: None,
+            picker: None,
+            menu: None,
+            workspace: None,
             exit_armed: None,
             request: None,
             width: 80,
@@ -192,6 +209,62 @@ impl App {
     /// Give up on the turn's pending approval, which then reads as declined.
     pub fn abandon(&mut self) {
         self.approval = None;
+    }
+
+    /// Show a picker in place of the input box until it is answered or cancelled.
+    pub fn open_picker(&mut self, picker: Picker) {
+        self.menu = None;
+        self.picker = Some(picker);
+        self.dirty = true;
+    }
+
+    /// Print a saved conversation, as Python's `_entries_for`: user prompts, replies,
+    /// and one block per tool call with the first line of its result.
+    pub fn replay(&mut self, messages: &[Message]) {
+        let results: HashMap<&str, &str> = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .filter_map(|message| {
+                let id = message.tool_call_id.as_deref()?;
+                Some((id, message.content.as_str()))
+            })
+            .collect();
+        for message in messages {
+            match message.role {
+                Role::User => self.echo_user(&message.content),
+                Role::Assistant => {
+                    if !message.content.trim().is_empty() {
+                        self.stream = sanitize(&message.content);
+                        self.finish_reply();
+                    }
+                    for call in &message.tool_calls {
+                        let preview = if call.arguments.is_empty() {
+                            String::new()
+                        } else {
+                            python_json_dumps(
+                                &serde_json::Value::Object(call.arguments.clone()),
+                                false,
+                            )
+                        };
+                        let summary = results.get(call.id.as_str()).map(|content| {
+                            content
+                                .trim()
+                                .lines()
+                                .next()
+                                .unwrap_or("(no output)")
+                                .to_owned()
+                        });
+                        let block = self.tool_block(
+                            &call.name,
+                            &preview,
+                            summary.as_deref().map(|summary| (true, summary)),
+                        );
+                        self.commit(block);
+                    }
+                }
+                Role::System | Role::Tool => {}
+            }
+        }
     }
 
     // ---- printing into scrollback ---------------------------------------
@@ -238,6 +311,7 @@ impl App {
         self.stream.clear();
         self.reply_started = false;
         self.tools.clear();
+        self.menu = None;
         self.status.working = true;
         self.status.phase = "thinking".into();
         self.dirty = true;
@@ -428,7 +502,7 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent, history: &[String]) -> Effect {
         self.dirty = true;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
+        if ctrl && key.code == KeyCode::Char('c') && self.picker.is_none() {
             return self.interrupt();
         }
         if self.approval.is_some() {
@@ -438,6 +512,17 @@ impl App {
         if key.code == KeyCode::BackTab {
             return Effect::CycleMode;
         }
+        if let Some(picker) = &mut self.picker {
+            match picker.on_key(key) {
+                PickerOutcome::Open => {}
+                PickerOutcome::Cancelled => self.picker = None,
+                PickerOutcome::Picked(kind, value) => {
+                    self.picker = None;
+                    self.request = Some(Request::Picked(kind, value));
+                }
+            }
+            return Effect::None;
+        }
         if let Some(running) = &mut self.running {
             if key.code == KeyCode::Esc && !running.cancel_requested {
                 return self.request_cancel();
@@ -446,9 +531,29 @@ impl App {
             return Effect::None;
         }
         self.exit_armed = None;
-        let editor = &mut self.editor;
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let Some(menu) = &mut self.menu {
+            match key.code {
+                KeyCode::Up => menu.up(),
+                KeyCode::Down => menu.down(),
+                KeyCode::Esc => self.menu = None,
+                KeyCode::Tab => self.accept_menu(false),
+                KeyCode::Enter if !shift && !alt => self.accept_menu(true),
+                _ => return self.edit(key, history),
+            }
+            return Effect::None;
+        }
+        self.edit(key, history)
+    }
+
+    /// An editing key at the idle prompt; the menu follows the draft.
+    fn edit(&mut self, key: KeyEvent, history: &[String]) -> Effect {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let before = self.editor.text();
+        let editor = &mut self.editor;
         match key.code {
             KeyCode::Enter if shift || alt => editor.insert("\n"),
             KeyCode::Char('j') if ctrl => editor.insert("\n"),
@@ -485,13 +590,50 @@ impl App {
             KeyCode::Esc => editor.clear(),
             _ => {}
         }
+        // Python syncs its palette on every change to the text, and only then.
+        if self.editor.text() != before {
+            self.sync_menu();
+        }
         Effect::None
     }
 
     pub fn on_paste(&mut self, text: &str) {
-        if self.running.is_none() {
+        if self.running.is_none() && self.picker.is_none() {
             self.editor.insert(&text.replace("\r\n", "\n"));
+            self.sync_menu();
             self.dirty = true;
+        }
+    }
+
+    /// Open, refresh, or close the menu to match the draft.
+    fn sync_menu(&mut self) {
+        self.menu = Menu::for_draft(
+            &self.editor.text(),
+            self.editor.cursor(),
+            self.workspace.as_deref(),
+        );
+    }
+
+    /// Take the highlighted menu item. A command runs (`run`, Enter) or is written
+    /// out for its argument (Tab); a path replaces the `@` token, and a directory
+    /// keeps the menu open on its contents.
+    fn accept_menu(&mut self, run: bool) {
+        let Some(menu) = self.menu.take() else {
+            return;
+        };
+        let chosen = menu.chosen().to_owned();
+        match menu.kind {
+            MenuKind::Commands if run => {
+                self.editor.clear();
+                self.request = Some(Request::Submit(chosen));
+            }
+            MenuKind::Commands => self.editor.set_text(&format!("{chosen} ")),
+            MenuKind::Paths { start, end } => {
+                self.editor.replace(start, end, &mention_text(&chosen));
+                if chosen.ends_with('/') && !chosen.contains(' ') {
+                    self.sync_menu();
+                }
+            }
         }
     }
 
@@ -621,6 +763,9 @@ impl App {
                 .saturating_sub(top.len().min(self.height / 2) + 4);
             bottom.extend(approval_panel(panel, width, budget));
             caret_base = 0;
+        } else if let Some(picker) = &self.picker {
+            bottom.extend(picker.render(width));
+            caret_base = 0;
         } else {
             let (lines, (row, col)) = self.editor.render(width, self.running.is_none());
             caret_base = bottom.len();
@@ -628,6 +773,9 @@ impl App {
                 caret = Some((row, col));
             }
             bottom.extend(lines);
+            if let Some(menu) = &self.menu {
+                bottom.extend(menu.render(width));
+            }
         }
         let status = if self.exit_armed.is_some() {
             Line::styled(Style::Dim, "  Press Ctrl+C again to exit")
@@ -736,10 +884,14 @@ fn approval_panel(panel: &ApprovalPanel, width: usize, budget: usize) -> Vec<Lin
         lines.push(line.push(Style::Plain, " ".repeat(pad)).push(border, " │"));
     }
     lines.push(Line::styled(border, format!("╰{}╯", "─".repeat(width - 2))));
-    lines.push(Line::styled(
-        Style::Dim,
-        "  y to run it · n or esc to deny · ↑↓ and enter to choose",
-    ));
+    // Every live row must fit, or the renderer's row count goes wrong.
+    lines.push(
+        Line::styled(
+            Style::Dim,
+            "  y to run it · n or esc to deny · ↑↓ and enter to choose",
+        )
+        .truncate(width),
+    );
     lines
 }
 
@@ -1009,6 +1161,137 @@ mod tests {
         let (live, _) = app.live();
         assert!(live.len() <= 9, "{}", live.len());
         assert!(live.iter().all(|line| line.width() <= 40));
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.on_key(key(KeyCode::Char(ch)), &[]);
+        }
+    }
+
+    #[test]
+    fn the_command_menu_runs_or_writes_out_the_highlighted_command() {
+        let mut app = app();
+        typed(&mut app, "/he");
+        assert!(live_text(&mut app)
+            .iter()
+            .any(|line| line.starts_with("  ❯ /help") && line.contains("Show this help")));
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(app.take_request(), Some(Request::Submit("/help".into())));
+        assert!(app.editor.is_empty());
+
+        typed(&mut app, "/mod");
+        app.on_key(key(KeyCode::Down), &[]);
+        app.on_key(key(KeyCode::Tab), &[]);
+        assert_eq!(app.editor.text(), "/model ");
+        assert!(app.menu.is_none(), "a space closes the menu");
+        assert_eq!(app.take_request(), None);
+    }
+
+    #[test]
+    fn escape_closes_the_menu_before_clearing_the_draft() {
+        let mut app = app();
+        typed(&mut app, "/c");
+        assert!(app.menu.is_some());
+        app.on_key(key(KeyCode::Esc), &[]);
+        assert!(app.menu.is_none());
+        assert_eq!(app.editor.text(), "/c");
+        app.on_key(key(KeyCode::Esc), &[]);
+        assert!(app.editor.is_empty());
+
+        // Up and Down browse history again once the menu is gone.
+        let history = vec!["earlier".to_owned()];
+        app.on_key(key(KeyCode::Up), &history);
+        assert_eq!(app.editor.text(), "earlier");
+    }
+
+    #[test]
+    fn at_paths_complete_from_the_workspace_and_descend_into_directories() {
+        let dir = std::env::temp_dir().join(format!("agent86-app-at-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.join("my notes.md"), "").unwrap();
+        let mut app = app();
+        app.workspace = Some(dir.clone());
+
+        typed(&mut app, "read @s");
+        assert!(live_text(&mut app).iter().any(|line| line == "  ❯ @src/"));
+        app.on_key(key(KeyCode::Tab), &[]);
+        assert_eq!(app.editor.text(), "read @src/");
+        assert!(live_text(&mut app)
+            .iter()
+            .any(|line| line == "  ❯ @src/main.rs"));
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(app.editor.text(), "read @src/main.rs");
+        assert!(app.menu.is_none());
+        assert_eq!(app.take_request(), None, "Enter completed, it did not send");
+
+        app.editor.clear();
+        typed(&mut app, "@my");
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(app.editor.text(), "@\"my notes.md\"");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picker_takes_the_input_box_s_place_and_answers_once() {
+        let mut app = app();
+        app.open_picker(Picker::mode("ask"));
+        let (live, caret) = app.live();
+        assert!(live
+            .iter()
+            .any(|line| line.plain_text().contains("Approval mode")));
+        assert_eq!(caret, None);
+        app.on_key(key(KeyCode::Char('x')), &[]);
+        assert!(app.editor.is_empty(), "typing goes to the picker");
+        app.on_key(key(KeyCode::Down), &[]);
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(
+            app.take_request(),
+            Some(Request::Picked(PickerKind::Mode, "auto".into()))
+        );
+        assert!(app.picker.is_none());
+
+        app.open_picker(Picker::mode("ask"));
+        app.on_key(ctrl('c'), &[]);
+        assert!(app.picker.is_none(), "Ctrl+C cancels the picker");
+        assert_eq!(app.take_request(), None);
+    }
+
+    #[test]
+    fn a_resumed_conversation_is_replayed_as_entries() {
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role": "system", "content": "you are agent86"},
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "Looking.", "tool_calls": [
+                {"id": "c1", "name": "list_dir", "arguments": {"path": "."}},
+                {"id": "c2", "name": "read_file", "arguments": {}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "\nsrc/\nREADME.md"},
+            {"role": "tool", "tool_call_id": "c2", "content": ""},
+            {"role": "assistant", "content": "Two entries."}
+        ]))
+        .unwrap();
+        let mut app = app();
+        app.replay(&messages);
+        assert_eq!(
+            committed_text(&mut app),
+            [
+                "",
+                "> list the files",
+                "",
+                "⏺ Looking.",
+                "",
+                r#"⏺ list_dir({"path": "."})"#,
+                "  ⎿  src/",
+                "",
+                "⏺ read_file()",
+                "  ⎿  (no output)",
+                "",
+                "⏺ Two entries.",
+            ]
+        );
     }
 
     #[test]

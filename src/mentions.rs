@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 /// Most names listed for a mentioned directory.
 pub const MAX_DIR_ENTRIES: usize = 200;
+/// Most completions offered for a partial `@` path.
+pub const MAX_COMPLETIONS: usize = 20;
 
 /// Directories never worth listing: huge, generated, or not source.
 pub const SKIP_DIRS: [&str; 10] = [
@@ -239,9 +241,99 @@ fn display(resolved: &Path, policy: &SandboxPolicy, raw: &str) -> String {
     }
 }
 
+/// Up to [`MAX_COMPLETIONS`] workspace paths matching a partial `@` mention.
+///
+/// `prefix` is what follows the `@` (a leading `@` and wrapping quotes are
+/// tolerated). Results are workspace-relative and `/`-separated, directories first
+/// and ending in `/` so completing again descends into them. Noise directories
+/// ([`SKIP_DIRS`]) and dotfiles are hidden unless the prefix names them.
+pub fn complete_mentions(prefix: &str, workspace: &Path) -> Vec<String> {
+    let cleaned = prefix
+        .trim()
+        .trim_start_matches('@')
+        .trim_matches('"')
+        .replace('\\', "/");
+    let (head, tail) = match cleaned.rfind('/') {
+        Some(at) => (Some(&cleaned[..at]), &cleaned[at + 1..]),
+        None => (None, cleaned.as_str()),
+    };
+    let Ok(root) = std::fs::canonicalize(workspace) else {
+        return Vec::new();
+    };
+    let directory = head.map_or_else(|| root.clone(), |head| root.join(head));
+    // Never complete outside the workspace, whatever `../..` the prefix holds.
+    let Ok(directory) = std::fs::canonicalize(directory) else {
+        return Vec::new();
+    };
+    if !directory.starts_with(&root) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut children: Vec<(bool, String)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            // A broken link or a permission wall is completed as a file.
+            let is_dir = entry.path().is_dir();
+            (is_dir, entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    children.sort_by_key(|(is_dir, name)| (!is_dir, name.to_lowercase()));
+
+    let needle = tail.to_lowercase();
+    children
+        .into_iter()
+        .filter(|(_, name)| {
+            let lower = name.to_lowercase();
+            lower.starts_with(&needle)
+                && (!SKIP_DIRS.contains(&name.as_str()) || needle == lower)
+                && (!name.starts_with('.') || needle.starts_with('.'))
+        })
+        .take(MAX_COMPLETIONS)
+        .map(|(is_dir, name)| {
+            let path = head.map_or_else(|| name.clone(), |head| format!("{head}/{name}"));
+            if is_dir {
+                format!("{path}/")
+            } else {
+                path
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completions_list_directories_first_and_stay_in_the_workspace() {
+        let dir = std::env::temp_dir().join(format!("agent86-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.as_path();
+        std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("Setup.py"), "").unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        std::fs::write(root.join("src/Lib.rs"), "").unwrap();
+        std::fs::write(root.join(".env"), "").unwrap();
+
+        assert_eq!(complete_mentions("", root), ["src/", "Setup.py"]);
+        assert_eq!(complete_mentions("s", root), ["src/", "Setup.py"]);
+        assert_eq!(
+            complete_mentions("@src/", root),
+            ["src/ui/", "src/Lib.rs", "src/main.rs"]
+        );
+        assert_eq!(complete_mentions("\"src\\m", root), ["src/main.rs"]);
+        // `.git` is noise even when dotfiles are asked for, unless named in full.
+        assert_eq!(complete_mentions(".", root), [".env"]);
+        assert_eq!(complete_mentions(".git", root), [".git/"]);
+        assert_eq!(complete_mentions("node_modules", root), ["node_modules/"]);
+        assert!(complete_mentions("../", root).is_empty());
+        assert!(complete_mentions("missing/", root).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn mentions_follow_pythons_pattern() {

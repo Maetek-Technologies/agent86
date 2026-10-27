@@ -4,7 +4,8 @@
 //!
 //! Python's default surface is a full-screen Textual app, with this loop as the
 //! fallback for `--plain`, `AGENT86_PLAIN`, piped stdin, or a terminal that cannot
-//! host it. The full-screen app is not ported yet, so this loop is always used.
+//! host it. Here the default is the inline interface in `crate::ui`, which runs the
+//! same registry on the same [`Repl`].
 //!
 //! Ctrl+C during a turn cancels it at the next safe point, as Python's full-screen
 //! app does with its cancel key: the turn ends with `[cancelled]` and is saved. At
@@ -274,13 +275,25 @@ pub enum Action {
 pub struct CommandResult {
     pub action: Action,
     pub render: Option<Text>,
+    /// The conversation was reset, so the interface wipes its transcript and
+    /// reprints the banner. Signalled here rather than by matching the command's
+    /// name; the plain loop has no transcript and prints `render` regardless.
+    pub clears_transcript: bool,
 }
 
 impl CommandResult {
+    fn of(action: Action) -> Self {
+        Self {
+            action,
+            render: None,
+            clears_transcript: false,
+        }
+    }
+
     fn handled(render: Text) -> Self {
         Self {
-            action: Action::Handled,
             render: Some(render),
+            ..Self::of(Action::Handled)
         }
     }
 
@@ -289,12 +302,24 @@ impl CommandResult {
     }
 }
 
-/// One slash command, backing both dispatch and `/help`.
+/// What a bare command (no argument) asks the interface to pick, as Python's
+/// `ChoiceKind`. The plain loop ignores it and runs the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    Model,
+    Mode,
+    ConfigModel,
+    ConfigMcp,
+    Resume,
+}
+
+/// One slash command, backing dispatch, `/help`, and the interface's command menu.
 pub struct CommandEntry {
     pub name: &'static str,
     pub usage: &'static str,
     pub description: &'static str,
     handler: fn(&mut Repl, &str) -> CommandResult,
+    pub needs_choice: Option<Choice>,
 }
 
 /// Python's registry, in its order.
@@ -303,18 +328,21 @@ pub const COMMANDS: [CommandEntry; 15] = [
         name: "/help",
         usage: "/help",
         description: "Show this help",
+        needs_choice: None,
         handler: |_, _| CommandResult::handled(help_table()),
     },
     CommandEntry {
         name: "/config",
         usage: "/config",
         description: "Show the resolved configuration",
+        needs_choice: None,
         handler: |repl, _| CommandResult::message(repl.config_render()),
     },
     CommandEntry {
         name: "/config model",
         usage: "/config model",
         description: "Manage providers & models: add, key, test, switch, save",
+        needs_choice: Some(Choice::ConfigModel),
         handler: |_, _| {
             CommandResult::message(
                 "The model manager is part of the full-screen interface, which the Rust port \
@@ -326,6 +354,7 @@ pub const COMMANDS: [CommandEntry; 15] = [
         name: "/config mcp",
         usage: "/config mcp",
         description: "Manage MCP servers: add, test, enable/disable, remove",
+        needs_choice: Some(Choice::ConfigMcp),
         handler: |_, _| {
             CommandResult::message(
                 "The MCP manager is part of the full-screen interface, which the Rust port \
@@ -338,73 +367,84 @@ pub const COMMANDS: [CommandEntry; 15] = [
         name: "/models",
         usage: "/models",
         description: "List configured models",
+        needs_choice: None,
         handler: |repl, _| CommandResult::handled(models_tables(&repl.config, &*repl.secrets)),
     },
     CommandEntry {
         name: "/model",
         usage: "/model <provider:model>",
         description: "Switch the active model for this session",
+        needs_choice: Some(Choice::Model),
         handler: |repl, arg| CommandResult::message(repl.set_model(arg)),
     },
     CommandEntry {
         name: "/tools",
         usage: "/tools",
         description: "List available tools",
+        needs_choice: None,
         handler: |repl, _| CommandResult::message(repl.tools_render()),
     },
     CommandEntry {
         name: "/skills",
         usage: "/skills",
         description: "List available skills",
+        needs_choice: None,
         handler: |_, _| CommandResult::message("no skills discovered"),
     },
     CommandEntry {
         name: "/memory",
         usage: "/memory",
         description: "Show memory stats and session id",
+        needs_choice: None,
         handler: |repl, _| CommandResult::message(repl.memory_render()),
     },
     CommandEntry {
         name: "/mode",
         usage: "/mode [ask|auto|deny]",
         description: "Show/set approval mode (Shift+Tab cycles)",
+        needs_choice: Some(Choice::Mode),
         handler: |repl, arg| CommandResult::message(repl.set_mode(arg)),
     },
     CommandEntry {
         name: "/cost",
         usage: "/cost",
         description: "Show token usage and cost this session",
+        needs_choice: None,
         handler: |repl, _| CommandResult::message(repl.cost_render()),
     },
     CommandEntry {
         name: "/sessions",
         usage: "/sessions",
         description: "List recent sessions",
+        needs_choice: None,
         handler: |repl, _| CommandResult::handled(repl.sessions_render(now())),
     },
     CommandEntry {
         name: "/resume",
         usage: "/resume [session-id]",
         description: "Resume a saved session",
+        needs_choice: Some(Choice::Resume),
         handler: |repl, arg| repl.resume(arg),
     },
     CommandEntry {
         name: "/clear",
         usage: "/clear",
         description: "Start a fresh conversation",
+        needs_choice: None,
         handler: |repl, _| {
             repl.state = repl.new_session();
-            CommandResult::message("conversation cleared")
+            CommandResult {
+                clears_transcript: true,
+                ..CommandResult::message("conversation cleared")
+            }
         },
     },
     CommandEntry {
         name: "/exit",
         usage: "/exit",
         description: "Quit",
-        handler: |_, _| CommandResult {
-            action: Action::Exit,
-            render: None,
-        },
+        needs_choice: None,
+        handler: |_, _| CommandResult::of(Action::Exit),
     },
 ];
 
@@ -534,7 +574,52 @@ pub fn relative_time(when: f64, now: f64) -> String {
     }
 }
 
-fn now() -> f64 {
+/// One session as a single line, `title · id[:8] · how long ago`, as Python's
+/// `session_label`. Shared by the session picker and anything else that lists
+/// sessions on one line. The title is the user's own text, so it is drawn plain.
+pub fn session_label(info: &SessionInfo, now: f64) -> String {
+    format!(
+        "{} · {} · {}",
+        info.label(),
+        short_id(&info.session_id),
+        relative_time(info.updated_at, now)
+    )
+}
+
+/// The model picker's choices, as Python's `model_choices` without a catalog: the
+/// three role slots, deduplicated by ref, with roles that share a ref named
+/// together (`default, route.frontier — openai:gpt-4o`). Each is (label, ref).
+pub fn model_choices(config: &Config) -> Vec<(String, String)> {
+    let roles = [
+        ("default", &config.model.default),
+        ("route.cheap", &config.model.route.cheap),
+        ("route.frontier", &config.model.route.frontier),
+    ];
+    let mut order: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (role, reference) in roles {
+        if reference.is_empty() {
+            continue;
+        }
+        match order
+            .iter_mut()
+            .find(|(seen, _)| *seen == reference.as_str())
+        {
+            Some((_, names)) => names.push(role),
+            None => order.push((reference, vec![role])),
+        }
+    }
+    order
+        .into_iter()
+        .map(|(reference, names)| {
+            (
+                format!("{} — {reference}", names.join(", ")),
+                reference.to_owned(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
@@ -706,22 +791,13 @@ impl Repl {
     /// Dispatch one stripped input line, as Python's `handle_command`.
     pub fn handle_command(&mut self, line: &str) -> CommandResult {
         if line.is_empty() {
-            return CommandResult {
-                action: Action::Noop,
-                render: None,
-            };
+            return CommandResult::of(Action::Noop);
         }
         if line == "/exit" || line == "/quit" {
-            return CommandResult {
-                action: Action::Exit,
-                render: None,
-            };
+            return CommandResult::of(Action::Exit);
         }
         if !line.starts_with('/') {
-            return CommandResult {
-                action: Action::Turn,
-                render: None,
-            };
+            return CommandResult::of(Action::Turn);
         }
         match find_command_for_line(line) {
             Some((entry, arg)) => (entry.handler)(self, &arg),
@@ -834,7 +910,7 @@ impl Repl {
 
     /// Recent sessions, or `None` when memory (and so the log) is off. A broken
     /// log must not take a command down, so a failure reads as no sessions.
-    fn recent_sessions(&self, limit: usize) -> Option<Vec<SessionInfo>> {
+    pub(crate) fn recent_sessions(&self, limit: usize) -> Option<Vec<SessionInfo>> {
         self.store
             .as_ref()
             .map(|store| store.recent_sessions(limit).unwrap_or_default())
@@ -897,15 +973,42 @@ impl Repl {
         let Some(state) = loaded else {
             return CommandResult::message(format!("no session '{arg}' found"));
         };
-        let title = store.title(&state.session_id).ok().flatten();
-        let message = format!(
-            "resumed session {} ({} messages){}",
-            state.session_id,
-            state.messages.len(),
-            title.map(|title| format!(" - {title}")).unwrap_or_default()
-        );
+        let message = self.resumed_note(&state);
         self.state = state;
         CommandResult::message(message)
+    }
+
+    /// Make the picked session the live one, as Python's `_on_session_picked`:
+    /// the note a rebuilt transcript ends with, or why the session could not load.
+    pub(crate) fn switch_session(&mut self, session_id: &str) -> Result<String, String> {
+        let loaded = self
+            .store
+            .as_ref()
+            .and_then(|store| store.load(session_id).ok().flatten());
+        let Some(state) = loaded else {
+            return Err(format!("no session '{session_id}' found"));
+        };
+        let note = self.resumed_note(&state);
+        self.state = state;
+        Ok(note)
+    }
+
+    /// `resumed session <id> (<n> messages) - <title>`: an id alone doesn't say
+    /// which conversation this is, so the stored title comes along.
+    fn resumed_note(&self, state: &AgentState) -> String {
+        let title = self
+            .store
+            .as_ref()
+            .and_then(|store| store.title(&state.session_id).ok().flatten());
+        let note = format!(
+            "resumed session {} ({} messages)",
+            state.session_id,
+            state.messages.len()
+        );
+        match title {
+            Some(title) => format!("{note} - {title}"),
+            None => note,
+        }
     }
 }
 
@@ -1249,6 +1352,69 @@ mod tests {
         assert_eq!(relative_time(now - 7200.0, now), "2h ago");
         assert_eq!(relative_time(now - 86400.0 * 3.0, now), "3d ago");
         assert_eq!(relative_time(now - 86400.0 * 65.0, now), "2mo ago");
+    }
+
+    #[test]
+    fn bare_commands_that_need_a_choice_are_python_s() {
+        let choices: Vec<(&str, Choice)> = COMMANDS
+            .iter()
+            .filter_map(|entry| entry.needs_choice.map(|choice| (entry.name, choice)))
+            .collect();
+        assert_eq!(
+            choices,
+            [
+                ("/config model", Choice::ConfigModel),
+                ("/config mcp", Choice::ConfigMcp),
+                ("/model", Choice::Model),
+                ("/mode", Choice::Mode),
+                ("/resume", Choice::Resume),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_choices_merge_roles_that_share_a_ref() {
+        let mut config = crate::config::load_config(
+            &crate::config::ConfigPaths {
+                user: None,
+                project: std::path::PathBuf::from("does-not-exist.toml"),
+            },
+            &crate::config::Overrides::default(),
+        )
+        .unwrap();
+        config.model.default = "openai:gpt-4o".into();
+        config.model.route.cheap = "ollama:llama3.1".into();
+        config.model.route.frontier = "openai:gpt-4o".into();
+        assert_eq!(
+            model_choices(&config),
+            [
+                (
+                    "default, route.frontier — openai:gpt-4o".to_owned(),
+                    "openai:gpt-4o".to_owned()
+                ),
+                (
+                    "route.cheap — ollama:llama3.1".to_owned(),
+                    "ollama:llama3.1".to_owned()
+                ),
+            ]
+        );
+        config.model.default.clear();
+        config.model.route.cheap.clear();
+        config.model.route.frontier.clear();
+        assert!(model_choices(&config).is_empty());
+    }
+
+    #[test]
+    fn a_session_label_is_title_id_and_age() {
+        let info = SessionInfo {
+            session_id: "0123456789abcdef".into(),
+            title: Some("fix the parser".into()),
+            updated_at: 1_000.0,
+        };
+        assert_eq!(
+            session_label(&info, 1_000.0 + 7_200.0),
+            "fix the parser · 01234567 · 2h ago"
+        );
     }
 
     #[test]

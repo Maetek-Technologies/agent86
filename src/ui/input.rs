@@ -36,9 +36,29 @@ impl Editor {
     }
 
     pub fn clear(&mut self) {
-        self.set(Vec::new());
+        self.set_text("");
+    }
+
+    /// Replace the draft, with the cursor at the end, and stop browsing history.
+    pub fn set_text(&mut self, text: &str) {
+        self.set(text.chars().collect());
         self.browsing = None;
         self.draft.clear();
+    }
+
+    /// The cursor, as a character index into the draft.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replace characters `start..end` with `text` and put the cursor after it.
+    pub fn replace(&mut self, start: usize, end: usize, text: &str) {
+        let end = end.min(self.text.len());
+        let start = start.min(end);
+        let inserted: Vec<char> = text.chars().collect();
+        self.cursor = start + inserted.len();
+        self.text.splice(start..end, inserted);
+        self.browsing = None;
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -335,6 +355,16 @@ mod tests {
         editor.insert("!");
         editor.down(&history);
         assert_eq!(editor.text(), "first!");
+    }
+
+    #[test]
+    fn a_span_can_be_replaced_in_place() {
+        let mut editor = typed("see @sr now");
+        editor.replace(4, 7, "@src/");
+        assert_eq!(editor.text(), "see @src/ now");
+        assert_eq!(editor.cursor(), 9);
+        editor.set_text("/model ");
+        assert_eq!((editor.text().as_str(), editor.cursor()), ("/model ", 7));
     }
 
     #[test]
