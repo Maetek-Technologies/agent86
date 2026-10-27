@@ -191,6 +191,72 @@ pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// Styled text word-wrapped into rows of at most `width` cells; a `\n` in a span
+/// starts a new row. Words longer than a row are broken.
+pub fn wrap_spans(spans: &[(Style, String)], width: usize) -> Vec<Line> {
+    let width = width.max(1);
+    let mut rows = vec![Line::default()];
+    let mut used = 0;
+    for (style, text) in spans {
+        for (index, part) in text.split('\n').enumerate() {
+            if index > 0 {
+                rows.push(Line::default());
+                used = 0;
+            }
+            for word in split_keeping_spaces(part) {
+                let cells = word.width();
+                if used + cells <= width {
+                    append(rows.last_mut(), *style, word);
+                    used += cells;
+                    continue;
+                }
+                if word.trim().is_empty() {
+                    // A space at the end of a row is dropped rather than starting the next one.
+                    rows.push(Line::default());
+                    used = 0;
+                    continue;
+                }
+                if used > 0 {
+                    trim_end(rows.last_mut());
+                    rows.push(Line::default());
+                    used = 0;
+                }
+                for ch in word.chars() {
+                    let cells = ch.width().unwrap_or(0);
+                    if used + cells > width && used > 0 {
+                        rows.push(Line::default());
+                        used = 0;
+                    }
+                    append(rows.last_mut(), *style, ch.encode_utf8(&mut [0; 4]));
+                    used += cells;
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Add `text` to the row, joining the last span when the style is the same.
+fn append(row: Option<&mut Line>, style: Style, text: &str) {
+    let Some(row) = row else { return };
+    match row.spans.last_mut() {
+        Some((last, piece)) if *last == style => piece.push_str(text),
+        _ => row.spans.push((style, text.to_owned())),
+    }
+}
+
+fn trim_end(row: Option<&mut Line>) {
+    let Some(row) = row else { return };
+    while let Some((_, piece)) = row.spans.last_mut() {
+        let trimmed = piece.trim_end_matches(' ').len();
+        piece.truncate(trimmed);
+        if !piece.is_empty() {
+            break;
+        }
+        row.spans.pop();
+    }
+}
+
 /// `text` split into runs of spaces and runs of everything else.
 fn split_keeping_spaces(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
@@ -234,6 +300,26 @@ mod tests {
         assert_eq!(wrap_words("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         assert_eq!(wrap_words("", 4), [""]);
         assert_eq!(wrap_words("ab  cd", 3), ["ab", "cd"]);
+    }
+
+    #[test]
+    fn styled_text_wraps_at_words_and_keeps_its_styles() {
+        let spans = vec![
+            (Style::Plain, "run ".to_owned()),
+            (Style::BoldCyan, "cargo test".to_owned()),
+            (Style::Plain, " then\nship it".to_owned()),
+        ];
+        let rows = wrap_spans(&spans, 10);
+        let text: Vec<String> = rows.iter().map(Line::plain_text).collect();
+        assert_eq!(text, ["run cargo", "test then", "ship it"]);
+        assert_eq!(
+            rows[0].spans,
+            vec![
+                (Style::Plain, "run ".to_owned()),
+                (Style::BoldCyan, "cargo".to_owned())
+            ]
+        );
+        assert_eq!(rows[1].spans[0], (Style::BoldCyan, "test".to_owned()));
     }
 
     #[test]

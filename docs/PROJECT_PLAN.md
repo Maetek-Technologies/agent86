@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with parts 2 (the inline base) and 3 (the `/` and `@` menus and the pickers) done and part 4 (Markdown, diffs, and the transcript view) next, and episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with parts 2 (the inline base), 3 (the `/` and `@` menus and the pickers), and 4 (Markdown, diffs, and the transcript view) done and part 5 (model catalogs, providers, keys, and config write-back) next, and episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -88,12 +88,17 @@ The Python implementation remains the reference and compatibility oracle. This p
   - the registry's `needs_choice` (Python's `ChoiceKind`): a bare `/mode`, `/model`, or `/resume`, typed or picked from the menu, opens a picker panel in place of the input box. The mode picker starts on the current mode; the model picker lists the configured role slots (`default`, `route.cheap`, `route.frontier`), deduplicated with their roles named together, and prefills `/model ` when none is set; the session picker lists recent sessions with Python's `title · id · age` labels, filtered by typing. A choice is dispatched as `/mode <mode>` or `/model <ref>`, as in Python
   - picking a session rebuilds the screen, as Python's `load_session` does: the banner, the saved conversation (prompts, replies, and each tool call with the first line of its result), then `resumed session <id> (<n> messages) - <title>`
   - `/clear` is recognised by the command result's `clears_transcript` flag, as in Python, not by its name
+- Added rich rendering to the interface (stage 9, part 4), ported from `tui/widgets/transcript.py`, `tool_block.py`, and `tui/screens/approval.py`:
+  - replies rendered as Markdown with `[ui] markdown` (on by default, as in Python): headings, emphasis, inline code, bullet and numbered lists (nested), block quotes, tables, rules, links shown with their address, and fenced code with a gutter. A block is committed once it is complete, so a code fence or a loose list is never split; a block longer than Python's 2,000-character tail limit is cut at a newline, and a code fence cut that way is closed and reopened
+  - the tools' `preview_lexer` (`diff` for `write_file` and `edit_file`, `bash` for `run_command`, `python` for `python_exec`), carried on the approval preview; the approval panel colours a diff (additions, removals, hunk headers)
+  - the Ctrl+O transcript view: the session's transcript on the alternate screen, with every tool call expanded as Python's `body_lines` (the arguments as indented JSON, the result capped at 200 lines); `a` or Ctrl+Shift+O collapses or expands them all, the arrows, PgUp/PgDn, Home, and End scroll, and Escape, `q`, or Ctrl+O returns with the screen as it was. It can be opened during a turn, and an approval request closes it
+  - the decision not to add a syntax highlighter for now (see [design](INTERFACE.md), section 6)
 - Added secret redaction ported from `secrets.py`, applied to error bodies and transport details
 - Added recorded SSE fixtures and a scripted local mock HTTP server covering success, tool calls, empty, unterminated, malformed, truncated, stalled, unreachable, client-error, retry, and retry-exhaustion cases
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **293 passed on Windows** (113 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **307 passed on Windows** (127 unit, 10 compatibility, 18 provider integration, 32 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 17 MCP, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -119,7 +124,7 @@ The agent works end to end, but it does not yet have:
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
 - Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
-- The rest of the interactive interface (stage 9, parts 4 to 6, planned in [docs/INTERFACE.md](INTERFACE.md)): Markdown replies, coloured diffs, the Ctrl+O transcript view, model catalogs in the model picker, and the model, provider, key, and MCP management screens
+- The rest of the interactive interface (stage 9, parts 5 and 6, planned in [docs/INTERFACE.md](INTERFACE.md)): model catalogs in the model picker, and the model, provider, key, and MCP management screens
 - Local embedding backend
 
 ### Known `run` differences from Python
@@ -167,9 +172,12 @@ The agent works end to end, but it does not yet have:
   - The session picker has one box: typing filters and Enter picks the highlighted session. Python's filter box picks on Enter only when exactly one session matches.
   - The mode and model pickers also take the choice's number. Ctrl+C closes a picker, as Escape does.
   - A command run from the `/` menu goes through the same path as a typed one: it is echoed (Python doesn't echo a bare `/mode`, `/model`, or `/resume` picked from its palette) and the full command goes into the prompt history (Python records what had been typed, such as `/he`).
-- **Not yet ported (planned for parts 4 to 6):**
-  - Markdown replies (answers are plain text)
-  - the Ctrl+O expansion of tool calls
+- **Rendering:**
+  - A reply is rendered as Markdown a block at a time as it streams, not as one document when it ends; a block is only committed once complete, so the result is the same except where Markdown links a later block to an earlier one (reference-style link definitions).
+  - The look is our own, not Rich's: `⏺` before the reply rather than an `agent86` label, `•` bullets, a gutter for code, a box-drawn rule under a table's header.
+  - Fenced code is not syntax-highlighted; Python highlights it with Pygments. A command or snippet in the approval panel is shown plain; a diff is coloured.
+- **Expanding tool calls:** Ctrl+O opens a full-screen transcript view with every tool call expanded, rather than expanding the last block in place; Ctrl+Shift+O (or `a`) toggles them all in that view.
+- **Not yet ported (planned for parts 5 and 6):**
   - model catalogs: the model picker offers only the configured role slots, and a typed `/model <bare id>` is not resolved against the provider's catalog
   - the model, provider, key, and MCP screens: a bare `/config model` or `/config mcp` prints the plain loop's message
 - **Context window:** the status line doesn't ask OpenRouter's models endpoint for the model's context length, as Python does. Overrides, Ollama's `num_ctx`, and Python's table apply.
@@ -316,7 +324,7 @@ Stage 9 is delivered in parts, one PR each. The details and acceptance tests for
 - [x] Part 1: the plain REPL, commands, mentions, history, and turn cancellation
 - [x] Part 2: the inline base: input box, streaming transcript, tool blocks, spinner, status line, approval panel, cancel and quit keys, and the plain-loop fallback
 - [x] Part 3: the `/` command menu, `@` path completion, and the mode, model, and session pickers
-- [ ] Part 4: Markdown replies, coloured diffs, and the Ctrl+O transcript view
+- [x] Part 4: Markdown replies, coloured diffs, and the Ctrl+O transcript view
 - [ ] Part 5: model catalogs, the provider manager, key entry, the connection test, and comment-preserving config write-back
 - [ ] Part 6: MCP server management (add, edit, remove, enable or disable, test) with live mounting
 

@@ -25,6 +25,8 @@ pub struct Screen<W: Write> {
     cursor_row: usize,
     cursor_col: usize,
     width: usize,
+    /// The alternate screen (the transcript view) is showing.
+    alternate: bool,
 }
 
 impl<W: Write> Screen<W> {
@@ -36,6 +38,7 @@ impl<W: Write> Screen<W> {
             cursor_row: 0,
             cursor_col: 0,
             width: width.max(1),
+            alternate: false,
         }
     }
 
@@ -116,6 +119,40 @@ impl<W: Write> Screen<W> {
         self.drawn.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.out.flush()
+    }
+
+    /// Switch to the alternate screen for the full-screen transcript view. The
+    /// scrollback and the live region stay as they are and come back on leaving.
+    pub fn enter_alternate(&mut self) -> io::Result<()> {
+        if self.alternate {
+            return Ok(());
+        }
+        self.alternate = true;
+        write!(self.out, "\x1b[?1049h\x1b[?25l")?;
+        self.out.flush()
+    }
+
+    /// Return from the alternate screen, with the cursor where it was.
+    pub fn leave_alternate(&mut self) -> io::Result<()> {
+        if !self.alternate {
+            return Ok(());
+        }
+        self.alternate = false;
+        write!(self.out, "\x1b[?1049l")?;
+        self.out.flush()
+    }
+
+    /// Draw a whole page on the alternate screen; each line must fit the width.
+    pub fn page(&mut self, lines: &[Line]) -> io::Result<()> {
+        write!(self.out, "\x1b[?2026h\x1b[H\x1b[2J")?;
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                write!(self.out, "\r\n")?;
+            }
+            write!(self.out, "{}", line.render(self.color))?;
+        }
+        write!(self.out, "\x1b[?2026l")?;
         self.out.flush()
     }
 

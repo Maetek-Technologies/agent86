@@ -67,6 +67,8 @@ pub enum Style {
     BoldRed,
     DimRed,
     DimYellow,
+    Italic,
+    BoldUnderline,
 }
 
 impl Style {
@@ -83,6 +85,8 @@ impl Style {
             Self::BoldRed => "\x1b[1;31m",
             Self::DimRed => "\x1b[2;31m",
             Self::DimYellow => "\x1b[2;33m",
+            Self::Italic => "\x1b[3m",
+            Self::BoldUnderline => "\x1b[1;4m",
         }
     }
 }

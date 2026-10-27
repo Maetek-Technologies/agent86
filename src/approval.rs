@@ -25,6 +25,8 @@ pub struct ApprovalPreview {
     pub summary: String,
     /// The tool's own description of the effect, such as a unified diff.
     pub detail: Option<String>,
+    /// What `detail` is written in (`diff`, `bash`, `python`), as Python's `lexer`.
+    pub lexer: Option<&'static str>,
 }
 
 /// Asks whether one side-effecting call may run: `(tool name, preview) -> approved`.
@@ -98,6 +100,7 @@ pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> App
         detail: tool
             .preview(&call.arguments, ctx)
             .filter(|detail| !detail.is_empty()),
+        lexer: tool.preview_lexer(),
     }
 }
 

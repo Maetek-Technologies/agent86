@@ -129,7 +129,7 @@ The text the harness streams is accumulated exactly, as Python's `ReplyEntry.tex
 
 Python renders the whole reply as one Markdown document once it is finished. Rendering block by block gives the same result for every block that can't span a blank line. Lists and tables are held until they end, so loose lists also render the same.
 
-Code blocks are shown with a dim border and no syntax highlighting at first. Python highlights them with Pygments (`monokai`). Whether to add `syntect` is decided in slice 4 against binary size; until then it is a known difference.
+Code blocks are shown with a dim gutter and no syntax highlighting. Python highlights them with Pygments (`monokai`). **Decided in part 4:** no syntax highlighter for now. `syntect` with its default syntaxes and themes adds several megabytes to the binary, and its regex engine needs either a C library (`onig`) or the slower pure-Rust `fancy-regex`, for colour that changes no behavior. Diffs, the one place where colour carries meaning, are coloured by hand (`src/ui/diff.rs`). This stays a known difference and can be revisited.
 
 ## 7. Transcript view (Ctrl+O)
 
@@ -137,8 +137,9 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 
 - **Opening:** Ctrl+O enters the alternate screen and shows the whole session transcript from the interface's entry model (section 8). Each tool block is expanded the way Python's `ToolBlockEntry.body_lines` is: the arguments as pretty JSON, then the result, capped at `RESULT_LINE_LIMIT`, 200 lines.
 - **Keys:** arrows, PgUp/PgDn, Home, and End scroll. Ctrl+Shift+O or `a` toggles all blocks between expanded and collapsed. Escape, `q`, or Ctrl+O returns.
-- **Returning** restores the screen exactly as it was, because the alternate screen leaves scrollback untouched.
-- **During a turn:** the view can be opened while a turn runs. The turn keeps going, and new entries appear in the view.
+- **Returning** restores the screen exactly as it was, because the alternate screen leaves scrollback untouched. Anything finished while the view was open is printed then.
+- **During a turn:** the view can be opened while a turn runs. The turn keeps going, and new entries appear in the view. An approval request closes the view, so the question is seen.
+- **Also:** `j`/`k`, Space, and `g`/`G` scroll as in a pager, and Ctrl+C returns to the conversation.
 
 ## 8. Architecture
 
@@ -150,8 +151,9 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 | `src/ui/app.rs` | `App`, the state machine: what has been committed, the reply tail, running tools, the approval panel, and what each key and `UiEvent` does. It never touches the terminal, so tests drive it directly |
 | `src/ui/screen.rs` | The inline renderer: frames of committed lines and the live region, the caret, and row accounting across resizes |
 | `src/ui/text.rs` | Styled `Line`s, wrapping in terminal cells, truncation, and `sanitize` for untrusted text |
-| `src/ui/entries.rs` (part 4) | The transcript entry model: `User`, `Reply`, `Tool`, `Notice`, `Error`, `Raw`, kept for the transcript view. Part 3 rebuilds a resumed session (Python's `_entries_for`) straight from its messages with `App::replay` |
-| `src/ui/render/` (part 4) | `markdown.rs` and `diff.rs`; the full-screen transcript view may use ratatui |
+| `src/ui/entries.rs` | The transcript entry model, kept for the transcript view: printed lines as they were printed, and tool calls with their full arguments and result (Python's `ToolBlockEntry`, with `body_lines`). `App::replay` rebuilds a resumed session (Python's `_entries_for`) into the same entries |
+| `src/ui/markdown.rs` | `commit_point` (how much of a streaming reply is complete blocks), `split_inside` (the tail-limit cut, closing and reopening a code fence), and `render` (Markdown to styled lines with `pulldown-cmark`) |
+| `src/ui/diff.rs` | Colouring for an approval's detail by the tool's `preview_lexer` |
 | `src/ui/input.rs` | The multi-line editor: cursor, editing keys, word movement, paste, and history navigation over `PromptHistory` |
 | `src/ui/menu.rs` | The `/` command menu and `@` path completion (`complete_mentions` itself lives in `src/mentions.rs`) |
 | `src/ui/picker.rs` | The mode, model, and session pickers (part 3): a list panel with optional type-to-filter |

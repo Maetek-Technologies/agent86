@@ -71,6 +71,12 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// What [`Tool::preview`] is written in (`diff`, `bash`, `python`), as Python's
+    /// `preview_lexer`, so the interface can colour it.
+    fn preview_lexer(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Run the tool. `ToolResult::call_id` may be left empty; [`Tool::run`] fills it in.
     fn execute(
         &self,

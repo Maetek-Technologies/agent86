@@ -47,6 +47,10 @@ impl Tool for RunCommandTool {
         Some(head_of(command, PREVIEW_MAX_LINES))
     }
 
+    fn preview_lexer(&self) -> Option<&'static str> {
+        Some("bash")
+    }
+
     fn execute(
         &self,
         args: &Map<String, Value>,
@@ -98,6 +102,10 @@ impl Tool for PythonExecTool {
     fn preview(&self, args: &Map<String, Value>, _ctx: &ToolContext) -> Option<String> {
         let code = args.get("code")?.as_str()?;
         Some(head_of(code, PREVIEW_MAX_LINES))
+    }
+
+    fn preview_lexer(&self) -> Option<&'static str> {
+        Some("python")
     }
 
     fn execute(
