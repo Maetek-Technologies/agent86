@@ -692,7 +692,7 @@ fn stop_reason_wire(reason: StopReason) -> String {
 }
 
 /// An error and its sources, joined like a Python exception message.
-fn error_chain(error: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {

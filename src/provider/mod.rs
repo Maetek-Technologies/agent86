@@ -7,6 +7,7 @@
 
 pub mod capabilities;
 pub mod catalog;
+pub mod ollama;
 pub mod openai;
 pub mod remote_windows;
 pub mod retry;
@@ -17,12 +18,13 @@ use crate::secrets::{resolve_api_key, OsKeyring, SecretStore};
 use crate::types::{Completion, CompletionDelta, CompletionRequest, ModelRef};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{BoxStream, StreamExt};
+use ollama::{OllamaConfig, OllamaProvider};
 use openai::{OpenAiConfig, OpenAiProvider};
 use std::time::Duration;
 use thiserror::Error;
 
 /// Providers with a dedicated adapter in Python that the Rust port does not have yet.
-const NOT_PORTED: &[&str] = &["anthropic", "ollama", "llamacpp"];
+const NOT_PORTED: &[&str] = &["anthropic", "llamacpp"];
 
 /// Construct the provider that serves `reference`, e.g. `openrouter:openai/gpt-4o-mini`.
 ///
@@ -70,6 +72,23 @@ fn build_provider(
     let name = reference.provider.as_str();
     let section = config.providers.get(name).cloned().unwrap_or_default();
 
+    // Ollama has its own adapter (and no key), whatever its section says.
+    if name == "ollama" {
+        let seconds = durations(name);
+        let provider = OllamaProvider::new(
+            reference.model.clone(),
+            OllamaConfig {
+                base_url: section.base_url.clone(),
+                num_ctx: section.num_ctx,
+                max_tokens: section.max_tokens,
+                connect_timeout: seconds("connect_timeout_s", section.connect_timeout_s)?,
+                read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
+                max_retries: section.max_retries,
+            },
+        )?;
+        return Ok(Box::new(provider));
+    }
+
     let require_key = match name {
         "openai" | "openai-compatible" => true,
         _ if NOT_PORTED.contains(&name) => {
@@ -97,12 +116,7 @@ fn openai_config(
     section: &ProviderConfig,
     require_key: bool,
 ) -> Result<OpenAiConfig, ProviderError> {
-    let seconds = |field: &str, value: f64| {
-        Duration::try_from_secs_f64(value).map_err(|_| ProviderError::InvalidSetting {
-            provider: name.to_owned(),
-            detail: format!("{field} must be a non-negative number of seconds, not {value}"),
-        })
-    };
+    let seconds = durations(name);
     Ok(OpenAiConfig {
         base_url: section.base_url.clone(),
         api_key_env: section.api_key_env.clone(),
@@ -113,6 +127,16 @@ fn openai_config(
         read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
         max_retries: section.max_retries,
     })
+}
+
+/// A `[providers.<name>]` timeout as a duration, refusing negative or absurd values.
+fn durations(name: &str) -> impl Fn(&str, f64) -> Result<Duration, ProviderError> + '_ {
+    move |field, value| {
+        Duration::try_from_secs_f64(value).map_err(|_| ProviderError::InvalidSetting {
+            provider: name.to_owned(),
+            detail: format!("{field} must be a non-negative number of seconds, not {value}"),
+        })
+    }
 }
 
 /// A stream of text deltas whose final item carries `done = true` and the full completion.
@@ -242,4 +266,8 @@ pub enum ProviderError {
         model: String,
         detail: String,
     },
+
+    /// A message already worded as Python's adapter words it (Ollama's).
+    #[error("{0}")]
+    Message(String),
 }

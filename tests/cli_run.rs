@@ -88,6 +88,34 @@ fn stderr(output: &Output) -> String {
 }
 
 #[tokio::test]
+async fn run_works_against_ollama_and_local_models_cost_nothing() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("ollama/text.ndjson"))]).await;
+    let workspace = Workspace::new("ollama");
+    workspace.write_project_config(&format!(
+        "[model]\ndefault = \"ollama:llama3.1:8b\"\n\n[providers.ollama]\nbase_url = \"{}\"\n",
+        server.base_url
+    ));
+
+    let output = workspace.run(&["run", "Say hello"]).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Hello, world\n");
+    let summary = stderr(&output);
+    assert!(
+        summary.starts_with("— 1 step · 0 tools · 26 in / 3 out · $0.0000 · "),
+        "{summary}"
+    );
+    let sent = &server.requests()[0];
+    assert_eq!(sent.request_line, "POST /api/chat HTTP/1.1");
+    assert_eq!(sent.body["model"], "llama3.1:8b");
+    // The built-in num_ctx, and the harness's output cap as num_predict, as in Python.
+    assert_eq!(
+        sent.body["options"],
+        serde_json::json!({"temperature": 0.0, "num_ctx": 8192, "num_predict": 8192})
+    );
+}
+
+#[tokio::test]
 async fn run_streams_the_answer_to_stdout_and_the_summary_to_stderr() {
     let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
     let workspace = Workspace::with_mock_provider("text", &server);
