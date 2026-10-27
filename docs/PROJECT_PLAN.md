@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-26  
-**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; Python's full-screen terminal interface (stage 9, part 2) next, with episodic and semantic memory deferred to stage 10
+**Current stage:** First milestone complete; pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) planned as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)), with part 2 (the inline base) next, and episodic and semantic memory deferred to stage 10
 
 ## 1. Purpose
 
@@ -75,7 +75,7 @@ Local validation completed successfully:
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
-- Live REPL check (2026-10-26, `openrouter:openai/gpt-4o-mini`, piped input): a turn mentioning `@shopping.txt` sent the file inline (the saved session holds the fenced block, titled with the typed text), the model answered with three items, and `/cost` and `/tools` reported the session; Ctrl+C at a real terminal is left to manual testing
+- Live REPL check (2026-10-26, `openrouter:openai/gpt-4o-mini`, piped input): a turn mentioning `@shopping.txt` sent the file inline (the saved session holds the fenced block, titled with the typed text), the model answered with three items, and `/cost` and `/tools` reported the session. A manual check at a real Windows terminal (2026-10-26) passed for the banner, the approval prompt, and Ctrl+C cancelling a running turn
 - Live MCP-over-HTTP check (2026-10-26, `openrouter:openai/gpt-4o-mini`): with the test server in streamable HTTP mode, `mcp tools` listed its tools, and in a `run` the model called `get_prompt` and described the prompt, including its non-text block; the server logged a session `DELETE` from each agent86 process
 - Live MCP check (2026-10-26, `openrouter:openai/gpt-4o-mini`): with the test MCP server configured, `mcp tools` listed its eight tools; in a `run`, the model first called `mcp__test__add` with no arguments (its schema was still deferred), got the missing-argument error, called it again with both numbers, and reported 5555 (3 steps)
 - Live flight-recorder check (2026-10-26): after a `run` that listed a directory, `trace show` listed the turn's five events with local times, token counts, and details
@@ -97,7 +97,7 @@ The agent works end to end, but it does not yet have:
 - Context-window fitting and compaction of long conversations
 - Memory, skills, and delegation tools, and skills themselves
 - Episodic and semantic memory, retention pruning, and OpenTelemetry span export (`[observability] otel`)
-- Python's full-screen terminal interface (Textual): the status footer, key bindings, the command palette, mention completion, and the model, MCP, session, and approval screens
+- The interactive interface that replaces Python's full-screen Textual app: the status line, key bindings, the command menu, mention completion, Markdown replies, and the model, provider, key, MCP, session, and approval screens. It is planned in [docs/INTERFACE.md](INTERFACE.md).
 - Local embedding backend
 
 ### Known `run` differences from Python
@@ -114,7 +114,8 @@ The agent works end to end, but it does not yet have:
 
 ### Known REPL differences from Python
 
-- The plain loop is the only surface. Python opens its full-screen Textual app when `[ui] tui` is on and stdin and stdout are terminals, and falls back to the plain loop otherwise; `--plain`, `AGENT86_PLAIN`, and `[ui] tui` are accepted but change nothing yet, and no "TUI unavailable" note is printed.
+- The interactive interface will render inline, in Claude Code's style, rather than as Python's full-screen Textual app ([ADR 0001](adr/0001-inline-terminal-interface.md)). Its commands, messages, approvals, files, and cancellation stay Python's. The differences it introduces are planned in [docs/INTERFACE.md](INTERFACE.md) and will be listed here as each slice lands.
+- The plain loop is the only surface so far. Python opens its full-screen Textual app when `[ui] tui` is on and stdin and stdout are terminals, and falls back to the plain loop otherwise; `--plain`, `AGENT86_PLAIN`, and `[ui] tui` are accepted but change nothing yet, and no "TUI unavailable" note is printed.
 - Ctrl+C during a turn cancels it at the next safe point (`[cancelled]`, saved, traced as cancelled), which is what Python's full-screen app does with its cancel key. Python's plain loop instead raises `KeyboardInterrupt`, prints `interrupted`, and abandons the turn without closing or saving it. A running tool is never interrupted: the cancel takes effect when it finishes.
 - Ctrl+C at an approval prompt does not decline; the prompt waits for an answer and the turn stops before the next call. Python declines.
 - A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
@@ -257,10 +258,19 @@ All criteria were met on 2026-10-26.
 | 6 | Subprocess and Docker sandboxing | Environment scrubbing and process-tree cleanup |
 | 7 | Sessions, memory, and observability | SQLite, retention, and trace compatibility |
 | 8 | MCP client | Transports, notifications, reconnects, and lifecycle races |
-| 9 | Interactive terminal interface | Textual-equivalent UX and cancellation |
+| 9 | Interactive terminal interface | Python's interactive behavior and cancellation, presented inline in Claude Code's style ([ADR 0001](adr/0001-inline-terminal-interface.md)) |
 | 10 | Local embedding options | Model runtime and offline behavior |
 
 Each stage should produce a usable vertical slice and be compared with the Python implementation before the project moves on.
+
+Stage 9 is delivered in parts, one PR each. The details and acceptance tests for parts 2 to 6 are in [docs/INTERFACE.md](INTERFACE.md), section 10.
+
+- [x] Part 1: the plain REPL, commands, mentions, history, and turn cancellation
+- [ ] Part 2: the inline base: input box, streaming transcript, tool blocks, spinner, status line, approval panel, cancel and quit keys, and the plain-loop fallback
+- [ ] Part 3: the `/` command menu, `@` path completion, and the mode, model, and session pickers
+- [ ] Part 4: Markdown replies, coloured diffs, and the Ctrl+O transcript view
+- [ ] Part 5: model catalogs, the provider manager, key entry, the connection test, and comment-preserving config write-back
+- [ ] Part 6: MCP server management (add, edit, remove, enable or disable, test) with live mounting
 
 ## 6. Compatibility strategy
 
