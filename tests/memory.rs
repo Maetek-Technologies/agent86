@@ -336,7 +336,7 @@ fn prune_and_retention_count_what_they_remove() {
 
 #[test]
 fn a_custom_embedder_spec_is_used_for_storage() {
-    let (embedder, note) = build_embedder("hash:8");
+    let (embedder, note) = build_embedder("hash:8", true);
     assert!(note.is_none());
     let memory = SessionStore::open_with(Path::new(":memory:"), Arc::clone(&embedder)).unwrap();
     assert_eq!(memory.embedder_spec(), "hash:8");

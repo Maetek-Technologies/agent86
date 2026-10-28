@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory with the hashing embedder (stage 10, part 1) done; the sentence-transformers embedder (stage 10, part 2) next
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed
 
 ## 1. Purpose
 
@@ -102,11 +102,18 @@ The Python implementation remains the reference and compatibility oracle. This p
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
 - Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
+- Added the local sentence-transformers embedder (stage 10, part 2), Python's default `sentence-transformers:all-MiniLM-L6-v2`, ported from `SentenceTransformerEmbedder` and the cache rules in `memory/embeddings.py`, on candle instead of torch:
+  - the model: BERT in `float32` (embeddings, attention, exact-`erf` GELU, layer norms as transformers' `BertModel`), the model's pooling (mean, CLS, max, or mean over the square root of the length), the Normalize module and then `normalize_embeddings=True`; the tokenizer is `tokenizer.json` through the `tokenizers` crate (the library Python's tokenizers wraps, at the same version), truncated to the model's `max_seq_length` (256 for MiniLM, from `sentence_bert_config.json`; 5.x's layout falls back to the tokenizer's limit) and never padded, as one text is encoded at a time
+  - vectors agree with sentence-transformers' to about 3e-7 per component (two or three `float32` ulps: the kernels sum in a different order) and token ids exactly, for the real model and for a tiny random BERT fixture in the same layout; episodes Python embedded with MiniLM are now recalled by Rust with the same scores, and the reverse
+  - the Hugging Face cache as `huggingface_hub` lays it out (`HF_HUB_CACHE`, `HF_HOME/hub`, or `~/.cache/huggingface/hub`; `refs/main` and `snapshots/<commit>/`): a cached model is loaded without a network call under `hf_offline` (Python's directory check, also honouring `HF_HUB_OFFLINE`); otherwise `main` is resolved at `HF_ENDPOINT` and the files sentence-transformers reads are downloaded (atomically, never the ONNX, OpenVINO, or PyTorch duplicates), falling back to the cache when the hub cannot be reached
+  - a model that cannot load falls back to `hash:256` with Python's note, `sentence-transformers unavailable (OSError); using the offline hash embedder.` (`ValueError` for a model this cannot run)
+  - a local model directory works as the spec, as in Python
+  - live checks (2026-10-27): the default spec loads from the real cache in about 0.6 s with no note; on a copy of the real database, `memory search` ranked the episodes Python wrote with the model exactly as an independent sentence-transformers computation did, to two decimals; a download into an empty cache took 2.4 s, fetched the same commit and the same eleven files Python's cache holds, and sentence-transformers then loaded that cache offline and produced identical vectors; with the local Ollama (`gemma4:12b`, isolated home), `remember` and then `recall` in a new session found the fact at `[score 0.64]`
 - Added long-term memory (stage 10, part 1), ported from `memory/store.py` (episodes, facts, ranking, pruning, retention), `episodic.py`, `semantic.py`, `system.py`, `embeddings.py` (the hashing embedder), `tools/builtin/memory.py`, the memory wiring in `orchestration/loop.py`, and the `agent86 memory` commands in `cli.py`:
   - episodes: every finished turn is recorded (task and answer) in the shared database; before a turn starts, past episodes scoring at least 0.35 (compactions excluded) are added to the system message as Python's "Relevant past experience" note, the task quoted as Python's `repr` and the outcome collapsed and cut at 200 characters
   - facts: `remember` and `recall` (not side-effecting, registered after the built-ins only when memory is on; `Memory is disabled.` otherwise), with Python's schemas, a `k` clamped to 1..20 and parsed with pydantic's lax `int` rules, the 0.30 floor, and `- <fact>  [score 0.62]` lines
   - the store: `float32` BLOBs as Python's `array("f")` writes them, a brute-force cosine scan (summed as Python 3.12's compensated `sum`, so scores are bit-identical), rows of another dimension skipped, and a stable sort
-  - the hashing embedder (`hash:<dim>`), bit-identical to Python's (MD5 buckets and signs over `[a-z0-9]+` tokens), so facts and episodes either implementation writes with it are found by the other. The default `sentence-transformers:all-MiniLM-L6-v2` is not ported yet and falls back to `hash:256` with a note, as Python does when the model cannot load
+  - the hashing embedder (`hash:<dim>`), bit-identical to Python's (MD5 buckets and signs over `[a-z0-9]+` tokens), so facts and episodes either implementation writes with it are found by the other
   - retention at startup from `[memory] retention_max_episodes` (1000), `retention_max_sessions` (500), and `retention_max_age_days` (0, off), recorded as Python's `retention_prune` trace event; curated facts are never pruned automatically
   - `agent86 memory stats|sessions|search|prune|forget`, with Python's output, the dry run, and Click's `[y/N]` confirmation (`Aborted!` at end of input)
   - live check (2026-10-27, local Ollama, `gemma4:12b`, isolated home): asked to remember a preference, the model called `remember`; in a new session it called `recall` and answered from the fact
@@ -128,7 +135,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **388 passed on Windows** (171 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 39 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 10 memory, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests
+- `cargo test --all-targets`: **399 passed on Windows** (175 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 40 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 10 memory, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -153,7 +160,6 @@ The agent works end to end, but it does not yet have:
 - Context-window fitting and compaction of long conversations
 - Skills and delegation tools, and skills themselves
 - OpenTelemetry span export (`[observability] otel`)
-- The local sentence-transformers embedder (`[memory] embeddings` falls back to the hashing embedder)
 
 ### Known `run` differences from Python
 
@@ -254,7 +260,11 @@ The agent works end to end, but it does not yet have:
 
 ### Known memory differences from Python
 
-- The default embedder, `sentence-transformers:all-MiniLM-L6-v2`, is not ported (stage 10, part 2), so the hashing embedder stands in with the note `sentence-transformers unavailable (not ported to the Rust build yet); using the offline hash embedder.` (Python's names the exception and suggests `pip install "agent86[local]"`). Until then, episodes and facts Python embedded with that model (384 dimensions) are skipped by Rust's searches, and the 256-dimension rows Rust writes are skipped by Python's when it has the model.
+- sentence-transformers vectors differ from Python's in the last two or three `float32` bits (about 3e-7), so a score within about 1e-6 of a recall threshold can fall on the other side of it.
+- Only BERT sentence-transformers models (Transformer, Pooling, and Normalize modules; absolute positions; GELU) are supported. Python runs any model sentence-transformers can; others fall back here with `(ValueError)`, as an unloadable model does in Python. Plain transformers checkpoints without `modules.json` are not supported.
+- The fallback note names the Rust failure's Python counterpart (`OSError` for a missing or unreachable model, `ValueError` for an unsupported one) and drops Python's `pip install "agent86[local]"` hint.
+- Downloads are anonymous: `HF_TOKEN` is not sent, so gated or private models cannot be fetched. Files are written straight into the snapshot (as `huggingface_hub` does on Windows without symlinks) rather than as `blobs/` with links, which both libraries read; `.no_exist` markers are not written.
+- With `hf_offline = false`, every start asks the hub for `main` (Python's `huggingface_hub` also checks each file's ETag).
 - Search is always the brute-force scan. Python uses `sqlite-vec`'s `vec_distance_cosine` when the extension loads, which computes in `float32`, so its scores can differ from the scan's in the last digits.
 - Scores follow Python 3.12's `sum`; under Python 3.11 (which the reference still supports) the last bit can differ.
 - A `recall` `k` written as an integer literal beyond 64 bits arrives as a float and is refused as too large; pydantic accepts any integer and the clamp makes it 20.
@@ -368,10 +378,10 @@ All criteria were met on 2026-10-26.
 
 Each stage should produce a usable vertical slice and be compared with the Python implementation before the project moves on.
 
-Stage 10 is delivered in two parts:
+Stage 10 was delivered in two parts:
 
 - [x] Part 1: episodic and semantic memory, the memory tools and commands, and retention, with the hashing embedder
-- [ ] Part 2: the `sentence-transformers` embedder (`all-MiniLM-L6-v2`) as a local Rust model runtime, producing vectors that match Python's so memory is shared both ways
+- [x] Part 2: the `sentence-transformers` embedder (`all-MiniLM-L6-v2`) on candle, producing vectors that match Python's so memory is shared both ways
 
 Stage 9 is delivered in parts, one PR each. The details and acceptance tests for parts 2 to 6 are in [docs/INTERFACE.md](INTERFACE.md), section 10.
 

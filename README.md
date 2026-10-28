@@ -36,7 +36,7 @@ The Python implementation remains the reference. This repository starts with a s
 
 Run `agent86` with no subcommand for the interactive interface, the same agent over a conversation. Type `/` for a menu of its commands (`/model`, `/mode`, `/cost`, `/sessions`, `/resume`, `/clear`, and more); a bare `/mode`, `/model`, or `/resume` opens a picker. `@path` puts a file (or a directory listing) from the workspace straight into your message, and typing `@` offers matching paths. Escape or Ctrl+C stops a running turn at the next safe point and keeps what happened so far. Shift+Tab cycles the approval mode. `agent86 --resume <id>` reopens a saved session. Prompts are remembered in `~/.agent86/history`, shared with the Python implementation. In place of Python's full-screen interface, the interface renders inline in Claude Code's style ([docs/INTERFACE.md](docs/INTERFACE.md)). `/config model` manages providers, keys, and models, and `/config mcp` adds, edits, tests, enables or disables, and removes MCP servers while the session runs. `--plain` (or `AGENT86_PLAIN`) gives Python's plain loop.
 
-The agent has long-term memory in the same database. Every finished turn is recorded, and when a similar task comes up later, what happened last time is added to the model's context. The model can store durable facts with `remember` and look them up with `recall`. `agent86 memory stats|sessions|search|prune|forget` inspects and trims it, and old episodes and sessions are pruned at startup past `[memory]`'s retention caps. Text is embedded with Python's hashing embedder for now; Python's default `sentence-transformers` model is the next step, so until then, memories Python saved with that model are not recalled here.
+The agent has long-term memory in the same database. Every finished turn is recorded, and when a similar task comes up later, what happened last time is added to the model's context. The model can store durable facts with `remember` and look them up with `recall`. `agent86 memory stats|sessions|search|prune|forget` inspects and trims it, and old episodes and sessions are pruned at startup past `[memory]`'s retention caps. Text is embedded locally with Python's default model, `sentence-transformers/all-MiniLM-L6-v2`, run on [candle](https://github.com/huggingface/candle): it is read from (or, the first time, downloaded into) the same Hugging Face cache Python uses, and its vectors match Python's, so either implementation recalls what the other stored. `hash:<dim>` selects Python's offline hashing embedder, which is also the fallback when the model cannot load.
 
 ## Why Rust?
 
@@ -76,7 +76,7 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] MCP client: stdio, streamable HTTP, and SSE transports, reconnects, `list_changed`, progress, and resource/prompt/completion tools (`agent86 mcp list|tools`)
 - [x] Interactive REPL (Python's plain loop, slash commands, `@file` mentions, history, Ctrl+C cancellation)
 - [x] Interactive terminal interface: inline, in Claude Code's style, with Python's commands, approvals, and management screens ([ADR 0001](docs/adr/0001-inline-terminal-interface.md))
-- [ ] Local embedding options (the hashing embedder is done; the sentence-transformers model is next)
+- [x] Local embedding options (the sentence-transformers model on candle, and the hashing embedder)
 
 Each stage should be dogfooded against the Python version before the next becomes the default path.
 

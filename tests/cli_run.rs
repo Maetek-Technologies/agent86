@@ -20,9 +20,10 @@ impl Workspace {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home").join(".agent86")).unwrap();
         std::fs::create_dir_all(root.join("project").join(".agent86")).unwrap();
-        // The default sentence-transformers embedder is not ported, and its
-        // fallback note would precede every run's output; the hash embedder is
-        // what it falls back to anyway.
+        // The default sentence-transformers model is not cached in the
+        // throwaway home, so it would be downloaded (or, offline, its fallback
+        // note would precede every run's output); the hash embedder keeps the
+        // runs self-contained.
         std::fs::write(
             root.join("home").join(".agent86").join("config.toml"),
             "[memory]\nembeddings = \"hash:256\"\n",
@@ -65,7 +66,12 @@ impl Workspace {
             .env("AGENT86_TEST_MOCK_KEY", TEST_KEY)
             .env_remove("AGENT86_MODEL")
             .env_remove("AGENT86_SANDBOX")
-            .env_remove("AGENT86_APPROVAL");
+            .env_remove("AGENT86_APPROVAL")
+            // No test may reach the Hugging Face hub or read the real cache.
+            .env_remove("HF_HUB_CACHE")
+            .env_remove("HF_HOME")
+            .env_remove("HF_ENDPOINT")
+            .env("HF_HUB_OFFLINE", "1");
         command
     }
 
@@ -1123,18 +1129,68 @@ async fn memory_commands_report_and_prune_the_store() {
     let empty = memory(&["memory", "sessions"]);
     assert_eq!(stdout(&empty), "no sessions yet\n");
 
-    // The default embedder is not ported; the fallback is said, as Python says it.
+    // A model that is not cached, with the hub offline: the fallback is said,
+    // as Python says it.
     workspace.append_project_config(
         "\n[memory]\nembeddings = \"sentence-transformers:all-MiniLM-L6-v2\"\n",
     );
     let fallback = memory(&["memory", "stats"]);
     assert!(fallback.status.success());
-    assert!(
-        stderr(&fallback).starts_with("memory: sentence-transformers unavailable"),
-        "{}",
-        stderr(&fallback)
+    assert_eq!(
+        stderr(&fallback),
+        "memory: sentence-transformers unavailable (OSError); using the offline hash embedder.\n"
     );
     assert!(stdout(&fallback).contains("embedder: hash:256"));
+}
+
+#[test]
+fn a_sentence_transformers_model_embeds_the_memory() {
+    let workspace = Workspace::new("st-model");
+    let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("memory")
+        .join("tiny-st");
+    let spec = format!("sentence-transformers:{}", model.display());
+    // A literal string, so a Windows path needs no escaping.
+    workspace.write_project_config(&format!("[memory]\nembeddings = '{spec}'\n"));
+    let memory = |args: &[&str]| workspace.command(args).output().unwrap();
+
+    let stats = memory(&["memory", "stats"]);
+    assert!(stats.status.success(), "{}", stderr(&stats));
+    assert_eq!(stderr(&stats), "");
+    assert!(
+        stdout(&stats).ends_with(&format!("  embedder: {spec}\n")),
+        "{}",
+        stdout(&stats)
+    );
+
+    // Facts stored through the model are found by it, at its dimension.
+    let db = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("memory.db");
+    let store = agent86::session::SessionStore::open_with(
+        &db,
+        agent86::memory::embeddings::build_embedder(&spec, true).0,
+    )
+    .unwrap();
+    store
+        .add_memory(
+            "the deploy key lives in the vault",
+            "fact",
+            &Default::default(),
+        )
+        .unwrap();
+    drop(store);
+    let search = memory(&["memory", "search", "the deploy key lives in the vault"]);
+    assert!(search.status.success(), "{}", stderr(&search));
+    assert!(
+        stdout(&search).contains("the deploy key lives in the vault"),
+        "{}",
+        stdout(&search)
+    );
 }
 
 #[tokio::test]

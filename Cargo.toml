@@ -31,6 +31,9 @@ toml = { version = "1.1.8", default-features = false, features = ["parse", "pres
 unicode-width = "0.2"
 url = "2.5.8"
 md5 = "0.8.1"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -15,6 +15,8 @@
 //! dimension (another embedder) are skipped, never compared.
 
 pub mod embeddings;
+pub mod hub;
+pub mod sentence_transformers;
 
 use crate::session::{SessionStore, StoreError};
 use embeddings::{cosine, pack, unpack};
