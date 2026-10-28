@@ -67,6 +67,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
     Harness {
         provider: std::sync::Arc::new(provider),
         router: Default::default(),
+        tracer: Default::default(),
         registry: default_registry(false, false, true),
         context: ToolContext::new(&workspace.0).unwrap(),
         limits: LimitsConfig {
@@ -101,6 +102,9 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
         recorder: Recorder::from_config(&ObservabilityConfig {
             trace: true,
             path: workspace.0.join("traces").display().to_string(),
+            otel: false,
+            otel_exporter: Default::default(),
+            otel_endpoint: None,
             redact: RedactMode::Secrets,
             max_field_chars: 2000,
             max_trace_bytes: 0,

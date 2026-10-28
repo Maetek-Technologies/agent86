@@ -264,6 +264,8 @@ pub struct Harness {
     pub provider: Arc<dyn Provider>,
     /// Triage routing (`crate::router`); [`Router::default`] never routes.
     pub router: Router,
+    /// OpenTelemetry spans (`crate::otel`); [`crate::otel::Tracer::default`] records none.
+    pub tracer: crate::otel::Tracer,
     pub registry: ToolRegistry,
     pub context: ToolContext,
     pub limits: LimitsConfig,
@@ -484,6 +486,17 @@ impl Harness {
         // refusing tools for the rest of the session.
         self.context.clear_skill();
         let started = Instant::now();
+        // One `turn` span per user turn, parent of its model and tool spans.
+        let mut span = self.tracer.start(
+            "turn",
+            vec![
+                ("session.id", json!(state.session_id)),
+                (
+                    "gen_ai.request.model",
+                    json!(self.active_provider().model()),
+                ),
+            ],
+        );
         let mut summary = TurnSummary::default();
         let result = self
             .turn(state, user_text, display_text, &mut summary, on_event)
@@ -508,6 +521,13 @@ impl Harness {
                 vec![("status", json!("error")), ("reason", json!(reason))],
             );
         }
+        // Closed with what the turn spent, on every exit, so a backend sees the cost
+        // of an aborted turn too.
+        span.set(turn_attributes(state, self.active_provider().model()));
+        if let Err(error) = &result {
+            span.fail(error.python_type(), &error.to_string());
+        }
+        self.tracer.end(span);
         result
     }
 
@@ -643,6 +663,15 @@ impl Harness {
                     max_tokens: Some(self.output_cap()),
                     stream: true,
                 };
+                // GenAI semantic conventions where a name exists, `agent86.*` otherwise.
+                let mut span = self.tracer.start(
+                    "model_call",
+                    vec![
+                        ("gen_ai.system", json!(provider.name())),
+                        ("gen_ai.request.model", json!(provider.model())),
+                        ("agent86.step", json!(breaker.steps() + 1)),
+                    ],
+                );
                 let mut stream = provider.stream(request);
                 let mut completion = None;
                 let mut buffered = String::new();
@@ -655,7 +684,15 @@ impl Harness {
                         delta = stream.next() => Some(delta),
                     };
                     let Some(Some(delta)) = next else { break };
-                    let delta = delta?;
+                    let delta = match delta {
+                        Ok(delta) => delta,
+                        Err(error) => {
+                            span.set(model_call_attributes(None));
+                            span.fail("ProviderError", &error.to_string());
+                            self.tracer.end(span);
+                            return Err(error.into());
+                        }
+                    };
                     if !delta.text.is_empty() {
                         if buffering {
                             buffered.push_str(&delta.text);
@@ -668,6 +705,8 @@ impl Harness {
                     }
                 }
                 drop(stream);
+                span.set(model_call_attributes(completion.as_ref()));
+                self.tracer.end(span);
                 if self.cancel.is_cancelled() {
                     // Whatever was held back still belongs to the user: redacted, then shown.
                     let partial = self.guardrails.inspect_egress(&buffered).1;
@@ -1040,20 +1079,40 @@ impl Harness {
     /// Run one approved call: a delegation runs its sub-agent here, on this
     /// runtime; anything else goes to the registry.
     async fn dispatch_call(&self, call: &ToolCall, sid: &str) -> (ToolResult, Usage) {
-        let (result, usage) = match self.delegation(call, &self.context) {
-            Some(Ok((role, task))) => self.delegate(call, &role, &task, 1).await,
-            Some(Err(invalid)) => (invalid, Usage::default()),
+        let request = match self.delegation(call, &self.context) {
+            Some(request) => request,
             None => return (self.dispatch(call, sid), Usage::default()),
         };
+        let mut span = self.tool_span(call);
+        let (result, usage) = match request {
+            Ok((role, task)) => self.delegate(call, &role, &task, 1).await,
+            Err(invalid) => (invalid, Usage::default()),
+        };
+        span.set(vec![("tool.ok", json!(result.ok))]);
+        self.tracer.end(span);
         self.record_tool_call(call, &result, sid);
         (result, usage)
     }
 
     /// Run one approved call and record it in the flight recorder.
     fn dispatch(&self, call: &ToolCall, sid: &str) -> ToolResult {
+        let mut span = self.tool_span(call);
         let result = self.registry.dispatch(call, &self.context);
+        span.set(vec![("tool.ok", json!(result.ok))]);
+        self.tracer.end(span);
         self.record_tool_call(call, &result, sid);
         result
+    }
+
+    /// A `tool_call` span for `call`, as Python's `_dispatch_call` opens.
+    fn tool_span(&self, call: &ToolCall) -> crate::otel::Span {
+        self.tracer.start(
+            "tool_call",
+            vec![
+                ("tool.name", json!(call.name)),
+                ("gen_ai.tool.name", json!(call.name)),
+            ],
+        )
     }
 
     fn record_tool_call(&self, call: &ToolCall, result: &ToolResult, sid: &str) {
@@ -1111,6 +1170,55 @@ fn not_executed(call: &ToolCall, reason: &str) -> ToolResult {
         error: Some(format!("Not executed: {reason}.")),
         metadata: serde_json::Map::new(),
     }
+}
+
+/// Closing attributes for a `model_call` span, as Python's `_model_call_attributes`.
+fn model_call_attributes(
+    completion: Option<&crate::types::Completion>,
+) -> Vec<(&'static str, Value)> {
+    let Some(completion) = completion else {
+        return vec![("agent86.completed", json!(false))];
+    };
+    let finish = completion
+        .stop_reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+        .map_or(Value::Null, |reason| json!([reason]));
+    vec![
+        ("agent86.completed", json!(true)),
+        (
+            "gen_ai.usage.input_tokens",
+            json!(completion.usage.input_tokens),
+        ),
+        (
+            "gen_ai.usage.output_tokens",
+            json!(completion.usage.output_tokens),
+        ),
+        ("gen_ai.response.finish_reasons", finish),
+        ("agent86.cost_usd", json!(completion.usage.cost_usd)),
+        ("agent86.tool_calls", json!(completion.tool_calls.len())),
+    ]
+}
+
+/// Closing attributes for the `turn` span, read off `state.last_turn`, as Python's
+/// `_turn_attributes`.
+fn turn_attributes(state: &AgentState, model: &str) -> Vec<(&'static str, Value)> {
+    let mut attributes = vec![("gen_ai.request.model", json!(model))];
+    if let Some(summary) = &state.last_turn {
+        attributes.extend([
+            ("gen_ai.usage.input_tokens", json!(summary.input_tokens)),
+            ("gen_ai.usage.output_tokens", json!(summary.output_tokens)),
+            ("agent86.cost_usd", json!(summary.cost_usd)),
+            ("agent86.steps", json!(summary.steps)),
+            ("agent86.tool_calls", json!(summary.tool_calls)),
+            ("agent86.duration_s", json!(summary.duration_s)),
+            (
+                "agent86.phase",
+                serde_json::to_value(state.phase).unwrap_or(Value::Null),
+            ),
+        ]);
+    }
+    attributes
 }
 
 /// Append `step` to the session and add its usage, as Python's `AgentState.record_step`.

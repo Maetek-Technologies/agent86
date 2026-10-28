@@ -42,6 +42,9 @@ fn config(dir: &Path, max_trace_bytes: u64, keep_traces: usize) -> Observability
     ObservabilityConfig {
         trace: true,
         path: dir.display().to_string(),
+        otel: false,
+        otel_exporter: Default::default(),
+        otel_endpoint: None,
         redact: RedactMode::Secrets,
         max_field_chars: 2000,
         max_trace_bytes,

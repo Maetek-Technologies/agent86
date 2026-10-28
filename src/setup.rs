@@ -116,6 +116,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     let mut harness = Harness {
         provider: Arc::from(provider),
         router: build_router(config),
+        tracer: crate::otel::Tracer::from_config(&config.observability),
         registry,
         context,
         limits: config.limits.clone(),
