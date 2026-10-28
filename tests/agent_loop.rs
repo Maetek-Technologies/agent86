@@ -12,6 +12,7 @@ use agent86::config::{
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
 use agent86::limits::{LimitHit, LimitKind};
 use agent86::observability::Recorder;
+use agent86::otel::{Destination, Tracer};
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::router::{RoutedModel, Router};
 use agent86::session::AgentState;
@@ -144,6 +145,7 @@ async fn run_with(
     let harness = Harness {
         provider: std::sync::Arc::new(provider),
         router: Default::default(),
+        tracer: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits,
@@ -286,6 +288,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
     let harness = Harness {
         provider: std::sync::Arc::new(provider(&server)),
         router: Default::default(),
+        tracer: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -725,6 +728,7 @@ async fn redact_mode_never_shows_the_raw_text() {
     let harness = Harness {
         provider: std::sync::Arc::new(provider),
         router: Default::default(),
+        tracer: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -812,6 +816,9 @@ async fn recorded_turn(
     let recorder = Recorder::from_config(&agent86::config::ObservabilityConfig {
         trace: true,
         path: trace_dir.display().to_string(),
+        otel: false,
+        otel_exporter: Default::default(),
+        otel_endpoint: None,
         redact: agent86::config::RedactMode::Secrets,
         max_field_chars: 2000,
         max_trace_bytes: 0,
@@ -821,6 +828,7 @@ async fn recorded_turn(
     let harness = Harness {
         provider: std::sync::Arc::new(provider),
         router: Default::default(),
+        tracer: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -939,6 +947,7 @@ fn cancellable(
     Harness {
         provider: std::sync::Arc::new(provider(server)),
         router: Default::default(),
+        tracer: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -960,6 +969,9 @@ fn trace_recorder(dir: &std::path::Path) -> Recorder {
     Recorder::from_config(&ObservabilityConfig {
         trace: true,
         path: dir.display().to_string(),
+        otel: false,
+        otel_exporter: Default::default(),
+        otel_endpoint: None,
         redact: RedactMode::Secrets,
         max_field_chars: 2000,
         max_trace_bytes: 0,
@@ -1356,4 +1368,194 @@ async fn a_route_that_cannot_be_built_fails_the_turn_and_a_pinned_model_stops_ro
     assert_eq!(output, "Pinned.");
     assert_eq!(server.requests()[0].body["model"], "test/model");
     assert_eq!(harness.routed_ref(), None);
+}
+
+/// The spans a mock collector received, by name.
+fn received_spans(collector: &MockServer) -> Vec<Value> {
+    collector
+        .requests()
+        .iter()
+        .flat_map(|request| {
+            assert!(request.request_line.starts_with("POST /v1/traces "));
+            assert_eq!(request.header("content-type"), Some("application/json"));
+            request.body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn attribute<'a>(span: &'a Value, key: &str) -> &'a Value {
+    span["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attribute| attribute["key"] == key)
+        .map_or(&Value::Null, |attribute| &attribute["value"])
+}
+
+fn collector_tracer(collector: &MockServer) -> Tracer {
+    Tracer::to(Destination::Otlp {
+        url: format!("{}/v1/traces", collector.base_url),
+        headers: vec![("x-team".into(), "core".into())],
+        timeout: std::time::Duration::from_secs(5),
+    })
+}
+
+// The collector is served by this runtime while the drop below waits for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn otel_spans_nest_model_and_tool_calls_under_the_turn() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("a", "list_dir", "{}")]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let ok = || Reply::Status {
+        status: 200,
+        headers: Vec::new(),
+        body: "{}".into(),
+    };
+    let collector = MockServer::start(vec![ok(), ok()]).await;
+    let workspace = Workspace::new("otel");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    harness.tracer = collector_tracer(&collector);
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "look", |_| {}).await.unwrap();
+    // Dropping the harness flushes what is left, as Python's provider shutdown.
+    drop(harness);
+
+    let spans = received_spans(&collector);
+    let names: Vec<&str> = spans.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["model_call", "tool_call", "model_call", "turn"]);
+    let turn = &spans[3];
+    for child in &spans[..3] {
+        assert_eq!(child["traceId"], turn["traceId"]);
+        assert_eq!(child["parentSpanId"], turn["spanId"]);
+    }
+    assert_eq!(turn.get("parentSpanId"), None);
+    assert_eq!(collector.requests()[0].header("x-team"), Some("core"));
+
+    assert_eq!(
+        attribute(turn, "session.id")["stringValue"],
+        state.session_id.as_str()
+    );
+    assert_eq!(attribute(turn, "agent86.steps")["intValue"], "2");
+    assert_eq!(attribute(turn, "agent86.tool_calls")["intValue"], "1");
+    assert_eq!(attribute(turn, "agent86.phase")["stringValue"], "done");
+    assert_eq!(turn["status"], json!({"code": 0}));
+
+    let first = &spans[0];
+    assert_eq!(attribute(first, "gen_ai.system")["stringValue"], "openai");
+    assert_eq!(
+        attribute(first, "gen_ai.request.model")["stringValue"],
+        "test/model"
+    );
+    assert_eq!(attribute(first, "agent86.step")["intValue"], "1");
+    assert_eq!(attribute(first, "agent86.completed")["boolValue"], true);
+    assert_eq!(attribute(first, "agent86.tool_calls")["intValue"], "1");
+    assert_eq!(
+        attribute(&spans[2], "gen_ai.response.finish_reasons"),
+        &json!({"arrayValue": {"values": [{"stringValue": "end_turn"}]}})
+    );
+    assert_eq!(attribute(&spans[2], "agent86.step")["intValue"], "2");
+    assert_eq!(attribute(&spans[1], "tool.name")["stringValue"], "list_dir");
+    assert_eq!(attribute(&spans[1], "tool.ok")["boolValue"], true);
+}
+
+// The collector is served by this runtime while the drop below waits for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_model_call_marks_its_span_and_the_turn_as_errors() {
+    let server = MockServer::start(vec![Reply::Status {
+        status: 400,
+        headers: Vec::new(),
+        body: "{\"error\": \"bad request\"}".into(),
+    }])
+    .await;
+    let collector = MockServer::start(vec![Reply::Status {
+        status: 200,
+        headers: Vec::new(),
+        body: "{}".into(),
+    }])
+    .await;
+    let workspace = Workspace::new("otel-error");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    harness.tracer = collector_tracer(&collector);
+    let mut state = AgentState::new();
+    let error = harness
+        .run_turn(&mut state, "look", |_| {})
+        .await
+        .unwrap_err();
+    drop(harness);
+
+    let spans = received_spans(&collector);
+    let names: Vec<&str> = spans.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["model_call", "turn"]);
+    for span in &spans {
+        assert_eq!(span["status"]["code"], 2);
+        assert_eq!(
+            span["status"]["message"],
+            format!("ProviderError: {error}").as_str()
+        );
+        assert_eq!(span["events"][0]["name"], "exception");
+        assert_eq!(
+            attribute(&span["events"][0], "exception.type")["stringValue"],
+            "ProviderError"
+        );
+    }
+    assert_eq!(
+        attribute(&spans[0], "agent86.completed")["boolValue"],
+        false
+    );
+    assert_eq!(
+        attribute(&spans[1], "agent86.phase")["stringValue"],
+        "error"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_collector_is_a_note_not_a_failure() {
+    let server = MockServer::start(vec![sse_text("Fine.", "stop")]).await;
+    let workspace = Workspace::new("otel-down");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    harness.tracer = Tracer::to(Destination::Otlp {
+        url: "http://127.0.0.1:9/v1/traces".into(),
+        headers: Vec::new(),
+        timeout: std::time::Duration::from_secs(2),
+    });
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "hi", |_| {}).await.unwrap();
+    assert_eq!(output, "Fine.");
+    let tracer = std::mem::take(&mut harness.tracer);
+    // The export happens on the worker; wait for its verdict.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tracer.note().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let note = tracer.note().unwrap_or_default();
+    assert!(
+        note.starts_with("otel: export to http://127.0.0.1:9/v1/traces failed"),
+        "{note}"
+    );
 }

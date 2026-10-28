@@ -435,7 +435,7 @@ fn otlp_id(parts: &[String], width: usize) -> String {
     digest[..width].to_owned()
 }
 
-fn otlp_value(value: &Value) -> Value {
+pub(crate) fn otlp_value(value: &Value) -> Value {
     match value {
         Value::Bool(flag) => json!({ "boolValue": flag }),
         Value::Number(number) if number.is_i64() || number.is_u64() => {
@@ -450,7 +450,7 @@ fn otlp_value(value: &Value) -> Value {
     }
 }
 
-fn otlp_attributes(attributes: &[(&str, Value)]) -> Value {
+pub(crate) fn otlp_attributes(attributes: &[(&str, Value)]) -> Value {
     Value::Array(
         attributes
             .iter()

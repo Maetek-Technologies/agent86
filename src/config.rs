@@ -68,6 +68,8 @@ max_steps = 8
 [observability]
 trace = true
 path = "~/.agent86/traces"
+otel = false
+otel_exporter = "otlp"
 redact = "secrets"
 max_field_chars = 2000
 max_trace_bytes = 50000000
@@ -340,13 +342,22 @@ fn default_mcp_max_result_chars() -> usize {
     8000
 }
 
-/// Flight-recorder settings (`[observability]`). OpenTelemetry export is not ported.
+/// Flight-recorder and OpenTelemetry settings (`[observability]`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ObservabilityConfig {
     /// Write the JSONL flight recorder.
     pub trace: bool,
     /// The trace directory; `~` expands.
     pub path: String,
+    /// Emit OpenTelemetry spans (`crate::otel`).
+    #[serde(default)]
+    pub otel: bool,
+    /// Where the spans go.
+    #[serde(default)]
+    pub otel_exporter: OtelExporter,
+    /// The collector, overriding `OTEL_EXPORTER_OTLP_ENDPOINT` when set.
+    #[serde(default)]
+    pub otel_endpoint: Option<String>,
     pub redact: RedactMode,
     /// Free-text fields are clipped to this many characters.
     pub max_field_chars: usize,
@@ -354,6 +365,19 @@ pub struct ObservabilityConfig {
     pub max_trace_bytes: u64,
     /// Rotated generations kept; `0` keeps no history.
     pub keep_traces: usize,
+}
+
+/// Where OpenTelemetry spans go (`[observability] otel_exporter`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtelExporter {
+    /// A collector over OTLP, honouring the standard `OTEL_*` variables.
+    #[default]
+    Otlp,
+    /// Printed to stderr, for local debugging.
+    Console,
+    /// Recorded, exported nowhere.
+    None,
 }
 
 /// What the recorder may write (`[observability] redact`).

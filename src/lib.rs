@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod memory;
 pub mod mentions;
 pub mod observability;
+pub mod otel;
 pub mod pricing;
 pub mod prompt;
 pub mod provider;

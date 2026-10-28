@@ -1995,3 +1995,59 @@ async fn triage_routing_sends_each_run_to_its_route() {
         .collect();
     assert_eq!(routes, [json!("small/model"), json!("large/model")]);
 }
+
+#[tokio::test]
+async fn otel_spans_reach_the_collector_or_the_console_when_enabled() {
+    let server = MockServer::start(vec![sse_text("Hi.", "stop"), sse_text("Hi.", "stop")]).await;
+    let collector = MockServer::start(vec![Reply::Status {
+        status: 200,
+        headers: Vec::new(),
+        body: "{}".into(),
+    }])
+    .await;
+    let workspace = Workspace::with_mock_provider("otel", &server);
+    workspace.append_project_config(&format!(
+        "\n[observability]\notel = true\notel_endpoint = \"{}\"\n",
+        collector.base_url
+    ));
+
+    // `run --json` stays one object on stdout; the spans are flushed before exit.
+    let output = workspace.run(&["run", "--json", "say hi"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let _: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let requests = collector.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].request_line.starts_with("POST /v1/traces "));
+    let names: Vec<&str> = requests[0].body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|span| span["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["model_call", "turn"]);
+
+    // The console exporter prints Python's SDK format to stderr, never stdout.
+    let exporter = |name: &str| {
+        format!(
+            "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n\n[observability]\notel = true\notel_exporter = \"{name}\"\n",
+            server.base_url
+        )
+    };
+    workspace.write_project_config(&exporter("console"));
+    let console = workspace.run(&["run", "--json", "say hi"]).await;
+    assert!(console.status.success(), "{}", stderr(&console));
+    let _: Value = serde_json::from_str(&stdout(&console)).unwrap();
+    let text = stderr(&console);
+    assert!(text.contains("    \"name\": \"turn\",\n"), "{text}");
+    assert!(text.contains("\"kind\": \"SpanKind.INTERNAL\""), "{text}");
+
+    // An unknown exporter is invalid config, as Python's enum rejects it.
+    workspace.write_project_config(&exporter("carrier-pigeon"));
+    let invalid = workspace.run(&["run", "x"]).await;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(
+        stderr(&invalid).starts_with("error: Invalid config:"),
+        "{}",
+        stderr(&invalid)
+    );
+}
