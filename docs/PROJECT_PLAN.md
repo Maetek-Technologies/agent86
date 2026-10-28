@@ -442,7 +442,7 @@ Contracts to preserve include:
 - Flight-recorder and export formats
 - Graceful degradation when optional capabilities are unavailable
 
-Recorded provider responses and differential tests should be introduced with the first provider. Existing Python tests should guide expected behavior wherever practical.
+Recorded provider responses were introduced with the first provider; parity is checked by fixtures generated from Python's sources and CPython rather than a differential harness (see the decision under Next actions). Existing Python tests should guide expected behavior wherever practical.
 
 The Rust runtime should be designed around explicit async ownership and cancellation rather than reproducing the Python mixture of threads and event loops literally.
 
@@ -479,6 +479,7 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] The remaining CLI commands (`models`, `config`, `skills`, `--sandbox`)
 - [x] Triage routing (`orchestration/router.py`): `[model] router = "triage"`, the cheap and frontier routes, the `route` trace event, compaction on the cheap model, and pinning on `/model`
 - [x] Live OpenTelemetry span export (`[observability] otel`)
-- [ ] The differential test harness against the Python implementation
+
+Decided (2026-10-28): no differential test harness that runs the Python implementation. Parity is pinned instead by per-feature fixtures produced from Python's own sources or CPython (`ast` extractions, CPython `re`, `difflib`, `ipaddress`, `json`, and `sum` outputs, sentence-transformers vectors, mirror scripts of the pydantic models and trace code) and by recorded provider streams. Running the reference implementation would mean executing third-party code on the development machine, and the fixtures already cover the contract. Revisit if a behavior turns out to have drifted in a way the fixtures did not catch.
 
 Parked (2026-10-28): output caps that depend on the model, such as a larger default for models known to think. `/limits` and the interface's offer to raise a limit cover the case without a table of thinking models to keep current, and it would change defaults Python users rely on. Revisit if the offer proves too frequent in practice.

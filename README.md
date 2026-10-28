@@ -67,7 +67,6 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Core provider-neutral vocabulary
 - [x] Recorded provider fixtures and mock-server tests
 - [x] OpenAI-compatible streaming provider
-- [ ] Differential test harness against the Python implementation
 - [x] Ollama streaming provider
 - [x] Anthropic and llama.cpp providers
 - [x] Text-only one-shot `run` and `run --json`
