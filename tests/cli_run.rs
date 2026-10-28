@@ -1891,9 +1891,15 @@ async fn models_and_config_list_providers_roles_and_where_config_is_read() {
         .join("home")
         .join(".agent86")
         .join("config.toml");
-    let project = workspace.project().join(".agent86").join("config.toml");
     assert_eq!(lines[1], format!("user     {} (exists)", user.display()));
-    assert_eq!(lines[2], format!("project  {} (exists)", project.display()));
+    // The project path is absolute from the working directory, which the OS reports
+    // with symlinks resolved (macOS's /var is /private/var), as Python's `resolve()`.
+    let project = Path::new("project").join(".agent86").join("config.toml");
+    assert!(lines[2].starts_with("project  "), "{path}");
+    assert!(
+        lines[2].ends_with(&format!("{} (exists)", project.display())),
+        "{path}"
+    );
 
     // `config show` is the resolved configuration as JSON, and `--sandbox`
     // overrides the mode as Python's global option does.
