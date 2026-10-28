@@ -103,7 +103,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     context.skills = Arc::clone(&skills);
 
     // MCP servers that fail to start contribute no tools; their notes say why.
-    let registry = default_registry(store.is_some(), !skills.is_empty());
+    let registry = default_registry(store.is_some(), !skills.is_empty(), config.agents.enabled);
     let mcp = McpManager::start(config).map(Arc::new);
     if let Some(manager) = &mcp {
         manager.attach(&registry);
@@ -115,6 +115,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         registry,
         context,
         limits: config.limits.clone(),
+        agents: config.agents.clone(),
         system: build_system_prompt(config, &skills),
         max_tokens,
         context_window,

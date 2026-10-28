@@ -1,0 +1,6 @@
+{
+ "DEFAULT_SUB_MAX_STEPS": 8,
+ "ROLE_PREAMBLE": "You are a '{role}' sub-agent operating inside a larger agent system. You were delegated a focused task by a supervising agent. Use tools as needed, complete the task precisely, and return ONLY the final result \u2014 no preamble.",
+ "DelegateTool": "Delegate a focused subtask to a fresh sub-agent with a given role (e.g. 'researcher', 'coder', 'reviewer'). The sub-agent runs to completion and returns its result. Use for well-scoped subtasks you want handled independently.",
+ "UseSkillTool": "Load the full instructions for a named skill. Call this when a skill from the 'Available skills' list applies to the task, then follow the returned instructions."
+}

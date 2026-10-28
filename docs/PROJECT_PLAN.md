@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills done, delegation (`delegate` and sub-agents) next
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done
 
 ## 1. Purpose
 
@@ -102,6 +102,13 @@ The Python implementation remains the reference and compatibility oracle. This p
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
 - Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
+- Added delegation, ported from `tools/builtin/delegate.py`, `agents/subagent.py`, and the harness's `spawn_subagent` and sub-agent usage accounting in `orchestration/loop.py`:
+  - `delegate` (on by default, `[agents] enabled`; Python's schema; read-only, and never in a parallel batch, as Python's `parallel_safe = False`) runs a role-scoped sub-agent and returns its answer as the tool result
+  - the sub-agent gets Python's persona (`You are a '<role>' sub-agent ...`) over the parent's system content, the task as its only message, the same tools, approval gate, guardrails, and recorder, its own skill state, and its own step budget (`[agents] max_steps`, 8, never above `[limits] max_steps`); its requests are fitted to the window like the parent's
+  - depth is bounded by `[agents] max_depth` (2): at the limit `delegate` is not offered, and a call beyond it gets `[delegation refused: max agent depth N reached]`; a tripped budget answers `[sub-agent '<role>' halted: ...]`, a failed model call fails the delegate call as `ProviderError: ...`, and invalid arguments get pydantic's message
+  - what a sub-agent spends (and anything it delegated) is added to the delegating step, the turn summary, the session usage, and the cost cap, without counting as the parent's steps
+  - Python's trace events: `spawn` (session `sub`), and per sub-agent (`sub:<role>`) `model_call` with `agent` and `depth`, `tool_call` with `depth`, observation `guardrail`, and `subagent_done`
+  - live check (2026-10-27, local Ollama, `gemma4:12b`, throwaway workspace and home): asked to delegate a review, the model called `delegate` with role `reviewer`; the sub-agent listed and read the files in four steps, and the parent summarized its report
 - Added skills, ported from `skills/` (the loader and `Skill`), `tools/builtin/skills_tool.py`, the skills section of `cognitive/prompt.py`, the `allowed-tools` enforcement in `tools/registry.py` and `tools/base.py`, the skill roots in `tools/sandbox/policy.py`, and `/skills`:
   - discovery from `<workspace>/.agent86/skills`, `<workspace>/.claude/skills`, `~/.agent86/skills`, `~/.claude/skills`, then `[skills] paths`, each root's folders in Python's sorted order (case-insensitive on Windows), the first root winning a name; `[skills] enabled = false` finds none
   - `SKILL.md` frontmatter read with Python's built-in parser (`key: value`, quotes, inline and block lists, `>`/`|` block scalars with indicators, comments), the closing `---` only on its own line, a missing `name` taken from the folder, and `allowed-tools` in any spelling (spaces, commas, an inline or block list)
@@ -148,7 +155,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **421 passed on Windows** (187 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **427 passed on Windows** (187 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 6 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -170,7 +177,7 @@ The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory]`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
-- Delegation: the `delegate` tool and sub-agents (`[agents]` is read but unused)
+- Python's programmatic `SupervisorOrchestrator` (`fan_out` over a `MessageBus`); nothing in the CLI or the interfaces reaches it
 - OpenTelemetry span export (`[observability] otel`)
 
 ### Known `run` differences from Python
@@ -239,7 +246,8 @@ The agent works end to end, but it does not yet have:
 
 ### Known loop differences from Python
 
-- Python also offers the `delegate` tool (on by default), so the tool list in each request differs.
+- A deliberate fix: a sub-agent whose final reply stops at the output cap continues, as the main loop's answer does (up to 3 times, each a step of its budget, with a `continuation` event), and the pieces are joined; one that reaches the cap before any text (a thinking model can spend all of it reasoning) answers `[sub-agent '<role>' wrote no answer: ...]`, and an empty answer `[sub-agent '<role>' returned no text]`. Python returns the last reply as it is, so the parent gets a truncated or empty result it cannot tell from a real one.
+- A sub-agent's requests are fitted to a budget computed from the parent's system message and tools; Python reuses the budget of the parent's last request, which also counted that request's recall note.
 - Compaction summaries are written by the current model. Python uses triage routing's cheap model when routing is on, which is not ported (it is off by default).
 - The window is looked up when the model is set (at start and on `/model`), not before every request; a `[model.context_window]` change written by `/config` applies from the next `/model`.
 - After a compaction mid-turn, the turn's start and a continuation in progress are re-indexed into the shorter history. Python keeps the old indices, which then point past where they should (a deliberate fix).
@@ -303,7 +311,7 @@ The agent works end to end, but it does not yet have:
 
 - `trace show` prints a plain aligned table with the same columns as Python's Rich table.
 - Live OpenTelemetry export (`[observability] otel`) is not ported; `trace export -f otlp-json` covers the offline case.
-- Events for subsystems that are not ported (`route`, sub-agent `spawn`, and `cancelled` turns) are never written.
+- Events for subsystems that are not ported (`route`, and `cancelled` turns) are never written.
 
 ### Known tool differences from Python
 

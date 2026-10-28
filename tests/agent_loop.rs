@@ -6,7 +6,8 @@ mod support;
 use agent86::agent::{CancelToken, Harness, HarnessError, TurnEvent, CONTINUE_PROMPT};
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
 use agent86::config::{
-    CompactionMode, EgressMode, IngressMode, LimitsConfig, ObservabilityConfig, RedactMode,
+    AgentsConfig, CompactionMode, EgressMode, IngressMode, LimitsConfig, ObservabilityConfig,
+    RedactMode,
 };
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
 use agent86::observability::Recorder;
@@ -53,6 +54,14 @@ fn limits() -> LimitsConfig {
         compaction: CompactionMode::Summarize,
         parallel_tools: true,
         tool_timeout_s: 60,
+    }
+}
+
+fn agents() -> AgentsConfig {
+    AgentsConfig {
+        enabled: true,
+        max_depth: 2,
+        max_steps: 8,
     }
 }
 
@@ -134,6 +143,7 @@ async fn run_with(
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits,
+        agents: agents(),
         system: system(),
         max_tokens: 1024,
         context_window: 128_000,
@@ -273,6 +283,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
+        agents: agents(),
         system: system(),
         max_tokens: 1024,
         context_window: 128_000,
@@ -709,6 +720,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
+        agents: agents(),
         system: system(),
         max_tokens: 1024,
         context_window: 128_000,
@@ -802,6 +814,7 @@ async fn recorded_turn(
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
+        agents: agents(),
         system: system(),
         max_tokens: 1024,
         context_window: 128_000,
@@ -917,6 +930,7 @@ fn cancellable(
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
+        agents: agents(),
         system: system(),
         max_tokens: 1024,
         context_window: 128_000,

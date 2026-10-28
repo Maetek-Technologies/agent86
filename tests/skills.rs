@@ -181,7 +181,7 @@ fn use_skill_loads_the_instructions_and_restricts_tools_for_the_turn() {
     std::fs::write(dir.workspace().join("notes.txt"), "hello").unwrap();
     let config = dir.config("");
     let skills = dir.discover(&config);
-    let registry = default_registry(false, true);
+    let registry = default_registry(false, true, false);
     assert!(registry.names().contains(&"use_skill".to_owned()));
     let ctx = context(&dir, skills);
 
@@ -244,11 +244,11 @@ fn use_skill_loads_the_instructions_and_restricts_tools_for_the_turn() {
 
 #[test]
 fn use_skill_is_registered_only_when_a_skill_exists() {
-    assert!(!default_registry(false, false)
+    assert!(!default_registry(false, false, false)
         .names()
         .contains(&"use_skill".to_owned()));
     let schema: Value = serde_json::from_str(&support::fixture("skills/schemas.json")).unwrap();
-    let spec = default_registry(false, true)
+    let spec = default_registry(false, true, false)
         .specs()
         .into_iter()
         .find(|spec| spec.name == "use_skill")

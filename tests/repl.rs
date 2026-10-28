@@ -317,7 +317,7 @@ async fn tools_model_and_config_commands_report_the_session() {
 
     assert!(
         text.contains(
-            "agent86> tools: edit_file, list_dir, python_exec, read_file, recall, remember, run_command, web_fetch, write_file\n"
+            "agent86> tools: delegate, edit_file, list_dir, python_exec, read_file, recall, remember, run_command, web_fetch, write_file\n"
         ),
         "{text}"
     );
