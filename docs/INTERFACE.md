@@ -56,7 +56,7 @@ The region's height varies with what it holds: it grows for menus and panels and
 
 ```
 ╭─ agent86 ──────────────────────────╮        ┐
-│ version  0.1.0                     │        │
+│ version  1.0.0                     │        │
 │ model    openrouter:openai/gpt-4o  │        │
 ╰────────────────────────────────────╯        │
 memory: …   (startup notes, dim)              │  scrollback
