@@ -4,7 +4,7 @@
 
 mod support;
 
-use agent86::agent::Harness;
+use agent86::agent::{Harness, CONTINUE_PROMPT};
 use agent86::approval::ApprovalGate;
 use agent86::config::{
     AgentsConfig, CompactionMode, EgressMode, IngressMode, LimitsConfig, ObservabilityConfig,
@@ -223,6 +223,59 @@ async fn a_delegated_task_runs_on_a_sub_agent_whose_answer_is_the_result() {
     assert!(parent.iter().any(|event| event["kind"] == "tool_call"
         && event["tool"] == "delegate"
         && event["ok"] == true));
+}
+
+#[tokio::test]
+async fn a_sub_agent_answer_cut_off_at_the_output_cap_continues_or_says_so() {
+    // A deliberate fix (Python returns the cut-off text as it is): a partial answer
+    // continues as the main loop's does, and the pieces are joined.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "review"}"#)]),
+        sse_text("Part one, ", "length"),
+        sse_text("part two.", "stop"),
+        sse_text("Reviewed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("continue");
+    let harness = harness(&server, &workspace, agents(2, 8));
+    let mut state = AgentState::new();
+    harness
+        .run_turn(&mut state, "review", |_| {})
+        .await
+        .unwrap();
+    let requests = server.requests();
+    let sub = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(sub[sub.len() - 2]["content"], "Part one, ");
+    assert_eq!(sub[sub.len() - 1]["content"], CONTINUE_PROMPT);
+    assert_eq!(last_tool_result(&requests[3]), "Part one, part two.");
+    let kinds: Vec<String> = workspace
+        .events("sub:reviewer")
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["model_call", "continuation", "model_call", "subagent_done"]
+    );
+
+    // A thinking model can spend the whole cap before writing any text: there is
+    // nothing to continue, and the parent is told why the answer is missing.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "review"}"#)]),
+        sse_text("", "length"),
+        sse_text("No report.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("cut-off");
+    let mut state = AgentState::new();
+    self::harness(&server, &workspace, agents(2, 8))
+        .run_turn(&mut state, "review", |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        last_tool_result(&server.requests()[2]),
+        "[sub-agent 'reviewer' wrote no answer: its last reply reached the output limit (5 tokens) before any text. Raise [limits] max_output_tokens or delegate a smaller task.]"
+    );
 }
 
 #[tokio::test]

@@ -155,7 +155,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **426 passed on Windows** (187 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 5 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **427 passed on Windows** (187 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 6 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -246,6 +246,7 @@ The agent works end to end, but it does not yet have:
 
 ### Known loop differences from Python
 
+- A deliberate fix: a sub-agent whose final reply stops at the output cap continues, as the main loop's answer does (up to 3 times, each a step of its budget, with a `continuation` event), and the pieces are joined; one that reaches the cap before any text (a thinking model can spend all of it reasoning) answers `[sub-agent '<role>' wrote no answer: ...]`, and an empty answer `[sub-agent '<role>' returned no text]`. Python returns the last reply as it is, so the parent gets a truncated or empty result it cannot tell from a real one.
 - A sub-agent's requests are fitted to a budget computed from the parent's system message and tools; Python reuses the budget of the parent's last request, which also counted that request's recall note.
 - Compaction summaries are written by the current model. Python uses triage routing's cheap model when routing is on, which is not ported (it is off by default).
 - The window is looked up when the model is set (at start and on `/model`), not before every request; a `[model.context_window]` change written by `/config` applies from the next `/model`.

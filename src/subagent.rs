@@ -10,7 +10,10 @@
 //! includes what it spent. Depth is tracked so delegation cannot recurse without
 //! bound.
 
-use crate::agent::{invalid_arguments_result, observation, CircuitBreaker, Harness, HarnessError};
+use crate::agent::{
+    invalid_arguments_result, observation, CircuitBreaker, Harness, HarnessError, CONTINUE_PROMPT,
+    MAX_CONTINUATIONS,
+};
 use crate::memory::working::fit;
 use crate::provider::ProviderError;
 use crate::tools::delegate::{self, NAME as DELEGATE};
@@ -128,6 +131,9 @@ impl Harness {
         let ctx = self.context.fork();
         let mut spent = Usage::default();
         let mut delegated = Usage::default();
+        // The pieces of an answer cut off at the output cap, and how often it was.
+        let mut parts: Vec<String> = Vec::new();
+        let mut continuations = 0;
         let halted = |error: HarnessError| match error {
             HarnessError::CircuitTripped(detail) => {
                 format!("[sub-agent '{role}' halted: {detail}]")
@@ -188,6 +194,42 @@ impl Harness {
             });
 
             if completion.tool_calls.is_empty() {
+                // A deliberate fix: Python returns whatever the last call wrote, so an
+                // answer cut off at the output cap reaches the parent truncated, or
+                // empty when a thinking model spent the whole cap reasoning. A partial
+                // answer continues as the main loop's does; a cap reached before any
+                // text is reported, so the parent can tell it from an empty answer.
+                let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
+                let has_text = !completion.text.trim().is_empty();
+                if cut_off && has_text && continuations < MAX_CONTINUATIONS {
+                    continuations += 1;
+                    parts.push(completion.text);
+                    messages.push(message(Role::User, CONTINUE_PROMPT.to_owned()));
+                    self.recorder.event(
+                        &sid,
+                        "continuation",
+                        vec![
+                            ("agent", json!(role)),
+                            ("depth", json!(depth)),
+                            ("index", json!(continuations)),
+                            ("step", json!(breaker.steps())),
+                            ("model", json!(self.provider.model())),
+                        ],
+                    );
+                    continue;
+                }
+                parts.push(completion.text);
+                let mut answer = parts.concat();
+                if answer.trim().is_empty() {
+                    answer = if cut_off {
+                        format!(
+                            "[sub-agent '{role}' wrote no answer: its last reply reached the output limit ({} tokens) before any text. Raise [limits] max_output_tokens or delegate a smaller task.]",
+                            completion.usage.output_tokens
+                        )
+                    } else {
+                        format!("[sub-agent '{role}' returned no text]")
+                    };
+                }
                 self.recorder.event(
                     &sid,
                     "subagent_done",
@@ -198,7 +240,7 @@ impl Harness {
                         ("cost_usd", json!(spent.cost_usd)),
                     ],
                 );
-                return Ok((completion.text, spent + delegated));
+                return Ok((answer, spent + delegated));
             }
 
             for call in &completion.tool_calls {
