@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-28  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done; turn limits adjustable at runtime (`/limits`, `run` flags, and the interface's offer to raise a limit), a deliberate addition beyond Python
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done; turn limits adjustable at runtime (`/limits`, `run` flags, and the interface's offer to raise a limit), a deliberate addition beyond Python; the remaining CLI commands (`models`, `config`, `skills`, `--sandbox`) done
 
 ## 1. Purpose
 
@@ -109,6 +109,7 @@ The Python implementation remains the reference and compatibility oracle. This p
   - what a sub-agent spends (and anything it delegated) is added to the delegating step, the turn summary, the session usage, and the cost cap, without counting as the parent's steps
   - Python's trace events: `spawn` (session `sub`), and per sub-agent (`sub:<role>`) `model_call` with `agent` and `depth`, `tool_call` with `depth`, observation `guardrail`, and `subagent_done`
   - live check (2026-10-27, local Ollama, `gemma4:12b`, throwaway workspace and home): asked to delegate a review, the model called `delegate` with role `reviewer`; the sub-agent listed and read the files in four steps, and the parent summarized its report
+- Added the remaining CLI commands, ported from `cli.py`: `agent86 models` and a bare `agent86 config` (Python's `_list_models`: the providers with each key's source, never the key, the keyring line, then the model roles and whether each ref parses), `agent86 config path` (each layer's absolute path and whether it exists), `agent86 config show` (the resolved configuration as JSON), `agent86 skills list` (the skills table, or `No skills found. Searched: ...`), `agent86 skills show <name>` (the instructions and bundled resources, or Python's error naming the known skills, exit 1), and the global `--sandbox`, which overrides `AGENT86_SANDBOX` and `[sandbox] mode`. The hints that name these commands now use Python's wording: the model-error hint (`run` and the REPL's `Cannot start:`), the malformed-config hint, `Memory is disabled in config.`, the memory database error, and `mcp list`'s empty hint
 - Added turn limits at runtime, a deliberate addition (Python reads `[limits] max_steps`, `[limits] max_output_tokens`, the provider's `max_tokens`, and `[agents] max_steps` only from config, and offers no way to change them while it runs). It came out of a delegated review on a thinking model whose sub-agents spent their whole 8192-token output cap reasoning:
   - three limits can be overridden for the rest of the process: `steps` (the turn's step budget), `agent_steps` (each sub-agent's, still never above `steps`), and `output` (the output cap of every model call). The `output` override replaces whichever setting Python's `max_output_tokens_for` picks (the provider's `max_tokens`, else `[limits] max_output_tokens`), so it always takes effect; overrides survive `/model`, `/clear`, and `/resume`
   - `/limits` (both surfaces) shows each limit with the setting it comes from, `/limits <steps|agent_steps|output> <n>` overrides one, and `/limits reset` drops the overrides. In the interface, `/limits save` shows the diff in the save panel and writes each override to the setting it replaces (the provider's `max_tokens` when that section sets one), comments kept; the plain loop points at the interface
@@ -161,7 +162,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **445 passed on Windows** (197 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 45 CLI end-to-end, 13 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 9 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 28 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **448 passed on Windows** (197 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 48 CLI end-to-end, 13 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 9 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 28 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -190,12 +191,11 @@ The agent works end to end, but it does not yet have:
 
 - The system prompt is the identity, the environment line, the skills section, the MCP section when servers are live, and the turn's episodic recall note, as in Python.
 - The environment line reports the Rust crate version (`agent86 v0.1.0`), not Python's (`v1.0.0`).
-- `--sandbox` is not accepted (`AGENT86_SANDBOX` and `[sandbox] mode` are).
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
 - `agent86 keys` has no Python CLI equivalent; Python stores keys only from its interactive `/config model` screen (which the interface here also has). Re-saving an account on Windows does not leave Python's stale `<account>@agent86` copy of the old key behind.
 - The missing-key error names the keyring entry to create (service `agent86`, account `<provider>`) instead of pointing at `/config model`.
 - Reading keys that Python stored is verified on Windows against the `keyring` package's source, and live on 2026-10-26: a key saved with Python's `keyring set agent86 openrouter` was read by Rust and accepted by OpenRouter. On macOS and Linux the attribute layouts match by inspection but have not been tested against entries Python wrote. `tests/os_keyring.rs` is an opt-in check for any platform.
-- The model-error hint suggests `--model` and an API key instead of the `agent86 models` command, which is not ported. The malformed-config hint does not mention `agent86 config path` for the same reason.
+- `agent86 models`, `agent86 config`, `config path`, and `skills list` print plain aligned tables with Python's columns (Rich tables in Python), and `models` always reports the OS keyring as available. `config show` prints the merged config layers as JSON (built-in defaults for the modelled sections, the files, and the overrides), not Python's full pydantic dump with every default, as `/config` does.
 - Rich wraps stderr at 80 columns when it is not a terminal; Rust does not wrap. stdout, including `--json` output (2-space indent, non-ASCII unescaped), is unaffected.
 
 ### Known REPL differences from Python
@@ -302,7 +302,7 @@ The agent works end to end, but it does not yet have:
 - Scores follow Python 3.12's `sum`; under Python 3.11 (which the reference still supports) the last bit can differ.
 - A `recall` `k` written as an integer literal beyond 64 bits arrives as a float and is refused as too large; pydantic accepts any integer and the clamp makes it 20.
 - The `memory` commands print plain aligned text instead of Rich tables, and stored text is printed as is; Rich would interpret markup in it.
-- `Memory is disabled in config.` does not mention `agent86 config path`, which is not ported. A negative `memory search -k` is a usage error; Python slices from the end.
+- A negative `memory search -k` is a usage error; Python slices from the end.
 
 ### Known MCP differences from Python
 
@@ -312,7 +312,7 @@ The agent works end to end, but it does not yet have:
 - `notifications/message` (server logging) is ignored; Python sends it to its logger, which `run` does not show. Live notes (progress, resource updates, list changes) are recorded for a future REPL, and `run` prints none, as in Python.
 - The `initialize` request names the client `agent86` with the crate version; the Python SDK sends its own client info.
 - On Windows a bare `command` is looked up on PATH with `PATHEXT`, so `npx` finds `npx.cmd`, as the Python SDK does.
-- `mcp list` and `mcp tools` print plain aligned tables with the same columns as Python's Rich tables, and the no-servers hint names "your config file" rather than `agent86 config path`, which is not ported.
+- `mcp list` and `mcp tools` print plain aligned tables with the same columns as Python's Rich tables.
 
 ### Known flight-recorder differences from Python
 
@@ -473,3 +473,9 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] Validate locally without credentials
 - [x] Perform an optional live OpenRouter smoke test (2026-10-26, `openrouter:openai/gpt-4o-mini`)
 - [x] Upload the CI workflow
+- [x] The remaining CLI commands (`models`, `config`, `skills`, `--sandbox`)
+- [ ] Triage routing (`orchestration/router.py`): `[model] router = "triage"`, the cheap and frontier routes, the `route` trace event, compaction on the cheap model, and pinning on `/model`
+- [ ] Live OpenTelemetry span export (`[observability] otel`)
+- [ ] The differential test harness against the Python implementation
+
+Parked (2026-10-28): output caps that depend on the model, such as a larger default for models known to think. `/limits` and the interface's offer to raise a limit cover the case without a table of thinking models to keep current, and it would change defaults Python users rely on. Revisit if the offer proves too frequent in practice.

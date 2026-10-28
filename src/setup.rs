@@ -24,11 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// What to do next when a model cannot be built: a bad ref, an unknown provider, a missing key.
-///
-/// Python points at `agent86 models`, which is not ported yet.
-pub const MODEL_HELP: &str = "Pick an OpenAI-compatible provider with `--model provider:model` \
-                              (e.g. `openrouter:openai/gpt-4o-mini`) and set its API key environment variable \
-                              or store the key in the OS keyring.";
+pub const MODEL_HELP: &str = "Run `agent86 models` to see the configured providers and which \
+                              of them has a key, then pick one with `--model provider:model`.";
+
+/// The plain loop's version, when the session cannot start, as Python's `run_repl`.
+pub const REPL_MODEL_HELP: &str = "`agent86 models` lists the configured providers and which \
+                                   of them has a key; `agent86 --model provider:model` picks \
+                                   another. Then retry.";
 
 /// The provider for a `provider:model` ref, with the parsed ref.
 pub fn build_provider(

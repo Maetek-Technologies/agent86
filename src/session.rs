@@ -164,8 +164,9 @@ impl SessionStore {
             .map_err(|error| {
                 StoreError(format!(
                     "Could not open the memory database at {} - {error}. Another agent86 may be \
-                 using it (close it and retry), or point `[memory] path` at another file. \
-                 `[memory] enabled = false` turns memory off entirely.",
+                 using it (close it and retry), or point `[memory] path` at another file - \
+                 `agent86 config path` shows which file to edit. `[memory] enabled = false` \
+                 turns memory off entirely.",
                     path.display()
                 ))
             })

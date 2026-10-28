@@ -20,7 +20,7 @@ use crate::mentions::expand_mentions;
 use crate::pricing::{format_cost, PriceTable, UNPRICED_LABEL};
 use crate::secrets::{SecretStore, SERVICE_NAME};
 use crate::session::{AgentState, SessionInfo, SessionStore};
-use crate::setup::{assemble, build_provider, SetupError, MODEL_HELP};
+use crate::setup::{assemble, build_provider, SetupError, REPL_MODEL_HELP};
 use crate::turn::format_turn_summary;
 use crate::types::{ApprovalMode, ModelRef};
 use std::io::{BufRead, IsTerminal, Write};
@@ -548,6 +548,30 @@ fn key_source(name: &str, api_key_env: Option<&str>, secrets: &dyn SecretStore) 
 
 /// `/models`: the providers and where their keys come from, then the model roles.
 pub fn models_tables(config: &Config, secrets: &dyn SecretStore) -> Text {
+    let mut text = providers_table(config, secrets);
+    text.push(Style::Plain, "\n");
+    text.append(roles_table(config));
+    text.append(keyring_line());
+    text
+}
+
+/// `agent86 models` and a bare `agent86 config`, as Python's `_list_models`, which
+/// puts the keyring line between the two tables.
+pub fn cli_models_tables(config: &Config, secrets: &dyn SecretStore) -> Text {
+    let mut text = providers_table(config, secrets);
+    text.append(keyring_line());
+    text.push(Style::Plain, "\n");
+    text.append(roles_table(config));
+    text
+}
+
+fn keyring_line() -> Text {
+    let mut text = Text::plain("\nOS keyring: ");
+    text.push(Style::Green, "available");
+    text
+}
+
+fn providers_table(config: &Config, secrets: &dyn SecretStore) -> Text {
     let dash = || (Style::Dim, "-".to_owned());
     let providers: Vec<Vec<(Style, String)>> = config
         .providers
@@ -567,6 +591,14 @@ pub fn models_tables(config: &Config, secrets: &dyn SecretStore) -> Text {
             ]
         })
         .collect();
+    table(
+        "Providers",
+        &["Provider", "Base URL", "API key env", "Key"],
+        &providers,
+    )
+}
+
+fn roles_table(config: &Config) -> Text {
     let roles: Vec<Vec<(Style, String)>> = [
         ("default", &config.model.default),
         ("route.cheap", &config.model.route.cheap),
@@ -586,16 +618,14 @@ pub fn models_tables(config: &Config, secrets: &dyn SecretStore) -> Text {
         ]
     })
     .collect();
-    let mut text = table(
-        "Providers",
-        &["Provider", "Base URL", "API key env", "Key"],
-        &providers,
-    );
-    text.push(Style::Plain, "\n");
-    text.append(table("Model roles", &["Role", "Model", "Valid"], &roles));
-    text.push(Style::Plain, "\nOS keyring: ");
-    text.push(Style::Green, "available");
-    text
+    table("Model roles", &["Role", "Model", "Valid"], &roles)
+}
+
+/// The merged config layers as indented JSON, for `/config` and `agent86 config show`.
+pub fn config_json(config: &Config) -> String {
+    serde_json::to_value(&config.table)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|error| format!("could not render the configuration: {error}"))
 }
 
 /// `when` (seconds since the epoch) as a coarse "how long ago", as Python's `relative_time`.
@@ -888,9 +918,7 @@ impl Repl {
     }
 
     fn config_render(&self) -> String {
-        serde_json::to_value(&self.config.table)
-            .and_then(|value| serde_json::to_string_pretty(&value))
-            .unwrap_or_else(|error| format!("could not render the configuration: {error}"))
+        config_json(&self.config)
     }
 
     fn set_model(&mut self, arg: &str) -> String {
@@ -1344,7 +1372,7 @@ pub fn start_repl(
             let mut text = Text::styled(Style::Red, "Cannot start:");
             text.push(Style::Plain, format!(" {message}"));
             console.print(&text);
-            console.line(Style::Dim, MODEL_HELP);
+            console.line(Style::Dim, REPL_MODEL_HELP);
             None
         }
     }
