@@ -8,6 +8,7 @@
 
 pub mod exec;
 pub mod files;
+pub mod memory;
 pub mod sandbox;
 pub mod web;
 
@@ -244,6 +245,39 @@ impl<'a> Arguments<'a> {
         }
     }
 
+    /// An `int` field with pydantic's lax parsing: integers, whole floats, booleans
+    /// (as 0 and 1), and strings of digits (with a sign, single underscores between
+    /// digits, surrounding whitespace, and a `.0` tail). Out-of-range values saturate.
+    pub fn integer(&mut self, field: &str, default: i64) -> i64 {
+        const PLAIN: &str = "Input should be a valid integer";
+        const UNPARSABLE: &str =
+            "Input should be a valid integer, unable to parse string as an integer";
+        let parsed = match self.args.get(field) {
+            None => return default,
+            Some(Value::Bool(flag)) => Ok(i64::from(*flag)),
+            Some(Value::Number(number)) => match (number.as_i64(), number.as_u64()) {
+                (Some(value), _) => Ok(value),
+                (None, Some(_)) => Ok(i64::MAX),
+                (None, None) => {
+                    let value = number.as_f64().unwrap_or(f64::NAN);
+                    if value.fract() != 0.0 {
+                        Err("Input should be a valid integer, got a number with a fractional part")
+                    } else if value.abs() > i64::MAX as f64 {
+                        Err("Unable to parse input string as an integer, exceeded maximum size")
+                    } else {
+                        Ok(value as i64)
+                    }
+                }
+            },
+            Some(Value::String(text)) => parse_python_int(text).ok_or(UNPARSABLE),
+            Some(_) => Err(PLAIN),
+        };
+        parsed.unwrap_or_else(|message| {
+            self.errors.push(format!("{field}: {message}"));
+            default
+        })
+    }
+
     /// A required `Literal[...]` string field.
     pub fn choice(&mut self, field: &str, choices: &[&str]) -> String {
         match self.args.get(field) {
@@ -276,6 +310,42 @@ impl<'a> Arguments<'a> {
             Err(ToolError::InvalidArguments(self.errors))
         }
     }
+}
+
+/// A string pydantic's lax mode accepts as an `int`, saturating out of range.
+fn parse_python_int(text: &str) -> Option<i64> {
+    let text = text.trim();
+    // A whole number written with a zero fraction ("7.0", "7.00") counts.
+    let text = match text.split_once('.') {
+        Some((whole, zeros)) if !zeros.is_empty() && zeros.bytes().all(|b| b == b'0') => whole,
+        Some(_) => return None,
+        None => text,
+    };
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    // Digits with single underscores between them, as Python's `int()`.
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+        || !digits.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for digit in digits.bytes().filter(u8::is_ascii_digit) {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(digit - b'0'));
+    }
+    Some(if negative {
+        value.saturating_neg()
+    } else {
+        value
+    })
 }
 
 /// Constraints applied to every tool execution.
@@ -411,6 +481,8 @@ pub struct ToolContext {
     pub executor: Executor,
     /// `web_fetch` settings.
     pub web: web::WebSettings,
+    /// Long-term memory for `remember` and `recall`; `None` when memory is off.
+    pub memory: Option<crate::session::SessionStore>,
 }
 
 impl ToolContext {
@@ -420,6 +492,7 @@ impl ToolContext {
             policy: SandboxPolicy::new(workspace)?,
             executor: Executor::Subprocess,
             web: web::WebSettings::default(),
+            memory: None,
         })
     }
 }
@@ -558,6 +631,23 @@ impl ToolRegistry {
 
 fn same_tool(a: &Arc<dyn Tool>, b: &Arc<dyn Tool>) -> bool {
     std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
+}
+
+/// Python's built-in tools, plus `remember` and `recall` when memory is on, in
+/// its registration order (`default_registry`).
+pub fn default_registry(with_memory: bool) -> ToolRegistry {
+    let registry = builtin_registry();
+    if with_memory {
+        for tool in [
+            Box::new(memory::RememberTool) as Box<dyn Tool>,
+            Box::new(memory::RecallTool),
+        ] {
+            registry
+                .register(tool)
+                .expect("memory tool names are unique");
+        }
+    }
+    registry
 }
 
 /// Python's built-in tools, in its registration order.

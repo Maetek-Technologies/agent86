@@ -3,17 +3,17 @@
 //! half of `memory/store.py`.
 //!
 //! The database file, schema, and `state_json` layout are Python's, so a session
-//! started by either implementation can be resumed by the other. The `episodes`
-//! and `memories` tables are created too, for compatibility, but are not used
-//! yet: episodic recall and semantic memory need embeddings, which are not ported.
+//! started by either implementation can be resumed by the other. The same store
+//! holds episodes and semantic facts; their half is in [`crate::memory`].
 
+use crate::memory::embeddings::{Embedder, HashingEmbedder};
 use crate::turn::{new_session_id, TurnSummary};
 use crate::types::{AgentPhase, Message, Role, Step, Usage};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Longest a derived session title may be, including the ellipsis.
@@ -112,14 +112,36 @@ pub fn session_title(state: &AgentState) -> Option<String> {
 #[error("{0}")]
 pub struct StoreError(pub String);
 
-/// Sessions in Python's memory database.
+/// Python's memory database: sessions here, episodes and facts in [`crate::memory`].
+///
+/// Clones share one connection, so the CLI, the harness, and the memory tools
+/// all use the same store. Access is serialized by its lock, as Python's store is
+/// only ever used from one thread at a time.
+#[derive(Clone)]
 pub struct SessionStore {
-    connection: Connection,
+    connection: Arc<Mutex<Connection>>,
+    pub(crate) embedder: Arc<dyn Embedder>,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for SessionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStore")
+            .field("path", &self.path)
+            .field("embedder", &self.embedder.spec())
+            .finish()
+    }
 }
 
 impl SessionStore {
-    /// Open (creating if needed) the database at `path`, or `:memory:`.
+    /// Open (creating if needed) the database at `path`, or `:memory:`, embedding
+    /// with the default `hash:256`.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with(path, Arc::new(HashingEmbedder::default()))
+    }
+
+    /// [`SessionStore::open`] with the embedder episodes and facts are indexed by.
+    pub fn open_with(path: &Path, embedder: Arc<dyn Embedder>) -> Result<Self, StoreError> {
         let opened = (|| -> Result<Connection, Box<dyn std::error::Error>> {
             if path != Path::new(":memory:") {
                 if let Some(parent) = path
@@ -134,7 +156,11 @@ impl SessionStore {
             Ok(connection)
         })();
         opened
-            .map(|connection| Self { connection })
+            .map(|connection| Self {
+                connection: Arc::new(Mutex::new(connection)),
+                embedder,
+                path: path.to_owned(),
+            })
             .map_err(|error| {
                 StoreError(format!(
                     "Could not open the memory database at {} - {error}. Another agent86 may be \
@@ -145,12 +171,29 @@ impl SessionStore {
             })
     }
 
+    /// The database file, as Python's `MemoryStore.path`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The embedder's spec, e.g. `hash:256`.
+    pub fn embedder_spec(&self) -> String {
+        self.embedder.spec()
+    }
+
+    /// The connection; a panic while it was held cannot leave SQLite inconsistent.
+    pub(crate) fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Upsert a session's state. `title = None` leaves any stored name alone.
     pub fn save(&self, state: &AgentState, title: Option<&str>) -> Result<(), StoreError> {
         let state_json =
             serde_json::to_string(state).map_err(|error| StoreError(error.to_string()))?;
         let now = now();
-        self.connection
+        self.connection()
             .execute(
                 "INSERT INTO sessions (session_id, created_at, updated_at, title, state_json)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -167,7 +210,7 @@ impl SessionStore {
     /// The stored state for `session_id`, if there is one that parses.
     pub fn load(&self, session_id: &str) -> Result<Option<AgentState>, StoreError> {
         let raw: Option<String> = self
-            .connection
+            .connection()
             .query_row(
                 "SELECT state_json FROM sessions WHERE session_id = ?1",
                 params![session_id],
@@ -185,7 +228,7 @@ impl SessionStore {
 
     /// The stored title for one session, or `None` (including for an unknown session).
     pub fn title(&self, session_id: &str) -> Result<Option<String>, StoreError> {
-        self.connection
+        self.connection()
             .query_row(
                 "SELECT title FROM sessions WHERE session_id = ?1",
                 params![session_id],
@@ -210,8 +253,8 @@ impl SessionStore {
     /// Recent sessions, newest first, as Python's `MemoryStore.recent_sessions`.
     pub fn recent_sessions(&self, limit: usize) -> Result<Vec<SessionInfo>, StoreError> {
         let error = |error: rusqlite::Error| StoreError(error.to_string());
-        let mut statement = self
-            .connection
+        let connection = self.connection();
+        let mut statement = connection
             .prepare(
                 "SELECT session_id, updated_at, title FROM sessions \
                  ORDER BY updated_at DESC LIMIT ?1",
@@ -232,7 +275,7 @@ impl SessionStore {
     /// Row counts of the three tables, for `/memory`.
     pub fn counts(&self) -> Result<StoreCounts, StoreError> {
         let count = |table: &str| {
-            self.connection
+            self.connection()
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get::<_, i64>(0)
                 })

@@ -135,6 +135,7 @@ async fn run_with(
         guardrails,
         recorder: Recorder::disabled(),
         mcp: None,
+        memory: None,
         cancel: Default::default(),
     };
     let mut state = AgentState::new();
@@ -272,6 +273,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder: Recorder::disabled(),
         mcp: None,
+        memory: None,
         cancel: Default::default(),
     };
     let mut state = AgentState::new();
@@ -706,6 +708,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         guardrails: redact,
         recorder: Recorder::disabled(),
         mcp: None,
+        memory: None,
         cancel: Default::default(),
     };
     let mut state = AgentState::new();
@@ -797,6 +800,7 @@ async fn recorded_turn(
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder,
         mcp: None,
+        memory: None,
         cancel: Default::default(),
     };
     let mut state = AgentState::new();
@@ -910,6 +914,7 @@ fn cancellable(
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder,
         mcp: None,
+        memory: None,
         cancel: cancel.clone(),
     }
 }
