@@ -402,7 +402,10 @@ async fn skills_lists_the_discovered_skills() {
     assert!(none.contains("agent86> no skills discovered\n"), "{none}");
 
     for (folder, text) in [
-        ("b", "---\nname: lint\ndescription: Run the linters.\n---\n"),
+        (
+            "b",
+            "---\nname: lint\ndescription: \"Run the \\\"strict\\\" linters.\"\nallowed-tools: read_file run_command\n---\n",
+        ),
         (
             "a",
             "---\nname: notes\ndescription: Draft release notes.\n---\n",
@@ -418,7 +421,9 @@ async fn skills_lists_the_discovered_skills() {
     }
     let text = stdout(&workspace.repl(&[], "/skills\n/tools\n").await);
     assert!(
-        text.contains("agent86> notes - Draft release notes.\nlint - Run the linters.\n"),
+        text.contains(
+            "agent86> notes\n  Draft release notes.\nlint\n  Run the \"strict\" linters.\n  tools while active: read_file, run_command\n"
+        ),
         "{text}"
     );
     assert!(

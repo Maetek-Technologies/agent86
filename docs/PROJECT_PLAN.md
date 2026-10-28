@@ -148,7 +148,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **420 passed on Windows** (186 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **421 passed on Windows** (187 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -273,8 +273,8 @@ The agent works end to end, but it does not yet have:
 
 ### Known skill differences from Python
 
-- `SKILL.md` frontmatter is always read with Python's built-in parser. Python uses PyYAML instead when it happens to be installed (the `local` extra brings it in), which reads full YAML: nested mappings, anchors, and YAML's own quoting and folding rules. The usual shapes (`key: value`, lists, `>`/`|` descriptions) read the same either way. `license` and `metadata` are not kept, since nothing reads them.
-- `/skills` prints the names and descriptions as plain text; Rich escapes markup in them.
+- `SKILL.md` frontmatter is always read with Python's built-in parser. Python uses PyYAML instead when it happens to be installed (the `local` extra brings it in), which reads full YAML: nested mappings, anchors, and YAML's own quoting and folding rules. The usual shapes (`key: value`, lists, `>`/`|` descriptions) read the same either way. Quoted strings are unescaped as PyYAML reads them (`\"` and `''`), since a typical install has PyYAML; Python's parser alone keeps the backslashes. Where PyYAML rejects one quoted string it falls back to the built-in parser for the whole file, but here only that string is left as written. `license` and `metadata` are not kept, since nothing reads them.
+- `/skills` puts each name on its own line (bold cyan), with the description indented under it and any `allowed-tools` after it, instead of Python's one `name - description` line per skill, which is hard to read once descriptions run past the terminal's width. Rich escapes markup in the names and descriptions; here they are plain text.
 
 ### Known memory differences from Python
 

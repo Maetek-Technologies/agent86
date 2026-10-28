@@ -18,7 +18,8 @@
 //! The frontmatter is read with Python's built-in parser (`_mini_frontmatter`),
 //! which covers what `SKILL.md` files use: `key: value`, quoted strings, inline
 //! and block lists, and `>`/`|` block scalars. Python uses PyYAML instead when it
-//! happens to be installed; that is a known difference for exotic YAML.
+//! happens to be installed; that is a known difference for exotic YAML. Quoted
+//! strings are unescaped as PyYAML reads them, because a typical install has it.
 
 use crate::config::Config;
 use crate::difflib::splitlines;
@@ -279,9 +280,85 @@ fn scalar(value: &str) -> Value {
     }
     let chars: Vec<char> = value.chars().collect();
     if chars.len() >= 2 && chars[0] == chars[chars.len() - 1] && matches!(chars[0], '\'' | '"') {
-        return Value::Str(chars[1..chars.len() - 1].iter().collect());
+        let inner: String = chars[1..chars.len() - 1].iter().collect();
+        // Python's mini parser only strips the quotes, but a typical install has
+        // PyYAML (huggingface_hub brings it), which reads YAML's escapes:
+        // `\"` in a double-quoted description is a quote, `''` in a single-quoted
+        // one is an apostrophe. A scalar PyYAML would reject stays as the mini
+        // parser leaves it, as Python falls back to that parser.
+        let unescaped = if chars[0] == '"' {
+            yaml_double_quoted(&inner)
+        } else {
+            yaml_single_quoted(&inner)
+        };
+        return Value::Str(unescaped.unwrap_or(inner));
     }
     Value::Str(value.to_owned())
+}
+
+/// The inside of a single-quoted YAML scalar: `''` is a quote, and a lone `'`
+/// is an error.
+fn yaml_single_quoted(inner: &str) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' && chars.next() != Some('\'') {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// The inside of a double-quoted YAML scalar with YAML 1.1's escapes, as PyYAML
+/// reads them; an unknown escape or a bare `"` is an error.
+fn yaml_double_quoted(inner: &str) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return None,
+            '\\' => {}
+            _ => {
+                out.push(c);
+                continue;
+            }
+        }
+        let escaped = match chars.next()? {
+            '0' => '\0',
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            't' | '\t' => '\t',
+            'n' => '\n',
+            'v' => '\u{b}',
+            'f' => '\u{c}',
+            'r' => '\r',
+            'e' => '\u{1b}',
+            ' ' => ' ',
+            '"' => '"',
+            '/' => '/',
+            '\\' => '\\',
+            'N' => '\u{85}',
+            '_' => '\u{a0}',
+            'L' => '\u{2028}',
+            'P' => '\u{2029}',
+            kind @ ('x' | 'u' | 'U') => {
+                let digits = match kind {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                let hex: String = chars.by_ref().take(digits).collect();
+                if hex.len() != digits || !hex.chars().all(|d| d.is_ascii_hexdigit()) {
+                    return None;
+                }
+                char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+            }
+            _ => return None,
+        };
+        out.push(escaped);
+    }
+    Some(out)
 }
 
 /// `allowed-tools` as tool names, as Python's `parse_allowed_tools`: space
@@ -480,6 +557,23 @@ mod tests {
         assert_eq!(mini_frontmatter("d: >-\n  a\n  b\n")["d"], s("a b"));
         assert_eq!(mini_frontmatter("d: |2\n  a\n")["d"], s("a"));
         assert_eq!(mini_frontmatter("d: >x\n")["d"], s(">x"));
+    }
+
+    #[test]
+    fn quoted_scalars_read_escapes_as_pyyaml_does() {
+        // Expected values from PyYAML's `safe_load`.
+        assert_eq!(scalar(r#""a \"b\" c""#), s("a \"b\" c"));
+        assert_eq!(scalar("'it''s'"), s("it's"));
+        assert_eq!(
+            scalar(r#""tab\there é \x41 \/ \\ \N\_\e""#),
+            s("tab\there \u{e9} A / \\ \u{85}\u{a0}\u{1b}")
+        );
+        assert_eq!(scalar(r#""\U0001F600""#), s("\u{1f600}"));
+        // What PyYAML rejects keeps the mini parser's reading.
+        assert_eq!(scalar(r#""bad \q""#), s(r"bad \q"));
+        assert_eq!(scalar("'lone ' quote'"), s("lone ' quote"));
+        assert_eq!(scalar(r#""a "b" c""#), s(r#"a "b" c"#));
+        assert_eq!(scalar(r#""short \x4""#), s(r"short \x4"));
     }
 
     #[test]
