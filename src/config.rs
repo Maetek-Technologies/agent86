@@ -38,7 +38,10 @@ max_steps = 40
 max_cost_usd = 5.0
 max_wall_clock_s = 900
 max_consecutive_errors = 3
+max_context_tokens = 0
 max_output_tokens = 8192
+context_reserve_tokens = 4096
+compaction = "summarize"
 parallel_tools = true
 tool_timeout_s = 60
 
@@ -198,7 +201,15 @@ pub struct LimitsConfig {
     pub max_wall_clock_s: u64,
     /// Failed tool results tolerated in a row; one more trips the circuit.
     pub max_consecutive_errors: u32,
+    /// An optional hard cap on the conversation's tokens; `0` derives the budget
+    /// from the model's real window alone.
+    pub max_context_tokens: u64,
     pub max_output_tokens: u32,
+    /// Headroom kept free inside the window on top of the output cap: slack for
+    /// the provider counting tokens differently than the estimate does.
+    pub context_reserve_tokens: u64,
+    /// What happens to the oldest turns when the conversation outgrows its budget.
+    pub compaction: CompactionMode,
     /// Run a step's read-only tool calls concurrently.
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
@@ -380,6 +391,17 @@ pub enum IngressMode {
     Warn,
     /// Also refuse turns carrying prompt injection.
     Block,
+}
+
+/// `[limits] compaction`: what happens to the oldest turns when the
+/// conversation outgrows its budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    /// Replace the oldest span with a model-written summary.
+    Summarize,
+    /// Silently drop the oldest span.
+    Drop,
 }
 
 /// `[guardrails] egress`.

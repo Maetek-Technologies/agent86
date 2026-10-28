@@ -866,6 +866,8 @@ impl Repl {
             Err(message) => message,
             Ok((provider, reference)) => {
                 self.harness.max_tokens = self.config.max_output_tokens_for(&reference.provider);
+                self.harness.context_window =
+                    crate::setup::model_context_window(&self.config, &reference.to_string());
                 self.harness.provider = provider;
                 self.model_ref = reference.to_string();
                 self.model_switches += 1;

@@ -14,12 +14,21 @@
 //! the next safe point: before a model call, while a response streams, and between
 //! tool calls, never in the middle of one. The partial exchange is kept.
 //!
-//! Not ported yet: context-window fitting and compaction, sub-agents, and persistence.
+//! Every request is fitted to the model's context window (`memory::working`).
+//! Before a model call, a conversation over budget has its oldest span replaced
+//! by a model-written summary (`[limits] compaction = "summarize"`), or dropped.
+//!
+//! Not ported yet: sub-agents.
 
 use crate::approval::ApprovalGate;
 use crate::config::EgressMode;
-use crate::config::LimitsConfig;
+use crate::config::{CompactionMode, LimitsConfig};
 use crate::guardrails::Guardrails;
+use crate::memory::working::{
+    apply_summary, compacted_notice, compaction_cut, compaction_failed_notice, conversation_budget,
+    count_spec_tokens, count_tokens, fit, fits, python_strip, render_transcript, KEEP_RECENT,
+    SUMMARY_MAX_TOKENS, SUMMARY_SYSTEM_PROMPT,
+};
 use crate::observability::Recorder;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
@@ -27,7 +36,8 @@ use crate::session::AgentState;
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::turn::TurnSummary;
 use crate::types::{
-    python_repr, AgentPhase, CompletionRequest, Message, Role, Step, ToolCall, ToolResult, Usage,
+    python_repr, AgentPhase, CompletionRequest, Message, Role, Step, ToolCall, ToolResult,
+    ToolSpec, Usage,
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -204,6 +214,11 @@ impl CircuitBreaker {
         self.cost_usd += usage.cost_usd;
     }
 
+    /// Count spending that is not a step, such as a compaction summary.
+    pub fn record_cost(&mut self, cost_usd: f64) {
+        self.cost_usd += cost_usd;
+    }
+
     pub fn record_tool_result(&mut self, ok: bool) -> Result<(), HarnessError> {
         if ok {
             self.consecutive_errors = 0;
@@ -234,6 +249,9 @@ pub struct Harness {
     pub system: Message,
     /// The output cap sent with every model call.
     pub max_tokens: u32,
+    /// Tokens of context the model can hold (`context_window_for`); the REPL's
+    /// `/model` updates it with the provider.
+    pub context_window: u64,
     /// Decides whether side-effecting calls may run.
     pub gate: ApprovalGate,
     /// Ingress, egress, and observation scanning.
@@ -268,6 +286,126 @@ impl Harness {
             system.content = format!("{}\n\n{extra}", system.content);
         }
         system
+    }
+
+    /// Conversation tokens available for this request, as Python's
+    /// `_context_budget`: the window minus what the request spends before any
+    /// history (the system message and the tool catalogue, both of which change at
+    /// runtime), minus the room the response needs.
+    fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
+        let overhead = count_tokens(std::slice::from_ref(system)) + count_spec_tokens(specs);
+        conversation_budget(
+            self.context_window,
+            overhead,
+            self.limits.context_reserve_tokens,
+            u64::from(self.max_tokens),
+            self.limits.max_context_tokens,
+        )
+    }
+
+    /// Replace the oldest over-budget span with a summary, in place, before a model
+    /// call, as Python's `_compact_if_needed`. Dropping the oldest turns (still
+    /// available as `compaction = "drop"`) makes a long session forget its own
+    /// goal; a summary keeps the goal, the decisions, and the paths found.
+    ///
+    /// Never fails the turn: a summary that cannot be written falls back to the drop
+    /// that fitting the request does anyway, and says so. Returns the notice to
+    /// stream and how many messages the history lost, so indices into it can follow.
+    async fn compact_if_needed(
+        &self,
+        state: &mut AgentState,
+        extra_system: Option<&str>,
+        summary: &mut TurnSummary,
+        breaker: &mut CircuitBreaker,
+        protect_from: usize,
+    ) -> Option<(String, usize)> {
+        if self.limits.compaction != CompactionMode::Summarize {
+            return None;
+        }
+        let system = self.system_message(extra_system);
+        let budget = self.context_budget(&system, &self.registry.specs());
+        if fits(&state.messages, budget) {
+            return None;
+        }
+        let cut = compaction_cut(&state.messages, budget, KEEP_RECENT, Some(protect_from));
+        if cut == 0 {
+            // Everything left is the current turn or its tool blocks: nothing is old
+            // enough to compact, so fitting trims and the provider's limits take over.
+            return None;
+        }
+        let sid = state.session_id.clone();
+        let prefix = &state.messages[..cut];
+        let dropped_tokens = count_tokens(prefix);
+        let request = CompletionRequest {
+            model: self.provider.model().to_owned(),
+            messages: vec![
+                message(Role::System, SUMMARY_SYSTEM_PROMPT),
+                message(Role::User, &render_transcript(prefix)),
+            ],
+            tools: Vec::new(),
+            temperature: 0.0,
+            // A summary is a bounded artefact; it should not cost more than the span.
+            max_tokens: Some(SUMMARY_MAX_TOKENS * 2),
+            stream: false,
+        };
+        let completion = tokio::select! {
+            biased;
+            // The next safe point sees the cancel and closes the turn out.
+            () = self.cancel.cancelled() => return None,
+            completion = self.provider.complete(request) => completion,
+        };
+        let failed = |status: &str, error: Option<String>| {
+            let mut fields = vec![
+                ("status", json!(status)),
+                ("fallback", json!("drop")),
+                ("dropped", json!(cut)),
+            ];
+            if let Some(error) = error {
+                fields.push(("error", json!(error)));
+            }
+            self.recorder.event(&sid, "compaction", fields);
+            Some((compaction_failed_notice(cut), 0))
+        };
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => return failed("failed", Some(format!("ProviderError: {error}"))),
+        };
+        let text = python_strip(&completion.text).to_owned();
+        if text.is_empty() {
+            return failed("empty", None);
+        }
+
+        // The originals are archived before they leave the live conversation.
+        if let Some(memory) = &self.memory {
+            let _ = memory.record_compaction(&sid, &text, prefix);
+        }
+        let before = state.messages.len();
+        let kept = state.messages.split_off(cut);
+        state.messages = apply_summary(&text, kept);
+        summary.compactions += 1;
+        summary.add_usage(&completion.usage);
+        breaker.record_cost(completion.usage.cost_usd);
+        self.recorder.event(
+            &sid,
+            "compaction",
+            vec![
+                ("status", json!("ok")),
+                ("dropped", json!(cut)),
+                ("dropped_tokens", json!(dropped_tokens)),
+                (
+                    "summary_tokens",
+                    json!(count_tokens(&[message(Role::User, &text)])),
+                ),
+                ("kept", json!(state.messages.len())),
+                ("model", json!(self.provider.model())),
+            ],
+        );
+        // Saved at once: a resume must see the compacted history, not a stale copy
+        // that would re-inflate the context on the next turn.
+        if let Some(memory) = &self.memory {
+            let _ = memory.persist(state);
+        }
+        Some((compacted_notice(cut), before - state.messages.len()))
     }
 
     /// Run one user turn on `state`, passing every piece of streamed text,
@@ -397,6 +535,9 @@ impl Harness {
             .memory
             .as_ref()
             .and_then(|memory| memory.recall_note(goal));
+        // Where this turn begins: compaction never reaches past it, so the ask being
+        // answered right now is never summarized away.
+        let mut turn_start = state.messages.len();
         state.messages.push(message(Role::User, goal));
         let mut breaker = CircuitBreaker::new(&self.limits);
         // Where the first partial answer went, and the pieces collected so far.
@@ -412,14 +553,41 @@ impl Harness {
             }
             breaker.before_step()?;
 
+            // Compact before the request is built, so the model call sees the
+            // compacted history. Once per step, never nested.
+            if let Some((notice, removed)) = self
+                .compact_if_needed(
+                    state,
+                    recall_note.as_deref(),
+                    summary,
+                    &mut breaker,
+                    turn_start,
+                )
+                .await
+            {
+                // Indices into the history move with it. (Python keeps the old
+                // ones, which go stale after a compaction mid-turn.)
+                turn_start -= removed;
+                if let Some(start) = continuation_start.as_mut() {
+                    *start -= removed;
+                }
+                // Said out loud: a conversation that quietly lost its oldest turns
+                // looks, from the user's seat, like a model that forgot.
+                emit(TurnEvent::Text(&notice));
+            }
+
             let completion = {
-                let mut request_messages = Vec::with_capacity(state.messages.len() + 1);
-                request_messages.push(self.system_message(recall_note.as_deref()));
-                request_messages.extend(state.messages.iter().cloned());
+                let system = self.system_message(recall_note.as_deref());
+                let tools = self.registry.specs();
+                let budget = self.context_budget(&system, &tools);
+                let conversation = fit(&state.messages, budget);
+                let mut request_messages = Vec::with_capacity(conversation.len() + 1);
+                request_messages.push(system);
+                request_messages.extend(conversation.iter().cloned());
                 let request = CompletionRequest {
                     model: self.provider.model().to_owned(),
                     messages: request_messages,
-                    tools: self.registry.specs(),
+                    tools,
                     temperature: 0.0,
                     max_tokens: Some(self.max_tokens),
                     stream: true,
@@ -962,7 +1130,10 @@ mod tests {
             max_cost_usd: 1.0,
             max_wall_clock_s: 900,
             max_consecutive_errors: 1,
+            max_context_tokens: 0,
             max_output_tokens: 8192,
+            context_reserve_tokens: 4096,
+            compaction: CompactionMode::Summarize,
             parallel_tools: true,
             tool_timeout_s: 60,
         }

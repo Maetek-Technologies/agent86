@@ -3,18 +3,22 @@
 
 use crate::agent::Harness;
 use crate::approval::{ApprovalGate, ApprovalPrompt};
-use crate::config::Config;
+use crate::config::{Config, ConfigPaths};
 use crate::guardrails::Guardrails;
 use crate::mcp::McpManager;
 use crate::memory::embeddings::build_embedder;
 use crate::observability::Recorder;
 use crate::prompt::build_system_prompt;
+use crate::provider::capabilities::context_window_with;
+use crate::provider::remote_windows::{cache_path, openrouter_context_window};
 use crate::provider::{provider_for_ref, Provider};
+use crate::secrets::OsKeyring;
 use crate::session::{expand_home, SessionStore};
 use crate::tools::sandbox::build_executor;
 use crate::tools::web::WebSettings;
 use crate::tools::{default_registry, ToolContext};
 use crate::types::ModelRef;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +98,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         manager.attach(&registry);
     }
     let max_tokens = config.max_output_tokens_for(&model_ref.provider);
+    let context_window = model_context_window(config, &model_ref.to_string());
     let harness = Harness {
         provider,
         registry,
@@ -101,6 +106,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         limits: config.limits.clone(),
         system: build_system_prompt(config),
         max_tokens,
+        context_window,
         gate: ApprovalGate::new(config.guardrails.approval, prompt),
         guardrails: Guardrails::new(&config.guardrails),
         recorder,
@@ -114,6 +120,20 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         store,
         memory_note,
         sandbox_note,
+    })
+}
+
+/// Tokens of context the model behind `model_ref` can hold, as Python's
+/// `context_window_for`: OpenRouter is asked for its own figure (memoized, and
+/// cached beside the user config for a day), then the overrides and the table.
+pub fn model_context_window(config: &Config, model_ref: &str) -> u64 {
+    let cache = ConfigPaths::discover()
+        .user
+        .as_deref()
+        .and_then(Path::parent)
+        .map(cache_path);
+    context_window_with(model_ref, config, |provider, model| {
+        openrouter_context_window(provider, model, config, cache.as_deref(), &OsKeyring)
     })
 }
 
