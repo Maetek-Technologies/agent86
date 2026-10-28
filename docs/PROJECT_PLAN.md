@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-28  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done; turn limits adjustable at runtime (`/limits`, `run` flags, and the interface's offer to raise a limit), a deliberate addition beyond Python; the remaining CLI commands (`models`, `config`, `skills`, `--sandbox`) done
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done; turn limits adjustable at runtime (`/limits`, `run` flags, and the interface's offer to raise a limit), a deliberate addition beyond Python; the remaining CLI commands (`models`, `config`, `skills`, `--sandbox`) done; triage routing done
 
 ## 1. Purpose
 
@@ -109,6 +109,7 @@ The Python implementation remains the reference and compatibility oracle. This p
   - what a sub-agent spends (and anything it delegated) is added to the delegating step, the turn summary, the session usage, and the cost cap, without counting as the parent's steps
   - Python's trace events: `spawn` (session `sub`), and per sub-agent (`sub:<role>`) `model_call` with `agent` and `depth`, `tool_call` with `depth`, observation `guardrail`, and `subagent_done`
   - live check (2026-10-27, local Ollama, `gemma4:12b`, throwaway workspace and home): asked to delegate a review, the model called `delegate` with role `reviewer`; the sub-agent listed and read the files in four steps, and the parent summarized its report
+- Added triage routing, ported from `orchestration/router.py` and its use in `orchestration/loop.py`: with `[model] router = "triage"`, each turn goes to `[model.route] cheap` when the task is at most 240 characters (after stripping) and has none of Python's complexity keywords (`code`, `debug`, `fix`, `review`, `step by step`, and the rest, whole words, any case), else to `[model.route] frontier`. The route is chosen after the ingress guardrail lets the input through, from the text the model sees (with `@file` mentions inlined), and recorded as Python's `route` event (`model`). Routed providers are built on first use from the config the session started with and cached by ref; the request's output cap and the context window follow the routed model, as do sub-agents, the status line, `/model`'s report, and the pricing of the turn summary. Compaction summaries go to the cheap route (or the active model when it cannot be built). `--model` sets the default and leaves routing on, as in Python; `/model` pins the chosen provider, which turns routing off for the rest of the session and drops the cached providers
 - Added the remaining CLI commands, ported from `cli.py`: `agent86 models` and a bare `agent86 config` (Python's `_list_models`: the providers with each key's source, never the key, the keyring line, then the model roles and whether each ref parses), `agent86 config path` (each layer's absolute path and whether it exists), `agent86 config show` (the resolved configuration as JSON), `agent86 skills list` (the skills table, or `No skills found. Searched: ...`), `agent86 skills show <name>` (the instructions and bundled resources, or Python's error naming the known skills, exit 1), and the global `--sandbox`, which overrides `AGENT86_SANDBOX` and `[sandbox] mode`. The hints that name these commands now use Python's wording: the model-error hint (`run` and the REPL's `Cannot start:`), the malformed-config hint, `Memory is disabled in config.`, the memory database error, and `mcp list`'s empty hint
 - Added turn limits at runtime, a deliberate addition (Python reads `[limits] max_steps`, `[limits] max_output_tokens`, the provider's `max_tokens`, and `[agents] max_steps` only from config, and offers no way to change them while it runs). It came out of a delegated review on a thinking model whose sub-agents spent their whole 8192-token output cap reasoning:
   - three limits can be overridden for the rest of the process: `steps` (the turn's step budget), `agent_steps` (each sub-agent's, still never above `steps`), and `output` (the output cap of every model call). The `output` override replaces whichever setting Python's `max_output_tokens_for` picks (the provider's `max_tokens`, else `[limits] max_output_tokens`), so it always takes effect; overrides survive `/model`, `/clear`, and `/resume`
@@ -162,7 +163,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **448 passed on Windows** (197 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 48 CLI end-to-end, 13 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 9 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 28 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **455 passed on Windows** (199 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 49 CLI end-to-end, 14 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 9 delegation, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 31 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -183,7 +184,6 @@ Local validation completed successfully:
 The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory]`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
-- Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
 - Python's programmatic `SupervisorOrchestrator` (`fan_out` over a `MessageBus`); nothing in the CLI or the interfaces reaches it
 - OpenTelemetry span export (`[observability] otel`)
 
@@ -207,7 +207,7 @@ The agent works end to end, but it does not yet have:
 - `/config` prints the merged TOML layers (built-in defaults for the modelled sections, the config files, and overrides) as JSON, not Python's full pydantic dump with every default.
 - `/config model` and `/config mcp` give Python's wording, pointing at the interface.
 - `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
-- `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
+- `/model` switches the provider for later turns and pins it, turning triage routing off, as in Python.
 - Answers are printed as plain text, as in Python's plain loop; the Markdown rendering behind `[ui] markdown` belongs to the full-screen app.
 
 ### Known interface differences from Python
@@ -255,8 +255,8 @@ The agent works end to end, but it does not yet have:
 - A deliberate fix: a sub-agent whose final reply stops at the output cap continues, as the main loop's answer does (up to 3 times, each a step of its budget, with a `continuation` event), and the pieces are joined; one that reaches the cap before any text (a thinking model can spend all of it reasoning) answers `[sub-agent '<role>' wrote no answer: ...]`, and an empty answer `[sub-agent '<role>' returned no text]`. Python returns the last reply as it is, so the parent gets a truncated or empty result it cannot tell from a real one.
 - A deliberate fix: a sub-agent's requests carry the main loop's output cap (`max_output_tokens_for`, or the session's override). Python's sub-agents send none, so they get the provider's default (8192 on Anthropic, the server's own on an OpenAI-compatible endpoint), which neither `[limits] max_output_tokens` nor anything but the provider's `max_tokens` changes. On an OpenAI-compatible endpoint whose default is larger than 8192, a sub-agent's cap is now lower unless the cap is raised.
 - A sub-agent's requests are fitted to a budget computed from the parent's system message and tools; Python reuses the budget of the parent's last request, which also counted that request's recall note.
-- Compaction summaries are written by the current model. Python uses triage routing's cheap model when routing is on, which is not ported (it is off by default).
-- The window is looked up when the model is set (at start and on `/model`), not before every request; a `[model.context_window]` change written by `/config` applies from the next `/model`.
+- A route that cannot be built (an unknown provider, a missing key) fails the turn as a failed turn: it is saved in the `error` phase and traced with `turn_end`. Python raises before the turn is closed, so neither happens there.
+- The window is looked up when the model is set (at start, on `/model`, and the first time a route is used), not before every request; a `[model.context_window]` change written by `/config` applies from the next `/model`.
 - After a compaction mid-turn, the turn's start and a continuation in progress are re-indexed into the shorter history. Python keeps the old indices, which then point past where they should (a deliberate fix).
 - The summary request can be cancelled; Python's blocks until it returns, and the turn stops at the next safe point.
 - A cancel also wakes a response that has stopped streaming; Python checks only as each delta arrives.
@@ -318,7 +318,7 @@ The agent works end to end, but it does not yet have:
 
 - `trace show` prints a plain aligned table with the same columns as Python's Rich table.
 - Live OpenTelemetry export (`[observability] otel`) is not ported; `trace export -f otlp-json` covers the offline case.
-- Events for subsystems that are not ported (`route`, and `cancelled` turns) are never written.
+- Events for subsystems that are not ported (`cancelled` turns) are never written.
 - `limit_raised` (a limit raised from the interface's offer) has no Python counterpart.
 
 ### Known tool differences from Python
@@ -474,7 +474,7 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] Perform an optional live OpenRouter smoke test (2026-10-26, `openrouter:openai/gpt-4o-mini`)
 - [x] Upload the CI workflow
 - [x] The remaining CLI commands (`models`, `config`, `skills`, `--sandbox`)
-- [ ] Triage routing (`orchestration/router.py`): `[model] router = "triage"`, the cheap and frontier routes, the `route` trace event, compaction on the cheap model, and pinning on `/model`
+- [x] Triage routing (`orchestration/router.py`): `[model] router = "triage"`, the cheap and frontier routes, the `route` trace event, compaction on the cheap model, and pinning on `/model`
 - [ ] Live OpenTelemetry span export (`[observability] otel`)
 - [ ] The differential test harness against the Python implementation
 

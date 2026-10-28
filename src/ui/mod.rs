@@ -190,7 +190,7 @@ fn status_from(repl: &Repl) -> StatusState {
         .config_paths
         .as_ref()
         .and_then(|paths| paths.user.as_deref()?.parent().map(cache_path));
-    let window = context_window_with(repl.model_ref(), &repl.config, |provider, model| {
+    let window = context_window_with(&repl.model_ref(), &repl.config, |provider, model| {
         openrouter_context_window(
             provider,
             model,
@@ -200,7 +200,7 @@ fn status_from(repl: &Repl) -> StatusState {
         )
     });
     StatusState {
-        model: repl.harness.provider.model().to_owned(),
+        model: repl.harness.active_provider().model().to_owned(),
         used_tokens: repl
             .state
             .steps

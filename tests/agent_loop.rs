@@ -13,6 +13,7 @@ use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
 use agent86::limits::{LimitHit, LimitKind};
 use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
+use agent86::router::{RoutedModel, Router};
 use agent86::session::AgentState;
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::RunOutput;
@@ -141,7 +142,8 @@ async fn run_with(
 ) -> Result<RunOutput, HarnessError> {
     let provider = provider(server);
     let harness = Harness {
-        provider: Box::new(provider),
+        provider: std::sync::Arc::new(provider),
+        router: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits,
@@ -282,7 +284,8 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
     .await;
     let workspace = Workspace::new("events");
     let harness = Harness {
-        provider: Box::new(provider(&server)),
+        provider: std::sync::Arc::new(provider(&server)),
+        router: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -720,7 +723,8 @@ async fn redact_mode_never_shows_the_raw_text() {
 
     let provider = provider(&server);
     let harness = Harness {
-        provider: Box::new(provider),
+        provider: std::sync::Arc::new(provider),
+        router: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -815,7 +819,8 @@ async fn recorded_turn(
     });
     let provider = provider(server);
     let harness = Harness {
-        provider: Box::new(provider),
+        provider: std::sync::Arc::new(provider),
+        router: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -932,7 +937,8 @@ fn cancellable(
     cancel: &CancelToken,
 ) -> Harness {
     Harness {
-        provider: Box::new(provider(server)),
+        provider: std::sync::Arc::new(provider(server)),
+        router: Default::default(),
         registry: builtin_registry(),
         context: ToolContext::new(&workspace.root).unwrap(),
         limits: limits(),
@@ -1200,4 +1206,154 @@ async fn a_reply_that_spent_the_whole_cap_before_any_text_is_asked_again_with_mo
     assert_eq!(messages.last().unwrap()["content"], "go");
     assert_eq!(state.steps.len(), 2);
     assert_eq!(state.last_turn.as_ref().unwrap().continuations, 0);
+}
+
+/// A router whose routes are `cheap/model` and `frontier/model` on `server`, each
+/// with its own output cap so a request shows which one it was built for.
+fn triage_router(server: &MockServer) -> Router {
+    let base_url = server.base_url.clone();
+    Router::new(
+        true,
+        "mock:cheap/model",
+        "mock:frontier/model",
+        Box::new(move |reference| {
+            let model = reference.strip_prefix("mock:").ok_or("unknown route")?;
+            let config = OpenAiConfig {
+                base_url: Some(base_url.clone()),
+                require_key: false,
+                max_retries: 0,
+                ..OpenAiConfig::default()
+            };
+            let provider = OpenAiProvider::new(model, config, None).map_err(|e| e.to_string())?;
+            Ok(RoutedModel {
+                reference: reference.to_owned(),
+                provider: Arc::new(provider),
+                max_tokens: if model.starts_with("cheap") { 500 } else { 900 },
+                context_window: 64_000,
+                output_setting: "[providers.mock] max_tokens".into(),
+            })
+        }),
+    )
+}
+
+#[tokio::test]
+async fn triage_routes_simple_asks_to_the_cheap_model_and_the_rest_to_the_frontier() {
+    let server =
+        MockServer::start(vec![sse_text("Paris.", "stop"), sse_text("Fixed.", "stop")]).await;
+    let workspace = Workspace::new("triage");
+    let traces = workspace.root.join("traces");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        trace_recorder(&traces),
+        &cancel,
+    );
+    harness.router = triage_router(&server);
+
+    let mut state = AgentState::new();
+    harness
+        .run_turn(&mut state, "capital of France?", |_| {})
+        .await
+        .unwrap();
+    assert_eq!(harness.routed_ref().as_deref(), Some("mock:cheap/model"));
+    harness
+        .run_turn(&mut state, "fix the failing test", |_| {})
+        .await
+        .unwrap();
+    assert_eq!(harness.routed_ref().as_deref(), Some("mock:frontier/model"));
+    assert_eq!(harness.active_provider().model(), "frontier/model");
+
+    // Each request went to its route, with that model's output cap.
+    let requests = server.requests();
+    assert_eq!(requests[0].body["model"], "cheap/model");
+    assert_eq!(requests[0].body["max_completion_tokens"], 500);
+    assert_eq!(requests[1].body["model"], "frontier/model");
+    assert_eq!(requests[1].body["max_completion_tokens"], 900);
+    // Python's `route` event, after the turn's start.
+    let events = trace_events(&traces);
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(&kinds[..2], ["turn_start", "route"]);
+    let routes: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "route")
+        .map(|event| &event["model"])
+        .collect();
+    assert_eq!(routes, [&json!("cheap/model"), &json!("frontier/model")]);
+}
+
+#[tokio::test]
+async fn compaction_summaries_go_to_the_cheap_route() {
+    let server = MockServer::start(vec![
+        sse_text("A summary.", "stop"),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("triage-summary");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    harness.router = triage_router(&server);
+    harness.limits.max_context_tokens = 60;
+    let mut state = AgentState::new();
+    for index in 0..8 {
+        state.messages.push(Message {
+            role: if index % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            content: format!("earlier message {index} with some words in it"),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        });
+    }
+    harness
+        .run_turn(&mut state, "refactor the parser", |_| {})
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert_eq!(requests[0].body["model"], "cheap/model", "the summary");
+    assert_eq!(requests[1].body["model"], "frontier/model", "the turn");
+}
+
+#[tokio::test]
+async fn a_route_that_cannot_be_built_fails_the_turn_and_a_pinned_model_stops_routing() {
+    let server = MockServer::start(vec![sse_text("Pinned.", "stop")]).await;
+    let workspace = Workspace::new("triage-pin");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    harness.router = Router::new(
+        true,
+        "nope:cheap",
+        "nope:frontier",
+        Box::new(|reference| Err(format!("Unknown provider for '{reference}'"))),
+    );
+    let mut state = AgentState::new();
+    let error = harness
+        .run_turn(&mut state, "hello", |_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Unknown provider for 'nope:cheap'");
+    assert!(server.requests().is_empty());
+
+    // `/model` pins the session's provider: routing is off from then on.
+    harness.router.pin();
+    let output = harness.run_turn(&mut state, "hello", |_| {}).await.unwrap();
+    assert_eq!(output, "Pinned.");
+    assert_eq!(server.requests()[0].body["model"], "test/model");
+    assert_eq!(harness.routed_ref(), None);
 }

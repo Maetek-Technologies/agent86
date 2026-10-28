@@ -34,6 +34,7 @@ use crate::memory::working::{
 use crate::observability::Recorder;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
+use crate::router::Router;
 use crate::session::AgentState;
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::turn::TurnSummary;
@@ -258,8 +259,11 @@ fn trip(reason: String) -> HarnessError {
 
 /// Everything one turn needs.
 pub struct Harness {
-    /// The model; the REPL's `/model` replaces it between turns.
-    pub provider: Box<dyn Provider>,
+    /// The session's model; the REPL's `/model` replaces it between turns. With
+    /// triage routing on, each turn may use another (see [`Harness::active_provider`]).
+    pub provider: Arc<dyn Provider>,
+    /// Triage routing (`crate::router`); [`Router::default`] never routes.
+    pub router: Router,
     pub registry: ToolRegistry,
     pub context: ToolContext,
     pub limits: LimitsConfig,
@@ -318,7 +322,7 @@ impl Harness {
     pub(crate) fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
         let overhead = count_tokens(std::slice::from_ref(system)) + count_spec_tokens(specs);
         conversation_budget(
-            self.context_window,
+            self.active_context_window(),
             overhead,
             self.limits.context_reserve_tokens,
             u64::from(self.output_cap()),
@@ -359,8 +363,9 @@ impl Harness {
         let sid = state.session_id.clone();
         let prefix = &state.messages[..cut];
         let dropped_tokens = count_tokens(prefix);
+        let summarizer = self.summary_provider();
         let request = CompletionRequest {
-            model: self.provider.model().to_owned(),
+            model: summarizer.model().to_owned(),
             messages: vec![
                 message(Role::System, SUMMARY_SYSTEM_PROMPT),
                 message(Role::User, &render_transcript(prefix)),
@@ -375,7 +380,7 @@ impl Harness {
             biased;
             // The next safe point sees the cancel and closes the turn out.
             () = self.cancel.cancelled() => return None,
-            completion = self.provider.complete(request) => completion,
+            completion = summarizer.complete(request) => completion,
         };
         let failed = |status: &str, error: Option<String>| {
             let mut fields = vec![
@@ -420,7 +425,7 @@ impl Harness {
                     json!(count_tokens(&[message(Role::User, &text)])),
                 ),
                 ("kept", json!(state.messages.len())),
-                ("model", json!(self.provider.model())),
+                ("model", json!(summarizer.model())),
             ],
         );
         // Saved at once: a resume must see the compacted history, not a stale copy
@@ -558,6 +563,10 @@ impl Harness {
         // already leaked. Each step's text is held back and replayed redacted.
         let buffering = self.guardrails.egress == EgressMode::Redact;
 
+        // Pick this turn's model (triage routing), after the input was let through.
+        self.route(goal, &sid)?;
+        let provider = self.active_provider();
+
         // What happened last time a task like this came up.
         let recall_note = self
             .memory
@@ -627,14 +636,14 @@ impl Harness {
                 request_messages.push(system);
                 request_messages.extend(conversation.iter().cloned());
                 let request = CompletionRequest {
-                    model: self.provider.model().to_owned(),
+                    model: provider.model().to_owned(),
                     messages: request_messages,
                     tools,
                     temperature: 0.0,
                     max_tokens: Some(self.output_cap()),
                     stream: true,
                 };
-                let mut stream = self.provider.stream(request);
+                let mut stream = provider.stream(request);
                 let mut completion = None;
                 let mut buffered = String::new();
                 loop {
@@ -669,8 +678,8 @@ impl Harness {
                     return Ok(output);
                 }
                 completion.ok_or_else(|| HarnessError::NoFinalCompletion {
-                    provider: self.provider.name().to_owned(),
-                    model: self.provider.model().to_owned(),
+                    provider: provider.name().to_owned(),
+                    model: provider.model().to_owned(),
                 })?
             };
 
@@ -687,7 +696,7 @@ impl Harness {
                 "model_call",
                 vec![
                     ("step", json!(breaker.steps())),
-                    ("model", json!(self.provider.model())),
+                    ("model", json!(provider.model())),
                     ("input_tokens", json!(completion.usage.input_tokens)),
                     ("output_tokens", json!(completion.usage.output_tokens)),
                     ("cost_usd", json!(completion.usage.cost_usd)),
@@ -778,7 +787,7 @@ impl Harness {
                         vec![
                             ("index", json!(summary.continuations)),
                             ("step", json!(breaker.steps())),
-                            ("model", json!(self.provider.model())),
+                            ("model", json!(provider.model())),
                             (
                                 "chars",
                                 json!(continuation_parts

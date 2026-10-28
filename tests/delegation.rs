@@ -65,7 +65,8 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
     )
     .unwrap();
     Harness {
-        provider: Box::new(provider),
+        provider: std::sync::Arc::new(provider),
+        router: Default::default(),
         registry: default_registry(false, false, true),
         context: ToolContext::new(&workspace.0).unwrap(),
         limits: LimitsConfig {
