@@ -181,22 +181,22 @@ fn workspace() -> PathBuf {
 }
 
 fn run(ctx: &ToolContext, name: &str, arguments: Value) -> ToolResult {
-    default_registry(true, false).dispatch(&call(name, arguments), ctx)
+    default_registry(true, false, false).dispatch(&call(name, arguments), ctx)
 }
 
 #[test]
 fn the_memory_tools_follow_the_builtins_with_pydantics_schemas() {
     let golden = golden();
-    let names: Vec<String> = default_registry(true, false)
+    let names: Vec<String> = default_registry(true, false, false)
         .specs()
         .into_iter()
         .map(|spec| spec.name)
         .collect();
     assert_eq!(names[names.len() - 2..], ["remember", "recall"]);
-    assert!(!default_registry(false, false)
+    assert!(!default_registry(false, false, false)
         .names()
         .contains(&"remember".to_owned()));
-    for spec in default_registry(true, false).specs() {
+    for spec in default_registry(true, false, false).specs() {
         if let Some(expected) = golden["schemas"].get(&spec.name) {
             assert_eq!(
                 serde_json::to_string(&spec.parameters).unwrap(),

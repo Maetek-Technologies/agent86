@@ -18,11 +18,12 @@
 //! Before a model call, a conversation over budget has its oldest span replaced
 //! by a model-written summary (`[limits] compaction = "summarize"`), or dropped.
 //!
-//! Not ported yet: sub-agents.
+//! `delegate` runs a sub-agent (`crate::subagent`) inside the batch's sequential
+//! part, and what it spends is added to the turn.
 
 use crate::approval::ApprovalGate;
 use crate::config::EgressMode;
-use crate::config::{CompactionMode, LimitsConfig};
+use crate::config::{AgentsConfig, CompactionMode, LimitsConfig};
 use crate::guardrails::Guardrails;
 use crate::memory::working::{
     apply_summary, compacted_notice, compaction_cut, compaction_failed_notice, conversation_budget,
@@ -246,6 +247,8 @@ pub struct Harness {
     pub registry: ToolRegistry,
     pub context: ToolContext,
     pub limits: LimitsConfig,
+    /// `[agents]`: whether `delegate` runs sub-agents, how deep, and how long.
+    pub agents: AgentsConfig,
     pub system: Message,
     /// The output cap sent with every model call.
     pub max_tokens: u32,
@@ -272,7 +275,7 @@ impl Harness {
     /// The system message for the next request: the prompt plus, when MCP servers
     /// are live, their section, then the turn's recall note, as Python's
     /// `_system_content`.
-    fn system_message(&self, extra: Option<&str>) -> Message {
+    pub(crate) fn system_message(&self, extra: Option<&str>) -> Message {
         let mut system = self.system.clone();
         if let Some(section) = self
             .mcp
@@ -292,7 +295,7 @@ impl Harness {
     /// `_context_budget`: the window minus what the request spends before any
     /// history (the system message and the tool catalogue, both of which change at
     /// runtime), minus the room the response needs.
-    fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
+    pub(crate) fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
         let overhead = count_tokens(std::slice::from_ref(system)) + count_spec_tokens(specs);
         conversation_budget(
             self.context_window,
@@ -783,9 +786,14 @@ impl Harness {
                 );
                 emit(TurnEvent::ToolCall { call, text: &text });
             }
-            let results = self.execute_batch(&tool_calls, &sid);
-            for (call, result) in tool_calls.iter().zip(results) {
+            let results = self.execute_batch(&tool_calls, &sid).await;
+            for (call, (result, delegated)) in tool_calls.iter().zip(results) {
                 summary.tool_calls += 1;
+                // What a sub-agent spent is what this turn spent: in the summary, the
+                // step, and the cost cap, but not as one of this turn's steps.
+                summary.add_usage(&delegated);
+                step.usage = step.usage + delegated;
+                breaker.record_cost(delegated.cost_usd);
                 let (content, findings) = self.guardrails.observe(observation(&result));
                 if let Some(findings) = findings {
                     self.recorder.event(
@@ -849,30 +857,29 @@ impl Harness {
     /// run sequentially, in the order the model asked for them, after the reads.
     /// Every approval is settled first, on this thread, because the gate may
     /// prompt a human.
-    fn execute_batch(&self, calls: &[ToolCall], sid: &str) -> Vec<ToolResult> {
+    async fn execute_batch(&self, calls: &[ToolCall], sid: &str) -> Vec<(ToolResult, Usage)> {
         let eligible = calls
             .iter()
             .filter(|call| self.parallel_eligible(call))
             .count();
         if !self.limits.parallel_tools || eligible < 2 {
             // Strictly sequential: each call is resolved and run before the next.
-            return calls
-                .iter()
-                .map(|call| {
-                    if self.cancel.is_cancelled() {
-                        not_executed(call, "cancelled")
-                    } else {
-                        self.execute_tool(call, sid)
-                    }
-                })
-                .collect();
+            let mut results = Vec::with_capacity(calls.len());
+            for call in calls {
+                results.push(if self.cancel.is_cancelled() {
+                    (not_executed(call, "cancelled"), Usage::default())
+                } else {
+                    self.execute_tool(call, sid).await
+                });
+            }
+            return results;
         }
 
-        let mut settled: Vec<Option<ToolResult>> = Vec::with_capacity(calls.len());
+        let mut settled: Vec<Option<(ToolResult, Usage)>> = Vec::with_capacity(calls.len());
         let mut may_parallel = Vec::with_capacity(calls.len());
         for call in calls {
             let (result, parallel) = self.resolve_call(call);
-            settled.push(result);
+            settled.push(result.map(|result| (result, Usage::default())));
             may_parallel.push(parallel);
         }
         let pending = || (0..calls.len()).filter(|&index| settled[index].is_none());
@@ -901,22 +908,24 @@ impl Harness {
                     .collect()
             });
             for (index, result) in collected {
-                settled[index] = Some(result);
+                settled[index] = Some((result, Usage::default()));
             }
         } else {
             for &index in &reads {
-                settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid));
+                settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid).await);
             }
         }
         // Between calls, never mid-execution: a tool that started is allowed to finish.
         for index in writes {
-            settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid));
+            settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid).await);
         }
 
         settled
             .into_iter()
             .zip(calls)
-            .map(|(result, call)| result.unwrap_or_else(|| not_executed(call, "skipped")))
+            .map(|(result, call)| {
+                result.unwrap_or_else(|| (not_executed(call, "skipped"), Usage::default()))
+            })
             .collect()
     }
 
@@ -927,7 +936,7 @@ impl Harness {
             && self
                 .registry
                 .get(&call.name)
-                .is_some_and(|tool| !tool.side_effecting())
+                .is_some_and(|tool| !tool.side_effecting() && tool.parallel_safe())
     }
 
     /// Decide one call without running it: `(settled result, may run in parallel)`.
@@ -946,20 +955,37 @@ impl Harness {
         if !decision.approved {
             return (Some(not_executed(call, decision.reason)), false);
         }
-        (None, !tool.side_effecting())
+        (None, !tool.side_effecting() && tool.parallel_safe())
     }
 
-    fn dispatch_unless_cancelled(&self, call: &ToolCall, sid: &str) -> ToolResult {
+    async fn dispatch_unless_cancelled(&self, call: &ToolCall, sid: &str) -> (ToolResult, Usage) {
         if self.cancel.is_cancelled() {
-            not_executed(call, "cancelled")
+            (not_executed(call, "cancelled"), Usage::default())
         } else {
-            self.dispatch(call, sid)
+            self.dispatch_call(call, sid).await
         }
+    }
+
+    /// Run one approved call: a delegation runs its sub-agent here, on this
+    /// runtime; anything else goes to the registry.
+    async fn dispatch_call(&self, call: &ToolCall, sid: &str) -> (ToolResult, Usage) {
+        let (result, usage) = match self.delegation(call, &self.context) {
+            Some(Ok((role, task))) => self.delegate(call, &role, &task, 1).await,
+            Some(Err(invalid)) => (invalid, Usage::default()),
+            None => return (self.dispatch(call, sid), Usage::default()),
+        };
+        self.record_tool_call(call, &result, sid);
+        (result, usage)
     }
 
     /// Run one approved call and record it in the flight recorder.
     fn dispatch(&self, call: &ToolCall, sid: &str) -> ToolResult {
         let result = self.registry.dispatch(call, &self.context);
+        self.record_tool_call(call, &result, sid);
+        result
+    }
+
+    fn record_tool_call(&self, call: &ToolCall, result: &ToolResult, sid: &str) {
         self.recorder.event(
             sid,
             "tool_call",
@@ -970,7 +996,6 @@ impl Harness {
                 ("error", json!(result.error)),
             ],
         );
-        result
     }
 
     /// Egress-scan tool-call arguments, the other way a secret leaves the harness.
@@ -997,10 +1022,10 @@ impl Harness {
     }
 
     /// Resolve and run one call.
-    fn execute_tool(&self, call: &ToolCall, sid: &str) -> ToolResult {
+    async fn execute_tool(&self, call: &ToolCall, sid: &str) -> (ToolResult, Usage) {
         match self.resolve_call(call) {
-            (Some(result), _) => result,
-            (None, _) => self.dispatch(call, sid),
+            (Some(result), _) => (result, Usage::default()),
+            (None, _) => self.dispatch_call(call, sid).await,
         }
     }
 }

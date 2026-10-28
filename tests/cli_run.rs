@@ -1021,7 +1021,8 @@ async fn finished_turns_are_recalled_into_later_similar_tasks() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names[names.len() - 2..], ["remember", "recall"]);
+    // Then `delegate`, which `[agents]` turns on by default, as in Python.
+    assert_eq!(names[names.len() - 3..], ["remember", "recall", "delegate"]);
 
     let search = workspace
         .run(&["memory", "search", "list the files", "-k", "1"])

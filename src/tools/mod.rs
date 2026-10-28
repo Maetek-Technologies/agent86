@@ -6,6 +6,7 @@
 //! [`ToolResult`] with `ok = false` that the model can correct itself from;
 //! nothing a tool does can crash the agent loop.
 
+pub mod delegate;
 pub mod exec;
 pub mod files;
 pub mod memory;
@@ -61,6 +62,12 @@ pub trait Tool: Send + Sync {
     /// True if invoking the tool causes an external side effect (gated by approvals).
     fn side_effecting(&self) -> bool {
         false
+    }
+
+    /// False for a tool that must not share a parallel batch even though it is
+    /// read-only, such as one that can reach the approval prompt.
+    fn parallel_safe(&self) -> bool {
+        true
     }
 
     /// The JSON Schema of the arguments, exactly as Python's pydantic models advertise it.
@@ -532,6 +539,14 @@ impl ToolContext {
         *self.active() = None;
     }
 
+    /// A copy for a sub-agent: the same tools and jail, and its own active skill,
+    /// starting as this context's, so what it activates restricts only itself.
+    pub fn fork(&self) -> Self {
+        let mut forked = self.clone();
+        forked.active_skill = Arc::new(std::sync::Mutex::new(self.active_skill()));
+        forked
+    }
+
     pub fn active_skill(&self) -> Option<Arc<crate::skills::Skill>> {
         self.active().clone()
     }
@@ -707,10 +722,10 @@ fn same_tool(a: &Arc<dyn Tool>, b: &Arc<dyn Tool>) -> bool {
     std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
 }
 
-/// Python's built-in tools, plus `remember` and `recall` when memory is on and
-/// `use_skill` when a skill was found, in its registration order
-/// (`default_registry`).
-pub fn default_registry(with_memory: bool, with_skills: bool) -> ToolRegistry {
+/// Python's built-in tools, plus `remember` and `recall` when memory is on,
+/// `use_skill` when a skill was found, and `delegate` when `[agents]` is on, in
+/// its registration order (`default_registry`).
+pub fn default_registry(with_memory: bool, with_skills: bool, with_delegate: bool) -> ToolRegistry {
     let registry = builtin_registry();
     if with_memory {
         for tool in [
@@ -726,6 +741,11 @@ pub fn default_registry(with_memory: bool, with_skills: bool) -> ToolRegistry {
         registry
             .register(Box::new(skills::UseSkillTool))
             .expect("use_skill is unique");
+    }
+    if with_delegate {
+        registry
+            .register(Box::new(delegate::DelegateTool))
+            .expect("delegate is unique");
     }
     registry
 }
