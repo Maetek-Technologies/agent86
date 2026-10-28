@@ -125,7 +125,7 @@ pub fn open_memory(config: &Config) -> (Option<SessionStore>, Option<String>) {
     if !config.memory.enabled {
         return (None, None);
     }
-    let (embedder, note) = build_embedder(&config.memory.embeddings);
+    let (embedder, note) = build_embedder(&config.memory.embeddings, config.memory.hf_offline);
     match SessionStore::open_with(&expand_home(&config.memory.path), embedder) {
         Ok(store) => (Some(store), note),
         Err(error) => (

@@ -1,13 +1,14 @@
 //! Embeddings, ported from Python's `memory/embeddings.py`.
 //!
-//! Python's default is a local `sentence-transformers` model. That needs torch,
-//! which is not always installed, so `build_embedder` falls back to the
-//! dependency-free [`HashingEmbedder`] and memory still works. The hashing
-//! embedder is ported exactly (same tokens, same MD5 buckets, same signs), so a
-//! `hash:<dim>` vector written by either implementation is found by the other.
-//! The sentence-transformers model is not ported yet; its spec takes the same
-//! fallback Python takes when the model cannot load.
+//! Python's default is a local `sentence-transformers` model
+//! ([`SentenceTransformerEmbedder`], run here on candle). When it cannot load
+//! (not cached and no network, or a model this cannot run), `build_embedder`
+//! falls back to the dependency-free [`HashingEmbedder`] and memory still
+//! works. The hashing embedder is ported exactly (same tokens, same MD5
+//! buckets, same signs), so a `hash:<dim>` vector written by either
+//! implementation is found by the other.
 
+use super::sentence_transformers::SentenceTransformerEmbedder;
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
 
@@ -80,7 +81,8 @@ impl Embedder for HashingEmbedder {
 
 /// An embedder from a spec string, with a note when the requested one was
 /// unavailable, as Python's `build_embedder` with fallback allowed.
-pub fn build_embedder(spec: &str) -> (Arc<dyn Embedder>, Option<String>) {
+/// `hf_offline` skips the hub for a model that is already cached.
+pub fn build_embedder(spec: &str, hf_offline: bool) -> (Arc<dyn Embedder>, Option<String>) {
     let (scheme, name) = spec.split_once(':').unwrap_or((spec, ""));
     match scheme.trim() {
         "hash" => {
@@ -93,14 +95,24 @@ pub fn build_embedder(spec: &str) -> (Arc<dyn Embedder>, Option<String>) {
             };
             (Arc::new(HashingEmbedder::new(dim)), None)
         }
-        "sentence-transformers" => (
-            Arc::new(HashingEmbedder::default()),
-            Some(
-                "sentence-transformers unavailable (not ported to the Rust build yet); using the \
-                 offline hash embedder."
-                    .to_owned(),
-            ),
-        ),
+        "sentence-transformers" => {
+            let name = if name.is_empty() {
+                "all-MiniLM-L6-v2"
+            } else {
+                name
+            };
+            match SentenceTransformerEmbedder::load(name, hf_offline) {
+                Ok(embedder) => (Arc::new(embedder), None),
+                // Python's note names the exception; its install hint does not apply.
+                Err(error) => (
+                    Arc::new(HashingEmbedder::default()),
+                    Some(format!(
+                        "sentence-transformers unavailable ({}); using the offline hash embedder.",
+                        error.python_name()
+                    )),
+                ),
+            }
+        }
         _ => (
             Arc::new(HashingEmbedder::default()),
             Some(format!("unknown embedder '{spec}'; using hash embedder.")),
@@ -159,17 +171,13 @@ mod tests {
 
     #[test]
     fn specs_pick_the_embedder_and_explain_fallbacks() {
-        assert_eq!(build_embedder("hash:64").0.spec(), "hash:64");
-        assert_eq!(build_embedder(" hash : 32 ").0.spec(), "hash:32");
-        assert_eq!(build_embedder("hash").0.spec(), "hash:256");
-        assert_eq!(build_embedder("hash:x").0.spec(), "hash:256");
-        assert!(build_embedder("hash:8").1.is_none());
+        assert_eq!(build_embedder("hash:64", true).0.spec(), "hash:64");
+        assert_eq!(build_embedder(" hash : 32 ", true).0.spec(), "hash:32");
+        assert_eq!(build_embedder("hash", true).0.spec(), "hash:256");
+        assert_eq!(build_embedder("hash:x", true).0.spec(), "hash:256");
+        assert!(build_embedder("hash:8", true).1.is_none());
 
-        let (embedder, note) = build_embedder("sentence-transformers:all-MiniLM-L6-v2");
-        assert_eq!(embedder.spec(), "hash:256");
-        assert!(note.unwrap().contains("using the offline hash embedder"));
-
-        let (embedder, note) = build_embedder("word2vec:big");
+        let (embedder, note) = build_embedder("word2vec:big", true);
         assert_eq!(embedder.spec(), "hash:256");
         assert_eq!(
             note.unwrap(),

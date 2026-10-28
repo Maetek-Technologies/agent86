@@ -1,0 +1,278 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "[PAD]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "[CLS]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "[SEP]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "[MASK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": null,
+    "lowercase": true
+  },
+  "pre_tokenizer": {
+    "type": "BertPreTokenizer"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "[CLS]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "SpecialToken": {
+          "id": "[CLS]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "[CLS]": {
+        "id": "[CLS]",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "[CLS]"
+        ]
+      },
+      "[SEP]": {
+        "id": "[SEP]",
+        "ids": [
+          3
+        ],
+        "tokens": [
+          "[SEP]"
+        ]
+      }
+    }
+  },
+  "decoder": {
+    "type": "WordPiece",
+    "prefix": "##",
+    "cleanup": true
+  },
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[PAD]": 0,
+      "[UNK]": 1,
+      "[CLS]": 2,
+      "[SEP]": 3,
+      "[MASK]": 4,
+      "a": 5,
+      "b": 6,
+      "c": 7,
+      "d": 8,
+      "e": 9,
+      "f": 10,
+      "g": 11,
+      "h": 12,
+      "i": 13,
+      "j": 14,
+      "k": 15,
+      "l": 16,
+      "m": 17,
+      "n": 18,
+      "o": 19,
+      "p": 20,
+      "q": 21,
+      "r": 22,
+      "s": 23,
+      "t": 24,
+      "u": 25,
+      "v": 26,
+      "w": 27,
+      "x": 28,
+      "y": 29,
+      "z": 30,
+      "0": 31,
+      "1": 32,
+      "2": 33,
+      "3": 34,
+      "4": 35,
+      "5": 36,
+      "6": 37,
+      "7": 38,
+      "8": 39,
+      "9": 40,
+      "##a": 41,
+      "##b": 42,
+      "##c": 43,
+      "##d": 44,
+      "##e": 45,
+      "##f": 46,
+      "##g": 47,
+      "##h": 48,
+      "##i": 49,
+      "##j": 50,
+      "##k": 51,
+      "##l": 52,
+      "##m": 53,
+      "##n": 54,
+      "##o": 55,
+      "##p": 56,
+      "##q": 57,
+      "##r": 58,
+      "##s": 59,
+      "##t": 60,
+      "##u": 61,
+      "##v": 62,
+      "##w": 63,
+      "##x": 64,
+      "##y": 65,
+      "##z": 66,
+      "##0": 67,
+      "##1": 68,
+      "##2": 69,
+      "##3": 70,
+      "##4": 71,
+      "##5": 72,
+      "##6": 73,
+      "##7": 74,
+      "##8": 75,
+      "##9": 76,
+      ".": 77,
+      ",": 78,
+      "!": 79,
+      "?": 80,
+      "(": 81,
+      ")": 82,
+      "[": 83,
+      "]": 84,
+      "{": 85,
+      "}": 86,
+      "-": 87,
+      "_": 88,
+      "中": 89,
+      "文": 90,
+      "—": 91,
+      "the": 92,
+      "an": 93,
+      "is": 94,
+      "in": 95,
+      "this": 96,
+      "my": 97,
+      "of": 98,
+      "to": 99,
+      "and": 100,
+      "list": 101,
+      "files": 102,
+      "directory": 103,
+      "editor": 104,
+      "favourite": 105,
+      "helix": 106,
+      "build": 107,
+      "rocket": 108,
+      "ship": 109,
+      "launch": 110,
+      "text": 111,
+      "hello": 112,
+      "world": 113,
+      "word": 114,
+      "un": 115,
+      "##believ": 116,
+      "##ably": 117,
+      "file": 118,
+      "dir": 119,
+      "##ect": 120,
+      "##ory": 121,
+      "tab": 122,
+      "new": 123,
+      "##line": 124,
+      "nul": 125,
+      "zero": 126,
+      "width": 127
+    }
+  }
+}

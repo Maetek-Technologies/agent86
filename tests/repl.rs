@@ -20,8 +20,8 @@ impl Workspace {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home").join(".agent86")).unwrap();
         std::fs::create_dir_all(root.join("project").join(".agent86")).unwrap();
-        // The default sentence-transformers embedder is not ported; its fallback
-        // note would open every transcript.
+        // The default sentence-transformers model is not cached in the throwaway
+        // home; the hash embedder keeps the sessions self-contained.
         std::fs::write(
             root.join("home").join(".agent86").join("config.toml"),
             "[memory]\nembeddings = \"hash:256\"\n",
@@ -60,6 +60,11 @@ impl Workspace {
             .env_remove("AGENT86_SANDBOX")
             .env_remove("AGENT86_APPROVAL")
             .env_remove("NO_COLOR")
+            // No test may reach the Hugging Face hub or read the real cache.
+            .env_remove("HF_HUB_CACHE")
+            .env_remove("HF_HOME")
+            .env_remove("HF_ENDPOINT")
+            .env("HF_HUB_OFFLINE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

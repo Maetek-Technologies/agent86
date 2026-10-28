@@ -332,11 +332,10 @@ pub struct MemoryConfig {
     pub enabled: bool,
     /// The SQLite database, shared with the Python implementation; `~` expands.
     pub path: String,
-    /// The embedder spec: `hash:<dim>`, or `sentence-transformers:<model>`, which
-    /// falls back to `hash:256` until it is ported.
+    /// The embedder spec: `hash:<dim>`, or `sentence-transformers:<model>`
+    /// (falling back to `hash:256` when the model cannot load).
     pub embeddings: String,
-    /// Skip the Hugging Face update check for a cached model (unused until the
-    /// model is ported).
+    /// Skip the Hugging Face update check for a cached model.
     pub hf_offline: bool,
     /// Retention caps for the episode and session log, applied when the harness
     /// starts; 0 disables a cap. Curated facts are never pruned automatically.
@@ -684,7 +683,7 @@ fn non_empty_env(name: &str) -> Option<String> {
 }
 
 /// The home directory as Python's `Path.home()` resolves it.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(variable)
         .filter(|value| !value.is_empty())
