@@ -31,8 +31,10 @@ toml = { version = "1.1.8", default-features = false, features = ["parse", "pres
 unicode-width = "0.2"
 url = "2.5.8"
 md5 = "0.8.1"
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
+# Pinned: candle 0.11's aarch64 NEON code uses float16 intrinsics that are not
+# stable in the MSRV (1.88), so it does not build on Apple silicon.
+candle-core = "=0.10.2"
+candle-nn = "=0.10.2"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 
 [lints.rust]
