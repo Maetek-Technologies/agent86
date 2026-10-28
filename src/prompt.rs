@@ -40,14 +40,34 @@ Debugging:
 ";
 
 /// Compile the system prompt into a single system message.
-pub fn build_system_prompt(config: &Config) -> Message {
-    let content = format!(
+pub fn build_system_prompt(config: &Config, skills: &crate::skills::Skills) -> Message {
+    let mut content = format!(
         "{}\n\nEnvironment: agent86 v{}. Default model: {}. Sandbox: {}.",
         BASE_IDENTITY.trim(),
         env!("CARGO_PKG_VERSION"),
         config.model.default,
         config.sandbox.mode.as_str(),
     );
+    if !skills.is_empty() {
+        // Progressive disclosure: names and descriptions only; `use_skill` loads the rest.
+        content.push_str(
+            "\n\nAvailable skills (call use_skill with the name to load full instructions):",
+        );
+        for skill in skills.values() {
+            content.push_str(&format!(
+                "\n- {}: {}",
+                skill.name,
+                crate::skills::one_line(&skill.description)
+            ));
+            // Said up front: finding the restriction through a refused call wastes a step.
+            if !skill.allowed_tools.is_empty() {
+                content.push_str(&format!(
+                    " [tools while active: {}]",
+                    skill.allowed_tools.join(", ")
+                ));
+            }
+        }
+    }
     Message {
         role: Role::System,
         content,

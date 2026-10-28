@@ -10,6 +10,7 @@ pub mod exec;
 pub mod files;
 pub mod memory;
 pub mod sandbox;
+pub mod skills;
 pub mod web;
 
 use crate::types::{ToolCall, ToolResult, ToolSpec};
@@ -353,7 +354,9 @@ fn parse_python_int(text: &str) -> Option<i64> {
 pub struct SandboxPolicy {
     /// The workspace root, fully resolved.
     workspace: PathBuf,
-    /// Further roots tools may reach. Python adds skill directories here; none yet.
+    /// Further roots tools may reach: the skill directories, so a skill's bundled
+    /// files can be read. (The jail has no read/write split, as in Python; a write
+    /// there still passes the approval gate.)
     allow_paths: Vec<PathBuf>,
     pub max_output_chars: usize,
     /// How long one sandboxed process may run before its tree is killed.
@@ -379,6 +382,16 @@ impl SandboxPolicy {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    /// Let tools also reach `roots` (already resolved), leaving out any inside the
+    /// workspace, as Python's `default_policy` does with the skill roots.
+    pub fn allow(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        for root in roots {
+            if !root.starts_with(&self.workspace) && !self.allow_paths.contains(&root) {
+                self.allow_paths.push(root);
+            }
+        }
     }
 
     /// Resolve `path` (relative to the workspace) and enforce the jail.
@@ -483,6 +496,11 @@ pub struct ToolContext {
     pub web: web::WebSettings,
     /// Long-term memory for `remember` and `recall`; `None` when memory is off.
     pub memory: Option<crate::session::SessionStore>,
+    /// The discovered skills, for `use_skill`.
+    pub skills: Arc<crate::skills::Skills>,
+    /// The skill `use_skill` activated this turn, whose `allowed-tools` restrict
+    /// what may run. Shared by clones of the context.
+    active_skill: Arc<std::sync::Mutex<Option<Arc<crate::skills::Skill>>>>,
 }
 
 impl ToolContext {
@@ -493,7 +511,41 @@ impl ToolContext {
             executor: Executor::Subprocess,
             web: web::WebSettings::default(),
             memory: None,
+            skills: Arc::default(),
+            active_skill: Arc::default(),
         })
+    }
+
+    fn active(&self) -> std::sync::MutexGuard<'_, Option<Arc<crate::skills::Skill>>> {
+        self.active_skill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Make `skill` the active one, replacing (never stacking on) any other.
+    pub fn activate_skill(&self, skill: &Arc<crate::skills::Skill>) {
+        *self.active() = Some(Arc::clone(skill));
+    }
+
+    /// Lift the active skill's restriction, as the end of a turn does.
+    pub fn clear_skill(&self) {
+        *self.active() = None;
+    }
+
+    pub fn active_skill(&self) -> Option<Arc<crate::skills::Skill>> {
+        self.active().clone()
+    }
+
+    /// Whether `name` may be called now, given the active skill's `allowed-tools`.
+    /// `use_skill` always may: it is how the model switches skills, and a skill
+    /// that forgot to list it would otherwise be a one-way door.
+    pub fn allowed_tool(&self, name: &str) -> bool {
+        match self.active().as_deref() {
+            Some(skill) if !skill.allowed_tools.is_empty() => {
+                name == "use_skill" || skill.allowed_tools.iter().any(|tool| tool == name)
+            }
+            _ => true,
+        }
     }
 }
 
@@ -613,6 +665,7 @@ impl ToolRegistry {
     /// blocks the MCP manager from updating the registry.
     pub fn dispatch(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
         match self.get(&call.name) {
+            Some(_) if !ctx.allowed_tool(&call.name) => skill_refusal(call, ctx),
             Some(tool) => tool.run(call, ctx),
             None => ToolResult {
                 call_id: call.id.clone(),
@@ -629,13 +682,35 @@ impl ToolRegistry {
     }
 }
 
+/// The answer to a call the active skill's `allowed-tools` forbid, naming the
+/// skill and its list so the model can re-plan rather than retry.
+fn skill_refusal(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+    let skill = ctx.active_skill();
+    let (name, allowed) = skill
+        .as_deref()
+        .map(|skill| (skill.name.as_str(), skill.allowed_tools.join(", ")))
+        .unwrap_or_default();
+    ToolResult {
+        call_id: call.id.clone(),
+        ..failure(
+            &call.name,
+            format!(
+                "Tool '{}' is not permitted while the skill '{name}' is active. That skill's \
+                 allowed-tools are: {allowed}. Use one of those, or finish with the skill first.",
+                call.name
+            ),
+        )
+    }
+}
+
 fn same_tool(a: &Arc<dyn Tool>, b: &Arc<dyn Tool>) -> bool {
     std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
 }
 
-/// Python's built-in tools, plus `remember` and `recall` when memory is on, in
-/// its registration order (`default_registry`).
-pub fn default_registry(with_memory: bool) -> ToolRegistry {
+/// Python's built-in tools, plus `remember` and `recall` when memory is on and
+/// `use_skill` when a skill was found, in its registration order
+/// (`default_registry`).
+pub fn default_registry(with_memory: bool, with_skills: bool) -> ToolRegistry {
     let registry = builtin_registry();
     if with_memory {
         for tool in [
@@ -646,6 +721,11 @@ pub fn default_registry(with_memory: bool) -> ToolRegistry {
                 .register(tool)
                 .expect("memory tool names are unique");
         }
+    }
+    if with_skills {
+        registry
+            .register(Box::new(skills::UseSkillTool))
+            .expect("use_skill is unique");
     }
     registry
 }

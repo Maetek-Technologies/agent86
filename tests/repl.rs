@@ -393,3 +393,36 @@ async fn an_unusable_model_cannot_start_the_repl() {
     );
     assert!(!text.contains("agent86>"));
 }
+
+#[tokio::test]
+async fn skills_lists_the_discovered_skills() {
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::new("skills", &server);
+    let none = stdout(&workspace.repl(&[], "/skills\n").await);
+    assert!(none.contains("agent86> no skills discovered\n"), "{none}");
+
+    for (folder, text) in [
+        ("b", "---\nname: lint\ndescription: Run the linters.\n---\n"),
+        (
+            "a",
+            "---\nname: notes\ndescription: Draft release notes.\n---\n",
+        ),
+    ] {
+        let dir = workspace
+            .project()
+            .join(".agent86")
+            .join("skills")
+            .join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), text).unwrap();
+    }
+    let text = stdout(&workspace.repl(&[], "/skills\n/tools\n").await);
+    assert!(
+        text.contains("agent86> notes - Draft release notes.\nlint - Run the linters.\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(", run_command, use_skill, web_fetch,"),
+        "{text}"
+    );
+}

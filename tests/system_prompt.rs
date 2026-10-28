@@ -26,7 +26,7 @@ fn the_prompt_is_the_identity_plus_the_environment_line() {
     };
     let config = load_config(&paths, &overrides).unwrap();
 
-    let message = build_system_prompt(&config);
+    let message = build_system_prompt(&config, &Default::default());
 
     assert_eq!(message.role, Role::System);
     let expected = format!(

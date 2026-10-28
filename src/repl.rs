@@ -392,7 +392,17 @@ pub const COMMANDS: [CommandEntry; 15] = [
         usage: "/skills",
         description: "List available skills",
         needs_choice: None,
-        handler: |_, _| CommandResult::message("no skills discovered"),
+        handler: |repl, _| {
+            let skills = &repl.harness.context.skills;
+            if skills.is_empty() {
+                return CommandResult::message("no skills discovered");
+            }
+            let lines: Vec<String> = skills
+                .values()
+                .map(|skill| format!("{} - {}", skill.name, skill.description))
+                .collect();
+            CommandResult::message(lines.join("\n"))
+        },
     },
     CommandEntry {
         name: "/memory",

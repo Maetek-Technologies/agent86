@@ -1704,3 +1704,95 @@ async fn drop_mode_trims_requests_without_summarizing() {
     );
     assert!(trace_events(&workspace, "compaction").is_empty());
 }
+
+#[tokio::test]
+async fn skills_are_advertised_loaded_and_enforce_their_tool_list() {
+    // The workspace's path is known before it exists, so the scripted read can name
+    // the user skill's bundled file, which sits outside the workspace.
+    let root = std::env::temp_dir().join(format!("agent86-cli-skills-{}", std::process::id()));
+    let user_skill = root
+        .join("home")
+        .join(".claude")
+        .join("skills")
+        .join("style");
+    let read = json!({ "path": user_skill.join("reference.md").display().to_string() }).to_string();
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("s", "use_skill", r#"{"name": "release-notes"}"#)]),
+        sse_tool_calls(&[
+            ("r", "read_file", &read),
+            ("w", "write_file", r#"{"path": "notes.md", "content": "x"}"#),
+        ]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("skills", &server);
+    assert_eq!(workspace.root, root);
+    let project_skill = workspace
+        .project()
+        .join(".agent86")
+        .join("skills")
+        .join("notes");
+    std::fs::create_dir_all(&project_skill).unwrap();
+    std::fs::write(
+        project_skill.join("SKILL.md"),
+        "---\nname: release-notes\ndescription: >\n  Draft release notes\n  from the changelog.\nallowed-tools: read_file\n---\nRead the reference first.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&user_skill).unwrap();
+    std::fs::write(
+        user_skill.join("SKILL.md"),
+        "---\nname: style\ndescription: House style.\n---\nBe brief.\n",
+    )
+    .unwrap();
+    std::fs::write(user_skill.join("reference.md"), "use the past tense").unwrap();
+
+    let output = workspace.run(&["run", "--yes", "draft the notes"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let requests = server.requests();
+
+    // Advertised: names and one-line descriptions in the system message, and the tool.
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.ends_with(
+            "\n\nAvailable skills (call use_skill with the name to load full instructions):\n\
+             - release-notes: Draft release notes from the changelog. [tools while active: read_file]\n\
+             - style: House style."
+        ),
+        "{system}"
+    );
+    let tools: Vec<&str> = requests[0].body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"use_skill"), "{tools:?}");
+
+    // Loaded on demand.
+    let results = |index: usize| -> Vec<Value> {
+        requests[index].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        results(1)[0]["content"],
+        "Read the reference first.\n\nWhile this skill is active you may only call these \
+         tools: read_file (plus use_skill). Other tools will be refused."
+    );
+
+    // While active, the listed tool runs, even on a skill's bundled file outside the
+    // workspace, and anything else is refused.
+    let results = results(2);
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[1]["content"], "use the past tense");
+    assert_eq!(
+        results[2]["content"],
+        "Tool 'write_file' is not permitted while the skill 'release-notes' is active. That \
+         skill's allowed-tools are: read_file. Use one of those, or finish with the skill first."
+    );
+    assert!(!workspace.project().join("notes.md").exists());
+}

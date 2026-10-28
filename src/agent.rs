@@ -451,11 +451,16 @@ impl Harness {
     ) -> Result<String, HarnessError> {
         // A cancel requested while no turn was running must not kill this one.
         self.cancel.clear();
+        // A skill activated with `use_skill` restricts tools for its turn only: the
+        // restriction is lifted on entry and on every exit, so it can never keep
+        // refusing tools for the rest of the session.
+        self.context.clear_skill();
         let started = Instant::now();
         let mut summary = TurnSummary::default();
         let result = self
             .turn(state, user_text, display_text, &mut summary, on_event)
             .await;
+        self.context.clear_skill();
         summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
         state.last_turn = Some(summary);
         if let Err(error) = &result {

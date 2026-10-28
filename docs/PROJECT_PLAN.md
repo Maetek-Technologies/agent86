@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills done, delegation (`delegate` and sub-agents) next
 
 ## 1. Purpose
 
@@ -102,6 +102,14 @@ The Python implementation remains the reference and compatibility oracle. This p
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
 - Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
+- Added skills, ported from `skills/` (the loader and `Skill`), `tools/builtin/skills_tool.py`, the skills section of `cognitive/prompt.py`, the `allowed-tools` enforcement in `tools/registry.py` and `tools/base.py`, the skill roots in `tools/sandbox/policy.py`, and `/skills`:
+  - discovery from `<workspace>/.agent86/skills`, `<workspace>/.claude/skills`, `~/.agent86/skills`, `~/.claude/skills`, then `[skills] paths`, each root's folders in Python's sorted order (case-insensitive on Windows), the first root winning a name; `[skills] enabled = false` finds none
+  - `SKILL.md` frontmatter read with Python's built-in parser (`key: value`, quotes, inline and block lists, `>`/`|` block scalars with indicators, comments), the closing `---` only on its own line, a missing `name` taken from the folder, and `allowed-tools` in any spelling (spaces, commas, an inline or block list)
+  - the system prompt's `Available skills` section (one line each, with `[tools while active: ...]`), and `use_skill` (registered only when a skill exists, Python's schema): the instructions, read once and kept, the bundled resources line, and the restriction notice, with Python's metadata and error for an unknown skill
+  - while a skill with `allowed-tools` is active, every other tool except `use_skill` is refused with Python's message naming the skill and its list; the restriction lasts until the turn ends, however it ends
+  - the skill roots join the sandbox's allowed roots, so a skill's bundled files outside the workspace can be read
+  - `/skills` lists `name - description`
+  - live check (2026-10-27, local Ollama, `gemma4:12b`, throwaway workspace and home): asked to use a project skill, the model called `use_skill`, got its instructions, and read the file they named with the one tool the skill allows
 - Added context-window fitting and compaction, ported from `memory/working.py` and the compaction path in `orchestration/loop.py`:
   - every request is fitted to the model's real window: the window (`context_window_for`, with OpenRouter's own figure) minus the system message and the tool catalogue, minus `[limits] context_reserve_tokens` (4096) and the output cap (together clamped to half the window), floored at 1024 tokens, then capped by `[limits] max_context_tokens` (0, no cap); tokens are Python's estimate (code points over 4, counting tool names and arguments); the oldest messages are dropped first and a leading tool result never survives without its call
   - before each model call, a history over budget has its oldest span (never the last six messages, the current turn, or half of a tool block) replaced by a summary the model writes under Python's instructions (`GOAL`, `DECISIONS`, `FACTS`, `OPEN`), merged into the next user message as `[Conversation summary — earlier turns compacted]`; the turn streams `[compacted N messages into a summary]`, the summary call's usage and cost count toward the turn, the trace gets Python's `compaction` event, the replaced messages are archived as a `kind = "compaction"` episode (as Python's pydantic dump), and the session is saved at once
@@ -140,7 +148,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **410 passed on Windows** (182 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 43 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **420 passed on Windows** (186 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 44 CLI end-to-end, 12 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 4 skills, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -162,12 +170,12 @@ The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory]`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
-- Skills and delegation tools, and skills themselves
+- Delegation: the `delegate` tool and sub-agents (`[agents]` is read but unused)
 - OpenTelemetry span export (`[observability] otel`)
 
 ### Known `run` differences from Python
 
-- The system prompt is the identity, the environment line, the MCP section when servers are live, and the turn's episodic recall note. Python also adds installed skills, which are not ported.
+- The system prompt is the identity, the environment line, the skills section, the MCP section when servers are live, and the turn's episodic recall note, as in Python.
 - The environment line reports the Rust crate version (`agent86 v0.1.0`), not Python's (`v1.0.0`).
 - `--sandbox` is not accepted (`AGENT86_SANDBOX` and `[sandbox] mode` are).
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
@@ -185,7 +193,6 @@ The agent works end to end, but it does not yet have:
 - A cancel that lands after the model asked for tools but before any ran answers each call with `Not executed: cancelled.`; Python leaves those calls unanswered, which providers reject on the next request.
 - `/config` prints the merged TOML layers (built-in defaults for the modelled sections, the config files, and overrides) as JSON, not Python's full pydantic dump with every default.
 - `/config model` and `/config mcp` give Python's wording, pointing at the interface.
-- `/skills` always reports `no skills discovered`, because skills are not ported.
 - `/models` always reports the OS keyring as available; Python checks for a usable backend. Its tables, `/sessions`, and the help list are plain aligned text (Rich tables in Python, with the same columns), and nothing is wrapped to the terminal width.
 - `/model` switches the provider for later turns; there is no router to pin, since triage routing is not ported.
 - Answers are printed as plain text, as in Python's plain loop; the Markdown rendering behind `[ui] markdown` belongs to the full-screen app.
@@ -232,7 +239,7 @@ The agent works end to end, but it does not yet have:
 
 ### Known loop differences from Python
 
-- Python also offers skill and delegation tools when those are enabled, so the tool list in each request differs.
+- Python also offers the `delegate` tool (on by default), so the tool list in each request differs.
 - Compaction summaries are written by the current model. Python uses triage routing's cheap model when routing is on, which is not ported (it is off by default).
 - The window is looked up when the model is set (at start and on `/model`), not before every request; a `[model.context_window]` change written by `/config` applies from the next `/model`.
 - After a compaction mid-turn, the turn's start and a continuation in progress are re-indexed into the shorter history. Python keeps the old indices, which then point past where they should (a deliberate fix).
@@ -263,6 +270,11 @@ The agent works end to end, but it does not yet have:
 ### Known session differences from Python
 
 - `state_json` is valid in both directions but not byte-identical: Rust omits empty lists and nulls that pydantic writes, and writes floats in Python's `json.dumps` style where pydantic uses shortest-decimal notation.
+
+### Known skill differences from Python
+
+- `SKILL.md` frontmatter is always read with Python's built-in parser. Python uses PyYAML instead when it happens to be installed (the `local` extra brings it in), which reads full YAML: nested mappings, anchors, and YAML's own quoting and folding rules. The usual shapes (`key: value`, lists, `>`/`|` descriptions) read the same either way. `license` and `metadata` are not kept, since nothing reads them.
+- `/skills` prints the names and descriptions as plain text; Rich escapes markup in them.
 
 ### Known memory differences from Python
 
@@ -297,7 +309,6 @@ The agent works end to end, but it does not yet have:
 
 - I/O failures other than the handled cases report Rust's error text after Python's exception name (for example `PermissionError: Access is denied. (os error 5)` rather than Python's `[Errno 13] Permission denied: '...'`).
 - Invalid UTF-8 is replaced per maximal invalid sequence (Rust's `from_utf8_lossy`) rather than per byte, so a run of bad bytes can yield fewer U+FFFD characters than Python.
-- The jail has no extra allowed roots yet; Python adds skill directories, which are not ported.
 
 ### Known provider differences from Python
 
