@@ -45,6 +45,12 @@ With `[model] router = "triage"`, each turn goes to the cheap model (`[model.rou
 
 Long conversations are fitted to the model's real context window. When a session outgrows it, the oldest turns are replaced by a summary the model writes (goal, decisions, facts, open items), so a resumed session keeps its goal; the originals are archived in memory. `[limits] compaction = "drop"` drops them instead, and `max_context_tokens` caps the budget.
 
+## Install
+
+Download the archive for your platform from [Releases](https://github.com/tdfleming/agent-86-rs/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64, macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/tdfleming/agent-86-rs --tag v1.0.0` (needs Rust 1.88 or newer).
+
+To publish a release, add notes for it in `docs/releases/<tag>.md`, set the version in `Cargo.toml`, merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives and creates the release.
+
 ## Why Rust?
 
 The port explores easier binary distribution, fast startup, explicit typed state transitions, and a coherent async runtime. It is not based on an assumption that Python makes model API calls slow: model, network, tool, and I/O latency will remain dominant in many workloads.

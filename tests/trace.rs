@@ -80,7 +80,12 @@ fn otlp_export_matches_python_byte_for_byte() {
         "{}\n",
         python_json_dumps_indented(&otlp_document(&events), false, 2)
     );
-    assert_eq!(text, golden["otlp"]["document_text"].as_str().unwrap());
+    // The golden carries Python's `__version__` (1.0.0); the export writes the crate's.
+    let expected = golden["otlp"]["document_text"]
+        .as_str()
+        .unwrap()
+        .replace("\"1.0.0\"", &format!("\"{}\"", env!("CARGO_PKG_VERSION")));
+    assert_eq!(text, expected);
     assert_eq!(
         python_json_dumps(&Value::Object(events[1].clone()), false),
         golden["jsonl_line"].as_str().unwrap()
