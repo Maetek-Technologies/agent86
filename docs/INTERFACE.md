@@ -160,6 +160,7 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 | `src/ui/status.rs` | A port of `ui/status.py` and `fit_status_line`. Shared, so `/cost` and the plain loop could use the same numbers |
 | `src/ui/panels.rs` (part 5) | The key entry, connection test, and save-diff panels (Python's `KeyEntryModal`, `ConnectionTestModal`, `SaveDiffModal`) and the frame every panel is drawn in. The provider list and the catalog picker are pickers (`picker.rs`); the approval panel is in `app.rs`. Part 6 adds the MCP manager, the server form, and the MCP test |
 | `src/ui/manage.rs` (part 5) | The catalog cache and the `/config model` chain, as the catalog and model-manager parts of Python's `tui/app.py`: the bare `/model` picker, the typed `/model <id>` fallback, and the chain from the provider list to the save |
+| `src/ui/limits.rs` | Beyond Python: the offer to raise a limit a turn reached (a panel answered like the approval panel) and `/limits save` through the save-diff panel. The limits themselves are in `src/limits.rs` |
 | `src/repl.rs` | Unchanged role: the command registry, `Repl`, and the plain loop. Command handlers already return `CommandResult`s, which both surfaces draw |
 
 ### Threads and events
@@ -168,6 +169,7 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 - **A turn runs on a worker thread** with its own tokio runtime, as the plain loop's turn does now. The worker owns the `Harness` and the `AgentState` for the duration of the turn and hands both back when it finishes. Nothing is shared under a lock while the UI draws. The UI keeps its own copies of what it displays (the status numbers and the entries).
 - **The harness gains a turn observer.** It is an optional sink of structured `TurnEvent`s: `Text`, `ToolStart { call }`, `ToolResult { call_id, result }`, `Notice`, `Phase`, and `Finished`. These are emitted alongside the existing text `emit`, so `run`, `run --json`, and the plain loop print exactly what they print today. Python's `turn_bridge` parses `[tool] …` lines and looks the arguments up in the state. Here the events carry the call and the result directly.
 - **Approvals:** the gate's prompt closure, running on the worker, sends an `ApprovalRequest` with a one-shot reply channel and blocks on it. The UI opens the approval panel and answers. On shutdown, every pending request is answered with deny, as Python's `_shutdown_workers` does.
+- **Limit offers** (beyond Python) work like approvals: the harness's limit prompt sends a `UiEvent::Limit` with a reply channel and blocks; the panel answers with the new value or none, Ctrl+C stops it and cancels the turn, and a turn that ends drops an offer nobody answered.
 - **Cancellation:** cancellation uses the existing `CancelToken`. Escape and Ctrl+C call `cancel()` and write the `cancelling…` note, and the turn ends at its next safe point.
 - **MCP notes:** these arrive through `McpManager::add_note_listener` and are forwarded as `UiEvent`s, so they show up even while idle (Python's `on_mcp_note`).
 - **Slow work never blocks the UI thread.** That covers catalog fetches, connection tests, and MCP tests, which run on workers and report back with events (Python's `CatalogReady` and the test modals' workers).
@@ -259,6 +261,10 @@ Each slice is one PR to `main`. Each passes `cargo test --all-targets`, `cargo f
 - **Command wording:** `/config mcp` in the plain loop changes to Python's wording.
 
 Stage 9 is complete after slice 5, and then the README roadmap item is ticked. **Done in part 6.** The chain lives in `src/ui/manage_mcp.rs`, the panels in `src/ui/mcp_panels.rs`, and the pure helpers (rows, the JSON shapes, the manual fields, `shlex`, the save's changes) in `src/ui/mcp_config.rs`.
+
+### Beyond Python: turn limits
+
+`/limits` shows the step budget, the sub-agent step budget, and the output cap, each with the setting it comes from, and `/limits <steps|agent_steps|output> <n>` overrides one for the session. `/limits save` shows the diff in the save panel and writes each override to the setting it replaces (the provider's `max_tokens` when that section sets one, else `[limits] max_output_tokens`), with comments kept. When a turn or a sub-agent reaches its step budget, or a reply reaches the output cap before any text, a panel offers to raise the limit (to double or four times it) and goes on: the breaker gets the new budget, or the request is sent again with the larger cap. The plain loop has `/limits` without the save and without the offer.
 
 ## 11. Testing
 

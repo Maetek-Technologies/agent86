@@ -75,6 +75,8 @@ pub enum SavePurpose {
     McpServer,
     /// An MCP server removed or disabled.
     McpUnmount,
+    /// `/limits save`.
+    Limits,
 }
 
 /// Masked entry of one API key. The key is never drawn: only one dot per

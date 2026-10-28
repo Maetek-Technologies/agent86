@@ -13,6 +13,7 @@ pub mod difflib;
 pub mod guardrails;
 pub mod history;
 pub mod keys;
+pub mod limits;
 pub mod mcp;
 pub mod memory;
 pub mod mentions;

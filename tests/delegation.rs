@@ -11,6 +11,7 @@ use agent86::config::{
     RedactMode,
 };
 use agent86::guardrails::Guardrails;
+use agent86::limits::{LimitHit, LimitKind};
 use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::session::AgentState;
@@ -19,6 +20,7 @@ use agent86::tools::{default_registry, ToolContext};
 use agent86::types::{ApprovalMode, Message, Role};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use support::{sse_text, sse_tool_calls, MockServer, Reply};
 
 struct Workspace(PathBuf);
@@ -87,6 +89,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
             name: None,
         },
         max_tokens: 1024,
+        session_limits: Default::default(),
         context_window: 128_000,
         gate: ApprovalGate::new(ApprovalMode::Ask, None),
         guardrails: Guardrails {
@@ -401,4 +404,112 @@ fn delegate_is_registered_only_when_agents_are_on_and_never_runs_in_parallel() {
         agent86::tools::skills::UseSkillTool.description(),
         python["UseSkillTool"]
     );
+}
+
+#[tokio::test]
+async fn sub_agents_get_the_main_loops_output_cap() {
+    // A deliberate fix: Python sends no cap, so a sub-agent gets the provider's
+    // default, which `[limits] max_output_tokens` and `/limits` cannot change.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"task": "one"}"#)]),
+        sse_text("First.", "stop"),
+        sse_text("Done.", "stop"),
+        sse_tool_calls(&[("d", "delegate", r#"{"task": "two"}"#)]),
+        sse_text("Second.", "stop"),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("cap");
+    let harness = harness(&server, &workspace, agents(2, 8));
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "one", |_| {}).await.unwrap();
+    // A session override reaches the sub-agents too.
+    harness.session_limits.set(LimitKind::Output, Some(4096));
+    harness.run_turn(&mut state, "two", |_| {}).await.unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests[1].body["max_completion_tokens"], 1024);
+    assert_eq!(requests[4].body["max_completion_tokens"], 4096);
+}
+
+#[tokio::test]
+async fn a_sub_agents_spent_budget_or_empty_cap_can_be_raised() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "review"}"#)]),
+        // The sub-agent's one step, then its budget is raised...
+        sse_tool_calls(&[("l", "list_dir", "{}")]),
+        // ...it reaches the cap before any text, and the cap is raised...
+        sse_text("", "length"),
+        // ...and it answers.
+        sse_text("Report.", "stop"),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("raise");
+    let mut harness = harness(&server, &workspace, agents(2, 1));
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&hits);
+    harness.session_limits.prompt = Some(Box::new(move |hit: &LimitHit| {
+        seen.lock().unwrap().push(hit.clone());
+        hit.offers.last().copied()
+    }));
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "go", |_| {}).await.unwrap();
+
+    let reviewer = Some("reviewer".to_owned());
+    assert_eq!(
+        *hits.lock().unwrap(),
+        [
+            LimitHit {
+                kind: LimitKind::AgentSteps,
+                agent: reviewer.clone(),
+                current: 1,
+                offers: vec![2, 4],
+            },
+            LimitHit {
+                kind: LimitKind::Output,
+                agent: reviewer,
+                current: 1024,
+                offers: vec![2048, 4096],
+            },
+        ]
+    );
+    let requests = server.requests();
+    assert_eq!(requests[3].body["max_completion_tokens"], 4096);
+    // The empty reply was left out of the sub-agent's history.
+    let sub = requests[3].body["messages"].as_array().unwrap();
+    assert_eq!(sub.last().unwrap()["role"], "tool");
+    assert_eq!(last_tool_result(&requests[4]), "Report.");
+    let raised: Vec<String> = workspace
+        .events("sub:reviewer")
+        .iter()
+        .filter(|event| event["kind"] == "limit_raised")
+        .map(|event| format!("{} {} {}", event["limit"], event["from"], event["to"]))
+        .collect();
+    assert_eq!(raised, [r#""agent_steps" 1 4"#, r#""output" 1024 4096"#]);
+}
+
+#[test]
+fn a_sub_agents_offer_stays_under_the_turns_budget() {
+    let budgets = AgentsConfig {
+        enabled: true,
+        max_depth: 2,
+        max_steps: 30,
+    };
+    let workspace = Workspace::new("ceiling");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let server = runtime.block_on(MockServer::start(Vec::new()));
+    let harness = harness(&server, &workspace, budgets);
+    assert_eq!(harness.agent_max_steps(), 30);
+    harness.session_limits.set(LimitKind::AgentSteps, Some(100));
+    assert_eq!(
+        harness.agent_max_steps(),
+        40,
+        "never above [limits] max_steps"
+    );
+    harness.session_limits.set(LimitKind::Steps, Some(120));
+    assert_eq!(harness.agent_max_steps(), 100);
 }

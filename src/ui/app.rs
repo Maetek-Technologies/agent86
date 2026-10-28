@@ -11,6 +11,7 @@
 use super::diff::detail_line;
 use super::entries::{view_lines, Entry, ToolEntry, ARG_PREVIEW_LIMIT};
 use super::input::Editor;
+use super::limits::LimitPanel;
 use super::markdown;
 use super::mcp_config::McpDraft;
 use super::mcp_panels::{McpAction, McpForm, McpList, McpTest, McpTestOutcome};
@@ -25,6 +26,7 @@ use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
 use crate::config_writer::ConfigEdit;
+use crate::limits::LimitHit;
 use crate::provider::catalog::CatalogEntry;
 use crate::pyjson::{python_json_dumps, python_json_dumps_indented};
 use crate::repl::{notice_text, Style, Text};
@@ -69,6 +71,12 @@ pub enum UiEvent {
         tool: String,
         preview: ApprovalPreview,
         reply: mpsc::Sender<bool>,
+    },
+    /// The turn reached a limit and asks whether to raise it; the worker waits for
+    /// the new value on `reply`. Dropping `reply` unanswered stops.
+    Limit {
+        hit: LimitHit,
+        reply: mpsc::Sender<Option<u32>>,
     },
     /// The turn ended: `None`, or the Python exception name and the message.
     Finished(Option<(String, String)>),
@@ -231,6 +239,8 @@ pub struct App {
     tools: Vec<(String, ToolEntry)>,
     running: Option<Running>,
     approval: Option<ApprovalPanel>,
+    /// The offer to raise a limit the turn reached.
+    limit: Option<LimitPanel>,
     /// A picker or a `/config model` panel.
     panel: Option<Panel>,
     /// The `/` or `@` completion menu under the input box.
@@ -265,6 +275,7 @@ impl App {
             tools: Vec::new(),
             running: None,
             approval: None,
+            limit: None,
             panel: None,
             menu: None,
             view: None,
@@ -317,6 +328,7 @@ impl App {
     /// Give up on the turn's pending approval, which then reads as declined.
     pub fn abandon(&mut self) {
         self.approval = None;
+        self.limit = None;
     }
 
     /// Show a picker in place of the input box until it is answered or cancelled.
@@ -516,6 +528,10 @@ impl App {
                     selected: 0,
                 });
             }
+            UiEvent::Limit { hit, reply } => {
+                self.view = None;
+                self.limit = Some(LimitPanel::new(hit, reply));
+            }
             UiEvent::Finished(error) => {
                 self.finish_reply();
                 // Announced but never observed (a cancel mid-batch): shown, not dropped.
@@ -539,6 +555,7 @@ impl App {
                 }
                 // An approval nobody answered is declined when its sender is dropped.
                 self.approval = None;
+                self.limit = None;
                 let quit = self
                     .running
                     .take()
@@ -766,6 +783,23 @@ impl App {
             self.approval_key(key);
             return Effect::None;
         }
+        if let Some(panel) = &mut self.limit {
+            if let Some(answer) = panel.on_key(key) {
+                if let Some(panel) = self.limit.take() {
+                    if let Some(value) = answer {
+                        self.note(
+                            Style::Dim,
+                            &format!(
+                                "{} raised to {value} for this session · /limits save keeps it",
+                                panel.hit.kind.name()
+                            ),
+                        );
+                    }
+                    panel.answer(answer);
+                }
+            }
+            return Effect::None;
+        }
         // In the MCP form, Shift+Tab moves between fields instead.
         if key.code == KeyCode::BackTab && !matches!(self.panel, Some(Panel::McpForm(_))) {
             return Effect::CycleMode;
@@ -945,6 +979,9 @@ impl App {
         if let Some(panel) = self.approval.take() {
             let _ = panel.reply.send(false);
         }
+        if let Some(panel) = self.limit.take() {
+            panel.answer(None);
+        }
         if let Some(running) = &mut self.running {
             if running.cancel_requested {
                 running.quit_after = true;
@@ -1064,6 +1101,9 @@ impl App {
                 .height
                 .saturating_sub(top.len().min(self.height / 2) + 4);
             bottom.extend(approval_panel(panel, width, budget));
+            caret_base = 0;
+        } else if let Some(panel) = &self.limit {
+            bottom.extend(panel.render(width));
             caret_base = 0;
         } else if let Some(panel) = &self.panel {
             bottom.extend(match panel {
@@ -1494,6 +1534,54 @@ mod tests {
         let mut eof = self::app();
         eof.on_key(ctrl('d'), &[]);
         assert_eq!(eof.take_request(), Some(Request::Exit));
+    }
+
+    #[test]
+    fn the_limit_offer_answers_the_worker_and_says_what_was_raised() {
+        let hit = || LimitHit {
+            kind: crate::limits::LimitKind::AgentSteps,
+            agent: Some("reviewer".into()),
+            current: 8,
+            offers: vec![16, 32],
+        };
+        let mut app = app_running();
+        app.set_size(81, 30);
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Limit { hit: hit(), reply });
+        let live = live_text(&mut app);
+        assert!(live
+            .iter()
+            .any(|line| line.contains("Sub-agent 'reviewer' reached its step budget (8 steps)")));
+        assert!(live
+            .iter()
+            .any(|line| line.contains("❯ 1. Raise to 16 steps")));
+        assert_eq!(app.live().1, None, "no caret while the panel is open");
+        app.on_key(key(KeyCode::Char('2')), &[]);
+        assert_eq!(answer.recv(), Ok(Some(32)));
+        assert!(committed_text(&mut app).iter().any(|line| line
+            .contains("agent_steps raised to 32 for this session · /limits save keeps it")));
+
+        // Escape stops without cancelling the turn.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Limit { hit: hit(), reply });
+        assert_eq!(app.on_key(key(KeyCode::Esc), &[]), Effect::None);
+        assert_eq!(answer.recv(), Ok(None));
+
+        // Ctrl+C stops it and cancels the turn.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Limit { hit: hit(), reply });
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key(ctrl_c, &[]), Effect::Cancel);
+        assert_eq!(answer.recv(), Ok(None));
+
+        // A turn that ends drops an offer nobody answered, which stops.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Limit { hit: hit(), reply });
+        app.on_turn_event(UiEvent::Finished(None));
+        assert!(answer.recv().is_err());
+        assert!(!live_text(&mut app)
+            .iter()
+            .any(|line| line.contains("step budget")));
     }
 
     #[test]

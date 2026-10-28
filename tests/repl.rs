@@ -431,3 +431,50 @@ async fn skills_lists_the_discovered_skills() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn limits_are_shown_set_for_the_session_and_reset() {
+    // Beyond Python, which reads these limits only from config.
+    let server = MockServer::start(vec![sse_text("Hello", "stop")]).await;
+    let workspace = Workspace::new("limits", &server);
+    workspace.write_config(&format!(
+        "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\nmax_tokens = 4096\n",
+        server.base_url
+    ));
+
+    let text = stdout(
+        &workspace
+            .repl(
+                &[],
+                "/limits\n/limits output 32000\n/limits agent_steps 50\n/limits steps 40\n\
+                 /limits bogus 1\n/limits steps 0\n/limits steps\nhi\n/limits\n/limits save\n\
+                 /limits reset\n/limits\n",
+            )
+            .await,
+    );
+
+    let configured = "limit        value  from\n\
+                      steps           40  [limits] max_steps\n\
+                      agent_steps      8  [agents] max_steps\n\
+                      output        4096  [providers.mock] max_tokens\n\
+                      /limits <steps|agent_steps|output> <n> sets one for this session · /limits reset · /limits save\n";
+    assert_eq!(text.matches(configured).count(), 2, "{text}");
+    for line in [
+        "agent86> output: 32000 for this session (/limits save keeps it)\n",
+        "agent86> agent_steps: 50 for this session, capped at steps (40)\n",
+        "agent86> steps: 40, as configured\n",
+        "agent86> unknown limit 'bogus' (steps|agent_steps|output)\n",
+        "agent86> '0' is not a positive whole number\n",
+        "agent86> /limits <steps|agent_steps|output> <n> sets one for this session · /limits reset · /limits save\n",
+        "agent86> limit        value  from\n\
+         steps           40  [limits] max_steps\n\
+         agent_steps     40  session ([agents] max_steps 8), capped at steps\n\
+         output       32000  session ([providers.mock] max_tokens 4096)\n",
+        "agent86> Saving limits is a TUI surface — run agent86 without --plain and use /limits save.\n",
+        "agent86> limits: back to the config\n",
+    ] {
+        assert!(text.contains(line), "{line:?} not in {text}");
+    }
+    // The session's cap is the one the model was sent.
+    assert_eq!(server.requests()[0].body["max_completion_tokens"], 32000);
+}

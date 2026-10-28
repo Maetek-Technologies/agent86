@@ -10,6 +10,7 @@ use agent86::config::{
     RedactMode,
 };
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
+use agent86::limits::{LimitHit, LimitKind};
 use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::session::AgentState;
@@ -18,6 +19,7 @@ use agent86::turn::RunOutput;
 use agent86::types::{AgentPhase, ApprovalMode, Message, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use support::{sse_text, sse_tool_calls, MockServer, Reply};
 
 /// A throwaway workspace with a couple of files in it.
@@ -146,6 +148,7 @@ async fn run_with(
         agents: agents(),
         system: system(),
         max_tokens: 1024,
+        session_limits: Default::default(),
         context_window: 128_000,
         gate,
         guardrails,
@@ -286,6 +289,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         agents: agents(),
         system: system(),
         max_tokens: 1024,
+        session_limits: Default::default(),
         context_window: 128_000,
         gate: ask_gate(),
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
@@ -723,6 +727,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         agents: agents(),
         system: system(),
         max_tokens: 1024,
+        session_limits: Default::default(),
         context_window: 128_000,
         gate: ask_gate(),
         guardrails: redact,
@@ -817,6 +822,7 @@ async fn recorded_turn(
         agents: agents(),
         system: system(),
         max_tokens: 1024,
+        session_limits: Default::default(),
         context_window: 128_000,
         gate,
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
@@ -933,6 +939,7 @@ fn cancellable(
         agents: agents(),
         system: system(),
         max_tokens: 1024,
+        session_limits: Default::default(),
         context_window: 128_000,
         gate,
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
@@ -1065,4 +1072,132 @@ async fn a_cancel_before_the_turn_does_not_stop_it() {
 
     assert_eq!(output, "Hello");
     assert_eq!(state.phase, AgentPhase::Done);
+}
+
+/// A hook that records each limit reached and answers with `answer`.
+fn offer_hook(
+    harness: &mut Harness,
+    answer: fn(&LimitHit) -> Option<u32>,
+) -> Arc<Mutex<Vec<LimitHit>>> {
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&hits);
+    harness.session_limits.prompt = Some(Box::new(move |hit| {
+        seen.lock().unwrap().push(hit.clone());
+        answer(hit)
+    }));
+    hits
+}
+
+#[tokio::test]
+async fn a_spent_step_budget_can_be_raised_and_the_turn_goes_on() {
+    // Beyond Python: the interface offers to raise the budget instead of ending the turn.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("a", "list_dir", "{}")]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("raise-steps");
+    let traces = workspace.root.join("traces");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        trace_recorder(&traces),
+        &cancel,
+    );
+    // A session override, as `/limits steps 1` or `run --max-steps 1` sets.
+    harness.session_limits.set(LimitKind::Steps, Some(1));
+    let hits = offer_hook(&mut harness, |hit| hit.offers.first().copied());
+
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "go", |_| {}).await.unwrap();
+
+    assert!(output.ends_with("Done."), "{output}");
+    assert_eq!(server.requests().len(), 2);
+    assert_eq!(
+        *hits.lock().unwrap(),
+        [LimitHit {
+            kind: LimitKind::Steps,
+            agent: None,
+            current: 1,
+            offers: vec![2, 4],
+        }]
+    );
+    // The raise lasts for the session.
+    assert_eq!(harness.max_steps(), 2);
+    let raised: Vec<Value> = trace_events(&traces)
+        .into_iter()
+        .filter(|event| event["kind"] == "limit_raised")
+        .collect();
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0]["limit"], "steps");
+    assert_eq!(raised[0]["from"], 1);
+    assert_eq!(raised[0]["to"], 2);
+}
+
+#[tokio::test]
+async fn a_declined_offer_ends_the_turn_at_the_budget_as_before() {
+    let server = MockServer::start(vec![sse_tool_calls(&[("a", "list_dir", "{}")])]).await;
+    let workspace = Workspace::new("raise-declined");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    harness.session_limits.set(LimitKind::Steps, Some(1));
+    let hits = offer_hook(&mut harness, |_| None);
+
+    let mut state = AgentState::new();
+    let error = harness
+        .run_turn(&mut state, "go", |_| {})
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Circuit tripped: step budget reached (1 steps)"
+    );
+    assert_eq!(hits.lock().unwrap().len(), 1);
+    assert_eq!(harness.max_steps(), 1);
+}
+
+#[tokio::test]
+async fn a_reply_that_spent_the_whole_cap_before_any_text_is_asked_again_with_more() {
+    let server = MockServer::start(vec![sse_text("", "length"), sse_text("Answer.", "stop")]).await;
+    let workspace = Workspace::new("raise-output");
+    let cancel = CancelToken::default();
+    let mut harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        Recorder::disabled(),
+        &cancel,
+    );
+    let hits = offer_hook(&mut harness, |hit| hit.offers.last().copied());
+
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "go", |_| {}).await.unwrap();
+
+    assert_eq!(output, "Answer.");
+    assert_eq!(
+        *hits.lock().unwrap(),
+        [LimitHit {
+            kind: LimitKind::Output,
+            agent: None,
+            current: 1024,
+            offers: vec![2048, 4096],
+        }]
+    );
+    let requests = server.requests();
+    assert_eq!(requests[0].body["max_completion_tokens"], 1024);
+    assert_eq!(requests[1].body["max_completion_tokens"], 4096);
+    // The empty reply is not part of the conversation; both calls are steps.
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(messages.last().unwrap()["content"], "go");
+    assert_eq!(state.steps.len(), 2);
+    assert_eq!(state.last_turn.as_ref().unwrap().continuations, 0);
 }

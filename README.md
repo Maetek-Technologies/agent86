@@ -29,6 +29,7 @@ The Python implementation remains the reference. This repository starts with a s
   - `/config mcp`: add an MCP server from a pasted JSON block or by hand, test it live, save it, and use its tools at once; edit, disable, or remove servers the same way
   - answers rendered as Markdown, coloured diffs in approvals, and Ctrl+O for the full transcript with every tool call expanded
   - Esc or Ctrl+C to cancel a turn
+  - `/limits` to see the step and output limits, change them for the session, or save them; when a turn or a sub-agent reaches one, the interface offers to raise it and carry on (beyond Python, where they are config-only)
   - Python's plain `agent86>` loop with `--plain` or piped input
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
@@ -38,7 +39,7 @@ Run `agent86` with no subcommand for the interactive interface, the same agent o
 
 The agent has long-term memory in the same database. Every finished turn is recorded, and when a similar task comes up later, what happened last time is added to the model's context. The model can store durable facts with `remember` and look them up with `recall`. `agent86 memory stats|sessions|search|prune|forget` inspects and trims it, and old episodes and sessions are pruned at startup past `[memory]`'s retention caps. Text is embedded locally with Python's default model, `sentence-transformers/all-MiniLM-L6-v2`, run on [candle](https://github.com/huggingface/candle): it is read from (or, the first time, downloaded into) the same Hugging Face cache Python uses, and its vectors match Python's, so either implementation recalls what the other stored. `hash:<dim>` selects Python's offline hashing embedder, which is also the fallback when the model cannot load.
 
-Skills work as in Python and Claude Code: a folder with a `SKILL.md` in `.agent86/skills` or `.claude/skills` (in the project or your home directory) is advertised to the model by name and description, and its full instructions load when the model calls `use_skill`. A skill's `allowed-tools` limits what may run while it is active, and files bundled with a skill can be read even outside the workspace. The model can also hand a focused subtask to a sub-agent with `delegate`: it runs with the same tools, approvals, and guardrails under its own step budget (`[agents]`), and what it spends counts toward the turn.
+Skills work as in Python and Claude Code: a folder with a `SKILL.md` in `.agent86/skills` or `.claude/skills` (in the project or your home directory) is advertised to the model by name and description, and its full instructions load when the model calls `use_skill`. A skill's `allowed-tools` limits what may run while it is active, and files bundled with a skill can be read even outside the workspace. The model can also hand a focused subtask to a sub-agent with `delegate`: it runs with the same tools, approvals, and guardrails under its own step budget (`[agents]`), and what it spends counts toward the turn. The step budgets and the output cap can be raised for one run (`run --max-steps`, `--max-output-tokens`, `--max-agent-steps`) or for the session (`/limits`), and the interface offers to raise one when a turn or a sub-agent reaches it, for example when a thinking model spends its whole output cap reasoning.
 
 Long conversations are fitted to the model's real context window. When a session outgrows it, the oldest turns are replaced by a summary the model writes (goal, decisions, facts, open items), so a resumed session keeps its goal; the originals are archived in memory. `[limits] compaction = "drop"` drops them instead, and `max_context_tokens` caps the budget.
 
@@ -73,6 +74,7 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Context-window fitting and compaction
 - [x] Skills (`SKILL.md` folders in `.agent86/skills` and `.claude/skills`, `use_skill`, `allowed-tools`)
 - [x] Delegation (`delegate` and sub-agents)
+- [x] Turn limits at runtime: `/limits`, `run --max-steps`, `--max-output-tokens`, and `--max-agent-steps`, and the interface's offer to raise a limit that was reached (beyond Python)
 - [x] Approvals and file-writing tools (`write_file`, `edit_file`)
 - [x] Guardrails (ingress, egress, observation scanning)
 - [x] Sandboxed command and Python execution (subprocess, or Docker)

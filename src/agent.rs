@@ -25,6 +25,7 @@ use crate::approval::ApprovalGate;
 use crate::config::EgressMode;
 use crate::config::{AgentsConfig, CompactionMode, LimitsConfig};
 use crate::guardrails::Guardrails;
+use crate::limits::LimitKind;
 use crate::memory::working::{
     apply_summary, compacted_notice, compaction_cut, compaction_failed_notice, conversation_budget,
     count_spec_tokens, count_tokens, fit, fits, python_strip, render_transcript, KEEP_RECENT,
@@ -184,6 +185,21 @@ impl CircuitBreaker {
         self.steps
     }
 
+    /// The step budget.
+    pub fn max_steps(&self) -> u32 {
+        self.limits.max_steps
+    }
+
+    /// Raise (or lower) the step budget mid-run, when the user raises it.
+    pub fn set_max_steps(&mut self, max_steps: u32) {
+        self.limits.max_steps = max_steps;
+    }
+
+    /// The step budget is spent, so the next [`CircuitBreaker::before_step`] trips.
+    pub fn out_of_steps(&self) -> bool {
+        self.steps >= self.limits.max_steps
+    }
+
     /// Fail if starting another model call would breach a bound.
     pub fn before_step(&self) -> Result<(), HarnessError> {
         let limits = &self.limits;
@@ -250,8 +266,12 @@ pub struct Harness {
     /// `[agents]`: whether `delegate` runs sub-agents, how deep, and how long.
     pub agents: AgentsConfig,
     pub system: Message,
-    /// The output cap sent with every model call.
+    /// The configured output cap, as Python's `max_output_tokens_for`; a session
+    /// override may replace it (see [`Harness::output_cap`]).
     pub max_tokens: u32,
+    /// Limits overridden for the session, and the hook that offers to raise one
+    /// when a turn reaches it (`crate::limits`).
+    pub session_limits: crate::limits::SessionLimits,
     /// Tokens of context the model can hold (`context_window_for`); the REPL's
     /// `/model` updates it with the provider.
     pub context_window: u64,
@@ -301,7 +321,7 @@ impl Harness {
             self.context_window,
             overhead,
             self.limits.context_reserve_tokens,
-            u64::from(self.max_tokens),
+            u64::from(self.output_cap()),
             self.limits.max_context_tokens,
         )
     }
@@ -547,7 +567,9 @@ impl Harness {
         // answered right now is never summarized away.
         let mut turn_start = state.messages.len();
         state.messages.push(message(Role::User, goal));
-        let mut breaker = CircuitBreaker::new(&self.limits);
+        let mut limits = self.limits.clone();
+        limits.max_steps = self.max_steps();
+        let mut breaker = CircuitBreaker::new(&limits);
         // Where the first partial answer went, and the pieces collected so far.
         let mut continuation_start: Option<usize> = None;
         let mut continuation_parts: Vec<String> = Vec::new();
@@ -558,6 +580,18 @@ impl Harness {
             if self.cancel.is_cancelled() {
                 self.cancelled(state, breaker.steps(), &mut emit);
                 return Ok(output);
+            }
+            // Beyond Python: the interface may offer to raise a spent budget.
+            if breaker.out_of_steps() {
+                match self.raise_limit(LimitKind::Steps, None, &sid, breaker.max_steps()) {
+                    Some(raised) => breaker.set_max_steps(raised),
+                    // Ctrl+C at the offer stops it and cancels the turn.
+                    None if self.cancel.is_cancelled() => {
+                        self.cancelled(state, breaker.steps(), &mut emit);
+                        return Ok(output);
+                    }
+                    None => {}
+                }
             }
             breaker.before_step()?;
 
@@ -597,7 +631,7 @@ impl Harness {
                     messages: request_messages,
                     tools,
                     temperature: 0.0,
-                    max_tokens: Some(self.max_tokens),
+                    max_tokens: Some(self.output_cap()),
                     stream: true,
                 };
                 let mut stream = self.provider.stream(request);
@@ -689,6 +723,35 @@ impl Harness {
             }
             let tool_calls = completion.tool_calls;
             self.scan_tool_arguments(&tool_calls, &sid);
+            let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
+            // Beyond Python: a reply that reached the cap before writing anything (a
+            // thinking model can spend all of it reasoning) has nothing to continue
+            // from. The interface may offer a larger cap and ask again; the empty
+            // reply is kept out of the history.
+            if cut_off
+                && tool_calls.is_empty()
+                && text.trim().is_empty()
+                && continuation_start.is_none()
+            {
+                let cap = self.output_cap();
+                if self
+                    .raise_limit(LimitKind::Output, None, &sid, cap)
+                    .is_some()
+                {
+                    record_step(
+                        state,
+                        Step {
+                            index: state.steps.len() as u64 + 1,
+                            phase: AgentPhase::Execute,
+                            thought: String::new(),
+                            tool_calls: Vec::new(),
+                            results: Vec::new(),
+                            usage: completion.usage,
+                        },
+                    );
+                    continue;
+                }
+            }
             let mut step = Step {
                 index: state.steps.len() as u64 + 1,
                 phase: AgentPhase::Execute,
@@ -703,7 +766,6 @@ impl Harness {
             });
 
             if tool_calls.is_empty() {
-                let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
                 if cut_off && summary.continuations < MAX_CONTINUATIONS {
                     summary.continuations += 1;
                     continuation_start.get_or_insert(state.messages.len() - 1);

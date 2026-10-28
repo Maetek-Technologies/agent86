@@ -108,16 +108,16 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     if let Some(manager) = &mcp {
         manager.attach(&registry);
     }
-    let max_tokens = config.max_output_tokens_for(&model_ref.provider);
     let context_window = model_context_window(config, &model_ref.to_string());
-    let harness = Harness {
+    let mut harness = Harness {
         provider,
         registry,
         context,
         limits: config.limits.clone(),
         agents: config.agents.clone(),
         system: build_system_prompt(config, &skills),
-        max_tokens,
+        max_tokens: 0,
+        session_limits: Default::default(),
         context_window,
         gate: ApprovalGate::new(config.guardrails.approval, prompt),
         guardrails: Guardrails::new(&config.guardrails),
@@ -126,6 +126,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         mcp,
         cancel: Default::default(),
     };
+    harness.configure_output(config, &model_ref.provider);
     Ok(Assembly {
         harness,
         model_ref,

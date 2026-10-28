@@ -2,6 +2,7 @@ use agent86::agent::HarnessError;
 use agent86::approval::terminal_prompt_if_interactive;
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};
 use agent86::keys;
+use agent86::limits::{LimitKind, LimitOverrides};
 use agent86::mcp::McpManager;
 use agent86::observability::{
     otlp_document, parse_since, python_repr_value, read_trace, trace_generations, TraceFilter,
@@ -68,6 +69,19 @@ enum Command {
         /// Resume/continue a session by id.
         #[arg(short, long)]
         session: Option<String>,
+
+        /// Step budget for the turn, in place of [limits] max_steps.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        max_steps: Option<u32>,
+
+        /// Output cap for every model call, in place of the provider's max_tokens
+        /// and [limits] max_output_tokens.
+        #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+        max_output_tokens: Option<u32>,
+
+        /// Step budget for each sub-agent, in place of [agents] max_steps.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        max_agent_steps: Option<u32>,
     },
 
     /// Inspect the flight-data recorder.
@@ -241,12 +255,20 @@ fn main() -> ExitCode {
             json,
             yes,
             session,
+            max_steps,
+            max_output_tokens,
+            max_agent_steps,
         }) => {
             let mut config = config;
             if yes {
                 config.guardrails.approval = ApprovalMode::Auto;
             }
-            run(&config, &goal, json, session.as_deref(), &stderr)
+            let limits = LimitOverrides {
+                steps: max_steps,
+                agent_steps: max_agent_steps,
+                output: max_output_tokens,
+            };
+            run(&config, &goal, json, session.as_deref(), limits, &stderr)
         }
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
@@ -270,6 +292,7 @@ fn run(
     goal: &str,
     as_json: bool,
     session: Option<&str>,
+    limits: LimitOverrides,
     stderr: &Stderr,
 ) -> ExitCode {
     // At a terminal, `ask` prompts for each side-effecting call; piped or in CI
@@ -287,6 +310,11 @@ fn run(
         }
     };
     let harness = assembly.harness;
+    for kind in LimitKind::ALL {
+        if let Some(value) = limits.get(kind) {
+            harness.session_limits.set(kind, Some(value));
+        }
+    }
     let store = assembly.store;
     let priced = PriceTable::from_config(config).is_priced(&assembly.model_ref.to_string());
 
