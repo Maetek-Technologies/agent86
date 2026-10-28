@@ -5,7 +5,9 @@ mod support;
 
 use agent86::agent::{CancelToken, Harness, HarnessError, TurnEvent, CONTINUE_PROMPT};
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
-use agent86::config::{EgressMode, IngressMode, LimitsConfig, ObservabilityConfig, RedactMode};
+use agent86::config::{
+    CompactionMode, EgressMode, IngressMode, LimitsConfig, ObservabilityConfig, RedactMode,
+};
 use agent86::guardrails::{Guardrails, UNTRUSTED_BANNER};
 use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
@@ -45,7 +47,10 @@ fn limits() -> LimitsConfig {
         max_cost_usd: 5.0,
         max_wall_clock_s: 900,
         max_consecutive_errors: 3,
+        max_context_tokens: 0,
         max_output_tokens: 8192,
+        context_reserve_tokens: 4096,
+        compaction: CompactionMode::Summarize,
         parallel_tools: true,
         tool_timeout_s: 60,
     }
@@ -131,6 +136,7 @@ async fn run_with(
         limits,
         system: system(),
         max_tokens: 1024,
+        context_window: 128_000,
         gate,
         guardrails,
         recorder: Recorder::disabled(),
@@ -269,6 +275,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         limits: limits(),
         system: system(),
         max_tokens: 1024,
+        context_window: 128_000,
         gate: ask_gate(),
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder: Recorder::disabled(),
@@ -704,6 +711,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         limits: limits(),
         system: system(),
         max_tokens: 1024,
+        context_window: 128_000,
         gate: ask_gate(),
         guardrails: redact,
         recorder: Recorder::disabled(),
@@ -796,6 +804,7 @@ async fn recorded_turn(
         limits: limits(),
         system: system(),
         max_tokens: 1024,
+        context_window: 128_000,
         gate,
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder,
@@ -910,6 +919,7 @@ fn cancellable(
         limits: limits(),
         system: system(),
         max_tokens: 1024,
+        context_window: 128_000,
         gate,
         guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
         recorder,

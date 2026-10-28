@@ -38,6 +38,8 @@ Run `agent86` with no subcommand for the interactive interface, the same agent o
 
 The agent has long-term memory in the same database. Every finished turn is recorded, and when a similar task comes up later, what happened last time is added to the model's context. The model can store durable facts with `remember` and look them up with `recall`. `agent86 memory stats|sessions|search|prune|forget` inspects and trims it, and old episodes and sessions are pruned at startup past `[memory]`'s retention caps. Text is embedded locally with Python's default model, `sentence-transformers/all-MiniLM-L6-v2`, run on [candle](https://github.com/huggingface/candle): it is read from (or, the first time, downloaded into) the same Hugging Face cache Python uses, and its vectors match Python's, so either implementation recalls what the other stored. `hash:<dim>` selects Python's offline hashing embedder, which is also the fallback when the model cannot load.
 
+Long conversations are fitted to the model's real context window. When a session outgrows it, the oldest turns are replaced by a summary the model writes (goal, decisions, facts, open items), so a resumed session keeps its goal; the originals are archived in memory. `[limits] compaction = "drop"` drops them instead, and `max_context_tokens` caps the budget.
+
 ## Why Rust?
 
 The port explores easier binary distribution, fast startup, explicit typed state transitions, and a coherent async runtime. It is not based on an assumption that Python makes model API calls slow: model, network, tool, and I/O latency will remain dominant in many workloads.
@@ -66,6 +68,7 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Text-only one-shot `run` and `run --json`
 - [x] Read-only workspace tools (`read_file`, `list_dir`)
 - [x] ReAct loop with circuit breakers and continuations
+- [x] Context-window fitting and compaction
 - [x] Approvals and file-writing tools (`write_file`, `edit_file`)
 - [x] Guardrails (ingress, egress, observation scanning)
 - [x] Sandboxed command and Python execution (subprocess, or Docker)

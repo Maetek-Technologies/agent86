@@ -17,6 +17,7 @@
 pub mod embeddings;
 pub mod hub;
 pub mod sentence_transformers;
+pub mod working;
 
 use crate::session::{SessionStore, StoreError};
 use embeddings::{cosine, pack, unpack};
@@ -154,6 +155,28 @@ impl SessionStore {
     }
 
     // ---- episodic and semantic facets ---------------------------------------
+
+    /// Archive the messages a compaction replaced, with the summary that
+    /// replaced them, as Python's `record_compaction`: compaction shrinks the
+    /// working memory but must not destroy the record. Tagged
+    /// [`COMPACTION_KIND`], so recall skips it.
+    pub fn record_compaction(
+        &self,
+        session_id: &str,
+        summary: &str,
+        dropped: &[crate::types::Message],
+    ) -> Result<i64, StoreError> {
+        let mut metadata = Map::new();
+        metadata.insert("kind".into(), Value::from(COMPACTION_KIND));
+        metadata.insert("dropped".into(), Value::from(dropped.len()));
+        metadata.insert("summary".into(), Value::from(summary));
+        self.add_episode(
+            session_id,
+            &format!("[compacted {} messages] {summary}", dropped.len()),
+            &working::archive_payload(dropped),
+            &metadata,
+        )
+    }
 
     /// Past episodes relevant to `task`, compactions excluded, as Python's
     /// `EpisodicMemory.recall`.

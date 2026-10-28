@@ -1,7 +1,7 @@
 # agent86-rs Project Plan
 
 **Last updated:** 2026-10-27  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done
 
 ## 1. Purpose
 
@@ -102,6 +102,11 @@ The Python implementation remains the reference and compatibility oracle. This p
   - providers are listed in config order everywhere (`/models` too), as in Python; they were sorted by name before
   - the plain loop's `/config model` now gives Python's wording
 - Added the Ollama provider (stage 2), ported from `cognitive/ollama_provider.py`: `ollama:<model>` streams from `/api/chat` as NDJSON with Python's payload (`options.temperature`, `num_ctx` from `[providers.ollama]`, and `num_predict` only when a cap is set), tools passed through, tool results carrying the tool's name, tool calls numbered `ollama-0`, `ollama-1`, ... with arguments taken as an object or a JSON string, usage from `prompt_eval_count` and `eval_count` at zero cost, Python's `done_reason` mapping (`load` and `unload` are `other`; `stop` with tool calls is `tool_use`), the shared retry rules (never after text), and Python's messages for an unreachable server, both timeouts (naming `[providers.ollama]`), HTTP errors, `error` lines, malformed NDJSON, and a stream cut short. It needs no key. Live check (2026-10-27, local Ollama, `gemma4:12b`): `run` called `list_dir` and named both files, at `$0.0000`
+- Added context-window fitting and compaction, ported from `memory/working.py` and the compaction path in `orchestration/loop.py`:
+  - every request is fitted to the model's real window: the window (`context_window_for`, with OpenRouter's own figure) minus the system message and the tool catalogue, minus `[limits] context_reserve_tokens` (4096) and the output cap (together clamped to half the window), floored at 1024 tokens, then capped by `[limits] max_context_tokens` (0, no cap); tokens are Python's estimate (code points over 4, counting tool names and arguments); the oldest messages are dropped first and a leading tool result never survives without its call
+  - before each model call, a history over budget has its oldest span (never the last six messages, the current turn, or half of a tool block) replaced by a summary the model writes under Python's instructions (`GOAL`, `DECISIONS`, `FACTS`, `OPEN`), merged into the next user message as `[Conversation summary — earlier turns compacted]`; the turn streams `[compacted N messages into a summary]`, the summary call's usage and cost count toward the turn, the trace gets Python's `compaction` event, the replaced messages are archived as a `kind = "compaction"` episode (as Python's pydantic dump), and the session is saved at once
+  - a summary that fails or comes back empty falls back to dropping, with `[compaction failed; dropped N messages]` and a `failed` or `empty` event; `[limits] compaction = "drop"` only drops
+  - live check (2026-10-27, local Ollama, `gemma4:12b`, isolated home, `max_context_tokens = 120`): on the sixth turn of a session, five messages were compacted into an 84-token summary that kept every path, branch, version, and job name exactly, and the model answered from it
 - Added the local sentence-transformers embedder (stage 10, part 2), Python's default `sentence-transformers:all-MiniLM-L6-v2`, ported from `SentenceTransformerEmbedder` and the cache rules in `memory/embeddings.py`, on candle instead of torch:
   - the model: BERT in `float32` (embeddings, attention, exact-`erf` GELU, layer norms as transformers' `BertModel`), the model's pooling (mean, CLS, max, or mean over the square root of the length), the Normalize module and then `normalize_embeddings=True`; the tokenizer is `tokenizer.json` through the `tokenizers` crate (the library Python's tokenizers wraps, at the same version), truncated to the model's `max_seq_length` (256 for MiniLM, from `sentence_bert_config.json`; 5.x's layout falls back to the tokenizer's limit) and never padded, as one text is encoded at a time
   - vectors agree with sentence-transformers' to about 3e-7 per component (two or three `float32` ulps: the kernels sum in a different order) and token ids exactly, for the real model and for a tiny random BERT fixture in the same layout; episodes Python embedded with MiniLM are now recalled by Rust with the same scores, and the reverse
@@ -135,7 +140,7 @@ The Python implementation remains the reference and compatibility oracle. This p
 
 Local validation completed successfully:
 
-- `cargo test --all-targets`: **399 passed on Windows** (175 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 40 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 10 memory, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
+- `cargo test --all-targets`: **410 passed on Windows** (182 unit, 10 compatibility, 18 provider integration, 7 Ollama provider, 9 Anthropic provider, 3 catalog, 43 CLI end-to-end, 11 REPL end-to-end, 5 sessions, 8 trace, 18 MCP, 11 memory, 6 embedding model, 13 tools, 11 write tools and approvals, 11 exec tools, 11 web fetch, 2 difflib, 2 guardrails, 25 agent loop, 2 system prompt, 2 API key; some exec tests are platform-specific), plus 2 opt-in live keyring tests and an opt-in check of the cached `all-MiniLM-L6-v2` (`AGENT86_TEST_MINILM=1`)
 - `cargo fmt --all -- --check`: passed
 - `cargo clippy --all-targets -- -D warnings`: passed
 - CLI `run` and `run --json` against the mock provider: passed
@@ -157,7 +162,6 @@ The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory]`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Triage routing (`[model] router = "triage"` is read but every turn uses the default model)
-- Context-window fitting and compaction of long conversations
 - Skills and delegation tools, and skills themselves
 - OpenTelemetry span export (`[observability] otel`)
 
@@ -229,7 +233,10 @@ The agent works end to end, but it does not yet have:
 ### Known loop differences from Python
 
 - Python also offers skill and delegation tools when those are enabled, so the tool list in each request differs.
-- The conversation is not fitted to the model's context window and never compacted; a very long tool loop could exceed the window and fail with a provider error.
+- Compaction summaries are written by the current model. Python uses triage routing's cheap model when routing is on, which is not ported (it is off by default).
+- The window is looked up when the model is set (at start and on `/model`), not before every request; a `[model.context_window]` change written by `/config` applies from the next `/model`.
+- After a compaction mid-turn, the turn's start and a continuation in progress are re-indexed into the shorter history. Python keeps the old indices, which then point past where they should (a deliberate fix).
+- The summary request can be cancelled; Python's blocks until it returns, and the turn stops at the next safe point.
 - A cancel also wakes a response that has stopped streaming; Python checks only as each delta arrives.
 
 ### Known approval differences from Python
@@ -256,7 +263,6 @@ The agent works end to end, but it does not yet have:
 ### Known session differences from Python
 
 - `state_json` is valid in both directions but not byte-identical: Rust omits empty lists and nulls that pydantic writes, and writes floats in Python's `json.dumps` style where pydantic uses shortest-decimal notation.
-- A long resumed session is sent in full; Python fits it to the model's context window and compacts it (not ported).
 
 ### Known memory differences from Python
 
@@ -268,7 +274,6 @@ The agent works end to end, but it does not yet have:
 - Search is always the brute-force scan. Python uses `sqlite-vec`'s `vec_distance_cosine` when the extension loads, which computes in `float32`, so its scores can differ from the scan's in the last digits.
 - Scores follow Python 3.12's `sum`; under Python 3.11 (which the reference still supports) the last bit can differ.
 - A `recall` `k` written as an integer literal beyond 64 bits arrives as a float and is refused as too large; pydantic accepts any integer and the clamp makes it 20.
-- Compacted spans are never archived as episodes, because compaction is not ported.
 - The `memory` commands print plain aligned text instead of Rich tables, and stored text is printed as is; Rich would interpret markup in it.
 - `Memory is disabled in config.` does not mention `agent86 config path`, which is not ported. A negative `memory search -k` is a usage error; Python slices from the end.
 
@@ -286,7 +291,7 @@ The agent works end to end, but it does not yet have:
 
 - `trace show` prints a plain aligned table with the same columns as Python's Rich table.
 - Live OpenTelemetry export (`[observability] otel`) is not ported; `trace export -f otlp-json` covers the offline case.
-- Events for subsystems that are not ported (`compaction`, `route`, sub-agent `spawn`, `retention_prune`, and `cancelled` turns) are never written.
+- Events for subsystems that are not ported (`route`, sub-agent `spawn`, and `cancelled` turns) are never written.
 
 ### Known tool differences from Python
 

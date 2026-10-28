@@ -346,3 +346,35 @@ fn a_custom_embedder_spec_is_used_for_storage() {
     let hits: Vec<Hit> = memory.search_memories("tabs over spaces", 1).unwrap();
     assert!((hits[0].score - 1.0).abs() < 1e-6);
 }
+
+/// The compaction strings match Python's `memory/working.py` and the loop's
+/// notices, extracted with `ast` (parsed, never run).
+#[test]
+fn compaction_strings_match_python() {
+    use agent86::memory::working::{
+        compacted_notice, compaction_failed_notice, KEEP_RECENT, MIN_CONVERSATION_TOKENS,
+        SUMMARY_HEADER, SUMMARY_MAX_TOKENS, SUMMARY_SYSTEM_PROMPT,
+    };
+    let python: Value = serde_json::from_str(&fixture("memory/working.json")).unwrap();
+    assert_eq!(SUMMARY_SYSTEM_PROMPT, python["SUMMARY_SYSTEM_PROMPT"]);
+    assert_eq!(SUMMARY_HEADER, python["SUMMARY_HEADER"]);
+    assert_eq!(u64::from(SUMMARY_MAX_TOKENS), python["SUMMARY_MAX_TOKENS"]);
+    assert_eq!(MIN_CONVERSATION_TOKENS, python["MIN_CONVERSATION_TOKENS"]);
+    assert_eq!(KEEP_RECENT as u64, python["KEEP_RECENT"]);
+    assert_eq!(python["_MAX_RESERVE_FRACTION"], 0.5);
+    assert_eq!(python["_TRANSCRIPT_MESSAGE_CHARS"], 2000);
+    assert_eq!(
+        compacted_notice(12),
+        python["compacted_notice"]
+            .as_str()
+            .unwrap()
+            .replace("{count}", "12")
+    );
+    assert_eq!(
+        compaction_failed_notice(3),
+        python["compaction_failed_notice"]
+            .as_str()
+            .unwrap()
+            .replace("{count}", "3")
+    );
+}

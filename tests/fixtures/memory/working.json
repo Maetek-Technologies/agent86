@@ -1,0 +1,11 @@
+{
+ "MIN_CONVERSATION_TOKENS": 1024,
+ "_MAX_RESERVE_FRACTION": 0.5,
+ "KEEP_RECENT": 6,
+ "SUMMARY_HEADER": "[Conversation summary \u2014 earlier turns compacted]",
+ "SUMMARY_MAX_TOKENS": 600,
+ "SUMMARY_SYSTEM_PROMPT": "You are compacting the earlier part of an agent's conversation so it fits in a context window. Write a dense factual summary of the transcript below, under these headings:\nGOAL: what the user is ultimately trying to achieve.\nDECISIONS: choices already made and why, including anything ruled out.\nFACTS: what was discovered \u2014 file paths, identifiers, commands, versions, numbers, error messages.\nOPEN: what is still unfinished or unverified.\n\nRules: reproduce every file path, identifier, command, URL and number EXACTLY as it appears \u2014 never paraphrase, abbreviate or 'correct' one. Record only what the transcript says; invent nothing. Omit pleasantries and narration. Be terse: aim for under 600 tokens. Output the summary only, with no preamble.",
+ "_TRANSCRIPT_MESSAGE_CHARS": 2000,
+ "compacted_notice": "\n[compacted {count} messages into a summary]\n",
+ "compaction_failed_notice": "\n[compaction failed; dropped {count} messages]\n"
+}

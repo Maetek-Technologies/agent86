@@ -2,7 +2,7 @@
 
 mod support;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use support::{fixture, sse_text, sse_tool_calls, MockServer, Reply};
@@ -1461,4 +1461,246 @@ MCP servers (every tool listed is callable now;"
         serde_json::json!(["a", "b"])
     );
     assert_eq!(requests[1].body["messages"][3]["content"], "5");
+}
+
+/// Three runs in one session, the first with a long goal, under a 260-token
+/// conversation cap: the third request has to drop the long goal, and the
+/// fourth turn starts over budget with something old enough to compact.
+async fn long_session(workspace: &Workspace) -> String {
+    let long_goal = format!("Remember this note: {}", "x".repeat(980));
+    let first = workspace.run(&["run", "--json", &long_goal]).await;
+    assert!(first.status.success(), "{}", stderr(&first));
+    let first: Value = serde_json::from_str(&stdout(&first)).unwrap();
+    let session = first["session_id"].as_str().unwrap().to_owned();
+    for goal in ["second question", "third question"] {
+        let output = workspace.run(&["run", "-s", &session, goal]).await;
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    session
+}
+
+fn trace_events(workspace: &Workspace, kind: &str) -> Vec<Value> {
+    let path = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("traces")
+        .join("trace.jsonl");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["kind"] == kind)
+        .collect()
+}
+
+fn request_roles(request: &support::Recorded) -> Vec<String> {
+    request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["role"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn long_sessions_are_compacted_into_a_summary() {
+    let server = MockServer::start(vec![
+        sse_text("ok 1", "stop"),
+        sse_text("ok 2", "stop"),
+        sse_text("ok 3", "stop"),
+        sse_text("GOAL: keep the long note.", "stop"),
+        sse_text("ok 4", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("compaction", &server);
+    workspace.append_project_config("\n[limits]\nmax_context_tokens = 260\n");
+    let session = long_session(&workspace).await;
+
+    let fourth = workspace
+        .run(&["run", "-s", &session, "fourth question"])
+        .await;
+    assert!(fourth.status.success(), "{}", stderr(&fourth));
+    assert_eq!(
+        stdout(&fourth),
+        "\n[compacted 1 messages into a summary]\nok 4\n"
+    );
+    assert!(
+        stderr(&fourth).contains("1 compaction"),
+        "{}",
+        stderr(&fourth)
+    );
+
+    let requests = server.requests();
+    // The third turn still fit (259 tokens); the fourth is the first over budget.
+    assert_eq!(
+        request_roles(&requests[2]),
+        ["system", "user", "assistant", "user", "assistant", "user"]
+    );
+
+    // The summary request: Python's instructions, the transcript of the span,
+    // a bounded answer, and no tools.
+    let summary = &requests[3].body;
+    let constants: Value = serde_json::from_str(&fixture("memory/working.json")).unwrap();
+    assert_eq!(
+        summary["messages"][0]["content"],
+        constants["SUMMARY_SYSTEM_PROMPT"]
+    );
+    assert_eq!(
+        summary["messages"][1]["content"].as_str().unwrap(),
+        format!("USER: Remember this note: {}", "x".repeat(980))
+    );
+    assert_eq!(summary["max_completion_tokens"], 1200);
+    assert!(summary.get("tools").is_none(), "{summary}");
+
+    // The fourth turn's request: the summary leads, everything newer is kept.
+    assert_eq!(
+        request_roles(&requests[4]),
+        [
+            "system",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user"
+        ]
+    );
+    assert_eq!(
+        requests[4].body["messages"][1]["content"],
+        format!(
+            "{}\nGOAL: keep the long note.",
+            constants["SUMMARY_HEADER"].as_str().unwrap()
+        )
+    );
+
+    // The compacted history is what the session keeps.
+    let (_, state) = workspace.stored_session(&session).unwrap();
+    let messages = state["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 8);
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[Conversation summary"));
+    assert_eq!(state["last_turn"]["compactions"], 1);
+
+    let events = trace_events(&workspace, "compaction");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = &events[0];
+    assert_eq!(event["status"], "ok");
+    assert_eq!(event["dropped"], 1);
+    assert_eq!(event["dropped_tokens"], 250);
+    assert_eq!(event["kept"], 7);
+    assert_eq!(event["model"], "test/model");
+
+    // The originals are archived as an episode recall never returns.
+    let connection = rusqlite::Connection::open(workspace.memory_db()).unwrap();
+    let (task, outcome, metadata): (String, String, String) = connection
+        .query_row(
+            "SELECT task, outcome, metadata_json FROM episodes WHERE task LIKE '[compacted%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(task, "[compacted 1 messages] GOAL: keep the long note.");
+    let archived: Value = serde_json::from_str(&outcome).unwrap();
+    assert_eq!(archived[0]["role"], "user");
+    assert_eq!(archived[0]["tool_calls"], json!([]));
+    assert_eq!(archived[0]["name"], Value::Null);
+    assert_eq!(
+        serde_json::from_str::<Value>(&metadata).unwrap(),
+        json!({"kind": "compaction", "dropped": 1, "summary": "GOAL: keep the long note."})
+    );
+}
+
+#[tokio::test]
+async fn a_failed_summary_falls_back_to_dropping_the_oldest_turns() {
+    let server = MockServer::start(vec![
+        sse_text("ok 1", "stop"),
+        sse_text("ok 2", "stop"),
+        sse_text("ok 3", "stop"),
+        Reply::Status {
+            status: 400,
+            headers: Vec::new(),
+            body: json!({"error": {"message": "no summaries today"}}).to_string(),
+        },
+        sse_text("ok 4", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("compaction-failed", &server);
+    workspace.append_project_config("\n[limits]\nmax_context_tokens = 260\n");
+    let session = long_session(&workspace).await;
+
+    let fourth = workspace
+        .run(&["run", "-s", &session, "fourth question"])
+        .await;
+    assert!(fourth.status.success(), "{}", stderr(&fourth));
+    assert_eq!(
+        stdout(&fourth),
+        "\n[compaction failed; dropped 1 messages]\nok 4\n"
+    );
+    // The request was fitted instead: the long goal is gone, nothing replaced it.
+    assert_eq!(
+        request_roles(&server.requests()[4]),
+        [
+            "system",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user"
+        ]
+    );
+    let (_, state) = workspace.stored_session(&session).unwrap();
+    assert_eq!(state["messages"].as_array().unwrap().len(), 8);
+
+    let events = trace_events(&workspace, "compaction");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["status"], "failed");
+    assert_eq!(events[0]["fallback"], "drop");
+    assert_eq!(events[0]["dropped"], 1);
+    assert!(
+        events[0]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("ProviderError: "),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn drop_mode_trims_requests_without_summarizing() {
+    let server = MockServer::start(vec![
+        sse_text("ok 1", "stop"),
+        sse_text("ok 2", "stop"),
+        sse_text("ok 3", "stop"),
+        sse_text("ok 4", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("compaction-drop", &server);
+    workspace
+        .append_project_config("\n[limits]\nmax_context_tokens = 260\ncompaction = \"drop\"\n");
+    let session = long_session(&workspace).await;
+
+    let fourth = workspace
+        .run(&["run", "-s", &session, "fourth question"])
+        .await;
+    assert!(fourth.status.success(), "{}", stderr(&fourth));
+    assert_eq!(stdout(&fourth), "ok 4\n");
+    assert_eq!(server.requests().len(), 4);
+    assert_eq!(
+        request_roles(&server.requests()[3]),
+        [
+            "system",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user"
+        ]
+    );
+    assert!(trace_events(&workspace, "compaction").is_empty());
 }
