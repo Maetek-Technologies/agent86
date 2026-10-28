@@ -849,12 +849,15 @@ impl Repl {
 
     /// Whether the current model has a known price, so a dollar figure means something.
     pub(crate) fn priced(&self) -> bool {
-        self.prices.is_priced(&self.model_ref)
+        self.prices.is_priced(&self.model_ref())
     }
 
-    /// The current model's `provider:model` ref.
-    pub(crate) fn model_ref(&self) -> &str {
-        &self.model_ref
+    /// The current model's `provider:model` ref: the one the last turn was routed
+    /// to, else the session's.
+    pub(crate) fn model_ref(&self) -> String {
+        self.harness
+            .routed_ref()
+            .unwrap_or_else(|| self.model_ref.clone())
     }
 
     /// The prompt history both surfaces record into (`[ui] history_file`).
@@ -926,8 +929,8 @@ impl Repl {
             return format!(
                 "current model: {}:{}\nusage: /model <provider:model>  \
                  e.g. /model openrouter:anthropic/claude-3.7-sonnet",
-                self.harness.provider.name(),
-                self.harness.provider.model()
+                self.harness.active_provider().name(),
+                self.harness.active_provider().model()
             );
         }
         match build_provider(&self.config, arg) {
@@ -938,7 +941,9 @@ impl Repl {
                     .configure_output(&self.config, &reference.provider);
                 self.harness.context_window =
                     crate::setup::model_context_window(&self.config, &reference.to_string());
-                self.harness.provider = provider;
+                self.harness.provider = provider.into();
+                // A chosen model is pinned: triage routing stops, as Python's `set_forced`.
+                self.harness.router.pin();
                 self.model_ref = reference.to_string();
                 self.model_switches += 1;
                 format!(
@@ -951,10 +956,12 @@ impl Repl {
     }
 
     /// The config section the active model was built from.
-    pub(crate) fn provider_section(&self) -> &str {
-        self.model_ref
+    pub(crate) fn provider_section(&self) -> String {
+        let reference = self.model_ref();
+        reference
             .split_once(':')
-            .map_or(self.model_ref.as_str(), |(provider, _)| provider)
+            .map_or(reference.as_str(), |(provider, _)| provider)
+            .to_owned()
     }
 
     /// `/limits`: show the limits, or set, reset, or save the session's overrides.
@@ -988,7 +995,7 @@ impl Repl {
             Ok(value) if value > 0 => value,
             _ => return format!("'{value}' is not a positive whole number"),
         };
-        let section = self.provider_section().to_owned();
+        let section = self.provider_section();
         // The configured value needs no override.
         let keep = (value != configured(kind, &self.config, &section)).then_some(value);
         self.harness.session_limits.set(kind, keep);
@@ -1009,7 +1016,7 @@ impl Repl {
     }
 
     fn limits_render(&self) -> Text {
-        let section = self.provider_section();
+        let section = &self.provider_section();
         let mut text = Text::styled(Style::Bold, "limit        value  from");
         for kind in LimitKind::ALL {
             let label = setting(kind, &self.config, section).1;

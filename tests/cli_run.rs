@@ -1971,3 +1971,27 @@ async fn skills_are_listed_and_shown_with_their_resources() {
          they were discovered from.\n"
     );
 }
+
+#[tokio::test]
+async fn triage_routing_sends_each_run_to_its_route() {
+    let server = MockServer::start(vec![sse_text("Hi.", "stop"), sse_text("Done.", "stop")]).await;
+    let workspace = Workspace::new("triage");
+    workspace.write_project_config(&format!(
+        "[model]\ndefault = \"mock:test/model\"\nrouter = \"triage\"\n\n[model.route]\ncheap = \"mock:small/model\"\nfrontier = \"mock:large/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n",
+        server.base_url
+    ));
+
+    let simple = workspace.run(&["run", "say hello"]).await;
+    assert!(simple.status.success(), "{}", stderr(&simple));
+    let complex = workspace.run(&["run", "debug the build"]).await;
+    assert!(complex.status.success(), "{}", stderr(&complex));
+
+    let requests = server.requests();
+    assert_eq!(requests[0].body["model"], "small/model");
+    assert_eq!(requests[1].body["model"], "large/model");
+    let routes: Vec<Value> = trace_events(&workspace, "route")
+        .into_iter()
+        .map(|event| event["model"].clone())
+        .collect();
+    assert_eq!(routes, [json!("small/model"), json!("large/model")]);
+}

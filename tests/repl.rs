@@ -478,3 +478,32 @@ async fn limits_are_shown_set_for_the_session_and_reset() {
     // The session's cap is the one the model was sent.
     assert_eq!(server.requests()[0].body["max_completion_tokens"], 32000);
 }
+
+#[tokio::test]
+async fn a_chosen_model_pins_the_session_and_stops_triage_routing() {
+    let server =
+        MockServer::start(vec![sse_text("Hi.", "stop"), sse_text("Hi again.", "stop")]).await;
+    let workspace = Workspace::new("triage-pin", &server);
+    workspace.write_config(&format!(
+        "[model]\ndefault = \"mock:test/model\"\nrouter = \"triage\"\n\n[model.route]\ncheap = \"mock:small/model\"\nfrontier = \"mock:large/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n",
+        server.base_url
+    ));
+
+    let text = stdout(
+        &workspace
+            .repl(
+                &[],
+                "say hello\n/model\n/model mock:pinned/model\nsay hello\n",
+            )
+            .await,
+    );
+
+    // The bare `/model` reports the model the last turn was routed to.
+    assert!(
+        text.contains("agent86> current model: openai:small/model\n"),
+        "{text}"
+    );
+    let requests = server.requests();
+    assert_eq!(requests[0].body["model"], "small/model");
+    assert_eq!(requests[1].body["model"], "pinned/model");
+}

@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod provider;
 pub mod pyjson;
 pub mod repl;
+pub mod router;
 pub mod secrets;
 pub mod session;
 pub mod setup;

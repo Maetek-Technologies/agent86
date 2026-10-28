@@ -23,7 +23,7 @@ pub fn open_save(app: &mut App, repl: &Repl) {
         );
         return;
     }
-    let changes = save_changes(overrides, &repl.config, repl.provider_section());
+    let changes = save_changes(overrides, &repl.config, &repl.provider_section());
     let paths = repl
         .config_paths
         .clone()

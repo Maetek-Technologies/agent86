@@ -366,7 +366,7 @@ fn run(
         }
     }
     let store = assembly.store;
-    let priced = PriceTable::from_config(config).is_priced(&assembly.model_ref.to_string());
+    let session_ref = assembly.model_ref.to_string();
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -454,6 +454,9 @@ fn run(
         let _ = stdout.flush();
         if let Some(turn) = &output.turn {
             // stderr: stdout is the answer, and `agent86 run ... > out.txt` must keep only that.
+            // Priced under the model the turn was routed to, as Python's `config_ref`.
+            let model_ref = harness.routed_ref().unwrap_or(session_ref);
+            let priced = PriceTable::from_config(config).is_priced(&model_ref);
             stderr.dim(&format_turn_summary(turn, priced));
         }
     }

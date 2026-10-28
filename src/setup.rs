@@ -3,8 +3,9 @@
 
 use crate::agent::Harness;
 use crate::approval::{ApprovalGate, ApprovalPrompt};
-use crate::config::{Config, ConfigPaths};
+use crate::config::{Config, ConfigPaths, RouterMode};
 use crate::guardrails::Guardrails;
+use crate::limits::output_setting;
 use crate::mcp::McpManager;
 use crate::memory::embeddings::build_embedder;
 use crate::observability::Recorder;
@@ -12,6 +13,7 @@ use crate::prompt::build_system_prompt;
 use crate::provider::capabilities::context_window_with;
 use crate::provider::remote_windows::{cache_path, openrouter_context_window};
 use crate::provider::{provider_for_ref, Provider};
+use crate::router::{RoutedModel, Router};
 use crate::secrets::OsKeyring;
 use crate::session::{expand_home, SessionStore};
 use crate::skills::{discover_skills, skill_roots};
@@ -112,7 +114,8 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     }
     let context_window = model_context_window(config, &model_ref.to_string());
     let mut harness = Harness {
-        provider,
+        provider: Arc::from(provider),
+        router: build_router(config),
         registry,
         context,
         limits: config.limits.clone(),
@@ -136,6 +139,28 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         memory_note,
         sandbox_note,
     })
+}
+
+/// The triage router for `config`, as Python's `ModelRouter`: routed models are
+/// built from the config the session started with, as Python's harness keeps it.
+pub fn build_router(config: &Config) -> Router {
+    let routing = config.clone();
+    let route = &config.model.route;
+    Router::new(
+        config.model.router == RouterMode::Triage,
+        &route.cheap,
+        &route.frontier,
+        Box::new(move |reference| {
+            let (provider, model_ref) = build_provider(&routing, reference)?;
+            Ok(RoutedModel {
+                reference: model_ref.to_string(),
+                provider: Arc::from(provider),
+                max_tokens: routing.max_output_tokens_for(&model_ref.provider),
+                context_window: model_context_window(&routing, &model_ref.to_string()),
+                output_setting: output_setting(&routing, &model_ref.provider).1,
+            })
+        }),
+    )
 }
 
 /// Tokens of context the model behind `model_ref` can hold, as Python's

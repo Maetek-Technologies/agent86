@@ -114,6 +114,8 @@ impl Harness {
         depth: u32,
     ) -> Result<(String, Usage), ProviderError> {
         let sid = format!("sub:{role}");
+        // The turn's model, routed or not, as Python's sub-agent uses `h.provider`.
+        let provider = self.active_provider();
         // The persona, then the parent's system content, so the sub-agent sees the
         // environment, the skills it can load, and the MCP tools it can call.
         let system = message(
@@ -167,7 +169,7 @@ impl Harness {
             let completion = self
                 .provider
                 .complete(CompletionRequest {
-                    model: self.provider.model().to_owned(),
+                    model: provider.model().to_owned(),
                     messages: request_messages,
                     tools: specs,
                     temperature: 0.0,
@@ -193,7 +195,7 @@ impl Harness {
                     ("agent", json!(role)),
                     ("depth", json!(depth)),
                     ("step", json!(breaker.steps())),
-                    ("model", json!(self.provider.model())),
+                    ("model", json!(provider.model())),
                     ("input_tokens", json!(completion.usage.input_tokens)),
                     ("output_tokens", json!(completion.usage.output_tokens)),
                     ("cost_usd", json!(completion.usage.cost_usd)),
@@ -237,7 +239,7 @@ impl Harness {
                             ("depth", json!(depth)),
                             ("index", json!(continuations)),
                             ("step", json!(breaker.steps())),
-                            ("model", json!(self.provider.model())),
+                            ("model", json!(provider.model())),
                         ],
                     );
                     continue;
@@ -249,7 +251,7 @@ impl Harness {
                         format!(
                             "[sub-agent '{role}' wrote no answer: its last reply reached the output limit ({} tokens) before any text. Raise {} or delegate a smaller task.]",
                             completion.usage.output_tokens,
-                            self.session_limits.output_setting()
+                            self.output_setting()
                         )
                     } else {
                         format!("[sub-agent '{role}' returned no text]")

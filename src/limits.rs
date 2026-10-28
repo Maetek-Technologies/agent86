@@ -273,7 +273,16 @@ impl Harness {
     pub fn output_cap(&self) -> u32 {
         self.session_limits
             .get(LimitKind::Output)
-            .unwrap_or(self.max_tokens)
+            .unwrap_or(self.configured_output())
+    }
+
+    /// What to raise for a larger output cap, for messages: the session's override,
+    /// else the setting the active model's cap comes from.
+    pub fn output_setting(&self) -> String {
+        match self.configured_output_setting() {
+            Some(setting) if self.session_limits.get(LimitKind::Output).is_none() => setting,
+            _ => self.session_limits.output_setting(),
+        }
     }
 
     /// The effective value of `kind`.
