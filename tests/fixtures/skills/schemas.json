@@ -1,0 +1,34 @@
+{
+ "delegate": {
+  "properties": {
+   "role": {
+    "default": "assistant",
+    "description": "The sub-agent's role/persona.",
+    "title": "Role",
+    "type": "string"
+   },
+   "task": {
+    "description": "The self-contained task for the sub-agent.",
+    "title": "Task",
+    "type": "string"
+   }
+  },
+  "required": [
+   "task"
+  ],
+  "type": "object"
+ },
+ "use_skill": {
+  "properties": {
+   "name": {
+    "description": "The exact name of the skill to load.",
+    "title": "Name",
+    "type": "string"
+   }
+  },
+  "required": [
+   "name"
+  ],
+  "type": "object"
+ }
+}

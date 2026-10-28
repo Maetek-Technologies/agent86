@@ -25,6 +25,7 @@ pub mod repl;
 pub mod secrets;
 pub mod session;
 pub mod setup;
+pub mod skills;
 pub mod tools;
 pub mod turn;
 pub mod types;

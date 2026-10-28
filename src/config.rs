@@ -56,6 +56,15 @@ env_passthrough = []
 [mcp]
 enabled = true
 
+[skills]
+enabled = true
+paths = []
+
+[agents]
+enabled = true
+max_depth = 2
+max_steps = 8
+
 [observability]
 trace = true
 path = "~/.agent86/traces"
@@ -123,6 +132,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     pub observability: ObservabilityConfig,
     pub mcp: McpConfig,
+    pub skills: SkillsConfig,
+    pub agents: AgentsConfig,
     /// MCP servers in config order, from `[mcp_servers.<name>]` or `[mcp.servers.<name>]`.
     #[serde(default)]
     pub mcp_servers: indexmap::IndexMap<String, McpServerConfig>,
@@ -214,6 +225,24 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
     pub tool_timeout_s: u64,
+}
+
+/// `[skills]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SkillsConfig {
+    pub enabled: bool,
+    /// Extra directories searched after the project's and the user's.
+    pub paths: Vec<String>,
+}
+
+/// `[agents]`: sub-agent spawning through the `delegate` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AgentsConfig {
+    pub enabled: bool,
+    /// How deep delegation may nest (the main agent is depth 0).
+    pub max_depth: u32,
+    /// Each sub-agent's step cap, kept below `limits.max_steps`.
+    pub max_steps: u32,
 }
 
 /// `[mcp]`.

@@ -14,6 +14,7 @@ use crate::provider::remote_windows::{cache_path, openrouter_context_window};
 use crate::provider::{provider_for_ref, Provider};
 use crate::secrets::OsKeyring;
 use crate::session::{expand_home, SessionStore};
+use crate::skills::{discover_skills, skill_roots};
 use crate::tools::sandbox::build_executor;
 use crate::tools::web::WebSettings;
 use crate::tools::{default_registry, ToolContext};
@@ -91,8 +92,18 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     }
     context.memory = store.clone();
 
+    // Skills come from the workspace and the home directory; their folders join the
+    // jail so the files a skill bundles can be read.
+    let workspace = crate::tools::plain_path(context.policy.workspace());
+    let home = crate::config::home_dir();
+    let skills = Arc::new(discover_skills(config, &workspace, home.as_deref()));
+    context
+        .policy
+        .allow(skill_roots(config, &workspace, home.as_deref()));
+    context.skills = Arc::clone(&skills);
+
     // MCP servers that fail to start contribute no tools; their notes say why.
-    let registry = default_registry(store.is_some());
+    let registry = default_registry(store.is_some(), !skills.is_empty());
     let mcp = McpManager::start(config).map(Arc::new);
     if let Some(manager) = &mcp {
         manager.attach(&registry);
@@ -104,7 +115,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         registry,
         context,
         limits: config.limits.clone(),
-        system: build_system_prompt(config),
+        system: build_system_prompt(config, &skills),
         max_tokens,
         context_window,
         gate: ApprovalGate::new(config.guardrails.approval, prompt),

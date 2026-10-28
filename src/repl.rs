@@ -392,7 +392,13 @@ pub const COMMANDS: [CommandEntry; 15] = [
         usage: "/skills",
         description: "List available skills",
         needs_choice: None,
-        handler: |_, _| CommandResult::message("no skills discovered"),
+        handler: |repl, _| {
+            let skills = &repl.harness.context.skills;
+            if skills.is_empty() {
+                return CommandResult::message("no skills discovered");
+            }
+            CommandResult::handled(skills_list(skills))
+        },
     },
     CommandEntry {
         name: "/memory",
@@ -471,6 +477,30 @@ fn help_table() -> Text {
                 entry.description
             ),
         );
+    }
+    text
+}
+
+/// `/skills`: each name on its own line, with its description (and any tool
+/// restriction) indented under it. Python prints `name - description` on one
+/// line, which is hard to scan once descriptions run past the terminal's width.
+fn skills_list(skills: &crate::skills::Skills) -> Text {
+    let mut text = Text::default();
+    for (index, skill) in skills.values().enumerate() {
+        if index > 0 {
+            text.push(Style::Plain, "\n");
+        }
+        text.push(Style::BoldCyan, skill.name.as_str());
+        let description = crate::skills::one_line(&skill.description);
+        if !description.is_empty() {
+            text.push(Style::Plain, format!("\n  {description}"));
+        }
+        if !skill.allowed_tools.is_empty() {
+            text.push(
+                Style::Dim,
+                format!("\n  tools while active: {}", skill.allowed_tools.join(", ")),
+            );
+        }
     }
     text
 }
