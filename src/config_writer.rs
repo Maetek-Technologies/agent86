@@ -249,7 +249,7 @@ fn set(table: &mut Table, parents: &[String], leaf: &str, mut value: Value) -> R
 /// `--model` or `--approval`.
 pub fn apply_edit(edit: &ConfigEdit, paths: &ConfigPaths) -> Result<Config, ConfigWriteError> {
     write_atomic(&edit.path, &edit.after_text)?;
-    load_config(paths, &Overrides::from_env(None, None))
+    load_config(paths, &Overrides::from_env(None, None, None))
         .map_err(|error| ConfigWriteError(error.to_string()))
 }
 

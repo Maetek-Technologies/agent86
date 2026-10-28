@@ -1,6 +1,6 @@
 use agent86::agent::HarnessError;
 use agent86::approval::terminal_prompt_if_interactive;
-use agent86::config::{load_config, Config, ConfigPaths, Overrides};
+use agent86::config::{home_dir, load_config, Config, ConfigPaths, Overrides};
 use agent86::keys;
 use agent86::limits::{LimitKind, LimitOverrides};
 use agent86::mcp::McpManager;
@@ -10,9 +10,11 @@ use agent86::observability::{
 };
 use agent86::pricing::PriceTable;
 use agent86::pyjson::{python_float_repr, python_json_dumps, python_json_dumps_indented};
+use agent86::repl::{cli_models_tables, config_json, Text};
 use agent86::secrets::{OsKeyring, SecretStore, SERVICE_NAME};
 use agent86::session::{expand_home, AgentState, SessionStore, StoreCounts};
 use agent86::setup::{assemble, open_memory, SetupError, MODEL_HELP};
+use agent86::skills::{default_skill_paths, discover_skills};
 use agent86::tools::memory::format_2f;
 use agent86::turn::{format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
@@ -34,6 +36,10 @@ struct Cli {
     /// Override model (provider:model).
     #[arg(short, long)]
     model: Option<String>,
+
+    /// Override sandbox mode.
+    #[arg(long)]
+    sandbox: Option<String>,
 
     /// HITL mode: auto|ask|deny.
     #[arg(long)]
@@ -83,6 +89,20 @@ enum Command {
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         max_agent_steps: Option<u32>,
     },
+
+    /// Inspect configuration. With no subcommand: show providers, key source, and
+    /// OS keyring status.
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
+
+    /// List configured models and providers.
+    Models,
+
+    /// Manage skills.
+    #[command(subcommand)]
+    Skills(SkillsCommand),
 
     /// Inspect the flight-data recorder.
     #[command(subcommand)]
@@ -215,6 +235,27 @@ enum TraceCommand {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show where configuration is read from.
+    Path,
+
+    /// Print the fully-resolved configuration.
+    Show,
+}
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    /// List discovered skills.
+    List,
+
+    /// Show a skill's full instructions.
+    Show {
+        /// Skill name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum KeysCommand {
     /// Store a provider's API key, prompting for it with input hidden.
     Set {
@@ -239,12 +280,15 @@ fn main() -> ExitCode {
 
     let config = match load_config(
         &ConfigPaths::discover(),
-        &Overrides::from_env(cli.model, cli.approval),
+        &Overrides::from_env(cli.model, cli.sandbox, cli.approval),
     ) {
         Ok(config) => config,
         Err(error) => {
             stderr.error(&error.to_string());
-            stderr.dim("Fix the TOML, or move that file aside to fall back to the defaults.");
+            stderr.dim(
+                "Fix the TOML, or move that file aside to fall back to the defaults. \
+                 `agent86 config path` lists every layer that is read.",
+            );
             return ExitCode::from(1);
         }
     };
@@ -270,6 +314,12 @@ fn main() -> ExitCode {
             };
             run(&config, &goal, json, session.as_deref(), limits, &stderr)
         }
+        Some(Command::Config { command }) => config_command(&config, command, &stderr),
+        Some(Command::Models) => {
+            print_text(&cli_models_tables(&config, &OsKeyring), &stderr);
+            ExitCode::SUCCESS
+        }
+        Some(Command::Skills(command)) => skills_command(&config, command, &stderr),
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
@@ -410,13 +460,106 @@ fn run(
     ExitCode::SUCCESS
 }
 
+/// Styled text on stdout, coloured as `Styled` colours it.
+fn print_text(text: &Text, stderr: &Stderr) {
+    println!("{}", text.render(Styled::stdout(stderr).color));
+}
+
+fn config_command(config: &Config, command: Option<ConfigCommand>, stderr: &Stderr) -> ExitCode {
+    match command {
+        None => print_text(&cli_models_tables(config, &OsKeyring), stderr),
+        Some(ConfigCommand::Path) => {
+            // Each layer, and whether it exists, as Python's `config_paths`.
+            let paths = ConfigPaths::discover();
+            let describe = |path: &std::path::Path| {
+                let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+                let found = if path.is_file() {
+                    "exists"
+                } else {
+                    "not found"
+                };
+                format!("{} ({found})", path.display())
+            };
+            let user = paths
+                .user
+                .as_deref()
+                .map_or_else(|| "- (no home directory)".to_owned(), describe);
+            print_table(
+                &["Layer", "Path"],
+                &[
+                    vec!["user".to_owned(), user],
+                    vec!["project".to_owned(), describe(&paths.project)],
+                ],
+            );
+        }
+        Some(ConfigCommand::Show) => println!("{}", config_json(config)),
+    }
+    ExitCode::SUCCESS
+}
+
+fn skills_command(config: &Config, command: SkillsCommand, stderr: &Stderr) -> ExitCode {
+    // Skills are found from the directory agent86 runs in, as `run` finds them.
+    let workspace = std::env::current_dir().unwrap_or_default();
+    let home = home_dir();
+    let skills = discover_skills(config, &workspace, home.as_deref());
+    match command {
+        SkillsCommand::List => {
+            if skills.is_empty() {
+                let searched: Vec<String> =
+                    default_skill_paths(config, &workspace, home.as_deref())
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect();
+                stdout_dim(
+                    &format!("No skills found. Searched: {}", searched.join(", ")),
+                    stderr,
+                );
+                return ExitCode::SUCCESS;
+            }
+            let rows: Vec<Vec<String>> = skills
+                .values()
+                .map(|skill| vec![skill.name.clone(), skill.description.clone()])
+                .collect();
+            print_table(&["Skill", "Description"], &rows);
+        }
+        SkillsCommand::Show { name } => {
+            let Some(skill) = skills.get(&name) else {
+                let known: Vec<&str> = skills.keys().map(String::as_str).collect();
+                let known = if known.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    known.join(", ")
+                };
+                stderr.red_lead(
+                    &format!("No skill named '{name}'."),
+                    &format!(
+                        "Known: {known}. Run `agent86 skills list` to see where they were \
+                         discovered from."
+                    ),
+                );
+                return ExitCode::from(1);
+            };
+            let out = Styled::stdout(stderr);
+            out.line("\x1b[1m", &skill.name, &format!(" - {}", skill.description));
+            println!();
+            println!("{}", skill.instructions());
+            let resources = skill.resources();
+            if !resources.is_empty() {
+                println!();
+                stdout_dim(&format!("resources: {}", resources.join(", ")), stderr);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn mcp_command(config: &Config, command: McpCommand, stderr: &Stderr) -> ExitCode {
     match command {
         McpCommand::List => {
             if config.mcp_servers.is_empty() {
                 stdout_dim(
                     "No MCP servers configured. Add one with `/config mcp` in the REPL, or an \
-                     `[mcp_servers.<name>]` block in your config file.",
+                     `[mcp_servers.<name>]` block in the file `agent86 config path` names.",
                     stderr,
                 );
                 return ExitCode::SUCCESS;
@@ -650,7 +793,8 @@ fn open_memory_store(config: &Config, stderr: &Stderr) -> Option<SessionStore> {
     if !config.memory.enabled {
         stderr.warn_lead(
             "Memory is disabled in config.",
-            "Set `[memory] enabled = true` to turn it on.",
+            "Set `[memory] enabled = true` to turn it on \
+             (`agent86 config path` shows which file to edit).",
         );
         return None;
     }
@@ -1128,6 +1272,15 @@ impl Stderr {
     /// An error printed after streamed text, starting on a fresh line.
     fn error_after_stream(&self, message: &str) {
         self.write("\n", "\x1b[31m", "error:", message);
+    }
+
+    /// `[red]lead[/red] rest`.
+    fn red_lead(&self, lead: &str, rest: &str) {
+        if self.color {
+            eprintln!("\x1b[31m{lead}\x1b[0m {rest}");
+        } else {
+            eprintln!("{lead} {rest}");
+        }
     }
 
     /// `[yellow]lead[/yellow] rest`.

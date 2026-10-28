@@ -576,19 +576,27 @@ pub struct Overrides {
     pub env_approval: Option<String>,
     /// `--model`.
     pub model: Option<String>,
+    /// `--sandbox`.
+    pub sandbox: Option<String>,
     /// `--approval`.
     pub approval: Option<String>,
 }
 
 impl Overrides {
     /// Read the supported `AGENT86_*` environment variables; empty values are ignored.
-    /// `model` and `approval` are the `--model` and `--approval` flags.
-    pub fn from_env(model: Option<String>, approval: Option<String>) -> Self {
+    /// `model`, `sandbox`, and `approval` are the `--model`, `--sandbox`, and
+    /// `--approval` flags.
+    pub fn from_env(
+        model: Option<String>,
+        sandbox: Option<String>,
+        approval: Option<String>,
+    ) -> Self {
         Self {
             env_model: non_empty_env("AGENT86_MODEL"),
             env_sandbox: non_empty_env("AGENT86_SANDBOX"),
             env_approval: non_empty_env("AGENT86_APPROVAL"),
             model,
+            sandbox,
             approval,
         }
     }
@@ -622,6 +630,7 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
         ("sandbox", "mode", &overrides.env_sandbox),
         ("guardrails", "approval", &overrides.env_approval),
         ("model", "default", &overrides.model),
+        ("sandbox", "mode", &overrides.sandbox),
         ("guardrails", "approval", &overrides.approval),
     ];
     for (section, key, value) in layers {
@@ -734,7 +743,7 @@ fn non_empty_env(name: &str) -> Option<String> {
 }
 
 /// The home directory as Python's `Path.home()` resolves it.
-pub(crate) fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(variable)
         .filter(|value| !value.is_empty())
@@ -918,6 +927,15 @@ mod tests {
         assert_eq!(
             load_config(&paths_in(&dir), &env).unwrap().sandbox.mode,
             SandboxMode::Docker
+        );
+        // `--sandbox` wins over `AGENT86_SANDBOX`, as Python's CLI overrides do.
+        let flag = Overrides {
+            sandbox: Some("subprocess".to_owned()),
+            ..env
+        };
+        assert_eq!(
+            load_config(&paths_in(&dir), &flag).unwrap().sandbox.mode,
+            SandboxMode::Subprocess
         );
 
         std::fs::write(

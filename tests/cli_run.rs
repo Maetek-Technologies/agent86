@@ -971,7 +971,8 @@ async fn memory_can_be_turned_off() {
     assert_eq!(stats.status.code(), Some(1));
     assert_eq!(
         stderr(&stats),
-        "Memory is disabled in config. Set `[memory] enabled = true` to turn it on.\n"
+        "Memory is disabled in config. Set `[memory] enabled = true` to turn it on \
+         (`agent86 config path` shows which file to edit).\n"
     );
 }
 
@@ -1389,7 +1390,7 @@ async fn mcp_commands_without_servers_say_where_to_add_one() {
     assert_eq!(
         stdout(&list),
         "No MCP servers configured. Add one with `/config mcp` in the REPL, or an \
-         `[mcp_servers.<name>]` block in your config file.\n"
+         `[mcp_servers.<name>]` block in the file `agent86 config path` names.\n"
     );
     let tools = workspace.run(&["mcp", "tools"]).await;
     assert_eq!(
@@ -1841,4 +1842,126 @@ async fn run_flags_override_the_step_and_output_limits() {
         let output = workspace.run(&args).await;
         assert_eq!(output.status.code(), Some(2), "{args:?}");
     }
+}
+
+#[tokio::test]
+async fn models_and_config_list_providers_roles_and_where_config_is_read() {
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::with_mock_provider("models", &server);
+    // Every provider's key variable is set, so the listing never consults the real
+    // OS keyring (the environment is checked first).
+    let listing = |args: &'static [&'static str]| {
+        let mut command = workspace.command(args);
+        for variable in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GROQ_API_KEY",
+        ] {
+            command.env(variable, "placeholder");
+        }
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+    };
+
+    // As Python's `_list_models`: providers, the keyring line, then the roles.
+    let models = listing(&["models"]).await.unwrap();
+    assert!(models.status.success(), "{}", stderr(&models));
+    let text = stdout(&models);
+    let providers = text.find("Providers\n").unwrap();
+    let keyring = text.find("\nOS keyring: available\n").unwrap();
+    let roles = text.find("Model roles\n").unwrap();
+    assert!(providers < keyring && keyring < roles, "{text}");
+    assert!(
+        text.lines().any(|line| line.starts_with("default ")
+            && line.contains(" mock:test/model ")
+            && line.ends_with(" ok")),
+        "{text}"
+    );
+    assert!(text.contains("AGENT86_TEST_MOCK_KEY  env"), "{text}");
+    assert!(!text.contains("keyring\n"), "{text}");
+    // A bare `config` is the same listing.
+    assert_eq!(stdout(&listing(&["config"]).await.unwrap()), text);
+
+    let path = stdout(&workspace.run(&["config", "path"]).await);
+    let lines: Vec<&str> = path.lines().collect();
+    assert_eq!(lines.len(), 3, "{path}");
+    assert!(lines[0].starts_with("Layer"), "{path}");
+    let user = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("config.toml");
+    let project = workspace.project().join(".agent86").join("config.toml");
+    assert_eq!(lines[1], format!("user     {} (exists)", user.display()));
+    assert_eq!(lines[2], format!("project  {} (exists)", project.display()));
+
+    // `config show` is the resolved configuration as JSON, and `--sandbox`
+    // overrides the mode as Python's global option does.
+    let show = workspace
+        .run(&["--sandbox", "docker", "config", "show"])
+        .await;
+    let resolved: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert_eq!(resolved["model"]["default"], "mock:test/model");
+    assert_eq!(resolved["sandbox"]["mode"], "docker");
+    let invalid = workspace.run(&["--sandbox", "vm", "config", "show"]).await;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(
+        stderr(&invalid).contains("`agent86 config path` lists every layer that is read."),
+        "{}",
+        stderr(&invalid)
+    );
+}
+
+#[tokio::test]
+async fn a_model_that_cannot_be_built_points_at_agent86_models() {
+    let workspace = Workspace::new("model-help");
+    let output = workspace.run(&["--model", "nope", "run", "x"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).ends_with(
+            "Run `agent86 models` to see the configured providers and which of them has a \
+             key, then pick one with `--model provider:model`.\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
+async fn skills_are_listed_and_shown_with_their_resources() {
+    let workspace = Workspace::new("skills-cli");
+    let empty = stdout(&workspace.run(&["skills", "list"]).await);
+    assert!(empty.starts_with("No skills found. Searched: "), "{empty}");
+    assert!(empty.contains(".agent86"), "{empty}");
+
+    let skill = workspace
+        .project()
+        .join(".agent86")
+        .join("skills")
+        .join("release");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: release\ndescription: Cut a release\n---\nBump the version, then tag.\n",
+    )
+    .unwrap();
+    std::fs::write(skill.join("checklist.md"), "- tests\n").unwrap();
+
+    let list = stdout(&workspace.run(&["skills", "list"]).await);
+    assert_eq!(list, "Skill    Description\nrelease  Cut a release\n");
+
+    let show = workspace.run(&["skills", "show", "release"]).await;
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert_eq!(
+        stdout(&show),
+        "release - Cut a release\n\nBump the version, then tag.\n\nresources: checklist.md\n"
+    );
+
+    let missing = workspace.run(&["skills", "show", "deploy"]).await;
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        stderr(&missing),
+        "No skill named 'deploy'. Known: release. Run `agent86 skills list` to see where \
+         they were discovered from.\n"
+    );
 }
