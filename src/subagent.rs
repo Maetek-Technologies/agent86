@@ -5,7 +5,7 @@
 //! harness's provider, tool registry, sandbox, approval gate, and recorder, so a
 //! delegated task gets the same guardrails and observability as the main agent.
 //! It runs under its own step budget (`[agents] max_steps`, never more than
-//! `[limits] max_steps`), reports every model call to the recorder tagged with
+//! `[limits] max_steps`) and the main loop's output cap, reports every model call to the recorder tagged with
 //! its role and depth, and hands its token usage back, so the parent turn's cost
 //! includes what it spent. Depth is tracked so delegation cannot recurse without
 //! bound.
@@ -14,6 +14,7 @@ use crate::agent::{
     invalid_arguments_result, observation, CircuitBreaker, Harness, HarnessError, CONTINUE_PROMPT,
     MAX_CONTINUATIONS,
 };
+use crate::limits::LimitKind;
 use crate::memory::working::fit;
 use crate::provider::ProviderError;
 use crate::tools::delegate::{self, NAME as DELEGATE};
@@ -125,7 +126,7 @@ impl Harness {
         );
         let mut messages = vec![message(Role::User, task.to_owned())];
         let mut limits = self.limits.clone();
-        limits.max_steps = limits.max_steps.min(self.agents.max_steps);
+        limits.max_steps = self.agent_max_steps();
         let mut breaker = CircuitBreaker::new(&limits);
         // Its own context: a skill it activates restricts only its own calls.
         let ctx = self.context.fork();
@@ -142,6 +143,14 @@ impl Harness {
         };
 
         loop {
+            // Beyond Python: the interface may offer to raise a spent budget.
+            if breaker.out_of_steps() {
+                if let Some(raised) =
+                    self.raise_limit(LimitKind::AgentSteps, Some(role), &sid, breaker.max_steps())
+                {
+                    breaker.set_max_steps(raised);
+                }
+            }
             if let Err(error) = breaker.before_step() {
                 return Ok((halted(error), spent + delegated));
             }
@@ -162,7 +171,11 @@ impl Harness {
                     messages: request_messages,
                     tools: specs,
                     temperature: 0.0,
-                    max_tokens: None,
+                    // A deliberate fix: Python sends none, so a sub-agent gets the
+                    // provider's default (8192 on Anthropic, the server's own on an
+                    // OpenAI-compatible endpoint), which no setting but the provider's
+                    // `max_tokens` changes. It gets the main loop's cap instead.
+                    max_tokens: Some(self.output_cap()),
                     stream: false,
                 })
                 .await?;
@@ -188,6 +201,19 @@ impl Harness {
                     ("tool_calls", json!(names)),
                 ],
             );
+            let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
+            let has_text = !completion.text.trim().is_empty();
+            // Beyond Python: a cap reached before any text may be raised and the
+            // request sent again, the empty reply left out of the history.
+            if cut_off && !has_text && completion.tool_calls.is_empty() && parts.is_empty() {
+                let cap = self.output_cap();
+                if self
+                    .raise_limit(LimitKind::Output, Some(role), &sid, cap)
+                    .is_some()
+                {
+                    continue;
+                }
+            }
             messages.push(Message {
                 tool_calls: completion.tool_calls.clone(),
                 ..message(Role::Assistant, completion.text.clone())
@@ -199,8 +225,6 @@ impl Harness {
                 // empty when a thinking model spent the whole cap reasoning. A partial
                 // answer continues as the main loop's does; a cap reached before any
                 // text is reported, so the parent can tell it from an empty answer.
-                let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
-                let has_text = !completion.text.trim().is_empty();
                 if cut_off && has_text && continuations < MAX_CONTINUATIONS {
                     continuations += 1;
                     parts.push(completion.text);
@@ -223,8 +247,9 @@ impl Harness {
                 if answer.trim().is_empty() {
                     answer = if cut_off {
                         format!(
-                            "[sub-agent '{role}' wrote no answer: its last reply reached the output limit ({} tokens) before any text. Raise [limits] max_output_tokens or delegate a smaller task.]",
-                            completion.usage.output_tokens
+                            "[sub-agent '{role}' wrote no answer: its last reply reached the output limit ({} tokens) before any text. Raise {} or delegate a smaller task.]",
+                            completion.usage.output_tokens,
+                            self.session_limits.output_setting()
                         )
                     } else {
                         format!("[sub-agent '{role}' returned no text]")

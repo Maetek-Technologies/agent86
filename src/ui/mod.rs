@@ -16,6 +16,7 @@ mod app;
 mod diff;
 mod entries;
 mod input;
+mod limits;
 mod manage;
 mod manage_mcp;
 mod markdown;
@@ -236,6 +237,19 @@ fn run(repl: &mut Repl) -> io::Result<()> {
         };
         approvals.send(request).is_ok() && answer.recv().unwrap_or(false)
     }));
+    // So does an offer to raise a limit the turn reached; a dropped sender stops.
+    let offers = events.clone();
+    repl.harness.session_limits.prompt = Some(Box::new(move |hit| {
+        let (reply, answer) = mpsc::channel();
+        let request = UiEvent::Limit {
+            hit: hit.clone(),
+            reply,
+        };
+        if offers.send(request).is_err() {
+            return None;
+        }
+        answer.recv().ok().flatten()
+    }));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -319,6 +333,10 @@ fn run(repl: &mut Repl) -> io::Result<()> {
                 manager.mcp.on_saved(&mut app, repl, edit);
                 None
             }
+            Request::Saved(SavePurpose::Limits, edit) => {
+                limits::on_saved(&mut app, repl, edit);
+                None
+            }
             Request::Saved(SavePurpose::McpUnmount, edit) => {
                 manager.mcp.on_unmount_saved(&mut app, repl, edit);
                 None
@@ -382,6 +400,11 @@ fn dispatch(
         // A typed model id may be resolved against the provider's catalog.
         if entry.name == "/model" && !arg.is_empty() {
             manager.dispatch_model(app, repl, &arg);
+            return Ok(true);
+        }
+        // Saving shows the diff first, as `/config model` does.
+        if entry.name == "/limits" && arg.trim() == "save" {
+            limits::open_save(app, repl);
             return Ok(true);
         }
     }

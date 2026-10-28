@@ -15,6 +15,7 @@ use crate::agent::Harness;
 use crate::approval::{stdout_prompt, ApprovalPrompt};
 use crate::config::{Config, ConfigPaths};
 use crate::history::PromptHistory;
+use crate::limits::{configured, setting, LimitKind};
 use crate::mentions::expand_mentions;
 use crate::pricing::{format_cost, PriceTable, UNPRICED_LABEL};
 use crate::secrets::{SecretStore, SERVICE_NAME};
@@ -327,7 +328,7 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 15] = [
+pub const COMMANDS: [CommandEntry; 16] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
@@ -421,6 +422,14 @@ pub const COMMANDS: [CommandEntry; 15] = [
         needs_choice: None,
         handler: |repl, _| CommandResult::message(repl.cost_render()),
     },
+    // Beyond Python, which reads these limits only from config.
+    CommandEntry {
+        name: "/limits",
+        usage: "/limits [name value]",
+        description: "Show/set step and output limits for this session",
+        needs_choice: None,
+        handler: |repl, arg| repl.limits(arg),
+    },
     CommandEntry {
         name: "/sessions",
         usage: "/sessions",
@@ -456,6 +465,8 @@ pub const COMMANDS: [CommandEntry; 15] = [
         handler: |_, _| CommandResult::of(Action::Exit),
     },
 ];
+
+const LIMITS_USAGE: &str = "/limits <steps|agent_steps|output> <n> sets one for this session · /limits reset · /limits save";
 
 fn help_table() -> Text {
     let width = COMMANDS
@@ -895,7 +906,8 @@ impl Repl {
             // The current model is left unchanged.
             Err(message) => message,
             Ok((provider, reference)) => {
-                self.harness.max_tokens = self.config.max_output_tokens_for(&reference.provider);
+                self.harness
+                    .configure_output(&self.config, &reference.provider);
                 self.harness.context_window =
                     crate::setup::model_context_window(&self.config, &reference.to_string());
                 self.harness.provider = provider;
@@ -908,6 +920,96 @@ impl Repl {
                 )
             }
         }
+    }
+
+    /// The config section the active model was built from.
+    pub(crate) fn provider_section(&self) -> &str {
+        self.model_ref
+            .split_once(':')
+            .map_or(self.model_ref.as_str(), |(provider, _)| provider)
+    }
+
+    /// `/limits`: show the limits, or set, reset, or save the session's overrides.
+    fn limits(&mut self, arg: &str) -> CommandResult {
+        let words: Vec<&str> = arg.split_whitespace().collect();
+        match words.as_slice() {
+            [] => CommandResult::handled(self.limits_render()),
+            ["reset"] => {
+                self.harness.session_limits.clear();
+                CommandResult::message("limits: back to the config")
+            }
+            // The interface saves through its diff panel before this runs.
+            ["save"] => {
+                let mut text = Text::plain("Saving limits is a TUI surface — run agent86 without ");
+                text.push(Style::Cyan, "--plain");
+                text.push(Style::Plain, " and use ");
+                text.push(Style::Cyan, "/limits save");
+                text.push(Style::Plain, ".");
+                CommandResult::handled(text)
+            }
+            [name, value] => CommandResult::message(self.set_limit(name, value)),
+            _ => CommandResult::message(LIMITS_USAGE),
+        }
+    }
+
+    fn set_limit(&mut self, name: &str, value: &str) -> String {
+        let Some(kind) = LimitKind::parse(name) else {
+            return format!("unknown limit '{name}' (steps|agent_steps|output)");
+        };
+        let value = match value.parse::<u32>() {
+            Ok(value) if value > 0 => value,
+            _ => return format!("'{value}' is not a positive whole number"),
+        };
+        let section = self.provider_section().to_owned();
+        // The configured value needs no override.
+        let keep = (value != configured(kind, &self.config, &section)).then_some(value);
+        self.harness.session_limits.set(kind, keep);
+        let effective = self.harness.limit(kind);
+        if effective < value {
+            format!(
+                "{}: {value} for this session, capped at steps ({effective})",
+                kind.name()
+            )
+        } else if keep.is_none() {
+            format!("{}: {value}, as configured", kind.name())
+        } else {
+            format!(
+                "{}: {value} for this session (/limits save keeps it)",
+                kind.name()
+            )
+        }
+    }
+
+    fn limits_render(&self) -> Text {
+        let section = self.provider_section();
+        let mut text = Text::styled(Style::Bold, "limit        value  from");
+        for kind in LimitKind::ALL {
+            let label = setting(kind, &self.config, section).1;
+            let configured = configured(kind, &self.config, section);
+            let set = self.harness.session_limits.get(kind);
+            let effective = self.harness.limit(kind);
+            let mut from = match set {
+                Some(_) => format!("session ({label} {configured})"),
+                None => label,
+            };
+            if effective < set.unwrap_or(configured) {
+                from.push_str(", capped at steps");
+            }
+            text.push(
+                Style::Plain,
+                format!("\n{:<11} {effective:>6}  ", kind.name()),
+            );
+            text.push(
+                if set.is_some() {
+                    Style::Cyan
+                } else {
+                    Style::Dim
+                },
+                from,
+            );
+        }
+        text.push(Style::Dim, format!("\n{LIMITS_USAGE}"));
+        text
     }
 
     fn set_mode(&mut self, arg: &str) -> String {

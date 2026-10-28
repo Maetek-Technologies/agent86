@@ -1797,3 +1797,48 @@ async fn skills_are_advertised_loaded_and_enforce_their_tool_list() {
     );
     assert!(!workspace.project().join("notes.md").exists());
 }
+
+#[tokio::test]
+async fn run_flags_override_the_step_and_output_limits() {
+    // Beyond Python, which reads these limits only from config. The output cap
+    // replaces the provider's `max_tokens` too, so the flag always takes effect.
+    let server = MockServer::start(vec![
+        support::sse_tool_calls(&[("a", "list_dir", "{}")]),
+        support::sse_tool_calls(&[("b", "list_dir", "{}")]),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("limit-flags", &server);
+    workspace.append_project_config("max_tokens = 4096\n");
+
+    let output = workspace
+        .run(&[
+            "run",
+            "--max-steps",
+            "1",
+            "--max-output-tokens",
+            "32000",
+            "--max-agent-steps",
+            "3",
+            "look",
+        ])
+        .await;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("step budget reached (1 steps)"),
+        "{}",
+        stderr(&output)
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["max_completion_tokens"], 32000);
+
+    for args in [
+        ["run", "--max-steps", "0", "x"],
+        ["run", "--max-output-tokens", "-5", "x"],
+        ["run", "--max-agent-steps", "many", "x"],
+    ] {
+        let output = workspace.run(&args).await;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
