@@ -917,6 +917,13 @@ impl Inner {
             .map_or(8000, |slot| slot.config.max_result_chars)
     }
 
+    /// `[mcp.servers.<server>.defaults]` for one of the server's tools.
+    fn tool_defaults(&self, server: &str, tool: &str) -> Option<Map<String, Value>> {
+        lock(&self.slots)
+            .get(server)
+            .and_then(|slot| slot.config.defaults.get(tool).cloned())
+    }
+
     fn call_tool(
         &self,
         server: &str,
@@ -1362,8 +1369,18 @@ impl Tool for McpTool {
             error,
             metadata: metadata.clone(),
         };
+        let manager = self.manager.upgrade();
+        // Beyond Python: the configured defaults fill in what the model left out.
+        // The call the loop keeps (history, trace, approval) is the model's own.
+        let defaults = manager
+            .as_ref()
+            .and_then(|manager| manager.tool_defaults(&self.server, &self.remote));
+        let arguments = match defaults {
+            Some(defaults) => with_defaults(&self.schema, &call.arguments, &defaults),
+            None => call.arguments.clone(),
+        };
         if first_use {
-            let missing = self.missing_required(&call.arguments);
+            let missing = self.missing_required(&arguments);
             if !missing.is_empty() {
                 return result(
                     false,
@@ -1377,8 +1394,8 @@ impl Tool for McpTool {
                 );
             }
         }
-        let outcome = match self.manager.upgrade() {
-            Some(manager) => manager.call_tool(&self.server, &self.remote, &call.arguments),
+        let outcome = match manager {
+            Some(manager) => manager.call_tool(&self.server, &self.remote, &arguments),
             None => Err(format!("MCP server '{}' is not connected.", self.server)),
         };
         match outcome {
@@ -1389,6 +1406,52 @@ impl Tool for McpTool {
                 Some(format!("MCP call failed: {message}")),
             ),
         }
+    }
+}
+
+/// `arguments` with each default the model left out added, when the tool's schema
+/// declares it (a schema that declares no properties accepts any). An argument the
+/// schema does not know would only make the server refuse the call.
+fn with_defaults(
+    schema: &Value,
+    arguments: &Map<String, Value>,
+    defaults: &Map<String, Value>,
+) -> Map<String, Value> {
+    let declared = schema.get("properties").and_then(Value::as_object);
+    let mut merged = arguments.clone();
+    for (key, value) in defaults {
+        if !merged.contains_key(key) && declared.is_none_or(|declared| declared.contains_key(key)) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+mod defaults_tests {
+    use super::*;
+
+    #[test]
+    fn only_declared_arguments_the_model_left_out_are_added() {
+        let defaults = json!({"maxAge": 0, "formats": ["markdown"], "typo": 1});
+        let defaults = defaults.as_object().unwrap();
+        let schema =
+            json!({"type": "object", "properties": {"url": {}, "maxAge": {}, "formats": {}}});
+        let arguments = json!({"url": "https://example.com", "formats": ["html"]});
+        assert_eq!(
+            Value::Object(with_defaults(
+                &schema,
+                arguments.as_object().unwrap(),
+                defaults
+            )),
+            json!({"url": "https://example.com", "formats": ["html"], "maxAge": 0})
+        );
+        // A schema that declares nothing accepts anything.
+        let open = json!({"type": "object"});
+        assert_eq!(
+            Value::Object(with_defaults(&open, &Map::new(), defaults)),
+            json!({"maxAge": 0, "formats": ["markdown"], "typo": 1})
+        );
     }
 }
 
