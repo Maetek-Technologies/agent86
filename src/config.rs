@@ -118,7 +118,7 @@ base_url = "https://api.groq.com/openai/v1"
 
 [providers.ollama]
 base_url = "http://localhost:11434"
-num_ctx = 8192
+num_ctx_max = 32768
 
 [providers.llamacpp]
 base_url = "http://localhost:8080"
@@ -526,8 +526,14 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Ollama's context window, sent as `num_ctx`. Unset, the model's own maximum
+    /// is asked for, up to `num_ctx_max`.
     #[serde(default)]
     pub num_ctx: Option<u32>,
+    /// The largest window asked for when `num_ctx` is unset (a deliberate
+    /// difference from Python, which sends 8192): Ollama allocates all of it.
+    #[serde(default)]
+    pub num_ctx_max: Option<u32>,
     /// A TCP connect that has not completed in this time is a down endpoint.
     #[serde(default = "default_connect_timeout_s")]
     pub connect_timeout_s: f64,
@@ -548,6 +554,7 @@ impl Default for ProviderConfig {
             api_key_env: None,
             base_url: None,
             num_ctx: None,
+            num_ctx_max: None,
             connect_timeout_s: default_connect_timeout_s(),
             read_timeout_s: default_read_timeout_s(),
             max_retries: default_max_retries(),

@@ -62,6 +62,16 @@ fn get_json(
     headers: &[(&str, String)],
     timeout: Duration,
 ) -> Result<Value, CatalogUnavailable> {
+    request_json(url, headers, None, timeout)
+}
+
+/// [`get_json`], or a POST of `body` when there is one.
+fn request_json(
+    url: &str,
+    headers: &[(&str, String)],
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<Value, CatalogUnavailable> {
     let secrets: Vec<&str> = headers
         .iter()
         .filter(|(name, _)| matches!(*name, "Authorization" | "x-api-key"))
@@ -88,7 +98,13 @@ fn get_json(
                         .redirect(reqwest::redirect::Policy::none())
                         .build()
                         .map_err(|error| error.to_string())?;
-                    let mut request = client.get(url);
+                    let mut request = match body {
+                        Some(body) => client
+                            .post(url)
+                            .header("content-type", "application/json")
+                            .body(body.to_string()),
+                        None => client.get(url),
+                    };
                     for (name, value) in headers {
                         request = request.header(*name, value);
                     }
@@ -200,6 +216,39 @@ pub fn fetch_ollama(base_url: &str) -> Result<Vec<CatalogEntry>, CatalogUnavaila
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let body = get_json(&url, &[], TIMEOUT)?;
     Ok(entries(list(&body, "models"), "name", "name"))
+}
+
+/// The context length `model` was trained for, from Ollama's `POST {base}/api/show`:
+/// `model_info["<architecture>.context_length"]`, or `None` when it reports none.
+pub fn fetch_ollama_context_length(
+    base_url: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<Option<u64>, CatalogUnavailable> {
+    let url = format!("{}/api/show", base_url.trim_end_matches('/'));
+    let body = request_json(
+        &url,
+        &[],
+        Some(&serde_json::json!({"model": model})),
+        timeout,
+    )?;
+    let Some(info) = body.get("model_info").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let named = info
+        .get("general.architecture")
+        .and_then(Value::as_str)
+        .and_then(|architecture| info.get(&format!("{architecture}.context_length")));
+    // Without an architecture, any `*.context_length` key is the model's own.
+    let length = named.or_else(|| {
+        info.iter()
+            .find(|(key, _)| key.ends_with(".context_length"))
+            .map(|(_, value)| value)
+    });
+    Ok(length
+        .and_then(Value::as_f64)
+        .filter(|&length| length >= 1.0)
+        .map(|length| length as u64))
 }
 
 /// The catalog for `provider`, sorted by id: Python's `fetch_catalog`.

@@ -101,12 +101,26 @@ fn stderr(output: &Output) -> String {
     text(&output.stderr)
 }
 
-#[tokio::test]
-async fn run_works_against_ollama_and_local_models_cost_nothing() {
-    let server = MockServer::start(vec![Reply::Sse(fixture("ollama/text.ndjson"))]).await;
-    let workspace = Workspace::new("ollama");
+/// An `/api/show` answer reporting `length` as the model's trained context.
+fn ollama_show(length: u64) -> Reply {
+    Reply::Status {
+        status: 200,
+        headers: vec![("Content-Type", "application/json".to_owned())],
+        body: serde_json::json!({"model_info": {
+            "general.architecture": "llama",
+            "llama.context_length": length,
+        }})
+        .to_string(),
+    }
+}
+
+/// Run `ollama:llama3.1:8b` against `replies` with `extra` in `[providers.ollama]`,
+/// returning the requests the server saw.
+async fn run_ollama(name: &str, replies: Vec<Reply>, extra: &str) -> Vec<support::Recorded> {
+    let server = MockServer::start(replies).await;
+    let workspace = Workspace::new(name);
     workspace.write_project_config(&format!(
-        "[model]\ndefault = \"ollama:llama3.1:8b\"\n\n[providers.ollama]\nbase_url = \"{}\"\n",
+        "[model]\ndefault = \"ollama:llama3.1:8b\"\n\n[providers.ollama]\nbase_url = \"{}\"\n{extra}",
         server.base_url
     ));
 
@@ -119,14 +133,65 @@ async fn run_works_against_ollama_and_local_models_cost_nothing() {
         summary.starts_with("— 1 step · 0 tools · 26 in / 3 out · $0.0000 · "),
         "{summary}"
     );
-    let sent = &server.requests()[0];
+    server.requests()
+}
+
+#[tokio::test]
+async fn run_works_against_ollama_and_local_models_cost_nothing() {
+    let replies = vec![
+        ollama_show(131_072),
+        Reply::Sse(fixture("ollama/text.ndjson")),
+    ];
+    let requests = run_ollama("ollama", replies, "").await;
+
+    assert_eq!(requests.len(), 2, "the model is asked about once");
+    assert_eq!(requests[0].request_line, "POST /api/show HTTP/1.1");
+    assert_eq!(
+        requests[0].body,
+        serde_json::json!({"model": "llama3.1:8b"})
+    );
+    let sent = &requests[1];
     assert_eq!(sent.request_line, "POST /api/chat HTTP/1.1");
     assert_eq!(sent.body["model"], "llama3.1:8b");
-    // The built-in num_ctx, and the harness's output cap as num_predict, as in Python.
+    // The model's 128k, capped at num_ctx_max's 32k (Python always sends 8192), and
+    // the harness's output cap as num_predict, as in Python.
     assert_eq!(
         sent.body["options"],
-        serde_json::json!({"temperature": 0.0, "num_ctx": 8192, "num_predict": 8192})
+        serde_json::json!({"temperature": 0.0, "num_ctx": 32768, "num_predict": 8192})
     );
+}
+
+#[tokio::test]
+async fn ollama_windows_follow_num_ctx_then_the_cap_then_pythons_default() {
+    let text = || Reply::Sse(fixture("ollama/text.ndjson"));
+    let num_ctx = |requests: &[support::Recorded]| {
+        let chat = requests.last().unwrap();
+        assert_eq!(chat.request_line, "POST /api/chat HTTP/1.1");
+        chat.body["options"]["num_ctx"].clone()
+    };
+
+    // A num_ctx of the user's own is sent as it is, and the model is not asked.
+    let requests = run_ollama("ollama-own", vec![text()], "num_ctx = 200000\n").await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(num_ctx(&requests), 200_000);
+
+    // A raised cap lets more of the model's window through.
+    let replies = vec![ollama_show(131_072), text()];
+    let requests = run_ollama("ollama-cap", replies, "num_ctx_max = 65536\n").await;
+    assert_eq!(num_ctx(&requests), 65_536);
+
+    // A model smaller than the cap gets its own window.
+    let requests = run_ollama("ollama-small", vec![ollama_show(4_096), text()], "").await;
+    assert_eq!(num_ctx(&requests), 4_096);
+
+    // When the server cannot say, Python's 8192.
+    let missing = Reply::Status {
+        status: 404,
+        headers: vec![],
+        body: r#"{"error":"not found"}"#.to_owned(),
+    };
+    let requests = run_ollama("ollama-unknown", vec![missing, text()], "").await;
+    assert_eq!(num_ctx(&requests), 8_192);
 }
 
 #[tokio::test]

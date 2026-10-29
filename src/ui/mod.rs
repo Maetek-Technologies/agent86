@@ -35,7 +35,7 @@ use crate::config::Config;
 use crate::config::ConfigPaths;
 use crate::mentions::expand_mentions;
 use crate::provider::capabilities::context_window_with;
-use crate::provider::remote_windows::{cache_path, openrouter_context_window};
+use crate::provider::remote_windows::{cache_path, discover_context_window};
 use crate::repl::{
     find_command_for_line, now, plain_loop, session_label, start_repl, Action, Choice, Repl, Style,
     NO_MEMORY_NOTE,
@@ -186,13 +186,14 @@ fn windows_console() -> io::Result<()> {
 /// What the status line shows for the session as it stands.
 fn status_from(repl: &Repl) -> StatusState {
     let usage = &repl.state.usage;
-    // OpenRouter is asked for its models' windows, cached beside the user config.
+    // OpenRouter is asked for its models' windows, cached beside the user config,
+    // and Ollama for its model's maximum.
     let cache = repl
         .config_paths
         .as_ref()
         .and_then(|paths| paths.user.as_deref()?.parent().map(cache_path));
     let window = context_window_with(&repl.model_ref(), &repl.config, |provider, model| {
-        openrouter_context_window(
+        discover_context_window(
             provider,
             model,
             &repl.config,
