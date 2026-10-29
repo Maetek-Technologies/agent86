@@ -149,12 +149,25 @@ fn final_completion_delta_round_trips() {
             stop_reason: Some("end_turn".to_owned()),
             ..Default::default()
         }),
+        ..Default::default()
     };
 
     let encoded = serde_json::to_string(&delta).unwrap();
     let decoded: CompletionDelta = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, delta);
     assert_eq!(decoded.completion.unwrap().usage, Usage::default());
+}
+
+#[test]
+fn completions_without_thinking_keep_pythons_shape() {
+    let completion = agent86::types::Completion {
+        text: "Done".to_owned(),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_value(&completion).unwrap();
+    assert_eq!(encoded.get("thinking"), None);
+    let delta = serde_json::to_value(CompletionDelta::default()).unwrap();
+    assert_eq!(delta, json!({"text": "", "done": false}));
 }
 
 #[test]

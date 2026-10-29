@@ -88,6 +88,7 @@ From top to bottom, the live region holds:
 | Banner | Compact Rich panel: `version`, `model` | Block-letter `AGENT 86` wordmark, cyan to violet, over `v<version> · <cwd>` (dim); no model, since a switch could not update it in scrollback; one line when the terminal is narrower than the wordmark (`src/ui/banner.rs`) |
 | User prompt | `> text` (bold) | `> text` (bold, grey background band, like Claude Code) |
 | Reply | `agent86 ` label (bold cyan), then text; Markdown when finished | `⏺ ` then the text, Markdown rendered per block; continuation lines indented two spaces |
+| Reasoning | not shown | `∴ ` then the model's reasoning, all dim, a paragraph at a time; the unfinished tail live (its last 8 rows); never in `run` or the plain loop (beyond Python) |
 | Tool call | `▸ name({args…}) → summary` (dim; red when the call failed) | `⏺ name(args…)` (bold name) and on the next line `  ⎿ summary` (dim; red when the call failed); the collapsed lengths follow Python (`ARG_PREVIEW_LIMIT` 72, `SUMMARY_LIMIT` 100) |
 | Harness notice | dim line | dim line |
 | MCP note | `mcp: …` yellow | same |

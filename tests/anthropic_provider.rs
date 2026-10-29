@@ -80,6 +80,25 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 #[tokio::test]
+async fn thinking_blocks_stream_apart_from_the_text() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("anthropic/thinking.sse"))]).await;
+    let provider = provider("claude-sonnet-4-6", config(&server.base_url));
+
+    let (deltas, error) = drain(&provider, request("2+2?")).await;
+    assert_eq!(error, None);
+    let thinking: Vec<&str> = deltas
+        .iter()
+        .filter(|delta| !delta.thinking.is_empty())
+        .map(|delta| delta.thinking.as_str())
+        .collect();
+    assert_eq!(thinking, ["Two and two", " is four."]);
+    let completion = deltas.last().unwrap().completion.clone().unwrap();
+    // The signature and the redacted block carry nothing readable.
+    assert_eq!(completion.thinking, "Two and two is four.");
+    assert_eq!(completion.text, "4");
+}
+
+#[tokio::test]
 async fn streams_text_then_a_final_completion_with_cache_aware_usage() {
     let server = MockServer::start(vec![Reply::Sse(fixture("anthropic/text.sse"))]).await;
     let provider = provider("claude-sonnet-4-6", config(&server.base_url));

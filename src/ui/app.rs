@@ -42,6 +42,8 @@ use std::time::{Duration, Instant};
 /// The longest reply tail held back without a block boundary, as Python's
 /// `_STREAM_TAIL_LIMIT`; past it the tail is committed at its last newline.
 pub const STREAM_TAIL_LIMIT: usize = 2000;
+/// The most rows of unfinished reasoning the live region shows.
+pub const THINKING_LIVE_ROWS: usize = 8;
 /// How long the "press Ctrl+C again" offer stays open.
 pub const EXIT_WINDOW: Duration = Duration::from_secs(2);
 
@@ -50,6 +52,8 @@ const SPINNER: [&str; 6] = ["·", "✢", "✳", "∗", "✻", "✽"];
 /// What a turn running on the worker thread reports to the interface.
 pub enum UiEvent {
     Text(String),
+    /// A piece of the model's reasoning, shown dimmed.
+    Thinking(String),
     ToolCall {
         id: String,
         name: String,
@@ -120,6 +124,7 @@ impl From<TurnEvent<'_>> for UiEvent {
     fn from(event: TurnEvent<'_>) -> Self {
         match event {
             TurnEvent::Text(text) => Self::Text(text.to_owned()),
+            TurnEvent::Thinking(text) => Self::Thinking(text.to_owned()),
             TurnEvent::ToolCall { call, .. } => Self::ToolCall {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -240,6 +245,10 @@ pub struct App {
     entries: Vec<Entry>,
     /// The reply's tail: text streamed but not yet committed.
     stream: String,
+    /// The model's reasoning not yet committed, drawn dimmed above the reply.
+    thinking: String,
+    /// The current reasoning has committed its first paragraph (with the `∴` marker).
+    thinking_started: bool,
     /// The current reply has committed its first chunk (with the `⏺` marker).
     reply_started: bool,
     /// The tail was split off at a block boundary, so a blank line comes first.
@@ -281,6 +290,8 @@ impl App {
             committed: Vec::new(),
             entries: Vec::new(),
             stream: String::new(),
+            thinking: String::new(),
+            thinking_started: false,
             reply_started: false,
             blank_before_chunk: false,
             tools: Vec::new(),
@@ -462,6 +473,8 @@ impl App {
             quit_after: false,
         });
         self.stream.clear();
+        self.thinking.clear();
+        self.thinking_started = false;
         self.reply_started = false;
         self.tools.clear();
         self.menu = None;
@@ -481,9 +494,21 @@ impl App {
                     self.note(Style::Dim, &notice);
                     return;
                 }
+                if !text.is_empty() {
+                    self.finish_thinking();
+                }
                 self.stream.push_str(&sanitize(&text));
                 self.status.phase = "thinking".into();
                 self.drain_blocks();
+            }
+            UiEvent::Thinking(text) => {
+                // Reasoning after some of the reply starts a block of its own below it.
+                if !self.stream.is_empty() || self.reply_started {
+                    self.finish_reply();
+                }
+                self.thinking.push_str(&sanitize(&text));
+                self.status.phase = "thinking".into();
+                self.drain_thinking();
             }
             UiEvent::ToolCall {
                 id,
@@ -701,8 +726,58 @@ impl App {
             .collect()
     }
 
+    /// Commit the reasoning's finished paragraphs, dimmed, keeping the tail live.
+    fn drain_thinking(&mut self) {
+        while let Some(at) = self.thinking.rfind("\n\n").map(|at| at + 2) {
+            let tail = self.thinking.split_off(at);
+            let head = std::mem::replace(&mut self.thinking, tail);
+            self.commit_thinking(&head);
+        }
+    }
+
+    /// Commit one piece of reasoning under the `∴` marker, all of it dimmed.
+    fn commit_thinking(&mut self, chunk: &str) {
+        let rows = self.thinking_rows(chunk);
+        if rows.is_empty() {
+            return;
+        }
+        // A blank row before each paragraph, as the reasoning had.
+        let mut lines = vec![Line::default()];
+        lines.extend(rows);
+        self.thinking_started = true;
+        self.commit(lines);
+    }
+
+    /// Reasoning as dimmed rows: `∴` on the first row of a block, indented after it.
+    fn thinking_rows(&self, text: &str) -> Vec<Line> {
+        let body = text.trim_matches('\n');
+        if body.trim().is_empty() {
+            return Vec::new();
+        }
+        self.reply_rows(body)
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let lead = if index == 0 && !self.thinking_started {
+                    "∴ "
+                } else {
+                    "  "
+                };
+                Line::styled(Style::Dim, lead).push(Style::Dim, row)
+            })
+            .collect()
+    }
+
+    /// End the reasoning in progress: commit its tail.
+    fn finish_thinking(&mut self) {
+        let tail = std::mem::take(&mut self.thinking);
+        self.commit_thinking(&tail);
+        self.thinking_started = false;
+    }
+
     /// End the reply in progress: commit its tail.
     fn finish_reply(&mut self) {
+        self.finish_thinking();
         let tail = std::mem::take(&mut self.stream);
         self.commit_chunk(&tail);
         self.reply_started = false;
@@ -1094,6 +1169,14 @@ impl App {
         let mut top = Vec::new();
 
         if let Some(running) = &self.running {
+            // The reasoning's tail, its last few rows only: a paragraph that never
+            // ends must not push the input off the screen.
+            let thinking = self.thinking_rows(&self.thinking);
+            if !thinking.is_empty() {
+                top.push(Line::default());
+                let skip = thinking.len().saturating_sub(THINKING_LIVE_ROWS);
+                top.extend(thinking.into_iter().skip(skip));
+            }
             // Tools announced but still running, with the reply tail above them.
             if !self.stream.trim().is_empty() {
                 let body = if self.reply_started {
@@ -1368,6 +1451,49 @@ mod tests {
         app.on_turn_event(UiEvent::Finished(None));
         assert_eq!(committed_text(&mut app), ["", "  Second"]);
         assert_eq!(app.take_request(), Some(Request::TurnDone));
+    }
+
+    #[test]
+    fn reasoning_is_dimmed_and_committed_before_the_reply() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(UiEvent::Thinking("Let me see.\n\nThe".into()));
+        let lines = app.take_committed();
+        let text: Vec<String> = lines.iter().map(Line::plain_text).collect();
+        assert_eq!(text, ["", "∴ Let me see."]);
+        assert!(lines[1].spans.iter().all(|(style, _)| *style == Style::Dim));
+        assert!(live_text(&mut app).contains(&"  The".to_owned()));
+        app.on_turn_event(UiEvent::Thinking(" score is 51-28.".into()));
+        app.on_turn_event(UiEvent::Text("Dream lead.".into()));
+        assert_eq!(committed_text(&mut app), ["", "  The score is 51-28."]);
+        app.on_turn_event(UiEvent::Finished(None));
+        assert_eq!(committed_text(&mut app), ["", "⏺ Dream lead."]);
+    }
+
+    #[test]
+    fn unfinished_reasoning_shows_only_its_last_rows() {
+        let mut app = app();
+        app.start_turn();
+        let long: Vec<String> = (0..20).map(|n| format!("line {n}")).collect();
+        app.on_turn_event(UiEvent::Thinking(long.join("\n")));
+        let live = live_text(&mut app);
+        assert!(live.contains(&"  line 19".to_owned()));
+        assert!(!live.iter().any(|row| row.ends_with("line 11")));
+        // A turn that ends in reasoning still prints all of it.
+        app.on_turn_event(UiEvent::Finished(None));
+        assert_eq!(committed_text(&mut app).len(), 21);
+    }
+
+    #[test]
+    fn empty_answer_notices_are_set_apart() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(UiEvent::Thinking("Hmm.".into()));
+        app.on_turn_event(UiEvent::Text(crate::agent::EMPTY_ANSWER_NOTICE.into()));
+        assert_eq!(
+            committed_text(&mut app),
+            ["", "∴ Hmm.", "[no answer; asking the model again]"]
+        );
     }
 
     #[test]

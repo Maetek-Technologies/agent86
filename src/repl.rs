@@ -33,12 +33,14 @@ pub const NO_MEMORY_NOTE: &str =
 /// Prefixes of the harness's own mid-turn notices. They arrive as ordinary text, but
 /// they are the harness talking about the conversation, not the model answering, so
 /// they are set apart (dim, on their own line).
-pub const NOTICE_PREFIXES: [&str; 5] = [
+pub const NOTICE_PREFIXES: [&str; 7] = [
     "[compacted",
     "[compacting",
     "[compaction",
     "[continuation",
     "[continuing",
+    "[no answer",
+    "[the model gave no answer",
 ];
 
 /// The notice carried by this text, stripped, or `None` if it is not one.

@@ -75,6 +75,47 @@ async fn drain(
 }
 
 #[tokio::test]
+async fn thinking_streams_apart_from_the_text_and_is_kept_on_the_completion() {
+    let server = MockServer::start(vec![Reply::Sse(fixture("ollama/thinking.ndjson"))]).await;
+    let provider = provider(config(&server.base_url));
+
+    let (deltas, error) = drain(&provider, request("Score?")).await;
+    assert_eq!(error, None);
+    let thinking: Vec<&str> = deltas
+        .iter()
+        .filter(|delta| !delta.done)
+        .map(|delta| delta.thinking.as_str())
+        .collect();
+    assert_eq!(thinking, ["The Dream lead", " 51-28."]);
+    assert!(deltas.iter().all(|delta| delta.text.is_empty()));
+    let completion = deltas.last().unwrap().completion.clone().unwrap();
+    assert_eq!(completion.text, "");
+    assert_eq!(completion.thinking, "The Dream lead 51-28.");
+    assert_eq!(completion.stop_reason.as_deref(), Some("end_turn"));
+}
+
+#[tokio::test]
+async fn shown_thinking_rules_out_a_retry() {
+    let line = r#"{"model":"m","message":{"role":"assistant","content":"","thinking":"Hmm"},"done":false}"#;
+    let server = MockServer::start(vec![
+        Reply::Truncated(format!("{line}\n")),
+        Reply::Sse(fixture("ollama/text.ndjson")),
+    ])
+    .await;
+    let provider = provider(config(&server.base_url));
+
+    let (deltas, error) = drain(&provider, request("Hi")).await;
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].thinking, "Hmm");
+    assert!(error.is_some());
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "shown thinking is never retried"
+    );
+}
+
+#[tokio::test]
 async fn streams_ndjson_text_then_a_final_completion_at_zero_cost() {
     let server = MockServer::start(vec![Reply::Sse(fixture("ollama/text.ndjson"))]).await;
     let provider = provider(config(&server.base_url));

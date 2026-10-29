@@ -62,6 +62,19 @@ pub fn continuation_notice(index: u64) -> String {
     format!("\n[continuation {index}/{MAX_CONTINUATIONS}]\n")
 }
 
+/// What the harness asks, once, of a model whose final reply was empty. Beyond Python.
+pub const ANSWER_PROMPT: &str =
+    "Your last reply was empty. Give the user your answer now, as plain text.";
+
+/// Said when an empty final reply is sent back for an answer.
+pub const EMPTY_ANSWER_NOTICE: &str = "\n[no answer; asking the model again]\n";
+
+/// Said when the model still gave no answer and its reasoning is shown instead.
+pub const THINKING_ANSWER_NOTICE: &str = "\n[no answer; showing the model's reasoning]\n";
+
+/// Said when the model still gave no answer and had no reasoning to show.
+pub const NO_ANSWER_NOTICE: &str = "\n[the model gave no answer]\n";
+
 /// What a cancelled turn says, as Python's `_cancelled`.
 pub const CANCELLED_NOTICE: &str = "\n[cancelled]\n";
 
@@ -115,6 +128,9 @@ impl CancelToken {
 pub enum TurnEvent<'a> {
     /// The model's answer, or a notice from the harness (`[cancelled]`, `[guardrail] ...`).
     Text(&'a str),
+    /// A piece of the model's reasoning, already redacted. Not part of the turn's
+    /// output: only the interface shows it.
+    Thinking(&'a str),
     /// A tool call, announced before its batch runs; `text` is its `[tool] name(...)` line.
     ToolCall { call: &'a ToolCall, text: &'a str },
     /// A call's result, in call order. `observation` is what the model is shown, after
@@ -132,6 +148,7 @@ impl<'a> TurnEvent<'a> {
     pub fn text(&self) -> &'a str {
         match *self {
             Self::Text(text) | Self::ToolCall { text, .. } | Self::ToolResult { text, .. } => text,
+            Self::Thinking(_) => "",
         }
     }
 }
@@ -618,6 +635,12 @@ impl Harness {
         // Where the first partial answer went, and the pieces collected so far.
         let mut continuation_start: Option<usize> = None;
         let mut continuation_parts: Vec<String> = Vec::new();
+        // Beyond Python: an empty final reply is asked about once (`ask_again` puts
+        // ANSWER_PROMPT on the next request only, never in the history), and the
+        // reasoning it came with is kept in case the second try is empty too.
+        let mut nudged = false;
+        let mut ask_again = false;
+        let mut unanswered_thinking = String::new();
 
         loop {
             // Never start another model call once cancelled: that is the expensive,
@@ -663,7 +686,7 @@ impl Harness {
                 emit(TurnEvent::Text(&notice));
             }
 
-            let completion = {
+            let mut completion = {
                 let system = self.system_message(recall_note.as_deref());
                 let tools = self.registry.specs();
                 let budget = self.context_budget(&system, &tools);
@@ -671,6 +694,9 @@ impl Harness {
                 let mut request_messages = Vec::with_capacity(conversation.len() + 1);
                 request_messages.push(system);
                 request_messages.extend(conversation.iter().cloned());
+                if std::mem::take(&mut ask_again) {
+                    request_messages.push(message(Role::User, ANSWER_PROMPT));
+                }
                 let request = CompletionRequest {
                     model: provider.model().to_owned(),
                     messages: request_messages,
@@ -694,6 +720,7 @@ impl Harness {
                 // The model never saw a secret's value, but should it produce one
                 // anyway, it is not shown.
                 let mut redactor = StreamRedactor::default();
+                let mut thinking_redactor = StreamRedactor::default();
                 loop {
                     // A long or stalled response stops mid-flight, not after it ends.
                     // Dropping the stream drops the HTTP response.
@@ -712,6 +739,14 @@ impl Harness {
                             return Err(error.into());
                         }
                     };
+                    // Reasoning is shown only as it streams. Redact mode holds text
+                    // back until the guardrail has seen it, so it shows none.
+                    if !delta.thinking.is_empty() && !buffering {
+                        let shown = thinking_redactor.push(&self.context.secrets, &delta.thinking);
+                        if !shown.is_empty() {
+                            emit(TurnEvent::Thinking(&shown));
+                        }
+                    }
                     if !delta.text.is_empty() {
                         if buffering {
                             buffered.push_str(&delta.text);
@@ -727,6 +762,10 @@ impl Harness {
                     }
                 }
                 drop(stream);
+                let held = thinking_redactor.finish(&self.context.secrets);
+                if !held.is_empty() {
+                    emit(TurnEvent::Thinking(&held));
+                }
                 let held = redactor.finish(&self.context.secrets);
                 if !held.is_empty() {
                     emit(TurnEvent::Text(&held));
@@ -773,6 +812,55 @@ impl Harness {
                 ],
             );
 
+            // Beyond Python: a reply that ends cleanly with nothing to say (a thinking
+            // model can put its whole answer in its reasoning) is asked about once.
+            // The empty step stays out of the history. If the second reply is empty
+            // too, the reasoning stands in for the answer. A reply cut off at the cap
+            // is the continuation path's, and a model out of steps is not asked again.
+            let mut from_thinking = false;
+            if completion.tool_calls.is_empty()
+                && completion.stop_reason.as_deref() != Some("max_tokens")
+                && completion.text.trim().is_empty()
+                && continuation_start.is_none()
+            {
+                if !completion.thinking.trim().is_empty() {
+                    unanswered_thinking = std::mem::take(&mut completion.thinking);
+                }
+                if !nudged && !breaker.out_of_steps() {
+                    nudged = true;
+                    ask_again = true;
+                    self.recorder.event(
+                        &sid,
+                        "empty_answer",
+                        vec![
+                            ("step", json!(breaker.steps())),
+                            ("model", json!(provider.model())),
+                            ("thinking_chars", json!(unanswered_thinking.chars().count())),
+                        ],
+                    );
+                    record_step(
+                        state,
+                        Step {
+                            index: state.steps.len() as u64 + 1,
+                            phase: AgentPhase::Execute,
+                            thought: String::new(),
+                            tool_calls: Vec::new(),
+                            results: Vec::new(),
+                            usage: completion.usage,
+                        },
+                    );
+                    emit(TurnEvent::Text(EMPTY_ANSWER_NOTICE));
+                    continue;
+                }
+                if unanswered_thinking.trim().is_empty() {
+                    emit(TurnEvent::Text(NO_ANSWER_NOTICE));
+                } else {
+                    completion.text = std::mem::take(&mut unanswered_thinking);
+                    from_thinking = true;
+                    emit(TurnEvent::Text(THINKING_ANSWER_NOTICE));
+                }
+            }
+
             // Egress guardrail on the model's text. In redact mode the redacted copy
             // is what everything downstream sees: the output, the history, and the step.
             let answer = self.context.secrets.redact(&completion.text);
@@ -783,6 +871,10 @@ impl Harness {
                 }
                 redacted
             } else {
+                // Reasoning standing in for the answer was never streamed as text.
+                if from_thinking {
+                    emit(TurnEvent::Text(&answer));
+                }
                 answer
             };
             if egress.flagged() {

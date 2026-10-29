@@ -91,6 +91,18 @@ pub fn sse_text(text: &str, finish_reason: &str) -> Reply {
     Reply::Sse(sse_body(&chunks))
 }
 
+/// An OpenAI-style SSE reply that reasons (`reasoning_content`, as llama.cpp sends it)
+/// and then says `text`, which may be empty, ending with `stop`.
+pub fn sse_reasoning(reasoning: &str, text: &str) -> Reply {
+    let chunks = [
+        serde_json::json!({"choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        serde_json::json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
+    ];
+    Reply::Sse(sse_body(&chunks))
+}
+
 /// An OpenAI-style SSE reply asking for tool calls, each `(id, name, raw arguments)`.
 pub fn sse_tool_calls(calls: &[(&str, &str, &str)]) -> Reply {
     let fragments: Vec<serde_json::Value> = calls
