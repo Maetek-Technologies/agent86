@@ -11,8 +11,8 @@
 //! bound.
 
 use crate::agent::{
-    invalid_arguments_result, observation, CircuitBreaker, Harness, HarnessError, CONTINUE_PROMPT,
-    MAX_CONTINUATIONS,
+    invalid_arguments_result, observation, CircuitBreaker, Harness, HarnessError, ANSWER_PROMPT,
+    CONTINUE_PROMPT, MAX_CONTINUATIONS,
 };
 use crate::limits::LimitKind;
 use crate::memory::working::fit;
@@ -140,6 +140,11 @@ impl Harness {
         // The pieces of an answer cut off at the output cap, and how often it was.
         let mut parts: Vec<String> = Vec::new();
         let mut continuations = 0;
+        // Beyond Python, as in the main loop: an empty final reply is asked about once
+        // (on the next request only), and its reasoning kept in case the next is too.
+        let mut nudged = false;
+        let mut ask_again = false;
+        let mut unanswered_thinking = String::new();
         let halted = |error: HarnessError| match error {
             HarnessError::CircuitTripped(detail) => {
                 format!("[sub-agent '{role}' halted: {detail}]")
@@ -169,6 +174,9 @@ impl Harness {
             let budget = self.context_budget(&self.system_message(None), &self.registry.specs());
             let mut request_messages = vec![system.clone()];
             request_messages.extend(fit(&messages, budget).iter().cloned());
+            if std::mem::take(&mut ask_again) {
+                request_messages.push(message(Role::User, ANSWER_PROMPT.to_owned()));
+            }
             let completion = self
                 .provider
                 .complete(CompletionRequest {
@@ -219,6 +227,30 @@ impl Harness {
                     continue;
                 }
             }
+            // Beyond Python: a reply that ends cleanly with nothing to say is asked
+            // about once, the empty reply left out of the history; a model out of
+            // steps is not asked again.
+            if completion.tool_calls.is_empty() && !cut_off && !has_text && parts.is_empty() {
+                if !completion.thinking.trim().is_empty() {
+                    unanswered_thinking = completion.thinking.clone();
+                }
+                if !nudged && !breaker.out_of_steps() {
+                    nudged = true;
+                    ask_again = true;
+                    self.recorder.event(
+                        &sid,
+                        "empty_answer",
+                        vec![
+                            ("agent", json!(role)),
+                            ("depth", json!(depth)),
+                            ("step", json!(breaker.steps())),
+                            ("model", json!(provider.model())),
+                            ("thinking_chars", json!(unanswered_thinking.chars().count())),
+                        ],
+                    );
+                    continue;
+                }
+            }
             messages.push(Message {
                 tool_calls: completion.tool_calls.clone(),
                 ..message(Role::Assistant, completion.text.clone())
@@ -256,8 +288,14 @@ impl Harness {
                             completion.usage.output_tokens,
                             self.output_setting()
                         )
-                    } else {
+                    } else if unanswered_thinking.trim().is_empty() {
                         format!("[sub-agent '{role}' returned no text]")
+                    } else {
+                        // Said as such, so the parent can weigh it as reasoning.
+                        format!(
+                            "[sub-agent '{role}' gave no answer; its reasoning follows]\n{}",
+                            self.context.secrets.redact(&unanswered_thinking)
+                        )
                     };
                 }
                 self.recorder.event(

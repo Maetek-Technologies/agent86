@@ -4,7 +4,7 @@
 
 mod support;
 
-use agent86::agent::{Harness, CONTINUE_PROMPT};
+use agent86::agent::{Harness, ANSWER_PROMPT, CONTINUE_PROMPT};
 use agent86::approval::ApprovalGate;
 use agent86::config::{
     AgentsConfig, CompactionMode, EgressMode, IngressMode, LimitsConfig, ObservabilityConfig,
@@ -21,7 +21,7 @@ use agent86::types::{ApprovalMode, Message, Role};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use support::{sse_text, sse_tool_calls, MockServer, Reply};
+use support::{sse_reasoning, sse_text, sse_tool_calls, MockServer, Reply};
 
 struct Workspace(PathBuf);
 
@@ -235,6 +235,81 @@ async fn a_delegated_task_runs_on_a_sub_agent_whose_answer_is_the_result() {
     assert!(parent.iter().any(|event| event["kind"] == "tool_call"
         && event["tool"] == "delegate"
         && event["ok"] == true));
+}
+
+#[tokio::test]
+async fn an_empty_sub_agent_answer_is_asked_for_once() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "review"}"#)]),
+        sse_reasoning("Looks fine.", ""),
+        sse_text("No issues found.", "stop"),
+        sse_text("Reviewed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("empty-answer");
+    let mut state = AgentState::new();
+    harness(&server, &workspace, agents(2, 8))
+        .run_turn(&mut state, "review", |_| {})
+        .await
+        .unwrap();
+    let requests = server.requests();
+    // The second sub-agent request asks for the answer; the empty reply is not in it.
+    let sub = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(sub.len(), 3);
+    assert_eq!(sub[1]["content"], "review");
+    assert_eq!(
+        sub[2],
+        serde_json::json!({"role": "user", "content": ANSWER_PROMPT})
+    );
+    assert_eq!(last_tool_result(&requests[3]), "No issues found.");
+    let events = workspace.events("sub:reviewer");
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["model_call", "empty_answer", "model_call", "subagent_done"]
+    );
+    assert_eq!(events[1]["agent"], "reviewer");
+    assert_eq!(events[1]["thinking_chars"], 11);
+}
+
+#[tokio::test]
+async fn a_sub_agent_that_still_says_nothing_hands_back_its_reasoning() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "review"}"#)]),
+        sse_reasoning("Looks fine.", ""),
+        sse_reasoning("Both files look fine.", ""),
+        sse_text("Reviewed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("reasoning-answer");
+    let mut state = AgentState::new();
+    harness(&server, &workspace, agents(2, 8))
+        .run_turn(&mut state, "review", |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        last_tool_result(&server.requests()[3]),
+        "[sub-agent 'reviewer' gave no answer; its reasoning follows]\nBoth files look fine."
+    );
+
+    // With no reasoning either, the parent is told there was no text.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "review"}"#)]),
+        sse_text("", "stop"),
+        sse_text("", "stop"),
+        sse_text("Reviewed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("no-answer");
+    let mut state = AgentState::new();
+    harness(&server, &workspace, agents(2, 8))
+        .run_turn(&mut state, "review", |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        last_tool_result(&server.requests()[3]),
+        "[sub-agent 'reviewer' returned no text]"
+    );
 }
 
 #[tokio::test]
