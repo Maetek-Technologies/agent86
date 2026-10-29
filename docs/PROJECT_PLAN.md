@@ -191,7 +191,7 @@ The agent works end to end, but it does not yet have:
 ### Known `run` differences from Python
 
 - The system prompt is the identity, the environment line, the skills section, the MCP section when servers are live, and the turn's episodic recall note, as in Python.
-- The environment line reports the Rust crate version. From 1.0.0 it matches Python's (`agent86 v1.0.0`), but the two are versioned independently.
+- The environment line reports the Rust crate version. 1.0.0 matched Python's (`agent86 v1.0.0`); from 1.0.1, an interface-only release, the two differ, since they are versioned independently.
 - Usage is priced under the full `provider:model` ref rather than the bare model id. Python prices with the bare id, so a `[pricing.models]` override keyed by the ref (for example `"openrouter:openai/gpt-4o-mini"`) marks the model as priced but never applies the rate, and the summary shows `$0.0000`. The ref is tried first and then the bare id, so every other case matches Python. Python should get the same fix.
 - `agent86 keys` has no Python CLI equivalent; Python stores keys only from its interactive `/config model` screen (which the interface here also has). Re-saving an account on Windows does not leave Python's stale `<account>@agent86` copy of the old key behind.
 - The missing-key error names the keyring entry to create (service `agent86`, account `<provider>`) instead of pointing at `/config model`.
