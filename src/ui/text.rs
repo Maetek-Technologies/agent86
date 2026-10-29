@@ -41,7 +41,7 @@ impl Line {
         let mut out = String::new();
         for (style, text) in &self.spans {
             if color && *style != Style::Plain && !text.is_empty() {
-                out.push_str(style.ansi());
+                out.push_str(&style.ansi());
                 out.push_str(text);
                 out.push_str("\x1b[0m");
             } else {

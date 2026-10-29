@@ -37,9 +37,9 @@ Non-goals:
 | Turns | Text the model streams, harness notices, `[cancelled]`, error type and message, the hint `see agent86 trace show -s <id>`, the turn summary line | Markers, colours, layout |
 | Tools | What a block shows: the name, the argument preview, the result's first line, and the full arguments and result when expanded; `ok` versus error colouring | `⏺`/`⎿` shape; expanded view lives in the transcript view |
 | Approvals | When a prompt appears, what it shows (tool name, argument summary, tool detail such as the diff), the answers (approve, deny, Escape denies), deny on shutdown | Inline panel with numbered choices |
-| Status line | Segments, their text, and the order they are shed under width pressure (`status_segments`, `fit_status_line`) | Where it sits and its colours |
+| Status line | Segments, their text, and the order they are shed under width pressure (`status_segments`, `fit_status_line`) | Where it sits and its colours; the working directory segment (beyond Python) |
 | Files | `memory.db`, the history file, config write-back (comments preserved, secret guard, user/project scope), keyring entries | — |
-| Startup | Surface selection rules, startup notes, MCP notes, the compact banner's content (version and model) | Banner drawn in Claude Code's style |
+| Startup | Surface selection rules, startup notes, MCP notes, the compact banner's content (version and model) | The header: a gradient `AGENT 86` wordmark over the version and working directory |
 | Cancellation | Safe points, saved state, `turn_end` status `cancelled` | Key hints in the spinner line |
 
 Every change to a contract row is a bug. A change to a presentation row is allowed, but it is recorded as a known difference when Python's tests would notice it.
@@ -55,10 +55,9 @@ The terminal has two parts. **Scrollback** is everything above the live region: 
 The region's height varies with what it holds: it grows for menus and panels and shrinks back afterwards. Every live row is wrapped by us to one cell less than the terminal width, so the row count is always exact: some consoles wrap a row that reaches the last column at once.
 
 ```
-╭─ agent86 ──────────────────────────╮        ┐
-│ version  1.0.0                     │        │
-│ model    openrouter:openai/gpt-4o  │        │
-╰────────────────────────────────────╯        │
+ █████╗  ██████╗ ███████╗███╗   ██╗…          ┐
+ (six rows of the AGENT 86 wordmark)          │
+  v1.0.0 · ~/app                              │
 memory: …   (startup notes, dim)              │  scrollback
                                               │  (native, append-only)
 > list the files and fix the typo in README   │
@@ -71,7 +70,7 @@ memory: …   (startup notes, dim)              │  scrollback
 ╭────────────────────────────────────────────╮  │
 │ > _                                        │  │  live region
 ╰────────────────────────────────────────────╯  │  (redrawn)
-  gpt-4o · running edit_file… · sbx subprocess · mode: ask  [Shift+Tab]  ┘
+  gpt-4o · ~/app · running edit_file… · sbx subprocess · mode: ask  [Shift+Tab]  ┘
 ```
 
 From top to bottom, the live region holds:
@@ -80,13 +79,13 @@ From top to bottom, the live region holds:
 2. **The spinner line,** only while a turn runs. It shows a spinner glyph, the phase (`Thinking…`, `Running edit_file…`, `Cancelling…`), and the elapsed time. The hint is `esc to interrupt`. With `[ui] spinner = false` the glyph is static.
 3. **A menu or a panel.** A menu (the `/` commands or `@` paths) sits under the input box. A panel (an approval or a picker) replaces the input box while it is open.
 4. **The input box:** bordered, one to eight rows, scrolling after eight, like Python's `PromptInput`. It is disabled while a turn runs, but it still shows its draft.
-5. **The status line:** Python's `fit_status_line` text, dim, one row.
+5. **The status line:** Python's `fit_status_line` text plus the working directory after the model, dim, one row. The directory is never dropped; under width pressure it shrinks to its last component.
 
 ## 4. Visual vocabulary
 
 | Entry | Python's full-screen app | Here |
 |---|---|---|
-| Banner | Compact Rich panel: `version`, `model` | Same content, rounded cyan border |
+| Banner | Compact Rich panel: `version`, `model` | Block-letter `AGENT 86` wordmark, cyan to violet, over `v<version> · <cwd>` (dim); no model, since a switch could not update it in scrollback; one line when the terminal is narrower than the wordmark (`src/ui/banner.rs`) |
 | User prompt | `> text` (bold) | `> text` (bold, grey background band, like Claude Code) |
 | Reply | `agent86 ` label (bold cyan), then text; Markdown when finished | `⏺ ` then the text, Markdown rendered per block; continuation lines indented two spaces |
 | Tool call | `▸ name({args…}) → summary` (dim; red when the call failed) | `⏺ name(args…)` (bold name) and on the next line `  ⎿ summary` (dim; red when the call failed); the collapsed lengths follow Python (`ARG_PREVIEW_LIMIT` 72, `SUMMARY_LIMIT` 100) |
