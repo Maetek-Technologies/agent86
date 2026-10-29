@@ -98,6 +98,36 @@ const CONTEXT_WINDOWS: &[(&str, u64)] = &[
     ("phi", 16_384),
 ];
 
+/// The largest Ollama window asked for when `[providers.ollama] num_ctx` is unset
+/// and `num_ctx_max` gives none. Ollama allocates the whole window up front, so a
+/// model's full 256k could leave the GPU and crawl.
+pub const DEFAULT_OLLAMA_NUM_CTX_MAX: u32 = 32_768;
+
+/// The `num_ctx` to ask Ollama for: the section's own `num_ctx`, else the
+/// model's maximum (what `discover` reports) up to `num_ctx_max`, else
+/// [`DEFAULT_CONTEXT_WINDOW`], which is what Python always sends. `discover` is
+/// only called when it is needed.
+pub fn ollama_num_ctx(
+    section: Option<&crate::config::ProviderConfig>,
+    discover: impl FnOnce() -> Option<u64>,
+) -> u32 {
+    if let Some(num_ctx) = section
+        .and_then(|section| section.num_ctx)
+        .filter(|&n| n > 0)
+    {
+        return num_ctx;
+    }
+    let cap = section
+        .and_then(|section| section.num_ctx_max)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_OLLAMA_NUM_CTX_MAX);
+    discover()
+        .filter(|&length| length > 0)
+        .map_or(DEFAULT_CONTEXT_WINDOW as u32, |length| {
+            length.min(u64::from(cap)) as u32
+        })
+}
+
 /// [`context_window_with`] without asking any server, for callers that must not
 /// touch the network.
 pub fn context_window_for(model_ref: &str, config: &crate::config::Config) -> u64 {
@@ -109,6 +139,9 @@ pub fn context_window_for(model_ref: &str, config: &crate::config::Config) -> u6
 /// the bare id), then what `discover(provider, model)` reports (OpenRouter's own
 /// figure, see [`super::remote_windows`]), then the server's own setting for Ollama
 /// and llama.cpp, then the table, then [`DEFAULT_CONTEXT_WINDOW`].
+///
+/// Ollama serves whatever `num_ctx` asks for, so its window is [`ollama_num_ctx`],
+/// with `discover` reporting the model's maximum.
 pub fn context_window_with(
     model_ref: &str,
     config: &crate::config::Config,
@@ -120,24 +153,20 @@ pub fn context_window_with(
             return window;
         }
     }
+    if provider == "ollama" {
+        return u64::from(ollama_num_ctx(config.providers.get(provider), || {
+            discover(provider, model)
+        }));
+    }
     if !provider.is_empty() {
         if let Some(window) = discover(provider, model).filter(|&window| window > 0) {
             return window;
         }
     }
-    match provider {
-        // Ollama serves whatever `num_ctx` asks for; llama.cpp's window is a launch
-        // flag that the API does not report, so the default is the only honest answer.
-        "ollama" => {
-            return config
-                .providers
-                .get("ollama")
-                .and_then(|provider| provider.num_ctx)
-                .filter(|&num_ctx| num_ctx > 0)
-                .map_or(DEFAULT_CONTEXT_WINDOW, u64::from)
-        }
-        "llamacpp" => return DEFAULT_CONTEXT_WINDOW,
-        _ => {}
+    // llama.cpp's window is a launch flag that the API does not report, so the
+    // default is the only honest answer.
+    if provider == "llamacpp" {
+        return DEFAULT_CONTEXT_WINDOW;
     }
     let ident = model.trim().to_lowercase();
     CONTEXT_WINDOWS
@@ -192,6 +221,56 @@ mod tests {
         assert_eq!(
             context_window_for("openrouter:gpt-4o-mini", &config),
             32_000
+        );
+    }
+
+    #[test]
+    fn ollama_asks_for_the_models_maximum_up_to_the_cap() {
+        let section = |num_ctx, num_ctx_max| crate::config::ProviderConfig {
+            num_ctx,
+            num_ctx_max,
+            ..Default::default()
+        };
+        // Unset: the model's maximum, capped at 32k by default.
+        assert_eq!(ollama_num_ctx(None, || Some(262_144)), 32_768);
+        assert_eq!(ollama_num_ctx(None, || Some(4_096)), 4_096);
+        assert_eq!(
+            ollama_num_ctx(Some(&section(None, Some(65_536))), || Some(262_144)),
+            65_536
+        );
+        assert_eq!(
+            ollama_num_ctx(Some(&section(None, Some(0))), || Some(262_144)),
+            32_768,
+            "a zero cap is no cap setting"
+        );
+        // Nothing reported: Python's 8192.
+        assert_eq!(ollama_num_ctx(None, || None), 8_192);
+        assert_eq!(ollama_num_ctx(None, || Some(0)), 8_192);
+        // A num_ctx of the user's own wins, and the server is not asked.
+        assert_eq!(
+            ollama_num_ctx(Some(&section(Some(131_072), Some(16_384))), || {
+                panic!("asked")
+            }),
+            131_072
+        );
+
+        let paths = crate::config::ConfigPaths {
+            user: None,
+            project: std::path::PathBuf::from("no-such-dir/config.toml"),
+        };
+        let mut config = crate::config::load_config(&paths, &Default::default()).unwrap();
+        let window = context_window_with("ollama:qwen3.5:latest", &config, |provider, model| {
+            assert_eq!((provider, model), ("ollama", "qwen3.5:latest"));
+            Some(262_144)
+        });
+        assert_eq!(window, 32_768);
+        config
+            .model
+            .context_window
+            .insert("qwen3.5:latest".into(), 100_000);
+        assert_eq!(
+            context_window_for("ollama:qwen3.5:latest", &config),
+            100_000
         );
     }
 

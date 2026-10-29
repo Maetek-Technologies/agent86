@@ -336,6 +336,8 @@ The agent works end to end, but it does not yet have:
 
 - Ollama: a stream cut short reports the transport error's text from `reqwest` rather than httpx's `<ExceptionName>: <message>`, and a malformed NDJSON line names `serde_json`'s parse error rather than Python's `JSONDecodeError` text; the rest of each message is Python's. A thinking model's `thinking` field is ignored, as in Python, so a model that spends its whole turn thinking answers with nothing.
 
+- Ollama's context window (a deliberate change, 2026-10-29): Python always asks for `num_ctx = 8192`, its built-in default, and reports that as the window, whatever the model supports. Rust has no built-in `num_ctx`; it asks `/api/show` for the model's trained `<architecture>.context_length` (memoized per process, never cached on disk) and sends the smaller of that and `[providers.ollama] num_ctx_max` (default 32768, because Ollama allocates the whole window and a model's full 256k can leave the GPU). The status line and compaction use the same figure. A `num_ctx` the user sets is sent as before, without asking the server, and when `/api/show` cannot say, 8192 is sent, as in Python. Live check (2026-10-29, Ollama 0.40.7, `qwen3.5:latest`, trained for 262144): `run` sent 32768, and `/api/ps` showed the model loaded at 32768.
+
 - `Retry-After` HTTP-date values are not parsed; they fall back to exponential backoff. Delta-seconds values are honoured.
 - Python retries only `ConnectError`, `ConnectTimeout`, and `RemoteProtocolError`. `reqwest` does not expose the same classes, so Rust retries any transport failure other than a read timeout, still only before text has been emitted.
 - Like Python, an SSE `data:` chunk carrying an `{"error": ...}` object (sent by OpenRouter for mid-stream failures) is silently ignored. Both implementations should probably surface it; change them together.
@@ -480,6 +482,14 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] The remaining CLI commands (`models`, `config`, `skills`, `--sandbox`)
 - [x] Triage routing (`orchestration/router.py`): `[model] router = "triage"`, the cheap and frontier routes, the `route` trace event, compaction on the cheap model, and pinning on `/model`
 - [x] Live OpenTelemetry span export (`[observability] otel`)
+- [ ] Release builds for 64-bit ARM Linux (Raspberry Pi), and Linux builds that run on older glibc (see below)
+
+Planned (2026-10-29): Raspberry Pi and older-glibc Linux releases. Releases v1.0.0 and v1.0.1 ship only `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, and `x86_64-pc-windows-msvc`, so there is no archive for a Raspberry Pi, and ARM Linux is not in the CI matrix. Two problems, one PR, released as v1.0.2:
+
+- Add `{ os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }` to `.github/workflows/release.yml` (a native ARM runner, so no cross-compilation) and an ARM Linux job to `ci.yml`, then list the platform in the README's Install section.
+- Build both Linux targets on Ubuntu 22.04 (glibc 2.35) instead of `ubuntu-latest`. A Linux binary needs a glibc at least as new as the one it was built against: the current x86_64 build comes from Ubuntu 24.04 (glibc 2.39) and will not start on Debian/Raspberry Pi OS Bookworm (2.36), Ubuntu 22.04, or older systems.
+
+Until then, the Pi needs a source build (`cargo install --git ... --tag v1.0.1 --locked`) on 64-bit Raspberry Pi OS. It is untested: it needs rustup's toolchain (1.88+, newer than `apt`'s), `build-essential` (for `onig` and SQLite), and swap on boards with 2 GB or less. candle is pinned to 0.10.2 for ARM, but that was only checked on Apple silicon. 32-bit Raspberry Pi OS is not a target. A headless Pi usually has no Secret Service, so `agent86 keys set` is expected to fail there; keys come from the provider's environment variable instead.
 
 Decided (2026-10-28): no differential test harness that runs the Python implementation. Parity is pinned instead by per-feature fixtures produced from Python's own sources or CPython (`ast` extractions, CPython `re`, `difflib`, `ipaddress`, `json`, and `sum` outputs, sentence-transformers vectors, mirror scripts of the pydantic models and trace code) and by recorded provider streams. Running the reference implementation would mean executing third-party code on the development machine, and the fixtures already cover the contract. Revisit if a behavior turns out to have drifted in a way the fixtures did not catch.
 

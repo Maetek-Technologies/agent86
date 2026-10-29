@@ -10,8 +10,8 @@ use crate::mcp::McpManager;
 use crate::memory::embeddings::build_embedder;
 use crate::observability::Recorder;
 use crate::prompt::build_system_prompt;
-use crate::provider::capabilities::context_window_with;
-use crate::provider::remote_windows::{cache_path, openrouter_context_window};
+use crate::provider::capabilities::{context_window_with, ollama_num_ctx};
+use crate::provider::remote_windows::{cache_path, discover_context_window, ollama_context_window};
 use crate::provider::{provider_for_ref, Provider};
 use crate::router::{RoutedModel, Router};
 use crate::secrets::OsKeyring;
@@ -35,12 +35,29 @@ pub const REPL_MODEL_HELP: &str = "`agent86 models` lists the configured provide
                                    another. Then retry.";
 
 /// The provider for a `provider:model` ref, with the parsed ref.
+///
+/// An Ollama model is asked for the window [`model_context_window`] reports
+/// ([`ollama_num_ctx`]), so the request and the status line agree.
 pub fn build_provider(
     config: &Config,
     reference: &str,
 ) -> Result<(Box<dyn Provider>, ModelRef), String> {
     let reference = ModelRef::parse(reference).map_err(|error| error.to_string())?;
-    let provider = provider_for_ref(&reference, config).map_err(|error| error.to_string())?;
+    let provider = if reference.provider == "ollama" {
+        let num_ctx = ollama_num_ctx(config.providers.get("ollama"), || {
+            ollama_context_window("ollama", &reference.model, config)
+        });
+        let mut config = config.clone();
+        config
+            .providers
+            .entry("ollama".to_owned())
+            .or_default()
+            .num_ctx = Some(num_ctx);
+        provider_for_ref(&reference, &config)
+    } else {
+        provider_for_ref(&reference, config)
+    }
+    .map_err(|error| error.to_string())?;
     Ok((provider, reference))
 }
 
@@ -166,7 +183,8 @@ pub fn build_router(config: &Config) -> Router {
 
 /// Tokens of context the model behind `model_ref` can hold, as Python's
 /// `context_window_for`: OpenRouter is asked for its own figure (memoized, and
-/// cached beside the user config for a day), then the overrides and the table.
+/// cached beside the user config for a day) and Ollama for the model's maximum,
+/// then the overrides and the table.
 pub fn model_context_window(config: &Config, model_ref: &str) -> u64 {
     let cache = ConfigPaths::discover()
         .user
@@ -174,7 +192,7 @@ pub fn model_context_window(config: &Config, model_ref: &str) -> u64 {
         .and_then(Path::parent)
         .map(cache_path);
     context_window_with(model_ref, config, |provider, model| {
-        openrouter_context_window(provider, model, config, cache.as_deref(), &OsKeyring)
+        discover_context_window(provider, model, config, cache.as_deref(), &OsKeyring)
     })
 }
 

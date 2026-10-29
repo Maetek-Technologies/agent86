@@ -4,7 +4,8 @@ mod support;
 
 use agent86::config::ProviderConfig;
 use agent86::provider::catalog::{
-    fetch_catalog, fetch_ollama, fetch_openai_compatible_context_lengths,
+    fetch_catalog, fetch_ollama, fetch_ollama_context_length,
+    fetch_openai_compatible_context_lengths,
 };
 use std::time::Duration;
 use support::{MockServer, Reply};
@@ -126,4 +127,46 @@ async fn ollama_lists_its_tags_and_openrouter_reports_context_lengths() {
     assert_eq!(lengths.len(), 2);
     assert_eq!(lengths["vendor/big"], 262_144);
     assert_eq!(lengths["vendor/float"], 8192);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ollama_reports_a_models_trained_context_length() {
+    // Trimmed from a real `/api/show` answer (Ollama 0.40.7, qwen3.5).
+    let server = MockServer::start(vec![
+        json(serde_json::json!({"model_info": {
+            "general.architecture": "qwen35",
+            "general.parameter_count": 9_700_000_000u64,
+            "qwen35.block_count": 32,
+            "qwen35.context_length": 262144,
+        }})),
+        json(serde_json::json!({"model_info": {"llama.context_length": 131072}})),
+        json(serde_json::json!({"details": {"family": "mystery"}})),
+        Reply::Status {
+            status: 404,
+            headers: vec![],
+            body: r#"{"error":"model 'gone' not found"}"#.to_owned(),
+        },
+    ])
+    .await;
+    let base = server.base_url.clone();
+    let lengths = tokio::task::spawn_blocking(move || {
+        ["qwen3.5:latest", "llama3.1:8b", "mystery", "gone"]
+            .map(|model| fetch_ollama_context_length(&base, model, Duration::from_secs(3)))
+    })
+    .await
+    .unwrap();
+    assert_eq!(lengths[0], Ok(Some(262_144)));
+    assert_eq!(
+        lengths[1],
+        Ok(Some(131_072)),
+        "found without an architecture"
+    );
+    assert_eq!(lengths[2], Ok(None));
+    assert!(lengths[3].is_err());
+    let requests = server.requests();
+    assert_eq!(requests[0].request_line, "POST /api/show HTTP/1.1");
+    assert_eq!(
+        requests[0].body,
+        serde_json::json!({"model": "qwen3.5:latest"})
+    );
 }

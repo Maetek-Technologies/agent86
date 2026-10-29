@@ -6,8 +6,13 @@
 //! `qwen` row: 32,768). OpenRouter reports `context_length` per model, so it is
 //! asked: memoized per process, cached on disk for 24 hours, with a short timeout.
 //! Every failure gives `None`, so the caller falls through to the table.
+//!
+//! Ollama is asked too (`/api/show`), for the maximum that
+//! [`super::capabilities::ollama_num_ctx`] caps; that is beyond Python, which
+//! always asks Ollama for 8192. It is memoized per process only: a local model
+//! can be re-pulled at any time.
 
-use super::catalog::fetch_openai_compatible_context_lengths;
+use super::catalog::{fetch_ollama_context_length, fetch_openai_compatible_context_lengths};
 use crate::config::{Config, ProviderConfig};
 use crate::secrets::{resolve_api_key, SecretStore};
 use serde_json::{json, Value};
@@ -24,6 +29,11 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// a negative memo.
 static MEMO: LazyLock<Mutex<HashMap<String, HashMap<String, u64>>>> =
     LazyLock::new(Default::default);
+
+/// (normalized Ollama base URL, model) to its context length; `None` is a
+/// negative memo, so a server that is down is not asked again on every redraw.
+type OllamaLengths = HashMap<(String, String), Option<u64>>;
+static OLLAMA_MEMO: LazyLock<Mutex<OllamaLengths>> = LazyLock::new(Default::default);
 
 /// The cache file Python shares: `~/.agent86/cache/model_context_windows.json`,
 /// given the directory that holds the user config.
@@ -135,6 +145,45 @@ pub fn openrouter_context_window(
         fetch_openai_compatible_context_lengths(&base_url, key.as_deref(), FETCH_TIMEOUT).ok()
     });
     models.get(&model.trim().to_lowercase()).copied()
+}
+
+/// The context length an Ollama model was trained for, or `None` (never fails).
+pub fn ollama_context_window(provider: &str, model: &str, config: &Config) -> Option<u64> {
+    if provider != "ollama" {
+        return None;
+    }
+    let base_url = config
+        .providers
+        .get(provider)
+        .and_then(|section| section.base_url.as_deref())
+        .unwrap_or(super::ollama::DEFAULT_BASE_URL)
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let mut memo = OLLAMA_MEMO
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *memo
+        .entry((base_url.clone(), model.to_owned()))
+        .or_insert_with(|| {
+            fetch_ollama_context_length(&base_url, model, FETCH_TIMEOUT)
+                .ok()
+                .flatten()
+        })
+}
+
+/// What the server behind `provider` reports for `model`'s window: OpenRouter's
+/// figure, or an Ollama model's maximum. The `discover` of
+/// [`super::capabilities::context_window_with`].
+pub fn discover_context_window(
+    provider: &str,
+    model: &str,
+    config: &Config,
+    cache: Option<&Path>,
+    secrets: &dyn SecretStore,
+) -> Option<u64> {
+    openrouter_context_window(provider, model, config, cache, secrets)
+        .or_else(|| ollama_context_window(provider, model, config))
 }
 
 #[cfg(test)]
