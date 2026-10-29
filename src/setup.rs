@@ -107,7 +107,8 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
     // Sessions, episodes, and facts live in the memory database; if it cannot be
     // opened, run statelessly.
     let (store, memory_note) = open_memory(config);
-    let recorder = Recorder::from_config(&config.observability);
+    let recorder =
+        Recorder::from_config(&config.observability).with_secrets(context.secrets.clone());
     if let Some(store) = &store {
         enforce_retention(config, store, &recorder);
     }
@@ -123,8 +124,23 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         .allow(skill_roots(config, &workspace, home.as_deref()));
     context.skills = Arc::clone(&skills);
 
+    // Secrets are asked for where approvals are: at a terminal, hidden. With nobody
+    // there, `request_secret` is not offered at all (the interface installs its own
+    // panel over this prompt).
+    let interactive = prompt.is_some();
+    if interactive {
+        context
+            .secrets
+            .set_prompt(Some(Box::new(crate::vault::terminal_prompt)));
+    }
+
     // MCP servers that fail to start contribute no tools; their notes say why.
-    let registry = default_registry(store.is_some(), !skills.is_empty(), config.agents.enabled);
+    let registry = default_registry(
+        store.is_some(),
+        !skills.is_empty(),
+        config.agents.enabled,
+        interactive,
+    );
     let mcp = McpManager::start(config).map(Arc::new);
     if let Some(manager) = &mcp {
         manager.attach(&registry);

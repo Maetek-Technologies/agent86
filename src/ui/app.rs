@@ -31,6 +31,7 @@ use crate::provider::catalog::CatalogEntry;
 use crate::pyjson::{python_json_dumps, python_json_dumps_indented};
 use crate::repl::{notice_text, Style, Text};
 use crate::types::{Message, Role};
+use crate::vault::SecretRequest;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
@@ -77,6 +78,12 @@ pub enum UiEvent {
     Limit {
         hit: LimitHit,
         reply: mpsc::Sender<Option<u32>>,
+    },
+    /// `request_secret` asks the user for a secret (beyond Python); the worker waits
+    /// for the value on `reply`. Dropping `reply` unanswered declines.
+    Secret {
+        request: SecretRequest,
+        reply: mpsc::Sender<Option<String>>,
     },
     /// The turn ended: `None`, or the Python exception name and the message.
     Finished(Option<(String, String)>),
@@ -152,6 +159,8 @@ pub enum Request {
     Picked(PickerKind, String),
     /// The key entry was answered: the key, or `None` for nothing entered.
     Key(KeyPurpose, Option<String>),
+    /// `/secret NAME` was answered: the name, and the value or `None`.
+    Secret(String, Option<String>),
     /// The connection test ended.
     Tested(TestOutcome),
     /// The save panel was answered: the edit to apply, or `None` for a cancel.
@@ -241,6 +250,8 @@ pub struct App {
     approval: Option<ApprovalPanel>,
     /// The offer to raise a limit the turn reached.
     limit: Option<LimitPanel>,
+    /// A secret the turn asks for, and where its thread waits for the value.
+    secret: Option<(KeyEntry, mpsc::Sender<Option<String>>)>,
     /// A picker or a `/config model` panel.
     panel: Option<Panel>,
     /// The `/` or `@` completion menu under the input box.
@@ -276,6 +287,7 @@ impl App {
             running: None,
             approval: None,
             limit: None,
+            secret: None,
             panel: None,
             menu: None,
             view: None,
@@ -329,6 +341,7 @@ impl App {
     pub fn abandon(&mut self) {
         self.approval = None;
         self.limit = None;
+        self.secret = None;
     }
 
     /// Show a picker in place of the input box until it is answered or cancelled.
@@ -532,6 +545,11 @@ impl App {
                 self.view = None;
                 self.limit = Some(LimitPanel::new(hit, reply));
             }
+            UiEvent::Secret { request, reply } => {
+                self.view = None;
+                let entry = KeyEntry::secret(&request.name, &request.reason, request.replacing);
+                self.secret = Some((entry, reply));
+            }
             UiEvent::Finished(error) => {
                 self.finish_reply();
                 // Announced but never observed (a cancel mid-batch): shown, not dropped.
@@ -556,6 +574,7 @@ impl App {
                 // An approval nobody answered is declined when its sender is dropped.
                 self.approval = None;
                 self.limit = None;
+                self.secret = None;
                 let quit = self
                     .running
                     .take()
@@ -783,6 +802,14 @@ impl App {
             self.approval_key(key);
             return Effect::None;
         }
+        if let Some((entry, _)) = &mut self.secret {
+            if let Some(answer) = entry.on_key(key) {
+                if let Some((_, reply)) = self.secret.take() {
+                    let _ = reply.send(answer);
+                }
+            }
+            return Effect::None;
+        }
         if let Some(panel) = &mut self.limit {
             if let Some(answer) = panel.on_key(key) {
                 if let Some(panel) = self.limit.take() {
@@ -826,6 +853,9 @@ impl App {
                 },
                 Panel::Key(entry) => match entry.on_key(key) {
                     None => return Effect::None,
+                    Some(answer) if entry.purpose == KeyPurpose::Secret => {
+                        Some(Request::Secret(entry.provider.clone(), answer))
+                    }
                     Some(answer) => Some(Request::Key(entry.purpose, answer)),
                 },
                 Panel::Test(test) => match test.on_key(key) {
@@ -928,7 +958,10 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: &str) {
-        if let Some(Panel::Key(entry)) = &mut self.panel {
+        if let Some((entry, _)) = &mut self.secret {
+            entry.on_paste(text);
+            self.dirty = true;
+        } else if let Some(Panel::Key(entry)) = &mut self.panel {
             entry.on_paste(text);
             self.dirty = true;
         } else if let Some(Panel::McpForm(form)) = &mut self.panel {
@@ -981,6 +1014,9 @@ impl App {
         }
         if let Some(panel) = self.limit.take() {
             panel.answer(None);
+        }
+        if let Some((_, reply)) = self.secret.take() {
+            let _ = reply.send(None);
         }
         if let Some(running) = &mut self.running {
             if running.cancel_requested {
@@ -1106,6 +1142,9 @@ impl App {
                 .height
                 .saturating_sub(top.len().min(self.height / 2) + 4);
             bottom.extend(approval_panel(panel, width, budget));
+            caret_base = 0;
+        } else if let Some((entry, _)) = &self.secret {
+            bottom.extend(entry.render(width));
             caret_base = 0;
         } else if let Some(panel) = &self.limit {
             bottom.extend(panel.render(width));
@@ -1542,6 +1581,77 @@ mod tests {
         let mut eof = self::app();
         eof.on_key(ctrl('d'), &[]);
         assert_eq!(eof.take_request(), Some(Request::Exit));
+    }
+
+    #[test]
+    fn a_secret_is_entered_masked_and_answers_the_worker() {
+        let request = || SecretRequest {
+            name: "API_TOKEN".into(),
+            reason: "to call the billing API".into(),
+            replacing: false,
+        };
+        let mut app = app_running();
+        app.set_size(81, 30);
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(),
+            reply,
+        });
+        for ch in "tok_".chars() {
+            app.on_key(key(KeyCode::Char(ch)), &[]);
+        }
+        app.on_paste("s3cr3t\r\n");
+        let live = live_text(&mut app).join("\n");
+        assert!(live.contains("Secret API_TOKEN"), "{live}");
+        assert!(live.contains("to call the billing API"), "{live}");
+        assert!(live.contains(&"•".repeat(10)), "{live}");
+        assert!(!live.contains("tok_") && !live.contains("s3cr3t"), "{live}");
+        assert!(app.editor.is_empty(), "nothing reaches the draft");
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(answer.recv(), Ok(Some("tok_s3cr3t".to_owned())));
+        assert!(!committed_text(&mut app).join("\n").contains("s3cr3t"));
+
+        // Escape declines without cancelling the turn.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(),
+            reply,
+        });
+        assert_eq!(app.on_key(key(KeyCode::Esc), &[]), Effect::None);
+        assert_eq!(answer.recv(), Ok(None));
+
+        // Ctrl+C declines and cancels the turn.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(),
+            reply,
+        });
+        assert_eq!(app.on_key(ctrl('c'), &[]), Effect::Cancel);
+        assert_eq!(answer.recv(), Ok(None));
+
+        // A turn that ends drops an entry nobody finished, which declines.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(),
+            reply,
+        });
+        app.on_key(key(KeyCode::Char('x')), &[]);
+        app.on_turn_event(UiEvent::Finished(None));
+        assert!(answer.recv().is_err());
+    }
+
+    #[test]
+    fn slash_secret_answers_with_its_name() {
+        let mut app = app();
+        app.open_panel(Panel::Key(KeyEntry::secret("API_TOKEN", "", true)));
+        let live = live_text(&mut app).join("\n");
+        assert!(live.contains("Replaces the value entered before"), "{live}");
+        app.on_paste("v4lue");
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(
+            app.take_request(),
+            Some(Request::Secret("API_TOKEN".into(), Some("v4lue".into())))
+        );
     }
 
     #[test]

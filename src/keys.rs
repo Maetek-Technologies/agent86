@@ -71,7 +71,7 @@ pub fn read_key(provider: &str, from_stdin: bool) -> Result<String, String> {
 }
 
 /// Prompt without echoing what is typed or pasted.
-fn prompt_hidden(prompt: &str) -> Result<String, String> {
+pub(crate) fn prompt_hidden(prompt: &str) -> Result<String, String> {
     if in_msys_terminal() {
         prompt_hidden_with_stty(prompt)
     } else {

@@ -175,15 +175,18 @@ impl Executor {
         }
     }
 
+    /// Run `request`; `secrets` are the user's secrets (`crate::vault`), set in the
+    /// process's environment after the scrub, because the user granted them.
     pub fn run(
         &self,
         policy: &SandboxPolicy,
         request: &ExecRequest,
         stdin: Option<&str>,
+        secrets: &[(String, String)],
     ) -> std::io::Result<ExecResult> {
         match self {
-            Self::Subprocess => run_subprocess(policy, request, stdin),
-            Self::Docker(docker) => Ok(docker.run(policy, request, stdin)),
+            Self::Subprocess => run_subprocess(policy, request, stdin, secrets),
+            Self::Docker(docker) => Ok(docker.run(policy, request, stdin, secrets)),
         }
     }
 
@@ -359,16 +362,31 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 /// Like Python's `communicate(timeout=...)`, the deadline covers both the process
 /// exiting and its pipes closing: a backgrounded grandchild still holding stdout
 /// counts as still running.
+///
+/// `secrets` join the environment after the scrub: the scrub keeps out keys the
+/// process inherited, while these the user entered for the agent to use.
 pub fn run_subprocess(
     policy: &SandboxPolicy,
     request: &ExecRequest,
     stdin: Option<&str>,
+    secrets: &[(String, String)],
 ) -> std::io::Result<ExecResult> {
     let mut command = command_for(request);
+    let mut env = scrubbed_env(&policy.env_passthrough, std::env::vars_os());
+    for (name, value) in secrets {
+        // Upper-cased on Windows, as `scrubbed_env` passes names, so a secret
+        // replaces a variable of the same name rather than sitting beside it.
+        let name = if cfg!(windows) {
+            name.to_uppercase()
+        } else {
+            name.clone()
+        };
+        env.insert(OsString::from(name), OsString::from(value));
+    }
     command
         .current_dir(super::plain_path(policy.workspace()))
         .env_clear()
-        .envs(scrubbed_env(&policy.env_passthrough, std::env::vars_os()))
+        .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -468,6 +486,19 @@ impl DockerExecutor {
         request: &ExecRequest,
         name: Option<&str>,
     ) -> Vec<String> {
+        self.build_command_with_env(workspace, request, name, &[])
+    }
+
+    /// [`DockerExecutor::build_command`] passing the variables `env_names` into the
+    /// container. Each is a bare `-e NAME`, so Docker reads the value from its own
+    /// environment and it never appears in a process list.
+    pub fn build_command_with_env(
+        &self,
+        workspace: &Path,
+        request: &ExecRequest,
+        name: Option<&str>,
+        env_names: &[&str],
+    ) -> Vec<String> {
         let mut command: Vec<String> = [
             "docker",
             "run",
@@ -494,6 +525,9 @@ impl DockerExecutor {
             // The only handle on the container once `docker run` is killed.
             command.extend(["--name".to_owned(), name.to_owned()]);
         }
+        for env_name in env_names {
+            command.extend(["-e".to_owned(), (*env_name).to_owned()]);
+        }
         command.push(self.image.clone());
         match request {
             ExecRequest::Shell(line) => {
@@ -509,12 +543,16 @@ impl DockerExecutor {
         policy: &SandboxPolicy,
         request: &ExecRequest,
         stdin: Option<&str>,
+        secrets: &[(String, String)],
     ) -> ExecResult {
         let name = format!("agent86-{}", crate::turn::new_session_id());
-        let argv = self.build_command(policy.workspace(), request, Some(&name));
+        let env_names: Vec<&str> = secrets.iter().map(|(name, _)| name.as_str()).collect();
+        let argv =
+            self.build_command_with_env(policy.workspace(), request, Some(&name), &env_names);
         let mut command = Command::new(&argv[0]);
         command
             .args(&argv[1..])
+            .envs(secrets.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

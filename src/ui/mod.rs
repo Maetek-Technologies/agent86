@@ -41,10 +41,10 @@ use crate::repl::{
     NO_MEMORY_NOTE,
 };
 use crate::secrets::SecretStore;
-use app::{App, Effect, Request, UiEvent};
+use app::{App, Effect, Panel, Request, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use manage::Manager;
-use panels::{KeyPurpose, SavePurpose};
+use panels::{KeyEntry, KeyPurpose, SavePurpose};
 use picker::{Picker, PickerKind};
 use screen::Screen;
 use status::{short_path, StatusState};
@@ -262,6 +262,22 @@ fn run(repl: &mut Repl) -> io::Result<()> {
         }
         answer.recv().ok().flatten()
     }));
+    // And so does a secret the agent asks for; a dropped sender declines.
+    let secrets = events.clone();
+    repl.harness
+        .context
+        .secrets
+        .set_prompt(Some(Box::new(move |request| {
+            let (reply, answer) = mpsc::channel();
+            let request = UiEvent::Secret {
+                request: request.clone(),
+                reply,
+            };
+            if secrets.send(request).is_err() {
+                return None;
+            }
+            answer.recv().ok().flatten()
+        })));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -298,7 +314,9 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             Request::TurnDone => continue,
             Request::Submit(text) => {
                 let line = text.trim().to_owned();
-                repl.history().append(&line);
+                // A secret the user entered stays out of the history file.
+                let kept = repl.harness.context.secrets.redact(&line);
+                repl.history().append(&kept);
                 Some(line)
             }
             Request::Picked(PickerKind::Mode, mode) => Some(format!("/mode {mode}")),
@@ -321,6 +339,23 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             }
             Request::Key(KeyPurpose::McpVar, value) => {
                 manager.mcp.on_var(&mut app, repl, value);
+                None
+            }
+            // Secret entries answer as `Request::Secret`, which carries the name.
+            Request::Key(KeyPurpose::Secret, _) => None,
+            Request::Secret(name, value) => {
+                match value {
+                    Some(value) => {
+                        repl.harness.context.secrets.set(&name, value);
+                        app.note(
+                            Style::Dim,
+                            &format!(
+                                "secret {name} set for this session · the agent sees only its name"
+                            ),
+                        );
+                    }
+                    None => app.note(Style::Dim, &format!("secret {name} not set")),
+                }
                 None
             }
             Request::Mcp(action) => {
@@ -418,6 +453,14 @@ fn dispatch(
         if entry.name == "/limits" && arg.trim() == "save" {
             limits::open_save(app, repl);
             return Ok(true);
+        }
+        // A secret is typed into a masked panel, never the input box.
+        if entry.name == "/secret" {
+            if let Some(name) = crate::repl::secret_to_enter(&arg) {
+                let replacing = repl.harness.context.secrets.contains(name);
+                app.open_panel(Panel::Key(KeyEntry::secret(name, "", replacing)));
+                return Ok(true);
+            }
         }
     }
     let result = repl.handle_command(line);

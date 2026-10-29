@@ -42,6 +42,7 @@ use crate::types::{
     python_repr, AgentPhase, CompletionRequest, Message, Role, Step, ToolCall, ToolResult,
     ToolSpec, Usage,
 };
+use crate::vault::StreamRedactor;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -300,7 +301,8 @@ pub struct Harness {
 impl Harness {
     /// The system message for the next request: the prompt plus, when MCP servers
     /// are live, their section, then the turn's recall note, as Python's
-    /// `_system_content`.
+    /// `_system_content`. Beyond Python, the names of the secrets the user entered
+    /// come before the recall note, when there are any.
     pub(crate) fn system_message(&self, extra: Option<&str>) -> Message {
         let mut system = self.system.clone();
         if let Some(section) = self
@@ -309,6 +311,9 @@ impl Harness {
             .map(|mcp| mcp.prompt_section())
             .filter(|section| !section.is_empty())
         {
+            system.content = format!("{}\n\n{section}", system.content);
+        }
+        if let Some(section) = self.context.secrets.prompt_section() {
             system.content = format!("{}\n\n{section}", system.content);
         }
         if let Some(extra) = extra.filter(|extra| !extra.is_empty()) {
@@ -498,8 +503,12 @@ impl Harness {
             ],
         );
         let mut summary = TurnSummary::default();
+        // A secret the user pasted anyway (or an `@file` that holds one) goes no
+        // further than this: not to the model, the history, nor the trace.
+        let secrets = &self.context.secrets;
+        let (user_text, display_text) = (secrets.redact(user_text), secrets.redact(display_text));
         let result = self
-            .turn(state, user_text, display_text, &mut summary, on_event)
+            .turn(state, &user_text, &display_text, &mut summary, on_event)
             .await;
         self.context.clear_skill();
         summary.duration_s = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
@@ -675,6 +684,9 @@ impl Harness {
                 let mut stream = provider.stream(request);
                 let mut completion = None;
                 let mut buffered = String::new();
+                // The model never saw a secret's value, but should it produce one
+                // anyway, it is not shown.
+                let mut redactor = StreamRedactor::default();
                 loop {
                     // A long or stalled response stops mid-flight, not after it ends.
                     // Dropping the stream drops the HTTP response.
@@ -697,7 +709,10 @@ impl Harness {
                         if buffering {
                             buffered.push_str(&delta.text);
                         } else {
-                            emit(TurnEvent::Text(&delta.text));
+                            let shown = redactor.push(&self.context.secrets, &delta.text);
+                            if !shown.is_empty() {
+                                emit(TurnEvent::Text(&shown));
+                            }
                         }
                     }
                     if delta.done && delta.completion.is_some() {
@@ -705,11 +720,18 @@ impl Harness {
                     }
                 }
                 drop(stream);
+                let held = redactor.finish(&self.context.secrets);
+                if !held.is_empty() {
+                    emit(TurnEvent::Text(&held));
+                }
                 span.set(model_call_attributes(completion.as_ref()));
                 self.tracer.end(span);
                 if self.cancel.is_cancelled() {
                     // Whatever was held back still belongs to the user: redacted, then shown.
-                    let partial = self.guardrails.inspect_egress(&buffered).1;
+                    let partial = self
+                        .guardrails
+                        .inspect_egress(&self.context.secrets.redact(&buffered))
+                        .1;
                     if !partial.is_empty() {
                         emit(TurnEvent::Text(&partial));
                     }
@@ -746,14 +768,15 @@ impl Harness {
 
             // Egress guardrail on the model's text. In redact mode the redacted copy
             // is what everything downstream sees: the output, the history, and the step.
-            let (egress, redacted) = self.guardrails.inspect_egress(&completion.text);
+            let answer = self.context.secrets.redact(&completion.text);
+            let (egress, redacted) = self.guardrails.inspect_egress(&answer);
             let text = if buffering {
                 if !redacted.is_empty() {
                     emit(TurnEvent::Text(&redacted));
                 }
                 redacted
             } else {
-                completion.text
+                answer
             };
             if egress.flagged() {
                 self.recorder.event(

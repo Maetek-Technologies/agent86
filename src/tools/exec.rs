@@ -62,7 +62,12 @@ impl Tool for RunCommandTool {
 
         let result = ctx
             .executor
-            .run(&ctx.policy, &ExecRequest::Shell(command), None)
+            .run(
+                &ctx.policy,
+                &ExecRequest::Shell(command),
+                None,
+                &ctx.secrets.entries(),
+            )
             .map_err(|error| ToolError::io(&error))?;
         Ok(report(self.name(), &result))
     }
@@ -121,7 +126,7 @@ impl Tool for PythonExecTool {
         let request = ExecRequest::Argv(ctx.executor.python_argv());
         let result = ctx
             .executor
-            .run(&ctx.policy, &request, Some(&code))
+            .run(&ctx.policy, &request, Some(&code), &ctx.secrets.entries())
             .map_err(|error| ToolError::io(&error))?;
         Ok(report(self.name(), &result))
     }

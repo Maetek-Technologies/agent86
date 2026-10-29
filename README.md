@@ -32,6 +32,7 @@ The Python implementation remains the reference. This repository starts with a s
   - answers rendered as Markdown, coloured diffs in approvals, and Ctrl+O for the full transcript with every tool call expanded
   - Esc or Ctrl+C to cancel a turn
   - `/limits` to see the step and output limits, change them for the session, or save them; when a turn or a sub-agent reaches one, the interface offers to raise it and carry on (beyond Python, where they are config-only)
+  - `/secret NAME` to hand the agent a key, token, or password in a masked panel; the model only ever sees its name (beyond Python)
   - Python's plain `agent86>` loop with `--plain` or piped input
 - Formatting, linting, and tests on Linux, macOS, and Windows
 
@@ -42,6 +43,8 @@ Run `agent86` with no subcommand for the interactive interface, the same agent o
 The agent has long-term memory in the same database. Every finished turn is recorded, and when a similar task comes up later, what happened last time is added to the model's context. The model can store durable facts with `remember` and look them up with `recall`. `agent86 memory stats|sessions|search|prune|forget` inspects and trims it, and old episodes and sessions are pruned at startup past `[memory]`'s retention caps. Text is embedded locally with Python's default model, `sentence-transformers/all-MiniLM-L6-v2`, run on [candle](https://github.com/huggingface/candle): it is read from (or, the first time, downloaded into) the same Hugging Face cache Python uses, and its vectors match Python's, so either implementation recalls what the other stored. `hash:<dim>` selects Python's offline hashing embedder, which is also the fallback when the model cannot load.
 
 Skills work as in Python and Claude Code: a folder with a `SKILL.md` in `.agent86/skills` or `.claude/skills` (in the project or your home directory) is advertised to the model by name and description, and its full instructions load when the model calls `use_skill`. A skill's `allowed-tools` limits what may run while it is active, and files bundled with a skill can be read even outside the workspace. The model can also hand a focused subtask to a sub-agent with `delegate`: it runs with the same tools, approvals, and guardrails under its own step budget (`[agents]`), and what it spends counts toward the turn. The step budgets and the output cap can be raised for one run (`run --max-steps`, `--max-output-tokens`, `--max-agent-steps`) or for the session (`/limits`), and the interface offers to raise one when a turn or a sub-agent reaches it, for example when a thinking model spends its whole output cap reasoning.
+
+Secrets never have to go through the chat (beyond Python). When the agent needs a key, a token, or a password, it calls `request_secret`, and you type or paste the value into a masked prompt (a panel in the interface, a hidden prompt at the terminal); `/secret NAME` enters one without being asked, `/secret` lists the names, and `/secret forget NAME` drops one. The value is held for the session only. It reaches `run_command` and `python_exec` as an environment variable of that name (in the Docker sandbox too, passed by name so it never appears in a process list), and wherever it would show up in what the model, the history, the prompt history file, or the trace gets (tool output, your own messages, the model's reply), it is replaced by `${secret:NAME}`. This keeps secrets out of transcripts, provider logs, traces, and memory; it does not stop a hostile model, which could still get a transformed copy (base64, part of the value) past literal redaction. Piped and CI runs, where nobody can enter a value, are not offered the tool.
 
 With `[model] router = "triage"`, each turn goes to the cheap model (`[model.route] cheap`) when the ask is short and plain, and to the frontier model otherwise, as in Python; `/model` pins one model for the rest of the session.
 
@@ -88,6 +91,8 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] OpenTelemetry spans (`[observability] otel`, OTLP/HTTP or the console)
 - [x] Triage routing (`[model] router = "triage"`: simple asks to `[model.route] cheap`, the rest to `frontier`)
 - [x] Turn limits at runtime: `/limits`, `run --max-steps`, `--max-output-tokens`, and `--max-agent-steps`, and the interface's offer to raise a limit that was reached (beyond Python)
+- [x] Secure secret entry, part 1: `request_secret`, `/secret`, environment injection, and redaction (beyond Python)
+- [ ] Secure secret entry, parts 2 and 3: writing a secret into a file (`target`, `${secret:NAME}` placeholders) and remembering secrets per project in the OS keyring
 - [x] Approvals and file-writing tools (`write_file`, `edit_file`)
 - [x] Guardrails (ingress, egress, observation scanning)
 - [x] Sandboxed command and Python execution (subprocess, or Docker)
