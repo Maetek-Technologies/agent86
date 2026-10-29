@@ -16,6 +16,7 @@ use crate::agent::{
 };
 use crate::limits::LimitKind;
 use crate::memory::working::fit;
+use crate::prompt::time_note;
 use crate::provider::ProviderError;
 use crate::tools::delegate::{self, NAME as DELEGATE};
 use crate::tools::{success, ToolContext};
@@ -117,13 +118,15 @@ impl Harness {
         // The turn's model, routed or not, as Python's sub-agent uses `h.provider`.
         let provider = self.active_provider();
         // The persona, then the parent's system content, so the sub-agent sees the
-        // environment, the skills it can load, and the MCP tools it can call.
+        // environment, the skills it can load, and the MCP tools it can call, and
+        // (beyond Python) the time it started.
+        let time = time_note(&chrono::Local::now());
         let system = message(
             Role::System,
             format!(
                 "{}\n\n{}",
                 ROLE_PREAMBLE.replace("{role}", role),
-                self.system_message(None).content
+                self.system_message(Some(&time)).content
             ),
         );
         let mut messages = vec![message(Role::User, task.to_owned())];

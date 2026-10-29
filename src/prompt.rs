@@ -39,6 +39,23 @@ Debugging:
   about your own code paths, not as proof the environment is flaky.
 ";
 
+/// The current time, for the end of a turn's system message. Beyond Python, whose
+/// prompt carries no date: without one, a model cannot tell that a page cached
+/// hours ago is stale, nor what "today" is. UTC is given too, since tools often
+/// stamp their results in UTC. Fixed for a turn, so its steps share one prompt.
+pub fn time_note<Tz: chrono::TimeZone>(now: &chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!(
+        "Current date and time: {} (UTC{}), which is {} UTC. Tool results can be cached \
+         or out of date: when the question is about the present, check the dates they carry.",
+        now.format("%A, %Y-%m-%d %H:%M"),
+        now.format("%:z"),
+        now.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M"),
+    )
+}
+
 /// Compile the system prompt into a single system message.
 pub fn build_system_prompt(config: &Config, skills: &crate::skills::Skills) -> Message {
     let mut content = format!(
@@ -74,5 +91,23 @@ pub fn build_system_prompt(config: &Config, skills: &crate::skills::Skills) -> M
         tool_calls: Vec::new(),
         tool_call_id: None,
         name: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn the_time_line_gives_local_time_its_offset_and_utc() {
+        let eastern = chrono::FixedOffset::west_opt(4 * 3600).unwrap();
+        let now = eastern.with_ymd_and_hms(2026, 10, 29, 21, 5, 0).unwrap();
+        assert_eq!(
+            time_note(&now),
+            "Current date and time: Thursday, 2026-10-29 21:05 (UTC-04:00), which is \
+             2026-10-30 01:05 UTC. Tool results can be cached or out of date: when the \
+             question is about the present, check the dates they carry."
+        );
     }
 }

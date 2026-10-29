@@ -199,7 +199,11 @@ async fn an_entered_secret_reaches_tools_but_never_the_model_the_history_or_the_
     // From then on the system message names it.
     let system = second[0]["content"].as_str().unwrap();
     assert!(system.contains("## Secrets\n"), "{system}");
-    assert!(system.ends_with("\n- API_TOKEN"), "{system}");
+    // The secrets section is last before the turn's time line.
+    assert!(
+        system.contains("\n- API_TOKEN\n\nCurrent date and time: "),
+        "{system}"
+    );
     // The command saw the value; the model sees the placeholder in its place.
     let third = requests[2].body["messages"].as_array().unwrap();
     let observed = third.last().unwrap()["content"].as_str().unwrap();
