@@ -208,10 +208,12 @@ pub async fn collect_completion(
     mut deltas: DeltaStream<'_>,
 ) -> Result<Completion, ProviderError> {
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut last = None;
     while let Some(delta) = deltas.next().await {
         let delta = delta?;
         text.push_str(&delta.text);
+        thinking.push_str(&delta.thinking);
         if delta.done && delta.completion.is_some() {
             last = delta.completion;
         }
@@ -219,12 +221,16 @@ pub async fn collect_completion(
     Ok(match last {
         None => Completion {
             text,
+            thinking,
             model: Some(model.to_owned()),
             ..Completion::default()
         },
         Some(mut completion) => {
             if completion.text.is_empty() {
                 completion.text = text;
+            }
+            if completion.thinking.is_empty() {
+                completion.thinking = thinking;
             }
             completion
         }

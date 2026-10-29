@@ -3,7 +3,10 @@
 
 mod support;
 
-use agent86::agent::{CancelToken, Harness, HarnessError, TurnEvent, CONTINUE_PROMPT};
+use agent86::agent::{
+    CancelToken, Harness, HarnessError, TurnEvent, ANSWER_PROMPT, CONTINUE_PROMPT,
+    EMPTY_ANSWER_NOTICE, NO_ANSWER_NOTICE, THINKING_ANSWER_NOTICE,
+};
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
 use agent86::config::{
     AgentsConfig, CompactionMode, EgressMode, IngressMode, LimitsConfig, ObservabilityConfig,
@@ -22,7 +25,7 @@ use agent86::types::{AgentPhase, ApprovalMode, Message, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use support::{sse_text, sse_tool_calls, MockServer, Reply};
+use support::{sse_reasoning, sse_text, sse_tool_calls, MockServer, Reply};
 
 /// A throwaway workspace with a couple of files in it.
 struct Workspace {
@@ -312,6 +315,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
             streamed.push_str(event.text());
             seen.push(match event {
                 TurnEvent::Text(text) => format!("text {text:?}"),
+                TurnEvent::Thinking(text) => format!("thinking {text:?}"),
                 TurnEvent::ToolCall { call, .. } => format!("call {} {}", call.id, call.name),
                 TurnEvent::ToolResult {
                     call,
@@ -453,6 +457,148 @@ async fn continuations_stop_after_three() {
     assert_eq!(server.requests().len(), 4);
     assert_eq!(output.turn.unwrap().continuations, 3);
     assert!(output.output.ends_with("[continuation 3/3]\nmore"));
+}
+
+#[tokio::test]
+async fn an_empty_answer_is_asked_for_once_on_that_request_only() {
+    let server = MockServer::start(vec![
+        sse_reasoning("The capital is Paris.", ""),
+        sse_text("Paris.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("empty-answer");
+
+    let output = run(&server, &workspace, limits(), "capital of France?")
+        .await
+        .unwrap();
+
+    assert_eq!(output.output, format!("{EMPTY_ANSWER_NOTICE}Paris."));
+    assert_eq!(output.steps, 2);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    // The empty reply is not in the history; the request ends with the question.
+    let second = requests[1].body["messages"].as_array().unwrap().clone();
+    assert_eq!(second.len(), 3);
+    assert_eq!(
+        second[1],
+        json!({"role": "user", "content": "capital of France?"})
+    );
+    assert_eq!(second[2], json!({"role": "user", "content": ANSWER_PROMPT}));
+}
+
+#[tokio::test]
+async fn a_second_empty_answer_shows_the_reasoning_instead() {
+    let server = MockServer::start(vec![
+        sse_reasoning("It is 4.", ""),
+        sse_reasoning("Two and two make 4.", ""),
+    ])
+    .await;
+    let workspace = Workspace::new("thinking-answer");
+
+    let output = run(&server, &workspace, limits(), "2+2?").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        format!("{EMPTY_ANSWER_NOTICE}{THINKING_ANSWER_NOTICE}Two and two make 4.")
+    );
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn the_first_reasoning_stands_in_when_the_second_try_has_none() {
+    let server = MockServer::start(vec![sse_reasoning("It is 4.", ""), sse_text("", "stop")]).await;
+    let workspace = Workspace::new("thinking-kept");
+
+    let output = run(&server, &workspace, limits(), "2+2?").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        format!("{EMPTY_ANSWER_NOTICE}{THINKING_ANSWER_NOTICE}It is 4.")
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_never_comes_says_so() {
+    let server = MockServer::start(vec![sse_text("", "stop"), sse_text("  ", "stop")]).await;
+    let workspace = Workspace::new("no-answer");
+
+    let output = run(&server, &workspace, limits(), "hello").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        format!("{EMPTY_ANSWER_NOTICE}  {NO_ANSWER_NOTICE}")
+    );
+    assert_eq!(output.steps, 2);
+}
+
+#[tokio::test]
+async fn a_model_out_of_steps_is_not_asked_again() {
+    let server = MockServer::start(vec![sse_reasoning("Done thinking.", "")]).await;
+    let workspace = Workspace::new("no-answer-last-step");
+    let tight = LimitsConfig {
+        max_steps: 1,
+        ..limits()
+    };
+
+    let output = run(&server, &workspace, tight, "hello").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        format!("{THINKING_ANSWER_NOTICE}Done thinking.")
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn reasoning_is_reported_apart_from_the_output_and_kept_out_of_the_history() {
+    let server = MockServer::start(vec![
+        sse_reasoning("Hmm, let me see.", ""),
+        sse_reasoning("Short.", "Done."),
+    ])
+    .await;
+    let workspace = Workspace::new("thinking-events");
+    let harness = Harness {
+        provider: std::sync::Arc::new(provider(&server)),
+        router: Default::default(),
+        tracer: Default::default(),
+        registry: builtin_registry(),
+        context: ToolContext::new(&workspace.root).unwrap(),
+        limits: limits(),
+        agents: agents(),
+        system: system(),
+        max_tokens: 1024,
+        session_limits: Default::default(),
+        context_window: 128_000,
+        gate: ask_gate(),
+        guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
+        recorder: Recorder::disabled(),
+        mcp: None,
+        memory: None,
+        cancel: Default::default(),
+    };
+    let mut state = AgentState::new();
+    let mut thinking = Vec::new();
+    let mut streamed = String::new();
+    let output = harness
+        .run_turn_events(&mut state, "go", "go", |event| {
+            streamed.push_str(event.text());
+            if let TurnEvent::Thinking(text) = event {
+                thinking.push(text.to_owned());
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(output, format!("{EMPTY_ANSWER_NOTICE}Done."));
+    assert_eq!(streamed, output, "reasoning is not part of the output");
+    assert_eq!(thinking, ["Hmm, let me see.", "Short."]);
+    let history: Vec<(Role, &str)> = state
+        .messages
+        .iter()
+        .map(|message| (message.role, message.content.as_str()))
+        .collect();
+    assert_eq!(history, [(Role::User, "go"), (Role::Assistant, "Done.")]);
+    assert_eq!(state.steps.len(), 2);
 }
 
 #[tokio::test]

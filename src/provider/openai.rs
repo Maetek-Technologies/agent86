@@ -361,6 +361,7 @@ fn to_messages(messages: &[Message]) -> Value {
 #[derive(Default)]
 struct TurnState {
     text: String,
+    thinking: String,
     tool_fragments: BTreeMap<u64, ToolFragment>,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -570,6 +571,21 @@ impl StreamState<'_> {
         let choices = chunk.get("choices").and_then(Value::as_array);
         for choice in choices.into_iter().flatten() {
             let delta = choice.get("delta");
+            // Reasoning, under either name servers use (llama.cpp, vLLM, and DeepSeek
+            // say `reasoning_content`, OpenRouter `reasoning`). A server that sends
+            // both carries the same text twice, so one is taken. Once shown, it rules
+            // out a retry just as text does.
+            let reasoning = ["reasoning_content", "reasoning"]
+                .iter()
+                .find_map(|key| non_empty_str(delta.and_then(|d| d.get(*key))));
+            if let Some(piece) = reasoning {
+                self.turn.thinking.push_str(piece);
+                self.turn.emitted = true;
+                self.pending.push_back(CompletionDelta {
+                    thinking: piece.to_owned(),
+                    ..CompletionDelta::default()
+                });
+            }
             if let Some(piece) = delta.and_then(|d| d.get("content")).and_then(Value::as_str) {
                 if !piece.is_empty() {
                     self.turn.text.push_str(piece);
@@ -639,7 +655,9 @@ impl StreamState<'_> {
                 ),
                 stop_reason: stop_reason.map(stop_reason_wire),
                 model: Some(self.provider.model.clone()),
+                thinking: turn.thinking,
             }),
+            ..CompletionDelta::default()
         });
     }
 }

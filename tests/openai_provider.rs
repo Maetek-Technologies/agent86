@@ -65,6 +65,43 @@ async fn drain(
 }
 
 #[tokio::test]
+async fn reasoning_streams_apart_from_the_text_under_either_name() {
+    let chunk = |delta: serde_json::Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": delta, "finish_reason": null}]})
+        )
+    };
+    let body = [
+        // OpenRouter's name.
+        chunk(json!({"content": "", "reasoning": "First,"})),
+        // A server sending both names carries the same text twice: one is taken.
+        chunk(json!({"reasoning_content": " then", "reasoning": " then"})),
+        // llama.cpp's name.
+        chunk(json!({"reasoning_content": " done."})),
+        chunk(json!({"content": "Answer."})),
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            .to_owned(),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let server = MockServer::start(vec![Reply::Sse(body)]).await;
+    let provider = provider(config(&server));
+
+    let (deltas, error) = drain(&provider, request("Think")).await;
+    assert_eq!(error, None);
+    let thinking: Vec<&str> = deltas
+        .iter()
+        .filter(|delta| !delta.thinking.is_empty())
+        .map(|delta| delta.thinking.as_str())
+        .collect();
+    assert_eq!(thinking, ["First,", " then", " done."]);
+    let completion = deltas.last().unwrap().completion.clone().unwrap();
+    assert_eq!(completion.thinking, "First, then done.");
+    assert_eq!(completion.text, "Answer.");
+}
+
+#[tokio::test]
 async fn streams_text_deltas_then_a_final_completion() {
     let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
     let mut config = config(&server);

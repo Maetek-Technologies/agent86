@@ -284,6 +284,7 @@ fn as_arguments(arguments: Option<&Value>) -> Map<String, Value> {
 #[derive(Default)]
 struct TurnState {
     text: String,
+    thinking: String,
     tool_calls: Vec<ToolCall>,
     prompt_tokens: u64,
     eval_tokens: u64,
@@ -432,6 +433,20 @@ impl StreamState<'_> {
             return Err(provider.message(format!("Ollama error: {error}")));
         }
         let message = chunk.get("message");
+        // A thinking model's reasoning arrives in its own field, and can be all a
+        // reply has. Once shown, it rules out a retry just as text does.
+        if let Some(piece) = message
+            .and_then(|m| m.get("thinking"))
+            .and_then(Value::as_str)
+            .filter(|piece| !piece.is_empty())
+        {
+            self.turn.thinking.push_str(piece);
+            self.turn.emitted = true;
+            self.pending.push_back(CompletionDelta {
+                thinking: piece.to_owned(),
+                ..CompletionDelta::default()
+            });
+        }
         if let Some(piece) = message
             .and_then(|m| m.get("content"))
             .and_then(Value::as_str)
@@ -496,7 +511,9 @@ impl StreamState<'_> {
                     _ => String::new(),
                 }),
                 model: Some(self.provider.model.clone()),
+                thinking: turn.thinking,
             }),
+            ..CompletionDelta::default()
         });
     }
 }

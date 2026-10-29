@@ -440,6 +440,9 @@ fn to_messages(messages: &[Message]) -> (Option<&str>, Vec<Value>) {
 /// One content block of the message being streamed.
 enum Block {
     Text(String),
+    /// Extended thinking. The adapter never asks for it, but a block that arrives is
+    /// read; `redacted_thinking` carries nothing readable and stays `Other`.
+    Thinking(String),
     ToolUse {
         id: String,
         name: String,
@@ -732,6 +735,9 @@ impl StreamState<'_> {
                 let block = &body["content_block"];
                 turn.blocks.push(match block["type"].as_str() {
                     Some("text") => Block::Text(block["text"].as_str().unwrap_or("").to_owned()),
+                    Some("thinking") => {
+                        Block::Thinking(block["thinking"].as_str().unwrap_or("").to_owned())
+                    }
                     Some("tool_use") => Block::ToolUse {
                         id: block["id"].as_str().unwrap_or("").to_owned(),
                         name: block["name"].as_str().unwrap_or("").to_owned(),
@@ -763,6 +769,19 @@ impl StreamState<'_> {
                             });
                         }
                     }
+                    Some("thinking_delta") => {
+                        let thinking = delta["thinking"].as_str().unwrap_or("");
+                        if let Block::Thinking(accumulated) = block {
+                            accumulated.push_str(thinking);
+                        }
+                        if !thinking.is_empty() {
+                            turn.emitted = true;
+                            self.pending.push_back(CompletionDelta {
+                                thinking: thinking.to_owned(),
+                                ..CompletionDelta::default()
+                            });
+                        }
+                    }
                     Some("input_json_delta") => {
                         if let Block::ToolUse { json, .. } = block {
                             json.push_str(delta["partial_json"].as_str().unwrap_or(""));
@@ -790,10 +809,12 @@ impl StreamState<'_> {
             return Err(self.provider.stream_failed("AssertionError: "));
         }
         let mut text = String::new();
+        let mut thinking = String::new();
         let mut tool_calls = Vec::new();
         for block in turn.blocks {
             match block {
                 Block::Text(piece) => text.push_str(&piece),
+                Block::Thinking(piece) => thinking.push_str(&piece),
                 Block::ToolUse {
                     id,
                     name,
@@ -830,7 +851,9 @@ impl StreamState<'_> {
                     _ => String::new(),
                 }),
                 model: Some(provider.model.clone()),
+                thinking,
             }),
+            ..CompletionDelta::default()
         });
         Ok(())
     }

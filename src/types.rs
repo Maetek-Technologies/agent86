@@ -278,6 +278,12 @@ pub struct Completion {
     pub stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The model's reasoning, kept apart from `text` (Ollama's `thinking`, the
+    /// OpenAI-compatible `reasoning_content`/`reasoning`, Anthropic thinking blocks).
+    /// Beyond Python, which drops it: it is never sent back or saved, only shown and,
+    /// when the model answers with nothing else, offered in place of the answer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -288,6 +294,9 @@ pub struct CompletionDelta {
     pub done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<Completion>,
+    /// A piece of the model's reasoning; see [`Completion::thinking`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
