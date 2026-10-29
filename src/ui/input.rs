@@ -6,7 +6,8 @@
 //! is kept while history is browsed and handed back past the newest entry. Any
 //! edit ends browsing: what is on screen is then the user's draft.
 
-use super::text::Line;
+use super::status::last_component;
+use super::text::{sanitize, Line};
 use crate::repl::Style;
 use unicode_width::UnicodeWidthChar;
 
@@ -260,8 +261,14 @@ impl Editor {
     }
 
     /// The bordered input box, `width` cells wide, and the caret within it.
-    /// `active` is false while a turn runs: the draft is kept but dimmed.
-    pub fn render(&mut self, width: usize, active: bool) -> (Vec<Line>, (usize, usize)) {
+    /// `active` is false while a turn runs: the draft is kept but dimmed. `title`
+    /// (the working directory, beyond Python) sits right-aligned in the top border.
+    pub fn render(
+        &mut self,
+        width: usize,
+        active: bool,
+        title: &str,
+    ) -> (Vec<Line>, (usize, usize)) {
         let width = width.max(8);
         // "│ > " before the text and " │" after it.
         let inner = width - 6;
@@ -274,7 +281,7 @@ impl Editor {
         let shown = &rows[self.scroll..rows.len().min(self.scroll + MAX_ROWS)];
         let border = Style::Dim;
         let text_style = if active { Style::Plain } else { Style::Dim };
-        let mut lines = vec![Line::styled(border, format!("╭{}╮", "─".repeat(width - 2)))];
+        let mut lines = vec![top_border(width, title)];
         for (index, row) in shown.iter().enumerate() {
             let lead = if self.scroll + index == 0 { "> " } else { "  " };
             let pad = inner.saturating_sub(unicode_width::UnicodeWidthStr::width(row.as_str()));
@@ -289,6 +296,29 @@ impl Editor {
         lines.push(Line::styled(border, format!("╰{}╯", "─".repeat(width - 2))));
         (lines, (1 + caret_row - self.scroll, 4 + caret_col))
     }
+}
+
+/// The box's top border with `title` set into it near the right corner. A title
+/// too long for the width falls back to its last component, then to none, so the
+/// border keeps at least a few cells of rule on the left.
+fn top_border(width: usize, title: &str) -> Line {
+    let title = sanitize(title);
+    let fits = |text: &str| {
+        let cells = unicode_width::UnicodeWidthStr::width(text);
+        (!text.is_empty() && cells + 8 <= width).then_some(cells)
+    };
+    let short = last_component(&title).to_owned();
+    let Some((title, cells)) = fits(&title)
+        .map(|cells| (title.clone(), cells))
+        .or_else(|| fits(&short).map(|cells| (short, cells)))
+    else {
+        return Line::styled(Style::Dim, format!("╭{}╮", "─".repeat(width - 2)));
+    };
+    // "╭" + rule + " title " + "─╮"
+    let rule = width - cells - 5;
+    Line::styled(Style::Dim, format!("╭{} ", "─".repeat(rule)))
+        .push(Style::Plain, title)
+        .push(Style::Dim, " ─╮")
 }
 
 #[cfg(test)]
@@ -381,13 +411,33 @@ mod tests {
     #[test]
     fn the_box_is_bordered_and_scrolls_past_eight_rows() {
         let mut editor = typed("hi");
-        let (lines, caret) = editor.render(20, true);
+        let (lines, caret) = editor.render(20, true, "");
         assert_eq!(lines[0].plain_text(), format!("╭{}╮", "─".repeat(18)));
         assert_eq!(lines[1].plain_text(), format!("│ > hi{} │", " ".repeat(12)));
         assert_eq!(caret, (1, 6));
         let mut tall = typed(&"x\n".repeat(12));
-        let (lines, caret) = tall.render(20, true);
+        let (lines, caret) = tall.render(20, true, "");
         assert_eq!(lines.len(), MAX_ROWS + 2);
         assert_eq!(caret.0, MAX_ROWS);
+    }
+
+    #[test]
+    fn the_working_directory_sits_in_the_top_border() {
+        let row = |width, title| top_border(width, title).plain_text();
+        assert_eq!(
+            row(30, "~/src/app"),
+            format!("╭{} ~/src/app ─╮", "─".repeat(16))
+        );
+        // Too long for the width: the last component, then a bare border.
+        assert_eq!(row(14, "~/src/app"), format!("╭{} app ─╮", "─".repeat(6)));
+        assert_eq!(row(10, "~/src/app"), format!("╭{}╮", "─".repeat(8)));
+        for width in [10, 14, 30] {
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(row(width, "~/src/app").as_str()),
+                width
+            );
+        }
+        // Untrusted text from the filesystem cannot carry escape sequences.
+        assert!(!row(40, "~/a\x1b[31mb").contains('\x1b'));
     }
 }

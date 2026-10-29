@@ -74,7 +74,8 @@ The Python implementation remains the reference and compatibility oracle. This p
   - harness notices, dim, on their own line
   - each tool call shown while it runs, then committed as `⏺ name(args)` and `⎿ summary` when its result lands (Python's 72- and 100-character previews; red when the call failed)
   - a spinner line with the phase (`thinking`, `running <tool>`, `cancelling`) and the elapsed time
-  - Python's status line (model, context gauge, tokens, cost, sandbox, approval mode, `[Shift+Tab]`) plus the working directory after the model (beyond Python, home shown as `~`), which drops the hint, then the tokens, shortens the directory to its last component, then drops the gauge as the terminal narrows
+  - Python's status line (model, context gauge, tokens, cost, sandbox, approval mode, `[Shift+Tab]`), which drops the hint, then the tokens, then the gauge as the terminal narrows
+  - the working directory (beyond Python, home shown as `~`) set into the input box's top border, right-aligned, so it is always on screen without competing with the status line; a narrow box shows its last component, then none
   - side-effecting calls asked in an approval panel in place of the input box: the tool name, the argument summary, and the tool's detail, such as the diff; answered with `y`, `n`, Escape, or the arrows and Enter
   - Escape or Ctrl+C cancelling a running turn at its next safe point, and Shift+Tab cycling the approval mode, even mid-turn
   - MCP notes shown as they arrive, Python's error line with the `see agent86 trace show -s <id>` hint, and the turn summary

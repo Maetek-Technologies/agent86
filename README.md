@@ -4,7 +4,7 @@ An experimental, compatibility-first Rust implementation of [agent86](https://gi
 
 The Python implementation remains the reference. This repository starts with a small vertical foundation and adds behavior only with tests that make compatibility explicit.
 
-![The interactive interface at startup: the AGENT 86 header, the input box, and the status line with the model and working directory](docs/images/interface.png)
+![The interactive interface at startup: the AGENT 86 header, the input box with the working directory in its border, and the status line](docs/images/interface.png)
 
 ## Status
 

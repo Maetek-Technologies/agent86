@@ -37,7 +37,7 @@ Non-goals:
 | Turns | Text the model streams, harness notices, `[cancelled]`, error type and message, the hint `see agent86 trace show -s <id>`, the turn summary line | Markers, colours, layout |
 | Tools | What a block shows: the name, the argument preview, the result's first line, and the full arguments and result when expanded; `ok` versus error colouring | `⏺`/`⎿` shape; expanded view lives in the transcript view |
 | Approvals | When a prompt appears, what it shows (tool name, argument summary, tool detail such as the diff), the answers (approve, deny, Escape denies), deny on shutdown | Inline panel with numbered choices |
-| Status line | Segments, their text, and the order they are shed under width pressure (`status_segments`, `fit_status_line`) | Where it sits and its colours; the working directory segment (beyond Python) |
+| Status line | Segments, their text, and the order they are shed under width pressure (`status_segments`, `fit_status_line`) | Where it sits and its colours |
 | Files | `memory.db`, the history file, config write-back (comments preserved, secret guard, user/project scope), keyring entries | — |
 | Startup | Surface selection rules, startup notes, MCP notes, the compact banner's content (version and model) | The header: a gradient `AGENT 86` wordmark over the version and working directory |
 | Cancellation | Safe points, saved state, `turn_end` status `cancelled` | Key hints in the spinner line |
@@ -67,10 +67,10 @@ memory: …   (startup notes, dim)              │  scrollback
                                               │
 ⏺ I found the typo on line 3.                 ┘
 ✻ Running edit_file… (14s · esc to interrupt)   ┐
-╭────────────────────────────────────────────╮  │
+╭──────────────────────────────────── ~/app ─╮  │
 │ > _                                        │  │  live region
 ╰────────────────────────────────────────────╯  │  (redrawn)
-  gpt-4o · ~/app · running edit_file… · sbx subprocess · mode: ask  [Shift+Tab]  ┘
+  gpt-4o · running edit_file… · sbx subprocess · mode: ask  [Shift+Tab]  ┘
 ```
 
 From top to bottom, the live region holds:
@@ -78,8 +78,8 @@ From top to bottom, the live region holds:
 1. **The streaming tail:** the part of the current reply that is not yet complete enough to commit (section 6). It is capped at about 40% of the screen height, like Python's `#stream`.
 2. **The spinner line,** only while a turn runs. It shows a spinner glyph, the phase (`Thinking…`, `Running edit_file…`, `Cancelling…`), and the elapsed time. The hint is `esc to interrupt`. With `[ui] spinner = false` the glyph is static.
 3. **A menu or a panel.** A menu (the `/` commands or `@` paths) sits under the input box. A panel (an approval or a picker) replaces the input box while it is open.
-4. **The input box:** bordered, one to eight rows, scrolling after eight, like Python's `PromptInput`. It is disabled while a turn runs, but it still shows its draft.
-5. **The status line:** Python's `fit_status_line` text plus the working directory after the model, dim, one row. The directory is never dropped; under width pressure it shrinks to its last component.
+4. **The input box:** bordered, one to eight rows, scrolling after eight, like Python's `PromptInput`. It is disabled while a turn runs, but it still shows its draft. Its top border carries the working directory, right-aligned (beyond Python; home as `~`, the last component when the box is narrow).
+5. **The status line:** Python's `fit_status_line` text, dim, one row.
 
 ## 4. Visual vocabulary
 
