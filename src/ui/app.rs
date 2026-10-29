@@ -1122,7 +1122,9 @@ impl App {
             });
             caret_base = 0;
         } else {
-            let (lines, (row, col)) = self.editor.render(width, self.running.is_none());
+            let (lines, (row, col)) =
+                self.editor
+                    .render(width, self.running.is_none(), &self.status.cwd);
             caret_base = bottom.len();
             if self.running.is_none() {
                 caret = Some((row, col));

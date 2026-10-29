@@ -2,14 +2,10 @@
 //! `tui/widgets/status_footer.py` (how much of it fits).
 //!
 //! Under width pressure the line sheds, in order, the `[Shift+Tab]` hint (also in
-//! `/help`), the token counts (one `/cost` away), the working directory's parents
-//! (its last component stays), and the context gauge (the last to go, since a full
-//! window is the failure it exists to show). The model, the directory, the cost,
+//! `/help`), the token counts (one `/cost` away), and the context gauge (the last to
+//! go, since a full window is the failure it exists to show). The model, the cost,
 //! the approval mode, and the working indicator are never shed: they say what is
-//! running, where, what it costs, and whether it can act without asking.
-//!
-//! The working directory is beyond Python, whose status line has none: the banner
-//! that names it scrolls away, and the status line is the one row always on screen.
+//! running, what it costs, and whether it can act without asking.
 
 use std::path::Path;
 
@@ -18,15 +14,17 @@ use crate::tools::display_path;
 use crate::turn::human_tokens;
 use unicode_width::UnicodeWidthStr;
 
-/// Segment keys, in the order they are given up. `cwd` is shortened, not dropped.
-const SHED_ORDER: [&str; 4] = ["hint", "tok", "cwd", "ctx"];
+/// Segment keys, in the order they are given up.
+const SHED_ORDER: [&str; 3] = ["hint", "tok", "ctx"];
 
 /// What the status line reports, as Python's `StatusState`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusState {
     /// The bare model id.
     pub model: String,
-    /// The working directory as shown (see `short_path`); empty shows none.
+    /// The working directory as shown (see `short_path`), beyond Python. It is not
+    /// part of the line: the input box's top border carries it, so it never
+    /// competes with the segments for width. Empty shows none.
     pub cwd: String,
     /// Input tokens of the latest model call: how full the context is.
     pub used_tokens: u64,
@@ -88,7 +86,7 @@ pub fn short_path(path: &Path, home: Option<&Path>) -> String {
 }
 
 /// The last component of a shown path (`~/src/app` → `app`).
-fn last_component(path: &str) -> &str {
+pub fn last_component(path: &str) -> &str {
     path.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .next()
@@ -96,13 +94,9 @@ fn last_component(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// The line's labelled parts, in display order, as Python's `status_segments`,
-/// plus the working directory after the model.
+/// The line's labelled parts, in display order, as Python's `status_segments`.
 pub fn status_segments(state: &StatusState) -> Vec<(&'static str, String)> {
     let mut segments = vec![("model", state.model.clone())];
-    if !state.cwd.is_empty() {
-        segments.push(("cwd", state.cwd.clone()));
-    }
     if state.working {
         let phase = if state.phase.is_empty() {
             "working"
@@ -163,15 +157,7 @@ pub fn fit_status_line(state: &StatusState, width: usize) -> String {
         return line;
     }
     for key in SHED_ORDER {
-        if key == "cwd" {
-            for (segment, text) in segments.iter_mut() {
-                if *segment == "cwd" {
-                    *text = last_component(text).to_owned();
-                }
-            }
-        } else {
-            segments.retain(|(segment, _)| *segment != key);
-        }
+        segments.retain(|(segment, _)| *segment != key);
         line = join_segments(&segments);
         if line.width() <= width {
             break;
@@ -253,18 +239,10 @@ mod tests {
     }
 
     #[test]
-    fn the_working_directory_follows_the_model_and_is_shortened_not_shed() {
+    fn the_working_directory_stays_off_the_line() {
         let mut here = state();
         here.cwd = "~/src/app".into();
-        let full = fit_status_line(&here, 0);
-        assert!(full.starts_with("gpt-4o-mini · ~/src/app · ctx "), "{full}");
-        let no_tokens = fit_status_line(&here, full.width() - 20);
-        assert!(no_tokens.contains(" · ~/src/app · "), "{no_tokens}");
-        let minimal = fit_status_line(&here, 10);
-        assert_eq!(
-            minimal,
-            "gpt-4o-mini · app · $0.0123 · sbx subprocess · mode: ask"
-        );
+        assert_eq!(fit_status_line(&here, 0), fit_status_line(&state(), 0));
     }
 
     #[test]

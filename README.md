@@ -4,7 +4,7 @@ An experimental, compatibility-first Rust implementation of [agent86](https://gi
 
 The Python implementation remains the reference. This repository starts with a small vertical foundation and adds behavior only with tests that make compatibility explicit.
 
-![The interactive interface at startup: the AGENT 86 header, the input box, and the status line with the model and working directory](docs/images/interface.png)
+![The interactive interface at startup: the AGENT 86 header, the input box with the working directory in its border, and the status line](docs/images/interface.png)
 
 ## Status
 
@@ -49,7 +49,7 @@ Long conversations are fitted to the model's real context window. When a session
 
 ## Install
 
-Download the archive for your platform from [Releases](https://github.com/tdfleming/agent-86-rs/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64, macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/tdfleming/agent-86-rs --tag v1.0.0` (needs Rust 1.88 or newer).
+Download the archive for your platform from [Releases](https://github.com/tdfleming/agent-86-rs/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64, macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/tdfleming/agent-86-rs --tag v1.0.1` (needs Rust 1.88 or newer).
 
 To publish a release, add notes for it in `docs/releases/<tag>.md`, set the version in `Cargo.toml`, merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives and creates the release.
 
