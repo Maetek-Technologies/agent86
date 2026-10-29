@@ -98,13 +98,15 @@ const CONTEXT_WINDOWS: &[(&str, u64)] = &[
     ("phi", 16_384),
 ];
 
-/// The largest Ollama window asked for when `[providers.ollama] num_ctx` is unset
-/// and `num_ctx_max` gives none. Ollama allocates the whole window up front, so a
+/// The largest Ollama window asked for from a model's trained length, when neither
+/// `[providers.ollama] num_ctx` nor the model's Modelfile sets one and
+/// `num_ctx_max` gives none. Ollama allocates the whole window up front, so a
 /// model's full 256k could leave the GPU and crawl.
 pub const DEFAULT_OLLAMA_NUM_CTX_MAX: u32 = 32_768;
 
-/// The `num_ctx` to ask Ollama for: the section's own `num_ctx`, else the
-/// model's maximum (what `discover` reports) up to `num_ctx_max`, else
+/// The `num_ctx` to ask Ollama for: the section's own `num_ctx`, else what
+/// `discover` reports (the Modelfile's `num_ctx`, else the trained length up to
+/// `num_ctx_max`: [`super::remote_windows::ollama_window`]), else
 /// [`DEFAULT_CONTEXT_WINDOW`], which is what Python always sends. `discover` is
 /// only called when it is needed.
 pub fn ollama_num_ctx(
@@ -117,14 +119,10 @@ pub fn ollama_num_ctx(
     {
         return num_ctx;
     }
-    let cap = section
-        .and_then(|section| section.num_ctx_max)
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_OLLAMA_NUM_CTX_MAX);
     discover()
-        .filter(|&length| length > 0)
-        .map_or(DEFAULT_CONTEXT_WINDOW as u32, |length| {
-            length.min(u64::from(cap)) as u32
+        .filter(|&window| window > 0)
+        .map_or(DEFAULT_CONTEXT_WINDOW as u32, |window| {
+            u32::try_from(window).unwrap_or(u32::MAX)
         })
 }
 
@@ -225,24 +223,15 @@ mod tests {
     }
 
     #[test]
-    fn ollama_asks_for_the_models_maximum_up_to_the_cap() {
+    fn ollama_asks_for_the_section_setting_else_what_the_server_reports() {
         let section = |num_ctx, num_ctx_max| crate::config::ProviderConfig {
             num_ctx,
             num_ctx_max,
             ..Default::default()
         };
-        // Unset: the model's maximum, capped at 32k by default.
-        assert_eq!(ollama_num_ctx(None, || Some(262_144)), 32_768);
+        // Unset: what discovery settled on (`remote_windows::ollama_window`).
+        assert_eq!(ollama_num_ctx(None, || Some(262_144)), 262_144);
         assert_eq!(ollama_num_ctx(None, || Some(4_096)), 4_096);
-        assert_eq!(
-            ollama_num_ctx(Some(&section(None, Some(65_536))), || Some(262_144)),
-            65_536
-        );
-        assert_eq!(
-            ollama_num_ctx(Some(&section(None, Some(0))), || Some(262_144)),
-            32_768,
-            "a zero cap is no cap setting"
-        );
         // Nothing reported: Python's 8192.
         assert_eq!(ollama_num_ctx(None, || None), 8_192);
         assert_eq!(ollama_num_ctx(None, || Some(0)), 8_192);
@@ -261,9 +250,9 @@ mod tests {
         let mut config = crate::config::load_config(&paths, &Default::default()).unwrap();
         let window = context_window_with("ollama:qwen3.5:latest", &config, |provider, model| {
             assert_eq!((provider, model), ("ollama", "qwen3.5:latest"));
-            Some(262_144)
+            Some(65_536)
         });
-        assert_eq!(window, 32_768);
+        assert_eq!(window, 65_536);
         config
             .model
             .context_window

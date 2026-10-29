@@ -218,13 +218,30 @@ pub fn fetch_ollama(base_url: &str) -> Result<Vec<CatalogEntry>, CatalogUnavaila
     Ok(entries(list(&body, "models"), "name", "name"))
 }
 
-/// The context length `model` was trained for, from Ollama's `POST {base}/api/show`:
-/// `model_info["<architecture>.context_length"]`, or `None` when it reports none.
+/// What Ollama's `POST {base}/api/show` says about a model's context window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OllamaShow {
+    /// The length it was trained for: `model_info["<architecture>.context_length"]`.
+    pub context_length: Option<u64>,
+    /// The `num_ctx` its Modelfile sets (`PARAMETER num_ctx ...`), if any.
+    pub num_ctx: Option<u64>,
+}
+
+/// The context length `model` was trained for, or `None` when Ollama reports none.
 pub fn fetch_ollama_context_length(
     base_url: &str,
     model: &str,
     timeout: Duration,
 ) -> Result<Option<u64>, CatalogUnavailable> {
+    Ok(fetch_ollama_show(base_url, model, timeout)?.context_length)
+}
+
+/// The trained length and the Modelfile's `num_ctx` of `model`.
+pub fn fetch_ollama_show(
+    base_url: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<OllamaShow, CatalogUnavailable> {
     let url = format!("{}/api/show", base_url.trim_end_matches('/'));
     let body = request_json(
         &url,
@@ -232,9 +249,29 @@ pub fn fetch_ollama_context_length(
         Some(&serde_json::json!({"model": model})),
         timeout,
     )?;
-    let Some(info) = body.get("model_info").and_then(Value::as_object) else {
-        return Ok(None);
-    };
+    Ok(OllamaShow {
+        context_length: trained_context_length(&body),
+        num_ctx: body
+            .get("parameters")
+            .and_then(Value::as_str)
+            .and_then(modelfile_num_ctx),
+    })
+}
+
+/// `num_ctx` from `/api/show`'s `parameters`, which lists one `name value` pair per
+/// line, as the Modelfile's `PARAMETER` lines set them.
+fn modelfile_num_ctx(parameters: &str) -> Option<u64> {
+    parameters.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next() == Some("num_ctx"))
+            .then(|| words.next()?.parse::<u64>().ok())
+            .flatten()
+            .filter(|&num_ctx| num_ctx > 0)
+    })
+}
+
+fn trained_context_length(body: &Value) -> Option<u64> {
+    let info = body.get("model_info").and_then(Value::as_object)?;
     let named = info
         .get("general.architecture")
         .and_then(Value::as_str)
@@ -245,10 +282,10 @@ pub fn fetch_ollama_context_length(
             .find(|(key, _)| key.ends_with(".context_length"))
             .map(|(_, value)| value)
     });
-    Ok(length
+    length
         .and_then(Value::as_f64)
         .filter(|&length| length >= 1.0)
-        .map(|length| length as u64))
+        .map(|length| length as u64)
 }
 
 /// The catalog for `provider`, sorted by id: Python's `fetch_catalog`.
