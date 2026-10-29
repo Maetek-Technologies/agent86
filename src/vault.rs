@@ -203,6 +203,63 @@ impl SecretVault {
         }
     }
 
+    /// `text` with every [`placeholder`] replaced by the value it names: the reverse
+    /// of [`SecretVault::redact`], for the arguments of a tool that writes a secret
+    /// where the user asked (a file). A placeholder naming a secret that is not held
+    /// is an error naming it, so the model can ask for it rather than write the
+    /// placeholder literally. Text that only looks like one (`${secret:}`, a name
+    /// that is not a variable name, no closing brace) is left alone.
+    pub fn expand(&self, text: &str) -> Result<String, String> {
+        const OPEN: &str = "${secret:";
+        if !text.contains(OPEN) {
+            return Ok(text.to_owned());
+        }
+        let values = self.values();
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find(OPEN) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + OPEN.len()..];
+            let name = after.find('}').map(|end| &after[..end]);
+            match name.filter(|name| valid_name(name)) {
+                Some(name) => {
+                    let value = values
+                        .iter()
+                        .find(|(known, _)| known == name)
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| unknown_secret(name, &values))?;
+                    out.push_str(value);
+                    rest = &after[name.len() + 1..];
+                }
+                None => {
+                    out.push_str(OPEN);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    /// [`SecretVault::expand`] on every string in `value` (not keys).
+    pub fn expand_value(&self, value: &Value) -> Result<Value, String> {
+        Ok(match value {
+            Value::String(text) => Value::String(self.expand(text)?),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.expand_value(item))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, item)| Ok((key.clone(), self.expand_value(item)?)))
+                    .collect::<Result<_, String>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+
     /// The longest tail of `text` that could be the start of a held value, so a
     /// stream can hold it back until it knows. Always on a character boundary.
     fn partial_tail(&self, text: &str) -> usize {
@@ -231,11 +288,26 @@ impl SecretVault {
     }
 }
 
+/// The error for a placeholder naming a secret that is not held.
+fn unknown_secret(name: &str, values: &[(String, String)]) -> String {
+    let held = if values.is_empty() {
+        "No secrets are held".to_owned()
+    } else {
+        let names: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+        format!("The secrets held are {}", names.join(", "))
+    };
+    format!(
+        "Unknown secret {name} in {}. {held}; ask the user for it with request_secret.",
+        placeholder(name)
+    )
+}
+
 const SECTION_HEADER: &str = "## Secrets\n\
 The user has provided these secrets. Their values are hidden from you: each is set as \
-an environment variable of the same name in run_command and python_exec, and tool \
-output shows ${secret:NAME} where a value would appear. Never ask the user to type a \
-secret into the chat; call request_secret instead.";
+an environment variable of the same name in run_command and python_exec, write_file and \
+edit_file replace ${secret:NAME} in their arguments with the value, and tool output \
+shows ${secret:NAME} where a value would appear. Never ask the user to type a secret \
+into the chat; call request_secret instead.";
 
 /// Redacts streamed text as it arrives. A value split across two deltas would slip
 /// past a per-delta replacement, so the tail that could still become a value is held
@@ -413,6 +485,52 @@ mod tests {
         assert!(vault.ask("A", "deploy"));
         assert!(!vault.ask("B", "deploy"));
         assert_eq!(vault.names(), ["A"]);
+    }
+
+    #[test]
+    fn placeholders_expand_to_the_values_they_name() {
+        let vault = vault(&[("A", "one"), ("B_2", "two")]);
+        assert_eq!(
+            vault
+                .expand("A=${secret:A}\nB=${secret:B_2}${secret:A}")
+                .unwrap(),
+            "A=one\nB=twoone"
+        );
+        // Expansion undoes redaction.
+        let text = "token one and two";
+        assert_eq!(vault.expand(&vault.redact(text)).unwrap(), text);
+        // Only well-formed placeholders count.
+        for literal in [
+            "${secret:}",
+            "${secret:1A}",
+            "${secret:A",
+            "$secret:A",
+            "${secret:a b}",
+        ] {
+            assert_eq!(vault.expand(literal).unwrap(), literal);
+        }
+        assert_eq!(
+            vault.expand("${secret:C}").unwrap_err(),
+            "Unknown secret C in ${secret:C}. The secrets held are A, B_2; ask the user for \
+             it with request_secret."
+        );
+        assert_eq!(
+            SecretVault::default().expand("${secret:C}").unwrap_err(),
+            "Unknown secret C in ${secret:C}. No secrets are held; ask the user for it with \
+             request_secret."
+        );
+    }
+
+    #[test]
+    fn json_strings_expand_but_keys_and_other_values_stay() {
+        let vault = vault(&[("K", "v")]);
+        assert_eq!(
+            vault
+                .expand_value(&json!({"${secret:K}": ["${secret:K}", 1, null]}))
+                .unwrap(),
+            json!({"${secret:K}": ["v", 1, null]})
+        );
+        assert!(vault.expand_value(&json!(["${secret:X}"])).is_err());
     }
 
     #[test]

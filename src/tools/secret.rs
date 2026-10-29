@@ -17,7 +17,9 @@ impl Tool for RequestSecretTool {
         "Ask the user for a secret (an API key, token, or password) through a masked \
          prompt. Never ask for a secret in the chat; call this instead. The value is never \
          shown to you: it is set as the environment variable `name` in run_command and \
-         python_exec, and tool output shows ${secret:NAME} where it would appear."
+         python_exec, write_file and edit_file write it wherever their arguments say \
+         ${secret:NAME} (to put it in a .env file, say), and tool output shows \
+         ${secret:NAME} where it would appear."
     }
 
     /// The prompt is the user's consent, so the gate need not ask first; but it
@@ -81,8 +83,9 @@ impl Tool for RequestSecretTool {
             format!(
                 "The secret {name} is set. Use it as the environment variable {name} in \
                  run_command and python_exec (${name} in sh, %{name}% in cmd.exe, \
-                 os.environ[\"{name}\"] in Python). Its value is hidden from you; tool output \
-                 shows {} where it would appear.",
+                 os.environ[\"{name}\"] in Python), and write {0} in write_file or \
+                 edit_file to put it in a file. Its value is hidden from you; tool output \
+                 shows {0} where it would appear.",
                 placeholder(&name)
             ),
         ))
