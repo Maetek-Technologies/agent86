@@ -85,6 +85,10 @@ impl ApprovalGate {
 }
 
 /// The approval payload: a one-line argument summary plus the tool's own detail.
+///
+/// A tool that expands `${secret:NAME}` previews what it will really do (so a file
+/// that already holds the value shows no change on that line), and the detail is
+/// then redacted, so the user approves the placeholder, never reads the value.
 pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> ApprovalPreview {
     let text = python_json_dumps(&Value::Object(call.arguments.clone()), false);
     let summary = if text.chars().count() <= SUMMARY_LIMIT {
@@ -98,7 +102,12 @@ pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> App
     ApprovalPreview {
         summary,
         detail: tool
-            .preview(&call.arguments, ctx)
+            .preview(
+                &crate::tools::with_secrets(tool, call, ctx)
+                    .map_or_else(|_| call.arguments.clone(), |call| call.arguments.clone()),
+                ctx,
+            )
+            .map(|detail| ctx.secrets.redact(&detail))
             .filter(|detail| !detail.is_empty()),
         lexer: tool.preview_lexer(),
     }

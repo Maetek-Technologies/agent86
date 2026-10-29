@@ -387,3 +387,123 @@ fn the_tool_schema_is_pinned() {
     expected.insert("type".to_owned(), json!("object"));
     assert_eq!(tool.parameters(), Value::Object(expected));
 }
+
+/// The `.env` file, with Windows' text-mode line endings undone.
+fn env_file(workspace: &Workspace) -> String {
+    std::fs::read_to_string(workspace.root.join(".env"))
+        .unwrap()
+        .replace("\r\n", "\n")
+}
+
+#[test]
+fn file_tools_write_the_value_a_placeholder_names() {
+    let workspace = Workspace::new("placeholders");
+    let ctx = context(&workspace.root);
+    ctx.secrets.set("API_TOKEN", VALUE.to_owned());
+    let registry = default_registry(false, false, false, false);
+
+    let written = registry.dispatch(
+        &call(
+            "write_file",
+            json!({"path": ".env", "content": format!("API_TOKEN={PLACEHOLDER}\nOTHER=1\n")}),
+        ),
+        &ctx,
+    );
+    assert!(written.ok, "{:?}", written.error);
+    assert_eq!(
+        env_file(&workspace),
+        format!("API_TOKEN={VALUE}\nOTHER=1\n")
+    );
+    assert!(!written.content.contains(VALUE), "{}", written.content);
+
+    // What the model reads back, it can edit: the placeholder matches the value.
+    let read = registry.dispatch(&call("read_file", json!({"path": ".env"})), &ctx);
+    let line = read.content.lines().next().unwrap().to_owned();
+    assert_eq!(line, format!("API_TOKEN={PLACEHOLDER}"));
+    let edited = registry.dispatch(
+        &call(
+            "edit_file",
+            json!({
+                "path": ".env",
+                "old_string": format!("{line}\nOTHER=1"),
+                "new_string": format!("{line}\nOTHER=2"),
+            }),
+        ),
+        &ctx,
+    );
+    assert!(edited.ok, "{:?}", edited.error);
+    assert_eq!(
+        env_file(&workspace),
+        format!("API_TOKEN={VALUE}\nOTHER=2\n")
+    );
+    assert!(!edited.content.contains(VALUE), "{}", edited.content);
+}
+
+#[test]
+fn an_unknown_placeholder_fails_and_writes_nothing() {
+    let workspace = Workspace::new("unknown");
+    let ctx = context(&workspace.root);
+    ctx.secrets.set("API_TOKEN", VALUE.to_owned());
+    let registry = default_registry(false, false, false, false);
+
+    let result = registry.dispatch(
+        &call(
+            "write_file",
+            json!({"path": ".env", "content": "KEY=${secret:STRIPE_KEY}\n"}),
+        ),
+        &ctx,
+    );
+    assert!(!result.ok);
+    assert_eq!(
+        result.error.as_deref(),
+        Some(
+            "Unknown secret STRIPE_KEY in ${secret:STRIPE_KEY}. The secrets held are \
+             API_TOKEN; ask the user for it with request_secret."
+        )
+    );
+    assert_eq!(result.call_id, "c1");
+    assert!(!workspace.root.join(".env").exists());
+}
+
+#[test]
+fn only_the_file_writing_tools_expand_placeholders() {
+    // A command line or an MCP server never gets a value this way: commands use the
+    // environment variable, and everything else gets the placeholder text.
+    let registry = default_registry(true, true, true, true);
+    let expanding: Vec<String> = registry
+        .names()
+        .into_iter()
+        .filter(|name| registry.get(name).unwrap().expands_secrets())
+        .collect();
+    assert_eq!(expanding, ["edit_file", "write_file"]);
+}
+
+#[test]
+fn the_approval_preview_shows_the_real_change_with_the_value_hidden() {
+    let workspace = Workspace::new("preview");
+    std::fs::write(
+        workspace.root.join(".env"),
+        format!("API_TOKEN={VALUE}\nOTHER=1\n"),
+    )
+    .unwrap();
+    let ctx = context(&workspace.root);
+    ctx.secrets.set("API_TOKEN", VALUE.to_owned());
+    let registry = default_registry(false, false, false, false);
+    let tool = registry.get("write_file").unwrap();
+    let request = call(
+        "write_file",
+        json!({"path": ".env", "content": format!("API_TOKEN={PLACEHOLDER}\nOTHER=2\n")}),
+    );
+
+    let preview = agent86::approval::build_preview(tool.as_ref(), &request, &ctx);
+    let detail = preview.detail.unwrap();
+    assert!(!detail.contains(VALUE), "{detail}");
+    // The token line is unchanged context; only OTHER changes.
+    assert!(
+        detail.contains(&format!("\n API_TOKEN={PLACEHOLDER}\n")),
+        "{detail}"
+    );
+    assert!(detail.contains("\n-OTHER=1\n+OTHER=2"), "{detail}");
+    assert!(!detail.contains("-API_TOKEN"), "{detail}");
+    assert!(preview.summary.contains(PLACEHOLDER), "{}", preview.summary);
+}

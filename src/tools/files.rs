@@ -226,6 +226,12 @@ impl Tool for WriteFileTool {
         true
     }
 
+    /// Beyond Python: `${secret:NAME}` is written as the secret's value, so the model
+    /// can put a key in a file (`.env`) without ever seeing it.
+    fn expands_secrets(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "properties": {
@@ -335,6 +341,12 @@ impl Tool for EditFileTool {
     }
 
     fn side_effecting(&self) -> bool {
+        true
+    }
+
+    /// Beyond Python: `${secret:NAME}` is written as the secret's value, so the model
+    /// can put a key in a file (`.env`) without ever seeing it.
+    fn expands_secrets(&self) -> bool {
         true
     }
 

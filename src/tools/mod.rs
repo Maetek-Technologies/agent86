@@ -71,6 +71,14 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Beyond Python: whether `${secret:NAME}` in this tool's string arguments is
+    /// replaced by the user's secret when it runs (`crate::vault`). Only for tools
+    /// that put a value where the user can see and approve it (a file write), never
+    /// one that would carry it onto a command line or to a server.
+    fn expands_secrets(&self) -> bool {
+        false
+    }
+
     /// The JSON Schema of the arguments, exactly as Python's pydantic models advertise it.
     fn parameters(&self) -> Value;
 
@@ -699,7 +707,13 @@ impl ToolRegistry {
     fn dispatch_unredacted(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
         match self.get(&call.name) {
             Some(_) if !ctx.allowed_tool(&call.name) => skill_refusal(call, ctx),
-            Some(tool) => tool.run(call, ctx),
+            Some(tool) => match with_secrets(tool.as_ref(), call, ctx) {
+                Ok(call) => tool.run(&call, ctx),
+                Err(error) => ToolResult {
+                    call_id: call.id.clone(),
+                    ..failure(&call.name, error)
+                },
+            },
             None => ToolResult {
                 call_id: call.id.clone(),
                 ..failure(
@@ -713,6 +727,29 @@ impl ToolRegistry {
             },
         }
     }
+}
+
+/// `call` as `tool` runs it: with `${secret:NAME}` in its arguments replaced by the
+/// values, for a tool that [`Tool::expands_secrets`], or unchanged. The call the
+/// loop keeps (history, trace, approval summary) is never the expanded one.
+pub fn with_secrets<'a>(
+    tool: &dyn Tool,
+    call: &'a ToolCall,
+    ctx: &ToolContext,
+) -> Result<std::borrow::Cow<'a, ToolCall>, String> {
+    if !tool.expands_secrets() {
+        return Ok(std::borrow::Cow::Borrowed(call));
+    }
+    let Value::Object(arguments) = ctx
+        .secrets
+        .expand_value(&Value::Object(call.arguments.clone()))?
+    else {
+        unreachable!("an object expands to an object")
+    };
+    Ok(std::borrow::Cow::Owned(ToolCall {
+        arguments,
+        ..call.clone()
+    }))
 }
 
 /// The answer to a call the active skill's `allowed-tools` forbid, naming the
