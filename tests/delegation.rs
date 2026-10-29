@@ -179,14 +179,18 @@ async fn a_delegated_task_runs_on_a_sub_agent_whose_answer_is_the_result() {
 
     // The sub-agent's request: its persona over the parent's system content, the
     // task as the only user message, and every tool (depth 1 may still delegate).
+    // Beyond Python, the time the sub-agent started ends it.
     let sub = &requests[1].body["messages"];
+    let system = sub[0]["content"].as_str().unwrap();
+    let (head, time) = system.split_once("\n\nCurrent date and time: ").unwrap();
     assert_eq!(
-        sub[0]["content"],
+        head,
         format!(
             "{}\n\nYou are a test.",
             ROLE_PREAMBLE.replace("{role}", "researcher")
         )
     );
+    assert!(time.contains(" UTC. Tool results can be cached"), "{time}");
     assert_eq!(sub[1]["role"], "user");
     assert_eq!(
         sub[1]["content"],

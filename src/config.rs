@@ -277,6 +277,12 @@ pub struct McpServerConfig {
     pub call_timeout_s: f64,
     #[serde(default = "default_mcp_max_result_chars")]
     pub max_result_chars: usize,
+    /// Arguments to add to a tool's calls when the model leaves them out, by the
+    /// server's own tool name: `[mcp.servers.<name>.defaults] tool = { arg = value }`.
+    /// Only arguments the tool's schema declares are added; the model's own win.
+    /// Beyond Python, which has no such setting.
+    #[serde(default)]
+    pub defaults: indexmap::IndexMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 impl McpServerConfig {

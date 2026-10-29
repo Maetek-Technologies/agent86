@@ -32,6 +32,7 @@ use crate::memory::working::{
     SUMMARY_MAX_TOKENS, SUMMARY_SYSTEM_PROMPT,
 };
 use crate::observability::Recorder;
+use crate::prompt::time_note;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
 use crate::router::Router;
@@ -618,6 +619,12 @@ impl Harness {
             .memory
             .as_ref()
             .and_then(|memory| memory.recall_note(goal));
+        // Beyond Python: the time the turn started, then what was recalled.
+        let time = time_note(&chrono::Local::now());
+        let recall_note = Some(match recall_note {
+            Some(recalled) => format!("{time}\n\n{recalled}"),
+            None => time,
+        });
         // Where this turn begins: compaction never reaches past it, so the ask being
         // answered right now is never summarized away.
         let mut turn_start = state.messages.len();

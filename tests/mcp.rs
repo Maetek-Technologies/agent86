@@ -443,6 +443,31 @@ fn a_hung_server_times_out_connecting() {
 }
 
 #[test]
+fn configured_defaults_fill_in_what_the_model_left_out() {
+    let dir = TempDir::new("defaults");
+    let Some(config) = server_config(
+        &dir.0,
+        "test",
+        "normal",
+        "[mcp.servers.test.defaults]\nadd = { b = 10 }\necho = { text = 'from config' }\n",
+    ) else {
+        return;
+    };
+    let manager = McpManager::start(&config).unwrap();
+    let tools = manager.tools();
+    let ctx = ToolContext::new(&dir.0).unwrap();
+    let run = |name: &str, arguments: Value| tool(&tools, name).run(&call(name, arguments), &ctx);
+
+    // A default can supply a required argument, even on the deferred first call.
+    let echoed = run("mcp__test__echo", json!({}));
+    assert!(echoed.ok, "{echoed:?}");
+    assert_eq!(echoed.content, "from config");
+    assert_eq!(run("mcp__test__add", json!({"a": 1})).content, "11");
+    // The model's own argument wins.
+    assert_eq!(run("mcp__test__add", json!({"a": 1, "b": 2})).content, "3");
+}
+
+#[test]
 fn tools_are_listed_called_and_deferred() {
     let dir = TempDir::new("live");
     let Some(config) = server_config(

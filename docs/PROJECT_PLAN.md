@@ -141,6 +141,10 @@ The Python implementation remains the reference and compatibility oracle. This p
   - the skill roots join the sandbox's allowed roots, so a skill's bundled files outside the workspace can be read
   - `/skills` lists `name - description`
   - live check (2026-10-27, local Ollama, `gemma4:12b`, throwaway workspace and home): asked to use a project skill, the model called `use_skill`, got its instructions, and read the file they named with the one tool the skill allows
+- Added the current time and MCP default arguments, deliberate additions for stale data. A live run asked for a game's current score: Firecrawl served a copy of the scoreboard cached eight hours before tip-off, and the model, which had no way to know the time, reported it as live:
+  - every turn's system message ends with `Current date and time: <weekday>, <date> <time> (UTC<offset>), which is <date> <time> UTC.` and a reminder that tool results can be cached or out of date, before any recall note. It is fixed when the turn starts, so the turn's steps send one prompt; a sub-agent gets the time it started. Python's prompt carries no date
+  - `[mcp.servers.<name>.defaults]` maps a server's tool name to arguments added to its calls when the model leaves them out, for example `firecrawl_scrape = { maxAge = 0 }`. Only arguments the tool's schema declares are added (a schema with no properties accepts any), the model's own win, and a default can satisfy a required argument on the deferred first call. The call kept in the history, the trace, and the approval preview is the model's own; `/config mcp` edits leave the table alone
+  - live check (2026-10-29, local Ollama, `qwen3.5:9b-262k`, Firecrawl with `maxAge = 0` as a default): the model scraped the scoreboard without naming `maxAge`, Firecrawl scraped it fresh (no `cacheState`), and the model reported the live fourth-quarter score correctly
 - Added context-window fitting and compaction, ported from `memory/working.py` and the compaction path in `orchestration/loop.py`:
   - every request is fitted to the model's real window: the window (`context_window_for`, with OpenRouter's own figure) minus the system message and the tool catalogue, minus `[limits] context_reserve_tokens` (4096) and the output cap (together clamped to half the window), floored at 1024 tokens, then capped by `[limits] max_context_tokens` (0, no cap); tokens are Python's estimate (code points over 4, counting tool names and arguments); the oldest messages are dropped first and a leading tool result never survives without its call
   - before each model call, a history over budget has its oldest span (never the last six messages, the current turn, or half of a tool block) replaced by a summary the model writes under Python's instructions (`GOAL`, `DECISIONS`, `FACTS`, `OPEN`), merged into the next user message as `[Conversation summary — earlier turns compacted]`; the turn streams `[compacted N messages into a summary]`, the summary call's usage and cost count toward the turn, the trace gets Python's `compaction` event, the replaced messages are archived as a `kind = "compaction"` episode (as Python's pydantic dump), and the session is saved at once
@@ -276,6 +280,7 @@ The agent works end to end, but it does not yet have:
 - The summary request can be cancelled; Python's blocks until it returns, and the turn stops at the next safe point.
 - A cancel also wakes a response that has stopped streaming; Python checks only as each delta arrives.
 - A deliberate addition: a final reply with no text is asked about once (`[no answer; asking the model again]`, one more step), and if the second is empty too the model's reasoning stands in for the answer (`[no answer; showing the model's reasoning]`) or the turn says `[the model gave no answer]`. Python ends the turn with the empty reply. The `empty_answer` trace event has no Python counterpart.
+- A deliberate addition: the system message ends with the current local time and UTC, fixed per turn (and per sub-agent), followed by any recall note. Python's has no date. On Anthropic the system block's cache entry is rewritten each turn, as it already was whenever memory recalled something; the tools keep their own cache marker.
 
 ### Known approval differences from Python
 
@@ -329,6 +334,7 @@ The agent works end to end, but it does not yet have:
 - The `initialize` request names the client `agent86` with the crate version; the Python SDK sends its own client info.
 - On Windows a bare `command` is looked up on PATH with `PATHEXT`, so `npx` finds `npx.cmd`, as the Python SDK does.
 - `mcp list` and `mcp tools` print plain aligned tables with the same columns as Python's Rich tables.
+- A deliberate addition: `[mcp.servers.<name>.defaults]` adds configured arguments to a tool's calls when the model leaves them out. Python has no such setting and ignores the table.
 
 ### Known flight-recorder differences from Python
 

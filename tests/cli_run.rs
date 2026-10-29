@@ -101,6 +101,15 @@ fn stderr(output: &Output) -> String {
     text(&output.stderr)
 }
 
+/// A turn's system message without the time line every turn ends it with.
+fn without_time(system: &str) -> &str {
+    let (head, note) = system
+        .rsplit_once("\n\nCurrent date and time: ")
+        .unwrap_or_else(|| panic!("no time line: {system}"));
+    assert!(note.contains(" UTC. Tool results can be cached"), "{note}");
+    head
+}
+
 /// An `/api/show` answer reporting `length` as the model's trained context.
 fn ollama_show(length: u64) -> Reply {
     Reply::Status {
@@ -291,7 +300,10 @@ Environment: agent86 v{}. Default model: mock:test/model. Sandbox: subprocess.",
         fixture("prompt/base_identity.txt").trim(),
         env!("CARGO_PKG_VERSION"),
     );
-    assert_eq!(messages[0]["content"], expected_system.as_str());
+    assert_eq!(
+        without_time(messages[0]["content"].as_str().unwrap()),
+        expected_system
+    );
     assert_eq!(
         messages[1],
         serde_json::json!({"role": "user", "content": "Say hello"})
@@ -598,7 +610,7 @@ async fn the_system_prompt_reports_overridden_model_and_sandbox() {
         .unwrap()
         .to_owned();
     assert!(
-        system.ends_with("Default model: mock:other-model. Sandbox: docker."),
+        without_time(&system).ends_with("Default model: mock:other-model. Sandbox: docker."),
         "{system}"
     );
 }
@@ -1820,7 +1832,7 @@ async fn skills_are_advertised_loaded_and_enforce_their_tool_list() {
     // Advertised: names and one-line descriptions in the system message, and the tool.
     let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
     assert!(
-        system.ends_with(
+        without_time(system).ends_with(
             "\n\nAvailable skills (call use_skill with the name to load full instructions):\n\
              - release-notes: Draft release notes from the changelog. [tools while active: read_file]\n\
              - style: House style."
