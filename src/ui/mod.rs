@@ -13,6 +13,7 @@
 //! (Git Bash's mintty without winpty) falls back to the plain loop with a note.
 
 mod app;
+mod banner;
 mod diff;
 mod entries;
 mod input;
@@ -36,8 +37,8 @@ use crate::mentions::expand_mentions;
 use crate::provider::capabilities::context_window_with;
 use crate::provider::remote_windows::{cache_path, openrouter_context_window};
 use crate::repl::{
-    compact_banner, find_command_for_line, now, plain_loop, session_label, start_repl, Action,
-    Choice, Repl, Style, NO_MEMORY_NOTE,
+    find_command_for_line, now, plain_loop, session_label, start_repl, Action, Choice, Repl, Style,
+    NO_MEMORY_NOTE,
 };
 use crate::secrets::SecretStore;
 use app::{App, Effect, Request, UiEvent};
@@ -46,7 +47,7 @@ use manage::Manager;
 use panels::{KeyPurpose, SavePurpose};
 use picker::{Picker, PickerKind};
 use screen::Screen;
-use status::StatusState;
+use status::{short_path, StatusState};
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::sync::mpsc;
@@ -201,6 +202,10 @@ fn status_from(repl: &Repl) -> StatusState {
     });
     StatusState {
         model: repl.harness.active_provider().model().to_owned(),
+        cwd: short_path(
+            repl.harness.context.policy.workspace(),
+            crate::config::home_dir().as_deref(),
+        ),
         used_tokens: repl
             .state
             .steps
@@ -218,6 +223,12 @@ fn status_from(repl: &Repl) -> StatusState {
         cache_read_tokens: usage.cache_read_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
     }
+}
+
+/// Print the startup header (Python prints its compact banner at these points).
+fn commit_header(app: &mut App) {
+    let header = banner::header(env!("CARGO_PKG_VERSION"), &app.status.cwd, app.width());
+    app.commit_text(&header);
 }
 
 fn run(repl: &mut Repl) -> io::Result<()> {
@@ -263,7 +274,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     app.set_size(usize::from(width), usize::from(height));
     app.workspace = Some(repl.harness.context.policy.workspace().to_path_buf());
     app.markdown = repl.config.ui.markdown;
-    app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+    commit_header(&mut app);
     for note in &repl.startup_notes {
         app.note(Style::Dim, note);
     }
@@ -417,7 +428,7 @@ fn dispatch(
                 // The old exchange is gone from the session, so it leaves the screen too.
                 app.clear_transcript();
                 screen.clear_all()?;
-                app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+                commit_header(app);
             } else if let Some(render) = &result.render {
                 app.commit_text(render);
             }
@@ -469,7 +480,7 @@ fn resume_picked(
         Ok(note) => {
             app.clear_transcript();
             screen.clear_all()?;
-            app.commit_text(&compact_banner(&repl.config, env!("CARGO_PKG_VERSION")));
+            commit_header(app);
             app.replay(&repl.state.messages);
             app.note(Style::Dim, &note);
         }

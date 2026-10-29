@@ -1047,6 +1047,11 @@ impl App {
 
     // ---- the live region --------------------------------------------------
 
+    /// The terminal's width in cells.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
     /// The live region's lines, each fitting the width, and the caret.
     pub fn live(&mut self) -> (Vec<Line>, Caret) {
         let width = self.width;
@@ -1253,6 +1258,7 @@ mod tests {
     fn status() -> StatusState {
         StatusState {
             model: "gpt-4o-mini".into(),
+            cwd: String::new(),
             used_tokens: 0,
             window: 128_000,
             output_tokens: 0,

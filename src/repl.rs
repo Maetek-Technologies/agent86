@@ -70,11 +70,16 @@ pub enum Style {
     DimYellow,
     Italic,
     BoldUnderline,
+    /// Bold in one of the 256 terminal colours (the interface's logo gradient).
+    BoldColor(u8),
 }
 
 impl Style {
-    pub(crate) fn ansi(self) -> &'static str {
-        match self {
+    pub(crate) fn ansi(self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(match self {
+            Self::BoldColor(index) => {
+                return std::borrow::Cow::Owned(format!("\x1b[1;38;5;{index}m"));
+            }
             Self::Plain => "",
             Self::Dim => "\x1b[2m",
             Self::Bold => "\x1b[1m",
@@ -88,7 +93,7 @@ impl Style {
             Self::DimYellow => "\x1b[2;33m",
             Self::Italic => "\x1b[3m",
             Self::BoldUnderline => "\x1b[1;4m",
-        }
+        })
     }
 }
 
@@ -204,21 +209,6 @@ pub fn banner(config: &Config, version: &str) -> Text {
             (Style::Cyan, config.guardrails.approval.as_str().into()),
         ],
         vec![(Style::Dim, "Type /help for commands, /exit to quit.".into())],
-    ])
-}
-
-/// The full-screen interface's banner, as Python's `banner(cfg)` (`compact=True`):
-/// the version and the model; the status line reports the rest live.
-pub fn compact_banner(config: &Config, version: &str) -> Text {
-    panel(vec![
-        vec![
-            (Style::Plain, "version  ".into()),
-            (Style::Cyan, version.into()),
-        ],
-        vec![
-            (Style::Plain, "model    ".into()),
-            (Style::Cyan, config.model.default.clone()),
-        ],
     ])
 }
 
