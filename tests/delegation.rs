@@ -68,7 +68,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
         provider: std::sync::Arc::new(provider),
         router: Default::default(),
         tracer: Default::default(),
-        registry: default_registry(false, false, true),
+        registry: default_registry(false, false, true, false),
         context: ToolContext::new(&workspace.0).unwrap(),
         limits: LimitsConfig {
             max_steps: 40,
@@ -387,7 +387,7 @@ async fn bad_arguments_failures_and_disabled_delegation_are_tool_errors() {
 #[test]
 fn delegate_is_registered_only_when_agents_are_on_and_never_runs_in_parallel() {
     use agent86::tools::Tool;
-    assert!(!default_registry(false, false, false)
+    assert!(!default_registry(false, false, false, false)
         .names()
         .contains(&"delegate".to_owned()));
     let schemas: Value = serde_json::from_str(&support::fixture("skills/schemas.json")).unwrap();

@@ -480,6 +480,40 @@ async fn limits_are_shown_set_for_the_session_and_reset() {
 }
 
 #[tokio::test]
+async fn secrets_cannot_be_entered_on_piped_input_and_the_agent_is_not_offered_the_tool() {
+    // Beyond Python. With no terminal the value could not be hidden, so `/secret`
+    // refuses, and the model is offered exactly Python's tools.
+    let server = MockServer::start(vec![sse_text("Hello", "stop")]).await;
+    let workspace = Workspace::new("secret", &server);
+    workspace.write_config(&format!(
+        "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n",
+        server.base_url
+    ));
+
+    let text = stdout(
+        &workspace
+            .repl(
+                &[],
+                "/secret\n/secret API_TOKEN\n/secret 1bad\n/secret forget API_TOKEN\n/secret a b c\nhi\n",
+            )
+            .await,
+    );
+
+    for line in [
+        "agent86> no secrets this session · /secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one\n",
+        "agent86> secret API_TOKEN can only be entered at a terminal, where the input can be hidden\n",
+        "agent86> '1bad' is not a valid name (letters, digits, and _, not starting with a digit)\n",
+        "agent86> no secret named API_TOKEN\n",
+        "agent86> /secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one\n",
+    ] {
+        assert!(text.contains(line), "{line:?} not in {text}");
+    }
+    let tools = server.requests()[0].body["tools"].to_string();
+    assert!(tools.contains("\"run_command\""), "{tools}");
+    assert!(!tools.contains("request_secret"), "{tools}");
+}
+
+#[tokio::test]
 async fn a_chosen_model_pins_the_session_and_stops_triage_routing() {
     let server =
         MockServer::start(vec![sse_text("Hi.", "stop"), sse_text("Hi again.", "stop")]).await;

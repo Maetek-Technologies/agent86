@@ -11,6 +11,7 @@ pub mod exec;
 pub mod files;
 pub mod memory;
 pub mod sandbox;
+pub mod secret;
 pub mod skills;
 pub mod web;
 
@@ -508,6 +509,9 @@ pub struct ToolContext {
     /// The skill `use_skill` activated this turn, whose `allowed-tools` restrict
     /// what may run. Shared by clones of the context.
     active_skill: Arc<std::sync::Mutex<Option<Arc<crate::skills::Skill>>>>,
+    /// Secrets the user entered (beyond Python): set in tool processes' environment,
+    /// and redacted from every result. Shared by clones and sub-agent forks.
+    pub secrets: crate::vault::SecretVault,
 }
 
 impl ToolContext {
@@ -520,6 +524,7 @@ impl ToolContext {
             memory: None,
             skills: Arc::default(),
             active_skill: Arc::default(),
+            secrets: crate::vault::SecretVault::default(),
         })
     }
 
@@ -678,7 +683,20 @@ impl ToolRegistry {
 
     /// Run `call`. The lock is released before the tool runs, so a long call never
     /// blocks the MCP manager from updating the registry.
+    ///
+    /// Every result passes through here, from the loop, its parallel reads, and
+    /// sub-agents, so this is where a secret the user entered is taken out of what a
+    /// tool returns, before the model, the transcript, or the trace sees it.
     pub fn dispatch(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+        let mut result = self.dispatch_unredacted(call, ctx);
+        if !ctx.secrets.is_empty() {
+            result.content = ctx.secrets.redact(&result.content);
+            result.error = result.error.map(|error| ctx.secrets.redact(&error));
+        }
+        result
+    }
+
+    fn dispatch_unredacted(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
         match self.get(&call.name) {
             Some(_) if !ctx.allowed_tool(&call.name) => skill_refusal(call, ctx),
             Some(tool) => tool.run(call, ctx),
@@ -724,8 +742,15 @@ fn same_tool(a: &Arc<dyn Tool>, b: &Arc<dyn Tool>) -> bool {
 
 /// Python's built-in tools, plus `remember` and `recall` when memory is on,
 /// `use_skill` when a skill was found, and `delegate` when `[agents]` is on, in
-/// its registration order (`default_registry`).
-pub fn default_registry(with_memory: bool, with_skills: bool, with_delegate: bool) -> ToolRegistry {
+/// its registration order (`default_registry`). Then, beyond Python,
+/// `request_secret` when someone is there to answer it (`with_secrets`), so an
+/// unattended run offers exactly Python's tools.
+pub fn default_registry(
+    with_memory: bool,
+    with_skills: bool,
+    with_delegate: bool,
+    with_secrets: bool,
+) -> ToolRegistry {
     let registry = builtin_registry();
     if with_memory {
         for tool in [
@@ -746,6 +771,11 @@ pub fn default_registry(with_memory: bool, with_skills: bool, with_delegate: boo
         registry
             .register(Box::new(delegate::DelegateTool))
             .expect("delegate is unique");
+    }
+    if with_secrets {
+        registry
+            .register(Box::new(secret::RequestSecretTool))
+            .expect("request_secret is unique");
     }
     registry
 }

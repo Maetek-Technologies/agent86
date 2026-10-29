@@ -293,6 +293,53 @@ fn previews_show_the_whole_command_up_to_sixty_lines() {
 }
 
 #[test]
+fn docker_passes_secrets_by_name_only() {
+    // Beyond Python: the value is in the docker client's environment, never argv,
+    // so a process list cannot show it.
+    let config = SandboxConfig {
+        mode: agent86::config::SandboxMode::Docker,
+        docker_image: "python:3.12-slim".to_owned(),
+        docker_memory: "512m".to_owned(),
+        docker_cpus: "1".to_owned(),
+        docker_network: false,
+        env_passthrough: Vec::new(),
+    };
+    let argv = DockerExecutor::new(&config).build_command_with_env(
+        Path::new("/home/me/proj"),
+        &ExecRequest::Shell("env".to_owned()),
+        None,
+        &["API_TOKEN", "DB_PASSWORD"],
+    );
+    let image = argv
+        .iter()
+        .position(|part| part == "python:3.12-slim")
+        .unwrap();
+    assert_eq!(
+        argv[image - 4..image],
+        ["-e", "API_TOKEN", "-e", "DB_PASSWORD"]
+    );
+}
+
+#[test]
+fn an_entered_secret_reaches_a_real_process_and_comes_back_redacted() {
+    let workspace = Workspace::new("secret-env");
+    let ctx = workspace.context();
+    ctx.secrets
+        .set("AGENT86_TEST_SECRET", "zq-entered-value".to_owned());
+    let command = if cfg!(windows) {
+        "echo [%AGENT86_TEST_SECRET%]"
+    } else {
+        "echo [$AGENT86_TEST_SECRET]"
+    };
+    let result = self::command(&ctx, command);
+    assert!(result.ok, "{:?}", result.error);
+    assert_eq!(
+        result.content,
+        "exit code: 0\nstdout:\n[${secret:AGENT86_TEST_SECRET}]"
+    );
+}
+
+#[test]
 fn docker_commands_isolate_the_container() {
     let config = SandboxConfig {
         mode: agent86::config::SandboxMode::Docker,

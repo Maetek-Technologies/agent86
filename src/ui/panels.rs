@@ -64,6 +64,9 @@ pub enum KeyPurpose {
     Provider,
     /// A `${VAR}` an MCP server needs (`/config mcp`).
     McpVar,
+    /// A secret for the agent to use (`/secret NAME`, beyond Python), held for the
+    /// session; `provider` is its name.
+    Secret,
 }
 
 /// Which chain a save belongs to.
@@ -87,6 +90,10 @@ pub struct KeyEntry {
     pub provider: String,
     keyring_ok: bool,
     text: String,
+    /// For a secret: why the agent asked (empty when the user did), and whether a
+    /// value is already held under the name.
+    reason: String,
+    replacing: bool,
 }
 
 impl KeyEntry {
@@ -96,6 +103,17 @@ impl KeyEntry {
             provider: provider.to_owned(),
             keyring_ok,
             text: String::new(),
+            reason: String::new(),
+            replacing: false,
+        }
+    }
+
+    /// Masked entry of the secret `name` (see `crate::vault`).
+    pub fn secret(name: &str, reason: &str, replacing: bool) -> Self {
+        Self {
+            reason: reason.trim().to_owned(),
+            replacing,
+            ..Self::new(KeyPurpose::Secret, name, false)
         }
     }
 
@@ -125,12 +143,10 @@ impl KeyEntry {
     }
 
     pub fn render(&self, width: usize) -> Vec<Line> {
-        let field = if self.text.is_empty() {
-            Line::styled(Style::Cyan, "> ").push(Style::Dim, "paste key (never shown)")
-        } else {
-            Line::styled(Style::Cyan, "> ")
-                .push(Style::Plain, "•".repeat(self.text.chars().count()))
-        };
+        if self.purpose == KeyPurpose::Secret {
+            return self.render_secret(width);
+        }
+        let field = self.field("paste key (never shown)");
         let note = if self.keyring_ok {
             "Stored in the OS keyring after a successful connection test."
         } else {
@@ -150,6 +166,41 @@ impl KeyEntry {
             width,
             "enter to continue · esc to cancel",
         )
+    }
+
+    /// The masked field: one dot per character, never the text.
+    fn field(&self, empty: &str) -> Line {
+        if self.text.is_empty() {
+            Line::styled(Style::Cyan, "> ").push(Style::Dim, empty)
+        } else {
+            Line::styled(Style::Cyan, "> ")
+                .push(Style::Plain, "•".repeat(self.text.chars().count()))
+        }
+    }
+
+    fn render_secret(&self, width: usize) -> Vec<Line> {
+        let inner = width.saturating_sub(4).max(1);
+        let mut rows = vec![Line::styled(
+            Style::Bold,
+            format!("Secret {}", sanitize(&self.provider)),
+        )];
+        if !self.reason.is_empty() {
+            rows.extend(
+                wrap_words(&sanitize(&self.reason), inner)
+                    .into_iter()
+                    .map(|row| Line::styled(Style::Dim, row)),
+            );
+        }
+        rows.push(Line::default());
+        rows.push(self.field("type or paste it (never shown)"));
+        rows.push(Line::default());
+        let note = if self.replacing {
+            "Replaces the value entered before. The agent sees only the name."
+        } else {
+            "Held for this session. The agent sees only the name."
+        };
+        rows.push(Line::styled(Style::Dim, note));
+        framed(rows, width, "enter to set · esc to decline")
     }
 }
 

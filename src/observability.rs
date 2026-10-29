@@ -131,6 +131,9 @@ pub struct Recorder {
     max_bytes: u64,
     keep: usize,
     writer: Mutex<Option<Writer>>,
+    /// The user's secrets (`crate::vault`), taken out of every event before the
+    /// configured redaction runs, whatever `redact` is set to.
+    secrets: crate::vault::SecretVault,
 }
 
 impl Recorder {
@@ -143,6 +146,7 @@ impl Recorder {
             max_bytes: 0,
             keep: 0,
             writer: Mutex::new(None),
+            secrets: Default::default(),
         }
     }
 
@@ -159,6 +163,7 @@ impl Recorder {
             max_bytes: config.max_trace_bytes,
             keep: config.keep_traces,
             writer: Mutex::new(None),
+            secrets: Default::default(),
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -178,6 +183,12 @@ impl Recorder {
         self.path.as_deref()
     }
 
+    /// Redact the values held in `secrets` from every event from now on.
+    pub fn with_secrets(mut self, secrets: crate::vault::SecretVault) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
     /// Record one event: `ts`, `session`, and `kind`, then `fields` in order.
     pub fn event(&self, session: &str, kind: &str, fields: Vec<(&str, Value)>) {
         let Ok(mut guard) = self.writer.lock() else {
@@ -193,6 +204,11 @@ impl Recorder {
         for (name, value) in fields {
             record.insert(name.to_owned(), value);
         }
+        let mut record = Value::Object(record);
+        self.secrets.redact_value(&mut record);
+        let Value::Object(record) = record else {
+            return;
+        };
         let record = redact_event(&record, self.redact, self.max_field_chars);
         let line = format!("{}\n", python_json_dumps(&Value::Object(record), false));
         if writer

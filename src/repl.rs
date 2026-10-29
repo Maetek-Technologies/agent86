@@ -318,7 +318,7 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 16] = [
+pub const COMMANDS: [CommandEntry; 17] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
@@ -420,6 +420,14 @@ pub const COMMANDS: [CommandEntry; 16] = [
         needs_choice: None,
         handler: |repl, arg| repl.limits(arg),
     },
+    // Beyond Python: a secret for the agent, entered hidden (see `crate::vault`).
+    CommandEntry {
+        name: "/secret",
+        usage: "/secret [NAME]",
+        description: "Enter a secret for the agent, hidden; list or forget them",
+        needs_choice: None,
+        handler: |repl, arg| repl.secret(arg),
+    },
     CommandEntry {
         name: "/sessions",
         usage: "/sessions",
@@ -455,6 +463,17 @@ pub const COMMANDS: [CommandEntry; 16] = [
         handler: |_, _| CommandResult::of(Action::Exit),
     },
 ];
+
+const SECRET_USAGE: &str =
+    "/secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one";
+
+/// The name `/secret <arg>` asks to enter, when that is what it asks.
+pub fn secret_to_enter(arg: &str) -> Option<&str> {
+    match arg.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [name] if *name != "forget" && crate::vault::valid_name(name) => Some(name),
+        _ => None,
+    }
+}
 
 const LIMITS_USAGE: &str = "/limits <steps|agent_steps|output> <n> sets one for this session · /limits reset · /limits save";
 
@@ -977,6 +996,41 @@ impl Repl {
         }
     }
 
+    /// `/secret`: list the names held, enter one (hidden, at the terminal; the
+    /// interface opens its panel before this runs), or forget one.
+    fn secret(&mut self, arg: &str) -> CommandResult {
+        let vault = &self.harness.context.secrets;
+        let words: Vec<&str> = arg.split_whitespace().collect();
+        let message = match words.as_slice() {
+            [] if vault.is_empty() => {
+                format!("no secrets this session · {SECRET_USAGE}")
+            }
+            [] => format!("secrets (values hidden): {}", vault.names().join(", ")),
+            ["forget", name] => {
+                if vault.remove(name) {
+                    format!("secret {name} forgotten")
+                } else {
+                    format!("no secret named {name}")
+                }
+            }
+            _ => match secret_to_enter(arg) {
+                Some(name) if !vault.can_ask() => format!(
+                    "secret {name} can only be entered at a terminal, where the input can be hidden"
+                ),
+                Some(name) if vault.ask(name, "") => {
+                    format!("secret {name} set for this session · the agent sees only its name")
+                }
+                Some(name) => format!("secret {name} not set"),
+                None if words.len() == 1 => format!(
+                    "'{}' is not a valid name (letters, digits, and _, not starting with a digit)",
+                    words[0]
+                ),
+                None => SECRET_USAGE.to_owned(),
+            },
+        };
+        CommandResult::message(message)
+    }
+
     fn set_limit(&mut self, name: &str, value: &str) -> String {
         let Some(kind) = LimitKind::parse(name) else {
             return format!("unknown limit '{name}' (steps|agent_steps|output)");
@@ -1425,8 +1479,10 @@ pub fn plain_loop(mut repl: Repl) {
         };
 
         let line = raw.trim();
-        // The unstripped line, so a prompt typed with a leading space stays out of the file.
-        repl.history().append(raw.trim_end());
+        // The unstripped line, so a prompt typed with a leading space stays out of the
+        // file; a secret the user entered is kept out of it too.
+        let kept = repl.harness.context.secrets.redact(raw.trim_end());
+        repl.history().append(&kept);
         let result = repl.handle_command(line);
         match result.action {
             Action::Exit => {
