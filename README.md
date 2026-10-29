@@ -50,7 +50,7 @@ With `[model] router = "triage"`, each turn goes to the cheap model (`[model.rou
 
 Long conversations are fitted to the model's real context window. When a session outgrows it, the oldest turns are replaced by a summary the model writes (goal, decisions, facts, open items), so a resumed session keeps its goal; the originals are archived in memory. `[limits] compaction = "drop"` drops them instead, and `max_context_tokens` caps the budget.
 
-An Ollama model gets the context window it was trained for, up to `[providers.ollama] num_ctx_max` (32768 by default, since Ollama allocates the whole window up front); setting `num_ctx` asks for exactly that size instead. Python always asks Ollama for 8192.
+An Ollama model gets the `num_ctx` its Modelfile sets (`PARAMETER num_ctx 262144`), as it is; without one, the context window it was trained for, up to `[providers.ollama] num_ctx_max` (32768 by default, since Ollama allocates the whole window up front). Setting `num_ctx` in `[providers.ollama]` asks for exactly that size instead. Python always asks Ollama for 8192.
 
 ## Install
 

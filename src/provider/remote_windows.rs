@@ -7,12 +7,12 @@
 //! asked: memoized per process, cached on disk for 24 hours, with a short timeout.
 //! Every failure gives `None`, so the caller falls through to the table.
 //!
-//! Ollama is asked too (`/api/show`), for the maximum that
-//! [`super::capabilities::ollama_num_ctx`] caps; that is beyond Python, which
-//! always asks Ollama for 8192. It is memoized per process only: a local model
-//! can be re-pulled at any time.
+//! Ollama is asked too (`/api/show`), for the window to run a model at
+//! ([`ollama_window`]); that is beyond Python, which always asks Ollama for 8192.
+//! It is memoized per process only: a local model can be re-pulled at any time.
 
-use super::catalog::{fetch_ollama_context_length, fetch_openai_compatible_context_lengths};
+use super::capabilities::DEFAULT_OLLAMA_NUM_CTX_MAX;
+use super::catalog::{fetch_ollama_show, fetch_openai_compatible_context_lengths, OllamaShow};
 use crate::config::{Config, ProviderConfig};
 use crate::secrets::{resolve_api_key, SecretStore};
 use serde_json::{json, Value};
@@ -30,9 +30,9 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 static MEMO: LazyLock<Mutex<HashMap<String, HashMap<String, u64>>>> =
     LazyLock::new(Default::default);
 
-/// (normalized Ollama base URL, model) to its context length; `None` is a
+/// (normalized Ollama base URL, model) to what `/api/show` said; `None` is a
 /// negative memo, so a server that is down is not asked again on every redraw.
-type OllamaLengths = HashMap<(String, String), Option<u64>>;
+type OllamaLengths = HashMap<(String, String), Option<OllamaShow>>;
 static OLLAMA_MEMO: LazyLock<Mutex<OllamaLengths>> = LazyLock::new(Default::default);
 
 /// The cache file Python shares: `~/.agent86/cache/model_context_windows.json`,
@@ -147,7 +147,25 @@ pub fn openrouter_context_window(
     models.get(&model.trim().to_lowercase()).copied()
 }
 
-/// The context length an Ollama model was trained for, or `None` (never fails).
+/// The window to run an Ollama model at when `[providers.ollama] num_ctx` is unset:
+/// the `num_ctx` its Modelfile sets, as it is, since someone chose that size for
+/// this model; else the length it was trained for, up to `num_ctx_max` (32768 by
+/// default), because Ollama allocates the whole window up front and a model's full
+/// 256k could leave the GPU and crawl. `None` when Ollama reports neither.
+pub fn ollama_window(section: Option<&ProviderConfig>, show: &OllamaShow) -> Option<u64> {
+    if let Some(num_ctx) = show.num_ctx.filter(|&num_ctx| num_ctx > 0) {
+        return Some(num_ctx);
+    }
+    let cap = section
+        .and_then(|section| section.num_ctx_max)
+        .filter(|&cap| cap > 0)
+        .unwrap_or(DEFAULT_OLLAMA_NUM_CTX_MAX);
+    show.context_length
+        .filter(|&length| length > 0)
+        .map(|length| length.min(u64::from(cap)))
+}
+
+/// [`ollama_window`] for `model`, asking the server (never fails).
 pub fn ollama_context_window(provider: &str, model: &str, config: &Config) -> Option<u64> {
     if provider != "ollama" {
         return None;
@@ -160,16 +178,12 @@ pub fn ollama_context_window(provider: &str, model: &str, config: &Config) -> Op
         .trim()
         .trim_end_matches('/')
         .to_owned();
-    let mut memo = OLLAMA_MEMO
+    let show = *OLLAMA_MEMO
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *memo
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry((base_url.clone(), model.to_owned()))
-        .or_insert_with(|| {
-            fetch_ollama_context_length(&base_url, model, FETCH_TIMEOUT)
-                .ok()
-                .flatten()
-        })
+        .or_insert_with(|| fetch_ollama_show(&base_url, model, FETCH_TIMEOUT).ok());
+    ollama_window(config.providers.get(provider), &show?)
 }
 
 /// What the server behind `provider` reports for `model`'s window: OpenRouter's
@@ -189,6 +203,48 @@ pub fn discover_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ollama_modelfile_num_ctx_is_used_as_is_and_a_trained_length_is_capped() {
+        let section = |num_ctx_max| ProviderConfig {
+            num_ctx_max,
+            ..Default::default()
+        };
+        let show = |context_length, num_ctx| OllamaShow {
+            context_length,
+            num_ctx,
+        };
+        // The trained length, capped at 32k by default or at `num_ctx_max`.
+        assert_eq!(
+            ollama_window(None, &show(Some(262_144), None)),
+            Some(32_768)
+        );
+        assert_eq!(ollama_window(None, &show(Some(4_096), None)), Some(4_096));
+        assert_eq!(
+            ollama_window(Some(&section(Some(65_536))), &show(Some(262_144), None)),
+            Some(65_536)
+        );
+        assert_eq!(
+            ollama_window(Some(&section(Some(0))), &show(Some(262_144), None)),
+            Some(32_768),
+            "a zero cap is no cap setting"
+        );
+        // A Modelfile's own num_ctx was chosen for the model: no cap, even past the
+        // trained length.
+        assert_eq!(
+            ollama_window(None, &show(Some(262_144), Some(262_144))),
+            Some(262_144)
+        );
+        assert_eq!(
+            ollama_window(
+                Some(&section(Some(16_384))),
+                &show(Some(8_192), Some(65_536))
+            ),
+            Some(65_536)
+        );
+        assert_eq!(ollama_window(None, &show(None, None)), None);
+        assert_eq!(ollama_window(None, &show(Some(0), Some(0))), None);
+    }
 
     #[test]
     fn openrouter_is_recognised_by_name_or_host() {

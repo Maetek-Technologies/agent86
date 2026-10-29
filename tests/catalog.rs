@@ -4,8 +4,8 @@ mod support;
 
 use agent86::config::ProviderConfig;
 use agent86::provider::catalog::{
-    fetch_catalog, fetch_ollama, fetch_ollama_context_length,
-    fetch_openai_compatible_context_lengths,
+    fetch_catalog, fetch_ollama, fetch_ollama_context_length, fetch_ollama_show,
+    fetch_openai_compatible_context_lengths, OllamaShow,
 };
 use std::time::Duration;
 use support::{MockServer, Reply};
@@ -130,6 +130,43 @@ async fn ollama_lists_its_tags_and_openrouter_reports_context_lengths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ollama_reports_a_modelfiles_num_ctx() {
+    // `parameters` as Ollama 0.40.7 shows a Modelfile with `PARAMETER num_ctx`.
+    let server = MockServer::start(vec![
+        json(serde_json::json!({
+            "parameters": "temperature                    1\ntop_k                          20\nnum_ctx                        262144\nstop                           \"<|im_end|>\"",
+            "model_info": {"general.architecture": "qwen35", "qwen35.context_length": 262144},
+        })),
+        json(serde_json::json!({
+            "parameters": "num_ctx_extra 7\ntemperature 1",
+            "model_info": {"llama.context_length": 131072},
+        })),
+    ])
+    .await;
+    let base = server.base_url.clone();
+    let shows = tokio::task::spawn_blocking(move || {
+        ["qwen3.5:9b-262k", "llama3.1:8b"]
+            .map(|model| fetch_ollama_show(&base, model, Duration::from_secs(3)))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        shows[0],
+        Ok(OllamaShow {
+            context_length: Some(262_144),
+            num_ctx: Some(262_144),
+        })
+    );
+    assert_eq!(
+        shows[1],
+        Ok(OllamaShow {
+            context_length: Some(131_072),
+            num_ctx: None,
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ollama_reports_a_models_trained_context_length() {
     // Trimmed from a real `/api/show` answer (Ollama 0.40.7, qwen3.5).
     let server = MockServer::start(vec![
@@ -163,6 +200,7 @@ async fn ollama_reports_a_models_trained_context_length() {
     );
     assert_eq!(lengths[2], Ok(None));
     assert!(lengths[3].is_err());
+
     let requests = server.requests();
     assert_eq!(requests[0].request_line, "POST /api/show HTTP/1.1");
     assert_eq!(
