@@ -322,12 +322,32 @@ pub fn apply(plan: &Plan, inherit: bool) -> Result<String, String> {
         open_in_browser(&page).map_err(|error| format!("could not open {page}: {error}"))?;
         return Ok(format!("opened {page}"));
     };
-    let moved = move_running_binary_aside();
+    let moved = if cfg!(windows) {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("could not find the running binary: {error}"))?;
+        Some(
+            move_aside(&exe, &std::env::temp_dir(), std::process::id(), *install).map_err(
+                |error| {
+                    format!(
+                        "could not move the running binary out of the installer's way \
+                         ({error}); quit agent86 and run: {}",
+                        words.join(" ")
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
     let result = run(&words, inherit);
-    if result.is_err() {
-        // Nothing was installed, so the old binary goes back where it was.
-        if let Some((from, to)) = moved {
-            let _ = std::fs::rename(to, from);
+    if let (Err(error), Some((from, to))) = (&result, &moved) {
+        // Nothing was installed, so the old binary goes back where it was. If the
+        // installer took its directory away, say so rather than leave it broken.
+        if std::fs::rename(to, from).is_err() && !from.exists() {
+            return Err(format!(
+                "{error}\nThe old binary could not be put back; quit agent86 and run: {}",
+                words.join(" ")
+            ));
         }
     }
     result.map(|()| format!("agent86 {latest} installed; restart agent86 to use it"))
@@ -372,31 +392,62 @@ fn run(words: &[String], inherit: bool) -> Result<(), String> {
     ))
 }
 
-/// The suffix of a binary moved aside by `/update`.
-const MOVED_ASIDE: &str = "old";
+/// What a binary moved aside by `/update` is named: `agent86-old-<pid>.exe` in the
+/// temporary directory, or `agent86.old` beside itself.
+const MOVED_PREFIX: &str = "agent86-old-";
+const MOVED_SIBLING: &str = "old";
 
-/// Windows will not overwrite a running executable, but it will rename one, so
-/// the running binary is moved aside before the installer writes the new one.
-/// Elsewhere the installer replaces the file and the running process keeps the
-/// old one open, so nothing moves. Returns where it was and where it went.
-fn move_running_binary_aside() -> Option<(PathBuf, PathBuf)> {
-    if !cfg!(windows) {
-        return None;
-    }
-    let exe = std::env::current_exe().ok()?;
-    let aside = exe.with_extension(MOVED_ASIDE);
+/// Windows will not overwrite a running executable, nor remove the directory that
+/// holds one, but it will move one within a volume. So before the installer runs,
+/// the running binary is moved out of its directory into `temp`: npm (and Volta,
+/// which replaces the whole package directory) can then install freely. If `temp`
+/// is on another volume, a cargo install, which replaces only the file, can make do
+/// with a rename beside it; an npm install cannot, so it is refused. Elsewhere the
+/// installer replaces the file while the process keeps the old one open, so
+/// nothing moves. Returns where the binary was and where it went.
+pub fn move_aside(
+    exe: &Path,
+    temp: &Path,
+    pid: u32,
+    install: Install,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    let aside = temp.join(format!("{MOVED_PREFIX}{pid}.exe"));
     let _ = std::fs::remove_file(&aside);
-    std::fs::rename(&exe, &aside).ok()?;
-    Some((exe, aside))
+    match std::fs::rename(exe, &aside) {
+        Ok(()) => Ok((exe.to_path_buf(), aside)),
+        Err(error) if install != Install::Cargo => Err(error),
+        Err(_) => {
+            let aside = exe.with_extension(MOVED_SIBLING);
+            let _ = std::fs::remove_file(&aside);
+            std::fs::rename(exe, &aside)?;
+            Ok((exe.to_path_buf(), aside))
+        }
+    }
 }
 
-/// Remove the binary a previous `/update` moved aside, once it no longer runs.
+/// Remove the binaries earlier `/update`s moved aside, once they no longer run (a
+/// running one cannot be deleted, so it is left for next time).
 fn remove_moved_aside() {
     if !cfg!(windows) {
         return;
     }
+    remove_stale(&std::env::temp_dir());
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(exe.with_extension(MOVED_ASIDE));
+        let _ = std::fs::remove_file(exe.with_extension(MOVED_SIBLING));
+    }
+}
+
+/// Delete `agent86-old-*.exe` in `dir`, skipping any that are still running.
+pub fn remove_stale(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(MOVED_PREFIX) && name.ends_with(".exe") {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
