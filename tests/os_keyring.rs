@@ -4,17 +4,17 @@
 //! throwaway entries with Python, run the test, then delete them:
 //!
 //! ```text
-//! python -c "import keyring; [keyring.set_password('agent86-rs-keyring-test', a, v) for a, v in (('first', 'one'), ('second', 'two'))]"
+//! python -c "import keyring; [keyring.set_password('agent86-keyring-test', a, v) for a, v in (('first', 'one'), ('second', 'two'))]"
 //! cargo test --test os_keyring -- --ignored
-//! python -c "import keyring; [keyring.delete_password('agent86-rs-keyring-test', a) for a in ('first', 'second')]"
+//! python -c "import keyring; [keyring.delete_password('agent86-keyring-test', a) for a in ('first', 'second')]"
 //! ```
 //!
 //! Writing two accounts exercises Python's Windows layout, where the second
-//! write moves the first account to `first@agent86-rs-keyring-test`.
+//! write moves the first account to `first@agent86-keyring-test`.
 
 use agent86::secrets::{OsKeyring, SecretStore};
 
-const SERVICE: &str = "agent86-rs-keyring-test";
+const SERVICE: &str = "agent86-keyring-test";
 
 #[test]
 #[ignore = "needs entries written to the real OS keyring by Python's keyring package"]
@@ -32,7 +32,7 @@ fn entries_written_by_python_keyring_are_readable() {
 #[ignore = "writes and deletes throwaway entries in the real OS keyring"]
 fn store_read_and_delete_round_trip() {
     let store = OsKeyring;
-    let service = "agent86-rs-roundtrip-test";
+    let service = "agent86-roundtrip-test";
 
     store.set_password(service, "first", "one").unwrap();
     store.set_password(service, "second", "two").unwrap();

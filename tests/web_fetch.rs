@@ -169,7 +169,7 @@ async fn html_pages_are_fetched_and_reduced() {
         sent.header("user-agent"),
         Some(
             format!(
-                "agent86/{} (+https://github.com/tdfleming/agent-86-rs)",
+                "agent86/{} (+https://github.com/Maetek-Technologies/agent86)",
                 env!("CARGO_PKG_VERSION")
             )
             .as_str()

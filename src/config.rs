@@ -13,8 +13,8 @@
 //! Secrets are never stored here: config only names the environment variable
 //! that holds each provider's key (`api_key_env`).
 //!
-//! Only the sections the Rust port uses so far are read; other sections are
-//! accepted and ignored.
+//! Only the sections agent86 uses are read; other sections are accepted and
+//! ignored.
 
 use crate::types::ApprovalMode;
 use serde::Deserialize;

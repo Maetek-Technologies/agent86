@@ -90,6 +90,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "agent86-rs $GITHUB_REF_NAME" \
+            --title "agent86 $GITHUB_REF_NAME" \
             --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
             --verify-tag

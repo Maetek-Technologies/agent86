@@ -1,9 +1,8 @@
-//! Compatibility-first Rust implementation of agent86.
+//! agent86, an agentic harness on the command line.
 //!
-//! The crate contains the provider-neutral vocabulary, layered configuration,
-//! the model provider layer, and a text-only one-shot turn. Orchestration,
-//! tools, persistence, and user interfaces will be added behind explicit
-//! compatibility tests as the port progresses.
+//! It began as a compatibility-first rewrite of the Python implementation, and
+//! keeps the formats the two share (config, sessions, memory, traces, keyring)
+//! compatible with it.
 
 pub mod agent;
 pub mod approval;
