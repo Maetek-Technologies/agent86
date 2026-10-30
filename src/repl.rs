@@ -320,7 +320,7 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 17] = [
+pub const COMMANDS: [CommandEntry; 18] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
@@ -457,6 +457,14 @@ pub const COMMANDS: [CommandEntry; 17] = [
             }
         },
     },
+    // Beyond Python: see `crate::update`.
+    CommandEntry {
+        name: "/update",
+        usage: "/update [now]",
+        description: "Check for a newer release; /update now installs it",
+        needs_choice: None,
+        handler: |_, arg| update_command(arg, true),
+    },
     CommandEntry {
         name: "/exit",
         usage: "/exit",
@@ -465,6 +473,32 @@ pub const COMMANDS: [CommandEntry; 17] = [
         handler: |_, _| CommandResult::of(Action::Exit),
     },
 ];
+
+/// `/update`: say whether a newer release exists and how to install it, and with
+/// `now`, install it. `inherit` lets the installer write to the terminal.
+pub fn update_command(arg: &str, inherit: bool) -> CommandResult {
+    let now = match arg.trim() {
+        "" => false,
+        "now" => true,
+        _ => return CommandResult::message("usage: /update [now]"),
+    };
+    let plan = match crate::update::plan() {
+        Ok(plan) => plan,
+        Err(error) => {
+            return CommandResult::handled(Text::styled(
+                Style::Red,
+                format!("could not check for a newer release: {error}"),
+            ))
+        }
+    };
+    if !now {
+        return CommandResult::message(plan.describe());
+    }
+    match crate::update::apply(&plan, inherit) {
+        Ok(text) => CommandResult::message(text),
+        Err(error) => CommandResult::handled(Text::styled(Style::Red, error)),
+    }
+}
 
 const SECRET_USAGE: &str =
     "/secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one";
@@ -1448,9 +1482,14 @@ pub fn plain_loop(mut repl: Repl) {
         }
     };
 
-    // A non-terminal stdout means output is piped or redirected: no decorative panel.
+    // A non-terminal stdout means output is piped or redirected: no decorative
+    // panel, and no new-version notice in the output either.
+    let (notices, notice) = std::sync::mpsc::channel();
     if std::io::stdout().is_terminal() {
         console.print(&banner(&repl.config, env!("CARGO_PKG_VERSION")));
+        crate::update::start(repl.config.ui.update_check, move |text| {
+            let _ = notices.send(text);
+        });
     }
     for note in &repl.startup_notes {
         let style = if note.starts_with("sandbox:") {
@@ -1465,6 +1504,9 @@ pub fn plain_loop(mut repl: Repl) {
     loop {
         for note in repl.pending_mcp_notes() {
             console.line(Style::Yellow, &note);
+        }
+        if let Ok(text) = notice.try_recv() {
+            console.line(Style::Dim, &text);
         }
         console.write(&Text::plain("agent86> "));
         let raw = match input.next() {

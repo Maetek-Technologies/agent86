@@ -107,6 +107,9 @@ pub enum UiEvent {
         id: u64,
         result: Result<Vec<(String, String)>, String>,
     },
+    /// A line to print from background work (the new-version check, `/update`).
+    /// Held until no turn runs and no panel is open, as a catalog is.
+    Note(Style, String),
 }
 
 /// What a catalog was fetched for, as Python's `CatalogReady.purpose`.
@@ -176,6 +179,8 @@ pub enum Request {
     McpForm(Box<McpDraft>),
     /// The MCP test ended.
     McpTested(McpTestOutcome),
+    /// A line from background work, to print now. Held as a catalog is.
+    Note(Style, String),
     /// A catalog arrived. Held until no turn runs and no panel is open.
     Catalog {
         provider: String,
@@ -621,6 +626,7 @@ impl App {
                 result,
                 purpose,
             }),
+            UiEvent::Note(style, text) => self.deferred.push_back(Request::Note(style, text)),
             UiEvent::McpTested { id, result } => {
                 if let Some(Panel::McpTest(test)) = &mut self.panel {
                     if test.id == id {
@@ -1997,6 +2003,23 @@ mod tests {
             app.take_request(),
             Some(Request::Catalog { provider, .. }) if provider == "groq"
         ));
+
+        // So does a note from background work, such as the new-version notice.
+        app.start_turn();
+        app.on_turn_event(UiEvent::Note(
+            Style::Dim,
+            "agent86 9.9.9 is available".into(),
+        ));
+        assert_eq!(app.take_request(), None);
+        app.on_turn_event(UiEvent::Finished(None));
+        assert_eq!(app.take_request(), Some(Request::TurnDone));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::Note(
+                Style::Dim,
+                "agent86 9.9.9 is available".into()
+            ))
+        );
 
         // A test's answer closes only the panel it belongs to.
         app.open_panel(Panel::Test(ConnectionTest::new(2, "groq:llama")));

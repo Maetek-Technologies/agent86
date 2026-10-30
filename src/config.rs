@@ -94,6 +94,7 @@ spinner = true
 history_file = "~/.agent86/history"
 history_size = 1000
 markdown = true
+update_check = true
 
 [guardrails]
 approval = "ask"
@@ -202,6 +203,10 @@ pub struct UiConfig {
     pub history_size: i64,
     /// Render answers as Markdown in the full-screen interface.
     pub markdown: bool,
+    /// Check GitHub, at most once a day, for a newer release and say so in the
+    /// interactive surfaces (beyond Python; see `crate::update`).
+    #[serde(default = "default_true")]
+    pub update_check: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

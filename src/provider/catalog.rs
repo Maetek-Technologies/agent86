@@ -57,7 +57,7 @@ fn bearer(api_key: Option<&str>) -> Vec<(&'static str, String)> {
 
 /// GET `url` and parse the body as JSON. Every failure (transport, status, body)
 /// becomes the one message Python gives, with any key in it redacted.
-fn get_json(
+pub(crate) fn get_json(
     url: &str,
     headers: &[(&str, String)],
     timeout: Duration,
