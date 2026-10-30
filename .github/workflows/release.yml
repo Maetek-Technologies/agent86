@@ -24,7 +24,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          # Linux builds on 22.04 (glibc 2.35): a binary needs a glibc at least as
+          # new as the one it was built against, and 24.04's 2.39 would rule out
+          # Debian and Raspberry Pi OS Bookworm (2.36) and Ubuntu 22.04.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
@@ -35,6 +39,15 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Check the glibc it needs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          need=$(objdump -T "target/${{ matrix.target }}/release/agent86" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "needs $need"
+          # Bookworm's 2.36 must run it: fail if it needs anything newer than 2.35.
+          [ "$(printf '%s\nGLIBC_2.35\n' "$need" | sort -V | tail -1)" = GLIBC_2.35 ]
       - name: Package
         shell: bash
         run: |
