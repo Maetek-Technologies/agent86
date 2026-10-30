@@ -57,7 +57,7 @@ impl Default for WebSettings {
 /// refuse generic or browser-spoofed ones.
 pub fn default_user_agent() -> String {
     format!(
-        "agent86/{} (+https://github.com/tdfleming/agent-86-rs)",
+        "agent86/{} (+https://github.com/Maetek-Technologies/agent86)",
         env!("CARGO_PKG_VERSION")
     )
 }

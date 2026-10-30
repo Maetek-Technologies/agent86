@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-This directory records decisions where the Rust port deliberately departs from the Python implementation, or chooses between designs that the Python code does not settle. Python's ADRs live in its own repository under `docs/adr/`; this directory has its own numbering.
+This directory records decisions where agent86 deliberately departs from the Python implementation it replaced, or chooses between designs that the Python code did not settle. Python's ADRs live in its archived repository ([agent86-python](https://github.com/Maetek-Technologies/agent86-python)) under `docs/adr/`; this directory has its own numbering.
 
 ## Convention
 

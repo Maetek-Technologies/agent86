@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A compatibility-first Rust port of [agent86](https://github.com/Maetek-Technologies/agent-86), a Python agentic CLI harness. **The Python implementation is the behavioral oracle**: the Rust code must reproduce its observable behavior (CLI output streams, exit codes, `run --json` fields, TOML config semantics, provider streaming/tool-call behavior, approvals, session/trace formats, error degradation), not its internal structure.
+agent86, an agentic CLI harness, in Rust: the standard agent86. It began as a compatibility-first rewrite of the [Python implementation](https://github.com/Maetek-Technologies/agent86-python), now archived and no longer developed. Python was the behavioral oracle during the rewrite, and what the two share must stay compatible: CLI output streams, exit codes, `run --json` fields, TOML config semantics, and the session database (`state_json`), trace, prompt history, and keyring formats, so Python users can switch without losing anything. New behavior is designed here; record each difference from Python in the plan.
 
 The CLI can run one text-only turn against any OpenAI-compatible provider (`agent86 --model provider:model run [--json] <goal>`), as an agent over the current directory: Python's system prompt, the ReAct loop, and `read_file`, `write_file`, `edit_file`, and `list_dir`, with side-effecting calls passing through the approval gate. Python's ingress, egress, and observation guardrails apply. `run_command` and `python_exec` run under the sandbox executor, and `web_fetch` is guarded against SSRF. Each run is a session saved in Python's SQLite memory database and resumable with `run --session`; finished turns are recorded as episodes and recalled into similar later tasks, and the agent can `remember` and `recall` facts (`agent86 memory` inspects the store), embedded with Python's default `all-MiniLM-L6-v2` run on candle from the shared Hugging Face cache. The flight recorder logs it to `~/.agent86/traces/trace.jsonl`. Configured MCP servers (stdio, streamable HTTP, or SSE) are started for each run and their tools registered next to the built-ins, and kept in step with drops, reconnects, and `list_changed` while the run goes on. `agent86` with no subcommand opens the interactive interface: Python's REPL (its slash commands, `@file` mentions, and prompt history) rendered inline in Claude Code's style, with an approval panel, a spinner, a live status line, and Escape or Ctrl+C to cancel a turn at its next safe point. `/config model` and `/config mcp` manage providers, keys, models, and MCP servers, writing config back with comments kept. `--plain`, `AGENT86_PLAIN`, or piped input gives Python's plain loop. `docs/PROJECT_PLAN.md` is the source of truth for current status, the next steps, the staged roadmap, known differences from Python, and the credential policy. Read it before starting feature work, and update it (plus the README status/roadmap) when a stage lands. Keep both honest about what is and is not implemented.
 
@@ -81,7 +81,7 @@ CI (`.github/workflows/ci.yml`) runs tests on Linux, macOS, and Windows against 
 - `tests/openai_provider.rs` with `tests/support/mod.rs`: a scripted HTTP/1.1 mock server (one `Reply` per connection: full status, SSE, truncated, or stalled) plus recorded fixtures in `tests/fixtures/openai/*.sse` (kept LF by `.gitattributes`).
 - `tests/cli_run.rs`: runs the real binary against the mock server inside a throwaway workspace whose `HOME`/`USERPROFILE`, working directory, and environment are isolated. Use this pattern for any test of CLI output or exit codes. `tests/repl.rs` does the same for the REPL, with piped stdin (so no banner, colour, or approval prompt).
 
-When porting a module, read the Python source first. It is public at `Maetek-Technologies/agent-86` (`src/agent86/...`); its comments explain why each behavior exists, and those reasons usually belong in the Rust doc comments too.
+When changing behavior that came from Python, read the Python source first. It is public at `Maetek-Technologies/agent86-python` (`src/agent86/...`); its comments explain why each behavior exists, and those reasons usually belong in the Rust doc comments too.
 
 Conventions encoded in the types that must be preserved:
 
@@ -89,12 +89,12 @@ Conventions encoded in the types that must be preserved:
 - `ModelRef::parse` splits `provider:model` on the **first** colon only and trims whitespace (`local:model:variant` gives model `model:variant`).
 - When a provider returns malformed tool-call JSON, the raw string is kept under `INVALID_TOOL_ARGS_KEY` (`"__invalid_json__"`) in `ToolCall.arguments` rather than failing; read it back with `ToolCall::invalid_arguments()`.
 
-## Working rules for this port
+## Working rules
 
 - Shell commands from the Bash tool collapse doubled backslashes, so write source or fixtures containing backslash escapes with the Write or Edit tools, never via heredocs.
 
-- Add behavior only together with tests that make the compatibility contract explicit. Compare observable behavior; don't copy Python implementation details. Design around Rust async ownership and cancellation instead of literally reproducing Python's threads and event loops.
-- Work in small vertical slices that follow the roadmap order. Don't broaden features beyond what the Python version does.
+- Add behavior only together with tests that make the contract explicit. For behavior shared with Python, compare observable behavior; don't copy Python implementation details. Design around Rust async ownership and cancellation instead of literally reproducing Python's threads and event loops.
+- Work in small vertical slices that follow the plan's next actions. Changes beyond what the Python version does are welcome when they fix real problems, and each is recorded in the plan as a deliberate difference.
 - `run --json` must emit exactly one JSON object on stdout with errors on stderr. Keep the field names `session_id`, `output`, `steps`, `usage`, `turn` from the start.
 - Default tests must need no credentials or network: use recorded fixtures (e.g. SSE) and local mock servers. Live provider smoke tests are opt-in only and stay out of normal CI.
 - Secrets come from environment variables or the OS keyring only. They must never appear in config files, logs, errors, tests, or commits, and secret-shaped values should be redacted in error and trace paths.

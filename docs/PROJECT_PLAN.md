@@ -1,30 +1,29 @@
-# agent86-rs Project Plan
+# agent86 Project Plan
 
 **Last updated:** 2026-10-30  
-**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done; turn limits adjustable at runtime (`/limits`, `run` flags, and the interface's offer to raise a limit), a deliberate addition beyond Python; secure secret entry, parts 1 and 2 (`request_secret`, `/secret`, environment injection, redaction, and `${secret:NAME}` placeholders in the file tools), another addition beyond Python; the remaining CLI commands (`models`, `config`, `skills`, `--sandbox`) done; triage routing and OpenTelemetry span export done; released as v1.0.0 (binaries for Linux, macOS, and Windows built by `.github/workflows/release.yml` from a `v*` tag, notes in `docs/releases/`)
+**Current stage:** First milestone complete; the Ollama provider (stage 2) ported; every model provider ported (Anthropic and llama.cpp added); pricing, the system prompt, and keyring keys ported; `agent86 keys` added; read-only workspace tools (stage 3) and the ReAct loop (stage 4) ported; approvals, file-writing tools, guardrails (stage 5), sandboxed command and Python execution (stage 6), `web_fetch`, sessions, and the flight recorder (stage 7) done; the MCP client (stage 8) done; the plain interactive REPL with turn cancellation (stage 9, part 1) done; the interactive interface (stage 9, parts 2 to 6) done as an inline, Claude Code-style interface ([ADR 0001](adr/0001-inline-terminal-interface.md), [design](INTERFACE.md)): the inline base, the `/` and `@` menus and the pickers, Markdown, diffs, and the transcript view, model catalogs, providers, keys, and config write-back, and MCP management; episodic and semantic memory (stage 10, part 1) and the local sentence-transformers embedder (stage 10, part 2) done, so every stage of the roadmap has landed; context-window fitting and compaction done; skills and delegation (`delegate` and sub-agents) done; turn limits adjustable at runtime (`/limits`, `run` flags, and the interface's offer to raise a limit), a deliberate addition beyond Python; secure secret entry, parts 1 and 2 (`request_secret`, `/secret`, environment injection, redaction, and `${secret:NAME}` placeholders in the file tools), another addition beyond Python; the remaining CLI commands (`models`, `config`, `skills`, `--sandbox`) done; triage routing and OpenTelemetry span export done; released as v1.0.0 (binaries for Linux, macOS, and Windows built by `.github/workflows/release.yml` from a `v*` tag, notes in `docs/releases/`); the standard agent86 since 2026-10-30, with the Python implementation archived
 
 ## 1. Purpose
 
-agent86-rs is an experimental, compatibility-first Rust implementation of [agent86](https://github.com/Maetek-Technologies/agent-86), the Python agentic command-line harness.
+agent86 is an agentic harness on the command line: it connects to remote or local models and lets them use tools and skills. This repository is the standard agent86. It began as a compatibility-first Rust rewrite of the original Python implementation, which it replaced on 2026-10-30.
 
-The goal is not to translate every Python file mechanically. It is to build a coherent Rust implementation that preserves the existing behavioral contracts while exploring:
+The rewrite did not translate the Python files mechanically. It built a coherent Rust implementation that kept the Python version's behavioral contracts, for:
 
-- Easier distribution of the core application as a native executable
+- Distribution as one native executable, with no Python installation needed
 - Fast startup and predictable resource usage
 - Explicit, compiler-checked state transitions and provider-neutral types
 - A unified async design for providers, tools, cancellation, and external processes
-- A testable migration path that keeps the Python implementation as the behavioral reference
 
-Performance and resource improvements should be measured rather than assumed. Model APIs, MCP servers, subprocesses, and I/O will remain the dominant latency sources for many workloads.
+Performance and resource improvements should be measured rather than assumed. Model APIs, MCP servers, subprocesses, and I/O remain the dominant latency sources for many workloads.
 
-## 2. Repository and reference implementation
+## 2. Repository and the Python implementation
 
-- **Rust implementation:** [tdfleming/agent-86-rs](https://github.com/tdfleming/agent-86-rs), currently private
-- **Behavioral reference:** [Maetek-Technologies/agent-86](https://github.com/Maetek-Technologies/agent-86)
+- **agent86:** [Maetek-Technologies/agent86](https://github.com/Maetek-Technologies/agent86), public
+- **The Python implementation (archived):** [Maetek-Technologies/agent86-python](https://github.com/Maetek-Technologies/agent86-python), formerly `agent-86`, and `agent86` on PyPI
 
-The Rust repository was created under the personal `tdfleming` account because organization OAuth restrictions prevented repository creation under `Maetek-Technologies`. It can be transferred later if desired.
+This repository started as `tdfleming/agent-86-rs`, under a personal account because organization OAuth restrictions then prevented creating repositories under `Maetek-Technologies`, and was transferred and renamed on 2026-10-30. GitHub redirects the old URLs.
 
-The Python implementation remains the reference and compatibility oracle. This project does not currently replace it.
+The Python implementation was the behavioral oracle while the rewrite was under way, and the per-feature fixtures in `tests/fixtures/` were produced from its sources and from CPython. It is no longer developed. What the two share (the config files, the session and memory database, the trace format, the prompt history, and the keyring layout) stays compatible, so people can switch without losing anything; new behavior is designed here, and each difference is recorded under section 3.
 
 ## 3. Current status
 
@@ -464,7 +463,7 @@ Stage 9 is delivered in parts, one PR each. The details and acceptance tests for
 
 ## 6. Compatibility strategy
 
-The Python implementation is the behavioral oracle. Compatibility should be tested through observable behavior, not by copying implementation details.
+The Python implementation was the behavioral oracle while the rewrite was under way, and the contracts below stay compatible with it for what the two share. Compatibility is tested through observable behavior, not by copying implementation details.
 
 Contracts to preserve include:
 
@@ -523,8 +522,8 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 
 Decided (2026-10-30): this implementation is the standard agent86, and the Python implementation is the legacy one. Python was the behavioral oracle while the port was under way; every stage of the roadmap has landed, and the work since (the reasoning guard, routing, secrets, limits) goes beyond it. The formats the two share stay compatible (the session database and `state_json`, the config files, the trace, and the keyring layout), so a Python user can switch without losing sessions, keys, or config. The steps, in order:
 
-1. **Audit before going public.** Scan the full history for secrets (for example `gitleaks detect` over every commit) and for personal paths or addresses in fixtures, docs, and tests; the credential policy says none were committed, and this checks it. Decide whether the LICENSE copyright stays with Tony Fleming or moves to Maetek Technologies.
-2. **Documentation and code, in one PR.** Remove every "-rs" (README title and text, this plan's title, CLAUDE.md, the release workflow's `agent86-rs <tag>` title, `Cargo.toml`'s `repository`, `web_fetch`'s User-Agent and its test, the keyring test service names, and the links in `docs/releases/`), point every link at `Maetek-Technologies/agent86`, and reword the "experimental, compatibility-first Rust implementation" framing: the README, section 1, and section 2 say this is agent86. The "Known ... differences from Python" sections stay, retitled as differences from the legacy Python implementation, since they are what someone switching needs to know. CLAUDE.md keeps its compatibility rules for the shared formats, but no longer calls Python the oracle for new behavior. The published GitHub release titles and bodies are edited to match.
+1. **Audit before going public** (done 2026-10-30). `gitleaks` over every commit found 7 matches, all made-up test values in fixtures and tests (`sk-test-0123456789abcdefghij`, `AKIAABCDEFGHIJKLMNOP`, `sk-or-v1-0123...`); no personal paths or addresses are in the tree or the history, beyond the commit authors' email addresses. The LICENSE copyright moved to Maetek Technologies.
+2. **Documentation and code, in one PR** (done 2026-10-30). Every "-rs" is gone (the README and plan titles, CLAUDE.md, the release title, `Cargo.toml`'s `repository` and description, `web_fetch`'s User-Agent and its test, the keyring test service names, and the links in `docs/releases/`), every link points at `Maetek-Technologies/agent86` or `agent86-python`, and the README, sections 1, 2, and 6, CLAUDE.md, and the ADR index say this is agent86. The README gained "Switching from the Python version". The "Known ... differences from Python" sections keep their titles, since they are what someone switching needs to know; CLAUDE.md keeps the compatibility rules for the shared formats, but Python is no longer the oracle for new behavior. Doc comments that say what was "ported from" Python stay, as history. The published GitHub release titles and bodies are edited to match after the transfer.
 3. **Rename the Python repository** `Maetek-Technologies/agent-86` to `agent86-python`, with a README notice pointing at `Maetek-Technologies/agent86` and how to switch, then archive it. GitHub keeps redirecting the old `agent-86` URLs to the renamed repository. If the Python package is on PyPI, a final release with the same notice tells pip users.
 4. **Transfer** `tdfleming/agent-86-rs` to `Maetek-Technologies` and rename it `agent86`. Issues, pull requests, releases, and tags move with it, and GitHub redirects the old URLs (the transfer needs repository-creation rights in the org, which an OAuth restriction once blocked; an org admin can do it from the repository's settings).
 5. **Make it public**, then set up what a public repository needs: branch protection on `main` (CI required), secret scanning with push protection, Dependabot alerts, and Actions limited to the workflows here. Check that the release workflow still runs (ARM runners are available to public repositories too), and update the local clones' `origin`.

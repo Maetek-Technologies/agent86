@@ -1,14 +1,14 @@
-# agent86-rs
+# agent86
 
-An experimental, compatibility-first Rust implementation of [agent86](https://github.com/Maetek-Technologies/agent-86), the agentic command-line harness.
+An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary.
 
-The Python implementation remains the reference. This repository starts with a small vertical foundation and adds behavior only with tests that make compatibility explicit.
+This is the standard agent86. It replaced the original [Python implementation](https://github.com/Maetek-Technologies/agent86-python), which is archived. It reads and writes the same config, sessions, memory, traces, and keyring entries, so you can switch from the Python version without losing anything.
 
 ![The interactive interface at startup: the AGENT 86 header, the input box with the working directory in its border, and the status line](docs/images/interface.png)
 
 ## Status
 
-**A working agent, short of Python's full feature set.** The repository currently contains:
+**Everything the Python version did, and more.** agent86 has:
 
 - Provider-neutral roles, phases, stop reasons, messages, tool calls, completions, steps, and usage accounting
 - `provider:model` parsing
@@ -54,26 +54,27 @@ An Ollama model gets the `num_ctx` its Modelfile sets (`PARAMETER num_ctx 262144
 
 ## Install
 
-Download the archive for your platform from [Releases](https://github.com/tdfleming/agent-86-rs/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/tdfleming/agent-86-rs --tag v1.0.5` (needs Rust 1.88 or newer).
+Download the archive for your platform from [Releases](https://github.com/Maetek-Technologies/agent86/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/Maetek-Technologies/agent86 --tag v1.0.5` (needs Rust 1.88 or newer).
 
 To publish a release, add notes for it in `docs/releases/<tag>.md`, set the version in `Cargo.toml`, merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives and creates the release.
 
+### Switching from the Python version
+
+Uninstall it first (`pip uninstall agent86`, or `pipx uninstall agent86` if you installed it with pipx): both install a command named `agent86`, and whichever comes first on your `PATH` runs. Your `~/.agent86` config, sessions, memory, traces, prompt history, and keyring keys carry over as they are. [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) lists every way this version behaves differently.
+
 ## Why Rust?
 
-The port explores easier binary distribution, fast startup, explicit typed state transitions, and a coherent async runtime. It is not based on an assumption that Python makes model API calls slow: model, network, tool, and I/O latency will remain dominant in many workloads.
+agent86 began in Python and was rewritten in Rust for one native binary that needs no Python installation, fast startup, explicit typed state transitions, and a single async runtime for providers, tools, cancellation, and processes. The rewrite does not assume Python made model calls slow: model, network, tool, and I/O latency still dominate most workloads.
 
-## Compatibility contracts
+## Compatibility
 
-The Python implementation is the behavioral oracle. As features are ported, compatibility work should preserve:
+The rewrite reproduced the Python version's observable behavior, checked by tests against fixtures produced from Python's own sources and CPython. What the two share stays compatible:
 
 - CLI output streams, exit codes, and `run --json`
 - TOML configuration semantics
-- Provider streaming and tool-call behavior
-- Tool approval and sandbox policy
-- Session persistence and trace formats
-- Graceful degradation and error behavior
+- The session and memory database, the trace format, the prompt history, and the keyring layout
 
-Compatibility tests should compare observable behavior rather than reproduce Python implementation details.
+Changes beyond the Python version are deliberate, and each is recorded in the project plan.
 
 ## Roadmap
 
