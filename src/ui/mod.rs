@@ -124,6 +124,8 @@ impl Terminal {
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
         let _ = crossterm::execute!(stdout, event::EnableBracketedPaste);
+        // Save the title (xterm's title stack), so it can be put back on the way out.
+        let _ = io::Write::write_all(&mut stdout, PUSH_TITLE.as_bytes());
         // Lets terminals that support it report Shift+Enter. Windows reports it anyway.
         let keyboard_enhanced = !cfg!(windows)
             && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
@@ -159,10 +161,19 @@ fn restore_terminal(keyboard_enhanced: bool) {
     let _ = crossterm::execute!(
         stdout,
         event::DisableBracketedPaste,
-        crossterm::cursor::Show
+        crossterm::cursor::Show,
+        // An empty title gives the terminal back its own (Windows Terminal shows
+        // the shell again); one that keeps a title stack then restores the saved one.
+        crossterm::terminal::SetTitle(""),
+        crossterm::style::Print(POP_TITLE)
     );
     let _ = crossterm::terminal::disable_raw_mode();
 }
+
+/// xterm's save- and restore-title sequences (`CSI 22;0 t`, `CSI 23;0 t`), which
+/// terminals without a title stack ignore.
+const PUSH_TITLE: &str = "\x1b[22;0t";
+const POP_TITLE: &str = "\x1b[23;0t";
 
 /// The interface reads keys from the console and draws with VT sequences. Under
 /// mintty, stdin is a pipe that Rust reports as a terminal but no console reads
@@ -670,6 +681,9 @@ fn pump(
         if app.status.approval != mode {
             app.status.approval = mode.to_owned();
             app.mark_dirty();
+        }
+        if let Some(title) = app.take_title_change() {
+            let _ = crossterm::execute!(io::stdout(), crossterm::terminal::SetTitle(title));
         }
         let request = app.take_request();
         if app.view_open() {

@@ -274,6 +274,8 @@ pub struct App {
     view: Option<View>,
     /// Where `@` paths are completed from: the workspace.
     pub workspace: Option<PathBuf>,
+    /// The terminal title last written, so it is only written when it changes.
+    title_written: String,
     exit_armed: Option<Instant>,
     request: Option<Request>,
     /// Requests from workers that wait for a quiet moment (no turn, no panel).
@@ -308,6 +310,7 @@ impl App {
             menu: None,
             view: None,
             workspace: None,
+            title_written: String::new(),
             exit_armed: None,
             request: None,
             deferred: VecDeque::new(),
@@ -469,6 +472,38 @@ impl App {
     }
 
     // ---- turns ------------------------------------------------------------
+
+    /// The terminal's title (beyond Python, whose interface leaves it alone):
+    /// `agent86 · <folder>`, marked `✳` while a turn runs and `⚠` while the turn
+    /// waits for an answer from the user, so another tab shows when it needs them.
+    pub fn terminal_title(&self) -> String {
+        let folder = self
+            .workspace
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map(|name| sanitize(&name.to_string_lossy()).replace('\n', " "))
+            .filter(|name| !name.is_empty());
+        let name = match folder {
+            Some(folder) => format!("agent86 · {folder}"),
+            None => "agent86".to_owned(),
+        };
+        if self.approval.is_some() || self.limit.is_some() || self.secret.is_some() {
+            format!("⚠ {name}")
+        } else if self.running.is_some() {
+            format!("✳ {name}")
+        } else {
+            name
+        }
+    }
+
+    /// The title to write, when it differs from the one last written.
+    pub fn take_title_change(&mut self) -> Option<String> {
+        let title = self.terminal_title();
+        (title != self.title_written).then(|| {
+            self.title_written.clone_from(&title);
+            title
+        })
+    }
 
     /// A turn is starting.
     pub fn start_turn(&mut self) {
@@ -1617,6 +1652,37 @@ mod tests {
             reply,
         });
         assert!(!app.view_open());
+    }
+
+    #[test]
+    fn the_terminal_title_names_the_folder_and_says_when_it_needs_the_user() {
+        let mut app = app();
+        assert_eq!(app.take_title_change().as_deref(), Some("agent86"));
+        app.workspace = Some(PathBuf::from("/home/me/my-project"));
+        assert_eq!(
+            app.take_title_change().as_deref(),
+            Some("agent86 · my-project")
+        );
+        // Unchanged, it is not written again.
+        assert_eq!(app.take_title_change(), None);
+        app.start_turn();
+        assert_eq!(app.terminal_title(), "✳ agent86 · my-project");
+        let (reply, _answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Approval {
+            tool: "write_file".into(),
+            preview: ApprovalPreview {
+                summary: "{}".into(),
+                detail: None,
+                lexer: None,
+            },
+            reply,
+        });
+        assert_eq!(app.terminal_title(), "⚠ agent86 · my-project");
+        app.on_turn_event(UiEvent::Finished(None));
+        assert_eq!(app.terminal_title(), "agent86 · my-project");
+        // A folder name cannot smuggle escapes into the title.
+        app.workspace = Some(PathBuf::from("/tmp/a\u{1b}]0;x\u{7}b"));
+        assert_eq!(app.terminal_title(), "agent86 · a]0;xb");
     }
 
     #[test]
