@@ -142,9 +142,10 @@ jobs:
           name: npm
           path: npm-tgz/*.tgz
           if-no-files-found: error
+      # Trusted publishing: each package names this repository and workflow on
+      # npmjs.com, and npm trades the job's OIDC token for the right to publish,
+      # so no npm token is stored here.
       - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           # The platform packages first, so the launcher never names a missing one.
