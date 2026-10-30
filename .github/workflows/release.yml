@@ -1,14 +1,16 @@
 name: Release
 
-# A `v*` tag builds the binaries and publishes a GitHub release with them,
-# its notes taken from `docs/releases/<tag>.md`. A pull request that changes
-# this workflow runs the builds only, so the packaging is checked before a tag.
+# A `v*` tag builds the binaries, publishes a GitHub release with them (its
+# notes taken from `docs/releases/<tag>.md`), and publishes the npm packages
+# (`npm/build.mjs`). A pull request that changes this workflow or the npm files
+# runs everything but the publishing: the builds, the packages with a dry-run
+# publish, and an install of the packed packages on Linux, macOS, and Windows.
 
 on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths: [".github/workflows/release.yml", "npm/**"]
 
 permissions:
   contents: read
@@ -84,6 +86,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          # The archives, one artifact per target triple; not the npm packages.
+          pattern: "*-*"
           merge-multiple: true
       - name: Publish
         env:
@@ -93,3 +97,106 @@ jobs:
             --title "agent86 $GITHUB_REF_NAME" \
             --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
             --verify-tag
+
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm provenance, and trusted publishing once it is set up per package.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships npm 10.
+      - run: npm install -g npm@11
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*-*"
+          merge-multiple: true
+      - name: Unpack the binaries
+        run: |
+          set -euo pipefail
+          mkdir -p bins
+          for archive in dist/*.tar.gz; do tar -xzf "$archive" -C bins; done
+          for archive in dist/*.zip; do unzip -q "$archive" -d bins; done
+          ls bins
+      - name: Assemble and pack
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # A tag must name the version Cargo.toml has.
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml's $version"; exit 1
+          fi
+          node npm/build.mjs --version "$version" --bins bins --out npm-out
+          mkdir npm-tgz
+          for dir in npm-out/*; do (cd npm-tgz && npm pack "../$dir"); done
+          ls -l npm-tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm
+          path: npm-tgz/*.tgz
+          if-no-files-found: error
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The platform packages first, so the launcher never names a missing one.
+          for tgz in ./npm-tgz/maetek-agent86-*.tgz ./npm-tgz/agent86-*.tgz; do
+            manifest=$(tar -xOzf "$tgz" package/package.json)
+            name=$(node -e 'const m = JSON.parse(process.argv[1]); console.log(m.name)' "$manifest")
+            version=$(node -e 'const m = JSON.parse(process.argv[1]); console.log(m.version)' "$manifest")
+            if [ "${GITHUB_REF_TYPE}" != tag ]; then
+              npm publish "$tgz" --access public --dry-run
+            elif npm view "$name@$version" version > /dev/null 2>&1; then
+              # A re-run after a partial publish skips what is already out.
+              echo "$name@$version is already published"
+            else
+              npm publish "$tgz" --access public --provenance
+            fi
+          done
+
+  npm-install:
+    needs: npm
+    name: npm install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: linux-x64 }
+          - { os: macos-latest, platform: darwin-arm64 }
+          - { os: windows-latest, platform: win32-x64 }
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm
+          path: npm-tgz
+      - name: Install the packed packages and run them
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/npm-global"
+          # The platform package from its tarball, then the launcher without its
+          # optional dependencies, which are not on the registry yet; the launcher
+          # finds the platform package beside it in the global node_modules.
+          npm install -g --prefix "$prefix" ./npm-tgz/maetek-agent86-${{ matrix.platform }}-*.tgz
+          npm install -g --prefix "$prefix" --omit=optional ./npm-tgz/agent86-[0-9]*.tgz
+          if [ "${{ runner.os }}" = Windows ]; then bin="$prefix/agent86.cmd"; else bin="$prefix/bin/agent86"; fi
+          "$bin" --version
+          "$bin" --version | grep -q '^agent86 [0-9]'
+          # Exit statuses pass through the launcher: a usage error is 2.
+          set +e
+          "$bin" no-such-command 2> /dev/null
+          status=$?
+          set -e
+          [ "$status" = 2 ] || { echo "expected exit status 2, got $status"; exit 1; }

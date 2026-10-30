@@ -1,2 +1,4 @@
 tests/fixtures/** text eol=lf
 *.safetensors binary
+# The launcher's #! line breaks with a carriage return on Unix.
+npm/** text eol=lf
