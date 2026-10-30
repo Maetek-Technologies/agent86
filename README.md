@@ -94,6 +94,8 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Turn limits at runtime: `/limits`, `run --max-steps`, `--max-output-tokens`, and `--max-agent-steps`, and the interface's offer to raise a limit that was reached (beyond Python)
 - [x] Secure secret entry, parts 1 and 2: `request_secret`, `/secret`, environment injection, redaction, and `${secret:NAME}` placeholders in the file tools (beyond Python)
 - [ ] Secure secret entry, part 3: remembering secrets per project in the OS keyring
+- [ ] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
+- [ ] Install and update through npm (`npm install -g agent86`)
 - [x] Reasoning: thinking models' reasoning shown dimmed in the interface, and a final reply with no text asked about once, then answered from the reasoning (beyond Python)
 - [x] Reasoning guard: stray closing tags dropped from reasoning, reasoning stuck repeating itself stopped, and OpenRouter provider routing (`[providers.<name>.routing]`) (beyond Python)
 - [x] Approvals and file-writing tools (`write_file`, `edit_file`)
