@@ -153,11 +153,14 @@ jobs:
             manifest=$(tar -xOzf "$tgz" package/package.json)
             name=$(node -e 'const m = JSON.parse(process.argv[1]); console.log(m.name)' "$manifest")
             version=$(node -e 'const m = JSON.parse(process.argv[1]); console.log(m.version)' "$manifest")
-            if [ "${GITHUB_REF_TYPE}" != tag ]; then
-              npm publish "$tgz" --access public --dry-run
-            elif npm view "$name@$version" version > /dev/null 2>&1; then
-              # A re-run after a partial publish skips what is already out.
+            if npm view "$name@$version" version > /dev/null 2>&1; then
+              # A re-run after a partial publish skips what is already out, and so
+              # does a pull request between releases, whose version is the last one
+              # published (npm refuses even a dry run over it); npm-install still
+              # checks those packages.
               echo "$name@$version is already published"
+            elif [ "${GITHUB_REF_TYPE}" != tag ]; then
+              npm publish "$tgz" --access public --dry-run
             else
               npm publish "$tgz" --access public --provenance
             fi
