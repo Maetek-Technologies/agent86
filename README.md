@@ -54,7 +54,7 @@ An Ollama model gets the `num_ctx` its Modelfile sets (`PARAMETER num_ctx 262144
 
 ## Install
 
-Download the archive for your platform from [Releases](https://github.com/tdfleming/agent-86-rs/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64, macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/tdfleming/agent-86-rs --tag v1.0.4` (needs Rust 1.88 or newer).
+Download the archive for your platform from [Releases](https://github.com/tdfleming/agent-86-rs/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/tdfleming/agent-86-rs --tag v1.0.4` (needs Rust 1.88 or newer).
 
 To publish a release, add notes for it in `docs/releases/<tag>.md`, set the version in `Cargo.toml`, merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives and creates the release.
 

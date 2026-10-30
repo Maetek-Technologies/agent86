@@ -55,3 +55,14 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+# gemm-common's fp16 NEON helpers (vmulq_f16 and friends) carry no fp16 target
+# feature and only assemble once inlined into gemm-f16's fp16 kernels. Without
+# optimization they are compiled on their own, which fails on aarch64 Linux
+# (`instruction requires: fullfp16`); Apple's target enables fp16 by default.
+# Optimizing the two crates in dev builds matches what release builds do.
+[profile.dev.package.gemm-common]
+opt-level = 3
+
+[profile.dev.package.gemm-f16]
+opt-level = 3
