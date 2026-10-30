@@ -5,7 +5,7 @@ mod support;
 
 use agent86::agent::{
     CancelToken, Harness, HarnessError, TurnEvent, ANSWER_PROMPT, CONTINUE_PROMPT,
-    EMPTY_ANSWER_NOTICE, NO_ANSWER_NOTICE, THINKING_ANSWER_NOTICE,
+    EMPTY_ANSWER_NOTICE, NO_ANSWER_NOTICE, REASONING_LOOP_NOTICE, THINKING_ANSWER_NOTICE,
 };
 use agent86::approval::{ApprovalGate, ApprovalPrompt};
 use agent86::config::{
@@ -502,6 +502,47 @@ async fn a_second_empty_answer_shows_the_reasoning_instead() {
         format!("{EMPTY_ANSWER_NOTICE}{THINKING_ANSWER_NOTICE}Two and two make 4.")
     );
     assert_eq!(server.requests().len(), 2);
+}
+
+/// Reasoning that ends in a stray tag and then one piece repeated to the cap.
+fn looping_reasoning(before: &str) -> Reply {
+    let reasoning = format!("{before}\n</trans>\n{}", "\"\n".repeat(2000));
+    sse_reasoning(&reasoning, "")
+}
+
+#[tokio::test]
+async fn a_reply_whose_reasoning_loops_is_stopped_and_asked_about_again() {
+    let server =
+        MockServer::start(vec![looping_reasoning("It is 4."), sse_text("4.", "stop")]).await;
+    let workspace = Workspace::new("reasoning-loop");
+
+    let output = run(&server, &workspace, limits(), "2+2?").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        format!("{REASONING_LOOP_NOTICE}{EMPTY_ANSWER_NOTICE}4.")
+    );
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn looping_twice_offers_the_reasoning_before_the_loop() {
+    let server = MockServer::start(vec![
+        looping_reasoning("It is 4."),
+        looping_reasoning("Two and two make 4."),
+    ])
+    .await;
+    let workspace = Workspace::new("reasoning-loop-twice");
+
+    let output = run(&server, &workspace, limits(), "2+2?").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        format!(
+            "{REASONING_LOOP_NOTICE}{EMPTY_ANSWER_NOTICE}{REASONING_LOOP_NOTICE}\
+             {THINKING_ANSWER_NOTICE}Two and two make 4."
+        )
+    );
 }
 
 #[tokio::test]

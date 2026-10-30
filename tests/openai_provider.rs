@@ -101,6 +101,62 @@ async fn reasoning_streams_apart_from_the_text_under_either_name() {
     assert_eq!(completion.text, "Answer.");
 }
 
+/// What a badly configured host sent for a Qwen model on OpenRouter: the model's
+/// own closing tag inside the reasoning, then one piece repeated to the cap.
+#[tokio::test]
+async fn a_stray_closing_tag_is_dropped_and_looping_reasoning_ends_the_reply() {
+    let chunk = |reasoning: &str| {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "", "reasoning": reasoning}, "finish_reason": null}]})
+        )
+    };
+    let mut body = vec![chunk("17 * 23 = 391.\n"), chunk("</"), chunk("trans>\n")];
+    body.extend(std::iter::repeat_n(chunk("\"\n"), 3000));
+    body.push(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"never read\"},\"finish_reason\":\"stop\"}]}\n\n"
+            .to_owned(),
+    );
+    body.push("data: [DONE]\n\n".to_owned());
+    let server = MockServer::start(vec![Reply::Sse(body.concat())]).await;
+    let provider = provider(config(&server));
+
+    let (deltas, error) = drain(&provider, request("Think")).await;
+    assert_eq!(error, None);
+    let shown: String = deltas.iter().map(|delta| delta.thinking.as_str()).collect();
+    assert!(shown.starts_with("17 * 23 = 391.\n\"\n"), "{shown:.40?}");
+    assert!(!shown.contains("trans"));
+    // Stopped once the run was long enough to be sure, well before its end.
+    assert!(shown.len() < 2400, "{}", shown.len());
+    assert!(deltas.iter().all(|delta| delta.text.is_empty()));
+    let last = deltas.last().unwrap();
+    assert!(last.done);
+    let completion = last.completion.clone().unwrap();
+    assert_eq!(completion.stop_reason.as_deref(), Some("reasoning_loop"));
+    assert_eq!(completion.thinking, "17 * 23 = 391.");
+    assert_eq!(completion.text, "");
+}
+
+#[test]
+fn a_routing_table_is_sent_as_the_provider_field() {
+    let mut routing = serde_json::Map::new();
+    routing.insert("ignore".to_owned(), json!(["Phala"]));
+    let config = OpenAiConfig {
+        routing: Some(routing),
+        ..OpenAiConfig::default()
+    };
+    let provider = OpenAiProvider::new("m", config, Some(TEST_KEY.to_owned())).unwrap();
+    let payload = provider.payload(&request("hi"));
+    assert_eq!(payload["provider"], json!({"ignore": ["Phala"]}));
+    // Without one, or with an empty one, the field is left out.
+    let config = OpenAiConfig {
+        routing: Some(serde_json::Map::new()),
+        ..OpenAiConfig::default()
+    };
+    let provider = OpenAiProvider::new("m", config, Some(TEST_KEY.to_owned())).unwrap();
+    assert!(provider.payload(&request("hi")).get("provider").is_none());
+}
+
 #[tokio::test]
 async fn streams_text_deltas_then_a_final_completion() {
     let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;

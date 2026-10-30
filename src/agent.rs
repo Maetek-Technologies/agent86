@@ -33,6 +33,7 @@ use crate::memory::working::{
 };
 use crate::observability::Recorder;
 use crate::prompt::time_note;
+use crate::provider::reasoning::REASONING_LOOP;
 use crate::provider::{Provider, ProviderError};
 use crate::pyjson::{python_float_repr, python_json_dumps};
 use crate::router::Router;
@@ -74,6 +75,11 @@ pub const THINKING_ANSWER_NOTICE: &str = "\n[no answer; showing the model's reas
 
 /// Said when the model still gave no answer and had no reasoning to show.
 pub const NO_ANSWER_NOTICE: &str = "\n[the model gave no answer]\n";
+
+/// Said when the provider stopped a reply whose reasoning kept repeating itself.
+/// Beyond Python.
+pub const REASONING_LOOP_NOTICE: &str =
+    "\n[the model's reasoning was repeating itself; stopped it]\n";
 
 /// What a cancelled turn says, as Python's `_cancelled`.
 pub const CANCELLED_NOTICE: &str = "\n[cancelled]\n";
@@ -811,6 +817,10 @@ impl Harness {
                     ("tool_calls", json!(names)),
                 ],
             );
+
+            if completion.stop_reason.as_deref() == Some(REASONING_LOOP) {
+                emit(TurnEvent::Text(REASONING_LOOP_NOTICE));
+            }
 
             // Beyond Python: a reply that ends cleanly with nothing to say (a thinking
             // model can put its whole answer in its reasoning) is asked about once.

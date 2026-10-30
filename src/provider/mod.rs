@@ -10,6 +10,7 @@ pub mod capabilities;
 pub mod catalog;
 pub mod ollama;
 pub mod openai;
+pub mod reasoning;
 pub mod remote_windows;
 pub mod retry;
 
@@ -163,6 +164,7 @@ fn openai_config(
         connect_timeout: seconds("connect_timeout_s", section.connect_timeout_s)?,
         read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
         max_retries: section.max_retries,
+        routing: section.routing.clone(),
     })
 }
 
