@@ -6,6 +6,7 @@
 //! a real zero rather than a missing price.
 
 use super::openai::error_chain;
+use super::reasoning::{ReasoningFilter, REASONING_LOOP};
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy};
 use super::{DeltaStream, Provider, ProviderError};
 use crate::secrets::redact;
@@ -284,7 +285,7 @@ fn as_arguments(arguments: Option<&Value>) -> Map<String, Value> {
 #[derive(Default)]
 struct TurnState {
     text: String,
-    thinking: String,
+    thinking: ReasoningFilter,
     tool_calls: Vec<ToolCall>,
     prompt_tokens: u64,
     eval_tokens: u64,
@@ -434,24 +435,28 @@ impl StreamState<'_> {
         }
         let message = chunk.get("message");
         // A thinking model's reasoning arrives in its own field, and can be all a
-        // reply has. Once shown, it rules out a retry just as text does.
+        // reply has. Once shown, it rules out a retry just as text does. Beyond
+        // Python, a stray closing tag is dropped, and reasoning that loops ends the
+        // reply (see reasoning.rs).
         if let Some(piece) = message
             .and_then(|m| m.get("thinking"))
             .and_then(Value::as_str)
             .filter(|piece| !piece.is_empty())
         {
-            self.turn.thinking.push_str(piece);
-            self.turn.emitted = true;
-            self.pending.push_back(CompletionDelta {
-                thinking: piece.to_owned(),
-                ..CompletionDelta::default()
-            });
+            let shown = self.turn.thinking.push(piece);
+            self.show_thinking(shown);
+            if self.turn.thinking.looping() {
+                self.finish();
+                return Ok(());
+            }
         }
         if let Some(piece) = message
             .and_then(|m| m.get("content"))
             .and_then(Value::as_str)
             .filter(|piece| !piece.is_empty())
         {
+            let held = self.turn.thinking.flush();
+            self.show_thinking(held);
             self.turn.text.push_str(piece);
             self.turn.emitted = true;
             self.pending.push_back(CompletionDelta {
@@ -487,13 +492,35 @@ impl StreamState<'_> {
         Ok(())
     }
 
-    /// Queue the final delta carrying the assembled completion.
+    fn show_thinking(&mut self, shown: String) {
+        if !shown.is_empty() {
+            self.turn.emitted = true;
+            self.pending.push_back(CompletionDelta {
+                thinking: shown,
+                ..CompletionDelta::default()
+            });
+        }
+    }
+
+    /// Queue the final delta carrying the assembled completion. Reasoning that
+    /// looped ends the reply here: the response is dropped, which stops the
+    /// generation, and its counts, which come last, are never seen.
     fn finish(&mut self) {
         self.finished = true;
         self.response = None;
+        let held = self.turn.thinking.flush();
+        self.show_thinking(held);
         let turn = std::mem::take(&mut self.turn);
-        let stop_reason =
-            normalize_stop_reason(turn.done_reason.as_deref(), !turn.tool_calls.is_empty());
+        let stop_reason = if turn.thinking.looping() {
+            Some(REASONING_LOOP.to_owned())
+        } else {
+            normalize_stop_reason(turn.done_reason.as_deref(), !turn.tool_calls.is_empty()).map(
+                |reason| match serde_json::to_value(reason) {
+                    Ok(Value::String(text)) => text,
+                    _ => String::new(),
+                },
+            )
+        };
         self.pending.push_back(CompletionDelta {
             text: String::new(),
             done: true,
@@ -506,12 +533,9 @@ impl StreamState<'_> {
                     cost_usd: 0.0,
                     ..Usage::default()
                 },
-                stop_reason: stop_reason.map(|reason| match serde_json::to_value(reason) {
-                    Ok(Value::String(text)) => text,
-                    _ => String::new(),
-                }),
+                stop_reason,
                 model: Some(self.provider.model.clone()),
-                thinking: turn.thinking,
+                thinking: turn.thinking.into_text(),
             }),
             ..CompletionDelta::default()
         });

@@ -6,6 +6,7 @@
 //! accumulated by index into whole [`ToolCall`] values.
 
 use super::capabilities::supports_sampling_params;
+use super::reasoning::{ReasoningFilter, REASONING_LOOP};
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy, DEFAULT_MAX_RETRIES};
 use super::{DeltaStream, Provider, ProviderError};
 use crate::pricing::PriceTable;
@@ -62,6 +63,8 @@ pub struct OpenAiConfig {
     /// The maximum gap between received chunks, not a total-request deadline.
     pub read_timeout: Duration,
     pub max_retries: u32,
+    /// The section's `routing` table, sent as the request's `provider` field.
+    pub routing: Option<Map<String, Value>>,
 }
 
 impl Default for OpenAiConfig {
@@ -76,6 +79,7 @@ impl Default for OpenAiConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(300),
             max_retries: DEFAULT_MAX_RETRIES,
+            routing: None,
         }
     }
 }
@@ -194,6 +198,9 @@ impl OpenAiProvider {
         if !request.tools.is_empty() {
             payload["tools"] = to_tools(&request.tools);
             payload["tool_choice"] = json!("auto");
+        }
+        if let Some(routing) = self.config.routing.as_ref().filter(|r| !r.is_empty()) {
+            payload["provider"] = Value::Object(routing.clone());
         }
         payload
     }
@@ -361,7 +368,7 @@ fn to_messages(messages: &[Message]) -> Value {
 #[derive(Default)]
 struct TurnState {
     text: String,
-    thinking: String,
+    thinking: ReasoningFilter,
     tool_fragments: BTreeMap<u64, ToolFragment>,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -574,20 +581,23 @@ impl StreamState<'_> {
             // Reasoning, under either name servers use (llama.cpp, vLLM, and DeepSeek
             // say `reasoning_content`, OpenRouter `reasoning`). A server that sends
             // both carries the same text twice, so one is taken. Once shown, it rules
-            // out a retry just as text does.
+            // out a retry just as text does. Beyond Python, a stray closing tag is
+            // dropped, and reasoning that loops ends the reply (see reasoning.rs).
             let reasoning = ["reasoning_content", "reasoning"]
                 .iter()
                 .find_map(|key| non_empty_str(delta.and_then(|d| d.get(*key))));
             if let Some(piece) = reasoning {
-                self.turn.thinking.push_str(piece);
-                self.turn.emitted = true;
-                self.pending.push_back(CompletionDelta {
-                    thinking: piece.to_owned(),
-                    ..CompletionDelta::default()
-                });
+                let shown = self.turn.thinking.push(piece);
+                self.show_thinking(shown);
+                if self.turn.thinking.looping() {
+                    self.finish();
+                    return Ok(());
+                }
             }
             if let Some(piece) = delta.and_then(|d| d.get("content")).and_then(Value::as_str) {
                 if !piece.is_empty() {
+                    let held = self.turn.thinking.flush();
+                    self.show_thinking(held);
                     self.turn.text.push_str(piece);
                     self.turn.emitted = true;
                     self.pending.push_back(CompletionDelta {
@@ -630,14 +640,33 @@ impl StreamState<'_> {
         }
     }
 
-    /// Queue the final delta carrying the assembled completion.
+    fn show_thinking(&mut self, shown: String) {
+        if !shown.is_empty() {
+            self.turn.emitted = true;
+            self.pending.push_back(CompletionDelta {
+                thinking: shown,
+                ..CompletionDelta::default()
+            });
+        }
+    }
+
+    /// Queue the final delta carrying the assembled completion. Reasoning that
+    /// looped ends the reply here: the response is dropped, which stops the
+    /// generation, and its usage, which comes last, is never seen.
     fn finish(&mut self) {
         self.finished = true;
         self.response = None;
+        let held = self.turn.thinking.flush();
+        self.show_thinking(held);
         let turn = std::mem::take(&mut self.turn);
         let tool_calls = assemble_tool_calls(turn.tool_fragments);
-        let stop_reason =
-            normalize_stop_reason(turn.finish_reason.as_deref(), !tool_calls.is_empty());
+        let looped = turn.thinking.looping();
+        let stop_reason = if looped {
+            Some(REASONING_LOOP.to_owned())
+        } else {
+            normalize_stop_reason(turn.finish_reason.as_deref(), !tool_calls.is_empty())
+                .map(stop_reason_wire)
+        };
         self.pending.push_back(CompletionDelta {
             text: String::new(),
             done: true,
@@ -653,9 +682,9 @@ impl StreamState<'_> {
                         ..Usage::default()
                     },
                 ),
-                stop_reason: stop_reason.map(stop_reason_wire),
+                stop_reason,
                 model: Some(self.provider.model.clone()),
-                thinking: turn.thinking,
+                thinking: turn.thinking.into_text(),
             }),
             ..CompletionDelta::default()
         });

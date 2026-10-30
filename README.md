@@ -95,6 +95,7 @@ Compatibility tests should compare observable behavior rather than reproduce Pyt
 - [x] Secure secret entry, parts 1 and 2: `request_secret`, `/secret`, environment injection, redaction, and `${secret:NAME}` placeholders in the file tools (beyond Python)
 - [ ] Secure secret entry, part 3: remembering secrets per project in the OS keyring
 - [x] Reasoning: thinking models' reasoning shown dimmed in the interface, and a final reply with no text asked about once, then answered from the reasoning (beyond Python)
+- [x] Reasoning guard: stray closing tags dropped from reasoning, reasoning stuck repeating itself stopped, and OpenRouter provider routing (`[providers.<name>.routing]`) (beyond Python)
 - [x] Approvals and file-writing tools (`write_file`, `edit_file`)
 - [x] Guardrails (ingress, egress, observation scanning)
 - [x] Sandboxed command and Python execution (subprocess, or Docker)
@@ -141,6 +142,13 @@ OpenRouter models have no built-in price. To see costs, add your model's rates (
 [pricing.models."openrouter:openai/gpt-4o-mini"]
 input_per_mtok = 0.15
 output_per_mtok = 0.60
+```
+
+OpenRouter may serve a model from a host that handles it badly, for example one whose thinking model writes stray tags and then repeats itself (agent86 stops such a loop and asks again). To keep the model off that host, pass OpenRouter's [provider routing](https://openrouter.ai/docs/features/provider-routing) preferences, which are sent as the request's `provider` field:
+
+```toml
+[providers.openrouter.routing]
+ignore = ["Phala"]
 ```
 
 ## License

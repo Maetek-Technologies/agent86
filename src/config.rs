@@ -552,6 +552,12 @@ pub struct ProviderConfig {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_true")]
     pub prompt_cache: bool,
+    /// OpenRouter's provider routing preferences (`order`, `ignore`, `only`,
+    /// `sort`, ...), sent as the request's `provider` field by the
+    /// OpenAI-compatible adapter. Beyond Python: a way to keep a model off a host
+    /// that serves it badly.
+    #[serde(default)]
+    pub routing: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Default for ProviderConfig {
@@ -566,6 +572,7 @@ impl Default for ProviderConfig {
             max_retries: default_max_retries(),
             max_tokens: None,
             prompt_cache: true,
+            routing: None,
         }
     }
 }
@@ -866,6 +873,25 @@ mod tests {
         assert_eq!(openrouter.read_timeout_s, 300.0);
         assert_eq!(config.max_output_tokens_for("openrouter"), 8192);
         assert!(config.sources.is_empty());
+        assert_eq!(openrouter.routing, None);
+    }
+
+    #[test]
+    fn a_routing_table_is_read_as_json() {
+        let dir = temp_dir("routing");
+        let paths = paths_in(&dir);
+        std::fs::write(
+            &paths.project,
+            "[providers.openrouter.routing]\nignore = [\"Phala\"]\nallow_fallbacks = true\n",
+        )
+        .unwrap();
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        let routing = config.providers["openrouter"].routing.clone().unwrap();
+        assert_eq!(
+            serde_json::Value::Object(routing),
+            serde_json::json!({"ignore": ["Phala"], "allow_fallbacks": true})
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
