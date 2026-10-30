@@ -236,6 +236,7 @@ The agent works end to end, but it does not yet have:
 
 ### Known interface differences from Python
 
+- **The terminal title** (a deliberate addition, 2026-10-30): the interface sets the tab's title to `agent86 · <folder>`, with `✳` in front while a turn runs and `⚠` while the turn waits for an approval, a limit offer, or a secret, so another tab shows when it needs you. It is written only when it changes, from the drawing loop. On the way out (or a panic) the title is cleared, which gives the terminal back its own (Windows Terminal shows the shell again), and terminals with xterm's title stack restore the title saved at startup. The folder name is sanitized, so it cannot carry escape sequences. Python's interface leaves the title alone; under npm on Windows the tab otherwise reads `C:\WINDOWS\system32\cmd.exe`, from npm's `agent86.cmd` shim.
 - **Inline, not full-screen** ([ADR 0001](adr/0001-inline-terminal-interface.md)): the interface renders in Claude Code's style rather than as Python's full-screen Textual app, though the text of every message, note, error, and summary is Python's. Differences that follow from that:
   - The conversation stays in the terminal's scrollback after exit.
   - Replies and tool calls are marked `⏺` and `⎿`.
