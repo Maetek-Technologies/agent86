@@ -3,7 +3,9 @@
 
 mod support;
 
-use agent86::update::{cache_path, enabled, latest, Checked, Version, DISABLE_ENV};
+use agent86::update::{
+    cache_path, enabled, latest, move_aside, remove_stale, Checked, Install, Version, DISABLE_ENV,
+};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use support::{MockServer, Reply};
@@ -106,4 +108,93 @@ fn the_environment_turns_the_check_off() {
     assert!(enabled(true));
     std::env::remove_var(DISABLE_ENV);
     assert!(!enabled(false));
+}
+
+#[test]
+fn a_binary_moves_to_the_temporary_directory_or_cargo_falls_back_beside_it() {
+    let root = home("move");
+    let package = root.join("pkg").join("bin");
+    let temp = root.join("temp");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(&temp).unwrap();
+    let exe = package.join("agent86.exe");
+
+    std::fs::write(&exe, "old").unwrap();
+    let (from, to) = move_aside(&exe, &temp, 42, Install::Npm).unwrap();
+    assert_eq!(
+        (from, to.clone()),
+        (exe.clone(), temp.join("agent86-old-42.exe"))
+    );
+    assert!(!exe.exists() && to.exists());
+
+    // A temporary directory it cannot reach: npm is refused, cargo renames beside.
+    std::fs::write(&exe, "old").unwrap();
+    let nowhere = root.join("no-such-dir");
+    assert!(move_aside(&exe, &nowhere, 7, Install::Npm).is_err());
+    assert!(exe.exists());
+    let (_, to) = move_aside(&exe, &nowhere, 7, Install::Cargo).unwrap();
+    assert_eq!(to, package.join("agent86.old"));
+
+    // What was left behind is cleared, and nothing else.
+    std::fs::write(temp.join("agent86-old-9.exe"), "x").unwrap();
+    std::fs::write(temp.join("keep.exe"), "x").unwrap();
+    remove_stale(&temp);
+    let left: Vec<String> = std::fs::read_dir(&temp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["keep.exe"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What broke `/update now` under npm and Volta: a package directory holding a
+/// running binary cannot be removed or replaced on Windows, even after the
+/// binary is renamed within it. Moved to the temporary directory, it can.
+#[cfg(windows)]
+#[test]
+fn a_running_binary_moved_aside_no_longer_pins_its_package_directory() {
+    use std::process::{Command, Stdio};
+
+    let root = home("running");
+    let package = root.join("pkg");
+    let bin = package.join("bin");
+    let temp = root.join("temp");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&temp).unwrap();
+    let exe = bin.join("agent86.exe");
+    // Any program that keeps running will do, and agent86 itself exits at once
+    // without a configured model: a copy of ping, pinging for half a minute.
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    std::fs::copy(
+        PathBuf::from(system).join("System32").join("PING.EXE"),
+        &exe,
+    )
+    .unwrap();
+    let mut child = Command::new(&exe)
+        .args(["-n", "30", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "the copy is running");
+
+    let renamed = exe.with_extension("old");
+    std::fs::rename(&exe, &renamed).unwrap();
+    assert!(
+        std::fs::remove_dir_all(&package).is_err(),
+        "a running binary pins its directory even renamed"
+    );
+    std::fs::rename(&renamed, &exe).unwrap();
+
+    let (_, aside) = move_aside(&exe, &temp, child.id(), Install::Npm).unwrap();
+    std::fs::remove_dir_all(&package).unwrap();
+    assert!(child.try_wait().unwrap().is_none(), "it is still running");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    remove_stale(&temp);
+    assert!(!aside.exists());
+    let _ = std::fs::remove_dir_all(&root);
 }
