@@ -295,6 +295,10 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     for note in &repl.startup_notes {
         app.note(Style::Dim, note);
     }
+    let notices = events.clone();
+    crate::update::start(repl.config.ui.update_check, move |text| {
+        let _ = notices.send(UiEvent::Note(Style::Dim, text));
+    });
 
     loop {
         let history = repl.history().entries().to_vec();
@@ -388,6 +392,10 @@ fn run(repl: &mut Repl) -> io::Result<()> {
                 manager.mcp.on_unmount_saved(&mut app, repl, edit);
                 None
             }
+            Request::Note(style, text) => {
+                app.note(style, &text);
+                None
+            }
             Request::Catalog {
                 provider,
                 result,
@@ -454,6 +462,11 @@ fn dispatch(
             limits::open_save(app, repl);
             return Ok(true);
         }
+        // Checking and installing take a while, so they run off the drawing thread.
+        if entry.name == "/update" {
+            start_update(app, events, &arg);
+            return Ok(true);
+        }
         // A secret is typed into a masked panel, never the input box.
         if entry.name == "/secret" {
             if let Some(name) = crate::repl::secret_to_enter(&arg) {
@@ -483,6 +496,43 @@ fn dispatch(
         }
     }
     Ok(true)
+}
+
+/// `/update` on a worker thread, its answer coming back as a note. The installer's
+/// output is captured, since it would tear the live region; a failure shows its
+/// last lines.
+fn start_update(app: &mut App, events: &mpsc::Sender<UiEvent>, arg: &str) {
+    let now = match arg.trim() {
+        "" => false,
+        "now" => true,
+        _ => {
+            app.note(Style::Plain, "usage: /update [now]");
+            return;
+        }
+    };
+    app.note(
+        Style::Dim,
+        if now {
+            "updating agent86…"
+        } else {
+            "checking for a newer release…"
+        },
+    );
+    let events = events.clone();
+    std::thread::spawn(move || {
+        let result = crate::update::plan().and_then(|plan| {
+            if now {
+                crate::update::apply(&plan, false)
+            } else {
+                Ok(plan.describe())
+            }
+        });
+        let note = match result {
+            Ok(text) => UiEvent::Note(Style::Plain, text),
+            Err(error) => UiEvent::Note(Style::Red, error),
+        };
+        let _ = events.send(note);
+    });
 }
 
 /// Open the picker a bare command asks for, as Python's `_run_or_chain`. False

@@ -56,6 +56,8 @@ An Ollama model gets the `num_ctx` its Modelfile sets (`PARAMETER num_ctx 262144
 
 Download the archive for your platform from [Releases](https://github.com/Maetek-Technologies/agent86/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/Maetek-Technologies/agent86 --tag v1.0.5` (needs Rust 1.88 or newer).
 
+The interface and the plain loop check GitHub for a newer release at most once a day and say so when there is one; `/update` shows how to install it for the way you installed agent86, and `/update now` does it. `[ui] update_check = false` or `AGENT86_NO_UPDATE_CHECK=1` turns the check off, and `run` never checks.
+
 To publish a release, add notes for it in `docs/releases/<tag>.md`, set the version in `Cargo.toml`, merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives and creates the release.
 
 ### Switching from the Python version
@@ -95,7 +97,8 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] Turn limits at runtime: `/limits`, `run --max-steps`, `--max-output-tokens`, and `--max-agent-steps`, and the interface's offer to raise a limit that was reached (beyond Python)
 - [x] Secure secret entry, parts 1 and 2: `request_secret`, `/secret`, environment injection, redaction, and `${secret:NAME}` placeholders in the file tools (beyond Python)
 - [ ] Secure secret entry, part 3: remembering secrets per project in the OS keyring
-- [ ] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
+- [x] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
+- [x] A notice when a newer release is out, and `/update` to install it (beyond Python)
 - [ ] Install and update through npm (`npm install -g agent86`)
 - [x] Reasoning: thinking models' reasoning shown dimmed in the interface, and a final reply with no text asked about once, then answered from the reasoning (beyond Python)
 - [x] Reasoning guard: stray closing tags dropped from reasoning, reasoning stuck repeating itself stopped, and OpenRouter provider routing (`[providers.<name>.routing]`) (beyond Python)

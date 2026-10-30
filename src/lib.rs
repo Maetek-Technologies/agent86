@@ -33,4 +33,5 @@ pub mod tools;
 pub mod turn;
 pub mod types;
 pub mod ui;
+pub mod update;
 pub mod vault;
