@@ -162,19 +162,23 @@ fn a_running_binary_moved_aside_no_longer_pins_its_package_directory() {
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&temp).unwrap();
     let exe = bin.join("agent86.exe");
-    std::fs::copy(env!("CARGO_BIN_EXE_agent86"), &exe).unwrap();
-    // The plain loop waits on stdin, so the copy keeps running.
+    // Any program that keeps running will do, and agent86 itself exits at once
+    // without a configured model: a copy of ping, pinging for half a minute.
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    std::fs::copy(
+        PathBuf::from(system).join("System32").join("PING.EXE"),
+        &exe,
+    )
+    .unwrap();
     let mut child = Command::new(&exe)
-        .arg("--plain")
-        .current_dir(&root)
-        .env("HF_HUB_OFFLINE", "1")
-        .env(DISABLE_ENV, "1")
-        .stdin(Stdio::piped())
+        .args(["-n", "30", "127.0.0.1"])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "the copy is running");
 
     let renamed = exe.with_extension("old");
     std::fs::rename(&exe, &renamed).unwrap();
@@ -188,7 +192,6 @@ fn a_running_binary_moved_aside_no_longer_pins_its_package_directory() {
     std::fs::remove_dir_all(&package).unwrap();
     assert!(child.try_wait().unwrap().is_none(), "it is still running");
 
-    drop(child.stdin.take());
     let _ = child.kill();
     let _ = child.wait();
     remove_stale(&temp);
