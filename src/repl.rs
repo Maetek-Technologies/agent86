@@ -74,6 +74,12 @@ pub enum Style {
     BoldUnderline,
     /// Bold in one of the 256 terminal colours (the interface's logo gradient).
     BoldColor(u8),
+    /// A foreground colour over an optional background, both in the 256 terminal
+    /// colours: one cell of the startup header's half-block mascot.
+    Pixels {
+        fg: u8,
+        bg: Option<u8>,
+    },
 }
 
 impl Style {
@@ -81,6 +87,12 @@ impl Style {
         std::borrow::Cow::Borrowed(match self {
             Self::BoldColor(index) => {
                 return std::borrow::Cow::Owned(format!("\x1b[1;38;5;{index}m"));
+            }
+            Self::Pixels { fg, bg: None } => {
+                return std::borrow::Cow::Owned(format!("\x1b[38;5;{fg}m"));
+            }
+            Self::Pixels { fg, bg: Some(bg) } => {
+                return std::borrow::Cow::Owned(format!("\x1b[38;5;{fg};48;5;{bg}m"));
             }
             Self::Plain => "",
             Self::Dim => "\x1b[2m",
