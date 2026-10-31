@@ -102,6 +102,7 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] Secure secret entry, parts 1 and 2: `request_secret`, `/secret`, environment injection, redaction, and `${secret:NAME}` placeholders in the file tools (beyond Python)
 - [x] Secure secret entry, part 3: remembering secrets per project in the OS keyring (beyond Python)
 - [x] Arguments a model sends as JSON strings where the tool wants an array or an object are repaired (beyond Python)
+- [ ] Show or hide thinking and tool use in the interface: `full`, `summary`, or `hidden` for each, Ctrl+T and commands, `[ui] thinking` and `[ui] tool_use` (beyond Python; planned, see the project plan)
 - [ ] Scheduled jobs: the agent schedules work for itself, and `agent86 schedule daemon` runs it, with no session open (beyond Python; planned, see the project plan)
 - [x] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
 - [x] A notice when a newer release is out, and `/update` to install it (beyond Python)
