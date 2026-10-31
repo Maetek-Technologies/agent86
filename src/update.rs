@@ -339,13 +339,41 @@ pub fn apply(plan: &Plan, inherit: bool) -> Result<String, String> {
     } else {
         None
     };
-    let result = run(&words, inherit);
-    if let (Err(error), Some((from, to))) = (&result, &moved) {
+    install_verified(&words, latest, moved.as_ref(), &mut |words| {
+        run(words, inherit)
+    })
+}
+
+/// Run the installer, and where the binary was moved aside check that it landed
+/// again. An installer that exits 0 can still leave the directory without its
+/// binary (an npm update on Windows once left the platform package empty), and
+/// nothing else would notice until the next launch. A missing binary gets one more
+/// run of the installer, then an error naming the command to run by hand.
+fn install_verified(
+    words: &[String],
+    latest: &Version,
+    moved: Option<&(PathBuf, PathBuf)>,
+    run: &mut dyn FnMut(&[String]) -> Result<(), String>,
+) -> Result<String, String> {
+    let mut result = run(words);
+    if let (Err(error), Some((from, to))) = (&result, moved) {
         // Nothing was installed, so the old binary goes back where it was. If the
         // installer took its directory away, say so rather than leave it broken.
         if std::fs::rename(to, from).is_err() && !from.exists() {
             return Err(format!(
                 "{error}\nThe old binary could not be put back; quit agent86 and run: {}",
+                words.join(" ")
+            ));
+        }
+    }
+    if let (Ok(()), Some((from, _))) = (&result, moved) {
+        if !from.exists() {
+            result = run(words);
+        }
+        if result.is_ok() && !from.exists() {
+            return Err(format!(
+                "the installer finished, but {} is missing; quit agent86 and run: {}",
+                from.display(),
                 words.join(" ")
             ));
         }
@@ -562,6 +590,124 @@ mod tests {
             Plan::Current(Version(1, 0, 5)).describe(),
             "agent86 1.0.5 is the latest release"
         );
+    }
+
+    /// An install that moved a binary aside: `from` is where it ran, `to` where it went.
+    fn moved_binary(name: &str) -> (std::path::PathBuf, (PathBuf, PathBuf)) {
+        let dir =
+            std::env::temp_dir().join(format!("agent86-verify-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) = (dir.join("agent86.exe"), dir.join("aside.exe"));
+        std::fs::write(&to, "old").unwrap();
+        (dir, (from, to))
+    }
+
+    #[test]
+    fn an_install_that_puts_the_binary_back_is_done_after_one_run() {
+        let (dir, moved) = moved_binary("once");
+        let mut runs = 0;
+        let message = install_verified(
+            &["npm".into(), "install".into()],
+            &Version(1, 0, 11),
+            Some(&moved),
+            &mut |_| {
+                runs += 1;
+                std::fs::write(&moved.0, "new").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(runs, 1);
+        assert_eq!(
+            message,
+            "agent86 1.0.11 installed; restart agent86 to use it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_binary_after_a_clean_install_gets_one_more_run() {
+        let (dir, moved) = moved_binary("retry");
+        let mut runs = 0;
+        let result = install_verified(
+            &["npm".into(), "install".into()],
+            &Version(1, 0, 11),
+            Some(&moved),
+            &mut |_| {
+                runs += 1;
+                if runs == 2 {
+                    std::fs::write(&moved.0, "new").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(runs, 2);
+        assert!(result.is_ok(), "{result:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_binary_still_missing_names_the_command_to_run_by_hand() {
+        let (dir, moved) = moved_binary("missing");
+        let mut runs = 0;
+        let error = install_verified(
+            &[
+                "npm".into(),
+                "install".into(),
+                "-g".into(),
+                "agent86@1.0.11".into(),
+            ],
+            &Version(1, 0, 11),
+            Some(&moved),
+            &mut |_| {
+                runs += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(runs, 2);
+        assert!(error.contains("is missing"), "{error}");
+        assert!(
+            error.ends_with("quit agent86 and run: npm install -g agent86@1.0.11"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_install_puts_the_old_binary_back_without_a_retry() {
+        let (dir, moved) = moved_binary("failed");
+        let mut runs = 0;
+        let error = install_verified(
+            &["npm".into(), "install".into()],
+            &Version(1, 0, 11),
+            Some(&moved),
+            &mut |_| {
+                runs += 1;
+                Err("npm install failed".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!((runs, error.as_str()), (1, "npm install failed"));
+        assert_eq!(std::fs::read_to_string(&moved.0).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nothing_moved_means_nothing_to_verify() {
+        let mut runs = 0;
+        let result = install_verified(
+            &["npm".into(), "install".into()],
+            &Version(1, 0, 11),
+            None,
+            &mut |_| {
+                runs += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(runs, 1);
+        assert!(result.is_ok());
     }
 
     #[test]
