@@ -7,6 +7,7 @@ use super::text::{sanitize, wrap_words, Line};
 use crate::config::ConfigPaths;
 use crate::config_writer::{plan_edit, Change, ConfigEdit, Scope};
 use crate::repl::Style;
+use crate::vault::SecretRequest;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Most diff rows the save panel shows at once; the rest scroll.
@@ -94,6 +95,10 @@ pub struct KeyEntry {
     /// value is already held under the name.
     reason: String,
     replacing: bool,
+    /// For a secret: whether a keyring is there to remember it in, and the choice,
+    /// which Tab toggles.
+    can_remember: bool,
+    remember: bool,
 }
 
 impl KeyEntry {
@@ -105,16 +110,27 @@ impl KeyEntry {
             text: String::new(),
             reason: String::new(),
             replacing: false,
+            can_remember: false,
+            remember: false,
         }
     }
 
-    /// Masked entry of the secret `name` (see `crate::vault`).
-    pub fn secret(name: &str, reason: &str, replacing: bool) -> Self {
+    /// Masked entry of the secret `request` asks for (see `crate::vault`). The
+    /// choice to remember it starts on when the name is remembered already, so a
+    /// new value does not leave the old one in the keyring.
+    pub fn secret(request: &SecretRequest) -> Self {
         Self {
-            reason: reason.trim().to_owned(),
-            replacing,
-            ..Self::new(KeyPurpose::Secret, name, false)
+            reason: request.reason.trim().to_owned(),
+            replacing: request.replacing,
+            can_remember: request.can_remember,
+            remember: request.can_remember && request.remembered,
+            ..Self::new(KeyPurpose::Secret, &request.name, false)
         }
+    }
+
+    /// Whether the user chose to remember a secret for the project.
+    pub fn remember(&self) -> bool {
+        self.can_remember && self.remember
     }
 
     /// `None` while open; then `Some(key)`, where an empty or cancelled entry is `None`.
@@ -131,6 +147,7 @@ impl KeyEntry {
             KeyCode::Backspace => {
                 self.text.pop();
             }
+            KeyCode::Tab if self.can_remember => self.remember = !self.remember,
             KeyCode::Char('u') if ctrl => self.text.clear(),
             KeyCode::Char(ch) if !ctrl => self.text.push(ch),
             _ => {}
@@ -200,6 +217,17 @@ impl KeyEntry {
             "Held for this session. The agent sees only the name."
         };
         rows.push(Line::styled(Style::Dim, note));
+        if self.can_remember {
+            rows.push(
+                Line::styled(Style::Cyan, if self.remember { "[x] " } else { "[ ] " })
+                    .push(Style::Plain, "Remember for this project (OS keyring)"),
+            );
+            return framed(
+                rows,
+                width,
+                "enter to set · tab to toggle remember · esc to decline",
+            );
+        }
         framed(rows, width, "enter to set · esc to decline")
     }
 }

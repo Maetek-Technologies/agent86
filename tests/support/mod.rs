@@ -249,3 +249,49 @@ async fn read_request(socket: &mut TcpStream) -> Option<Recorded> {
         body,
     })
 }
+
+/// A tool with an array, an object, and a string parameter that answers with the
+/// JSON type each argument arrived as (`formats=array,options=object,text=string`),
+/// for the tests of argument repair.
+pub struct ShapesTool;
+
+impl agent86::tools::Tool for ShapesTool {
+    fn name(&self) -> &str {
+        "shapes"
+    }
+
+    fn description(&self) -> &str {
+        "Report the JSON type of each argument."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "formats": {"type": "array", "items": {"type": "string"}},
+                "options": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                "text": {"type": "string"},
+            },
+        })
+    }
+
+    fn execute(
+        &self,
+        args: &serde_json::Map<String, serde_json::Value>,
+        _ctx: &agent86::tools::ToolContext,
+    ) -> Result<agent86::types::ToolResult, agent86::tools::ToolError> {
+        let kinds: Vec<String> = args
+            .iter()
+            .map(|(key, value)| {
+                let kind = match value {
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) => "string",
+                    _ => "other",
+                };
+                format!("{key}={kind}")
+            })
+            .collect();
+        Ok(agent86::tools::success("shapes", kinds.join(",")))
+    }
+}

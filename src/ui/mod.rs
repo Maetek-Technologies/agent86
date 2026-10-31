@@ -360,14 +360,9 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             Request::Key(KeyPurpose::Secret, _) => None,
             Request::Secret(name, value) => {
                 match value {
-                    Some(value) => {
-                        repl.harness.context.secrets.set(&name, value);
-                        app.note(
-                            Style::Dim,
-                            &format!(
-                                "secret {name} set for this session · the agent sees only its name"
-                            ),
-                        );
+                    Some(answer) => {
+                        let stored = repl.harness.context.secrets.accept(&name, answer);
+                        app.note(Style::Dim, &stored.describe(&name));
                     }
                     None => app.note(Style::Dim, &format!("secret {name} not set")),
                 }
@@ -481,8 +476,8 @@ fn dispatch(
         // A secret is typed into a masked panel, never the input box.
         if entry.name == "/secret" {
             if let Some(name) = crate::repl::secret_to_enter(&arg) {
-                let replacing = repl.harness.context.secrets.contains(name);
-                app.open_panel(Panel::Key(KeyEntry::secret(name, "", replacing)));
+                let request = repl.harness.context.secrets.request(name, "");
+                app.open_panel(Panel::Key(KeyEntry::secret(&request)));
                 return Ok(true);
             }
         }

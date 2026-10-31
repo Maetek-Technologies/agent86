@@ -13,10 +13,11 @@ use agent86::config::{
 use agent86::guardrails::Guardrails;
 use agent86::observability::Recorder;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
+use agent86::secrets::{SecretStore, SecretStoreError};
 use agent86::session::AgentState;
 use agent86::tools::{default_registry, ToolContext, ToolRegistry};
 use agent86::types::{ApprovalMode, Message, Role, ToolCall};
-use agent86::vault::SecretRequest;
+use agent86::vault::{SecretAnswer, SecretRequest};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -162,7 +163,10 @@ async fn an_entered_secret_reaches_tools_but_never_the_model_the_history_or_the_
         .secrets
         .set_prompt(Some(Box::new(move |request| {
             seen.lock().unwrap().push(request.clone());
-            Some(VALUE.to_owned())
+            Some(SecretAnswer {
+                value: VALUE.to_owned(),
+                remember: false,
+            })
         })));
 
     let mut state = AgentState::new();
@@ -178,6 +182,9 @@ async fn an_entered_secret_reaches_tools_but_never_the_model_the_history_or_the_
             name: "API_TOKEN".to_owned(),
             reason: "to call the billing API".to_owned(),
             replacing: false,
+            // No keyring is attached to this harness, so none is offered.
+            can_remember: false,
+            remembered: false,
         }]
     );
     let requests = server.requests();
@@ -510,4 +517,141 @@ fn the_approval_preview_shows_the_real_change_with_the_value_hidden() {
     assert!(detail.contains("\n-OTHER=1\n+OTHER=2"), "{detail}");
     assert!(!detail.contains("-API_TOKEN"), "{detail}");
     assert!(preview.summary.contains(PLACEHOLDER), "{}", preview.summary);
+}
+
+/// An in-memory keyring that outlives a harness, as the real one outlives a session.
+#[derive(Default)]
+struct FakeKeyring {
+    entries: Mutex<Vec<((String, String), String)>>,
+}
+
+impl SecretStore for FakeKeyring {
+    fn get_password(&self, service: &str, account: &str) -> Option<String> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .find(|(key, _)| key.0 == service && key.1 == account)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn set_password(
+        &self,
+        service: &str,
+        account: &str,
+        secret: &str,
+    ) -> Result<(), SecretStoreError> {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|(key, _)| !(key.0 == service && key.1 == account));
+        entries.push(((service.to_owned(), account.to_owned()), secret.to_owned()));
+        Ok(())
+    }
+
+    fn delete_password(&self, service: &str, account: &str) -> Result<bool, SecretStoreError> {
+        let mut entries = self.entries.lock().unwrap();
+        let before = entries.len();
+        entries.retain(|(key, _)| !(key.0 == service && key.1 == account));
+        Ok(entries.len() != before)
+    }
+}
+
+#[tokio::test]
+async fn a_remembered_secret_is_there_in_the_next_session_and_never_in_what_the_model_sees() {
+    let keyring = Arc::new(FakeKeyring::default());
+    let workspace = Workspace::new("remember");
+
+    // Session one: the agent asks, and the user chooses to remember it.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "a",
+            "request_secret",
+            &arguments(json!({"name": "API_TOKEN", "reason": "to call the billing API"})),
+        )]),
+        sse_text("Saved.", "stop"),
+    ])
+    .await;
+    let first = harness(
+        &server,
+        &workspace,
+        default_registry(false, false, false, true),
+    );
+    first
+        .context
+        .secrets
+        .attach_store(keyring.clone(), &workspace.root);
+    let asked: Arc<Mutex<Vec<SecretRequest>>> = Arc::default();
+    let seen = Arc::clone(&asked);
+    first
+        .context
+        .secrets
+        .set_prompt(Some(Box::new(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            Some(SecretAnswer {
+                value: VALUE.to_owned(),
+                remember: true,
+            })
+        })));
+    let mut state = AgentState::new();
+    first.run_turn(&mut state, "Go", |_| {}).await.unwrap();
+    assert!(asked.lock().unwrap()[0].can_remember);
+    let announced = server.requests()[1].body["messages"].as_array().unwrap()[3]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        announced.contains("remember it for this project"),
+        "{announced}"
+    );
+    drop(first);
+
+    // Session two, a new vault on the same keyring: the secret is loaded before any
+    // turn, the system message names it, and a command can use it without a prompt.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "b",
+            "run_command",
+            &arguments(json!({"command": print_variable("API_TOKEN")})),
+        )]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let second = harness(
+        &server,
+        &workspace,
+        default_registry(false, false, false, true),
+    );
+    second
+        .context
+        .secrets
+        .attach_store(keyring.clone(), &workspace.root);
+    assert_eq!(second.context.secrets.load_remembered(), ["API_TOKEN"]);
+    let mut state = AgentState::new();
+    second.run_turn(&mut state, "Use it", |_| {}).await.unwrap();
+    let requests = server.requests();
+    let system = requests[0].body["messages"].as_array().unwrap()[0]["content"]
+        .as_str()
+        .unwrap();
+    assert!(system.contains("\n- API_TOKEN"), "{system}");
+    let observed = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        observed,
+        format!("exit code: 0\nstdout:\ngot {PLACEHOLDER}")
+    );
+    for request in &requests {
+        assert!(!request.body.to_string().contains(VALUE));
+    }
+    assert!(!serde_json::to_string(&state).unwrap().contains(VALUE));
+    assert!(!workspace.trace().contains(VALUE));
+
+    // /secret forget removes it from the session and the keyring, for good.
+    assert_eq!(second.context.secrets.forget("API_TOKEN"), Ok(true));
+    assert!(second.context.secrets.is_empty());
+    let third = ToolContext::new(&workspace.root).unwrap();
+    third.secrets.attach_store(keyring, &workspace.root);
+    assert!(third.secrets.load_remembered().is_empty());
 }

@@ -375,6 +375,7 @@ impl Harness {
                 ("depth", json!(depth)),
             ],
         );
+        self.record_repair(call, &result, sid);
         (result, usage)
     }
 }

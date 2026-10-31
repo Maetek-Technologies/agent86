@@ -500,11 +500,11 @@ async fn secrets_cannot_be_entered_on_piped_input_and_the_agent_is_not_offered_t
     );
 
     for line in [
-        "agent86> no secrets this session · /secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one\n",
+        "agent86> no secrets this session · /secret NAME enters a secret, hidden, and can remember it for this project · /secret lists them · /secret forget NAME drops one\n",
         "agent86> secret API_TOKEN can only be entered at a terminal, where the input can be hidden\n",
         "agent86> '1bad' is not a valid name (letters, digits, and _, not starting with a digit)\n",
         "agent86> no secret named API_TOKEN\n",
-        "agent86> /secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one\n",
+        "agent86> /secret NAME enters a secret, hidden, and can remember it for this project · /secret lists them · /secret forget NAME drops one\n",
     ] {
         assert!(text.contains(line), "{line:?} not in {text}");
     }

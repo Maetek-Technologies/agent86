@@ -316,3 +316,60 @@ fn duplicate_registration_is_refused() {
 fn workspaces_must_exist() {
     assert!(ToolContext::new(Path::new("definitely/not/a/real/workspace")).is_err());
 }
+
+fn shapes(arguments: Value) -> ToolResult {
+    let registry = builtin_registry();
+    registry.register(Box::new(support::ShapesTool)).unwrap();
+    let ctx = ToolContext::new(&std::env::temp_dir()).unwrap();
+    registry.dispatch(&call("shapes", arguments), &ctx)
+}
+
+#[test]
+fn json_strings_are_repaired_into_arrays_and_objects() {
+    // Beyond Python: `ollama:qwen3.5` sent `"[\"markdown\"]"` where the schema wants an array.
+    let result = shapes(json!({
+        "formats": "[\"markdown\"]",
+        "options": " {\"depth\": 2} ",
+        "text": "plain",
+    }));
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.content, "formats=array,options=object,text=string");
+    assert_eq!(
+        result.metadata["args_repaired"],
+        json!(["formats", "options"])
+    );
+}
+
+#[test]
+fn a_string_parameter_holding_json_is_left_alone() {
+    let result = shapes(json!({"text": "[\"markdown\"]"}));
+    assert_eq!(result.content, "text=string");
+    assert!(!result.metadata.contains_key("args_repaired"));
+}
+
+#[test]
+fn strings_that_do_not_repair_are_passed_on_unchanged() {
+    // Not JSON, JSON of the wrong kind, and an object where an array is wanted.
+    for formats in ["markdown", "{\"a\": 1}", "\"[1]\"", "42", ""] {
+        let result = shapes(json!({"formats": formats}));
+        assert_eq!(result.content, "formats=string", "{formats:?}");
+        assert!(
+            !result.metadata.contains_key("args_repaired"),
+            "{formats:?}"
+        );
+    }
+    // Real arrays and objects are untouched, and so are unknown keys.
+    let result = shapes(json!({"formats": ["a"], "extra": "[1]"}));
+    assert_eq!(result.content, "formats=array,extra=string");
+    assert!(!result.metadata.contains_key("args_repaired"));
+}
+
+#[test]
+fn builtin_tools_without_array_parameters_are_unaffected() {
+    let ws = Workspace::new("repair-builtin");
+    ws.write("a.txt", b"hello\n");
+    let ctx = ws.context();
+    let result = dispatch(&ctx, "read_file", json!({"path": "[\"a.txt\"]"}));
+    assert_eq!(error_of(&result), "No such file: [\"a.txt\"]");
+    assert!(!result.metadata.contains_key("args_repaired"));
+}

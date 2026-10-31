@@ -1258,6 +1258,19 @@ impl Harness {
                 ("error", json!(result.error)),
             ],
         );
+        self.record_repair(call, result, sid);
+    }
+
+    /// Beyond Python: note a call whose JSON-string arguments the registry repaired
+    /// (`tools::repair_arguments`). The call itself is recorded as the model sent it.
+    pub(crate) fn record_repair(&self, call: &ToolCall, result: &ToolResult, sid: &str) {
+        if let Some(repaired) = result.metadata.get(crate::tools::ARGS_REPAIRED_KEY) {
+            self.recorder.event(
+                sid,
+                "tool_args_repaired",
+                vec![("tool", json!(call.name)), ("arguments", repaired.clone())],
+            );
+        }
     }
 
     /// Egress-scan tool-call arguments, the other way a secret leaves the harness.

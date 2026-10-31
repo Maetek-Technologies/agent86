@@ -17,7 +17,7 @@ pub mod web;
 
 use crate::types::{ToolCall, ToolResult, ToolSpec};
 use sandbox::Executor;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -708,7 +708,16 @@ impl ToolRegistry {
         match self.get(&call.name) {
             Some(_) if !ctx.allowed_tool(&call.name) => skill_refusal(call, ctx),
             Some(tool) => match with_secrets(tool.as_ref(), call, ctx) {
-                Ok(call) => tool.run(&call, ctx),
+                Ok(call) => {
+                    let (call, repaired) = repaired_call(tool.as_ref(), call);
+                    let mut result = tool.run(&call, ctx);
+                    if !repaired.is_empty() {
+                        result
+                            .metadata
+                            .insert(ARGS_REPAIRED_KEY.to_owned(), json!(repaired));
+                    }
+                    result
+                }
                 Err(error) => ToolResult {
                     call_id: call.id.clone(),
                     ..failure(&call.name, error)
@@ -750,6 +759,86 @@ pub fn with_secrets<'a>(
         arguments,
         ..call.clone()
     }))
+}
+
+/// The `ToolResult::metadata` key under which [`ToolRegistry::dispatch`] lists the
+/// parameters it repaired, so the loop can record a `tool_args_repaired` event.
+pub const ARGS_REPAIRED_KEY: &str = "args_repaired";
+
+/// `call` with its JSON-string arguments repaired against `tool`'s schema, and the
+/// names of the parameters repaired. The call the loop keeps is never this one.
+fn repaired_call<'a>(
+    tool: &dyn Tool,
+    call: std::borrow::Cow<'a, ToolCall>,
+) -> (std::borrow::Cow<'a, ToolCall>, Vec<String>) {
+    let Some((arguments, repaired)) = repair_arguments(&tool.parameters(), &call.arguments) else {
+        return (call, Vec::new());
+    };
+    let call = ToolCall {
+        arguments,
+        ..call.into_owned()
+    };
+    (std::borrow::Cow::Owned(call), repaired)
+}
+
+/// Beyond Python: models sometimes send an array or an object argument as a JSON
+/// string (`"[\"markdown\"]"` where the schema wants `["markdown"]`), which the
+/// tool then rejects and the turn loses a step. When a parameter's schema accepts
+/// an array or an object but not a string, and the model sent a string that parses
+/// as JSON of that kind, the parsed value is used. Anything else is left alone, so
+/// the error the model gets for it is unchanged, and a string parameter that
+/// happens to hold JSON is never touched.
+///
+/// `None` when nothing needed repair, else the repaired arguments and the names of
+/// the parameters that were.
+pub fn repair_arguments(
+    schema: &Value,
+    arguments: &Map<String, Value>,
+) -> Option<(Map<String, Value>, Vec<String>)> {
+    let properties = schema.get("properties")?.as_object()?;
+    let mut repaired_arguments = arguments.clone();
+    let mut repaired = Vec::new();
+    for (name, value) in arguments {
+        let (Value::String(text), Some(property)) = (value, properties.get(name)) else {
+            continue;
+        };
+        let accepted = accepted_types(property);
+        if accepted.contains(&"string") {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        let kind = match parsed {
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            _ => continue,
+        };
+        if accepted.contains(&kind) {
+            repaired_arguments.insert(name.clone(), parsed);
+            repaired.push(name.clone());
+        }
+    }
+    (!repaired.is_empty()).then_some((repaired_arguments, repaired))
+}
+
+/// The JSON types a property schema accepts: its `type` (a name or a list), and
+/// those of its `anyOf`/`oneOf` branches (pydantic writes `Optional[list]` that way).
+fn accepted_types(property: &Value) -> Vec<&str> {
+    let mut types = Vec::new();
+    match property.get("type") {
+        Some(Value::String(kind)) => types.push(kind.as_str()),
+        Some(Value::Array(kinds)) => types.extend(kinds.iter().filter_map(Value::as_str)),
+        _ => {}
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = property.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                types.extend(accepted_types(branch));
+            }
+        }
+    }
+    types
 }
 
 /// The answer to a call the active skill's `allowed-tools` forbid, naming the

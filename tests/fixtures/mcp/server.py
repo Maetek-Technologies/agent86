@@ -6,6 +6,7 @@ The first argument picks a behaviour:
   hang    - read requests and never answer
   http    - serve streamable HTTP on 127.0.0.1; prints "PORT <n>" first
   sse     - serve the legacy HTTP+SSE transport on 127.0.0.1; prints "PORT <n>" first
+  shapes  - serve over stdio with one tool, `shapes`, that reports the JSON type of each argument
 """
 
 import json
@@ -49,6 +50,19 @@ TOOLS = [
     {"name": "progress", "description": "Reports progress.", "inputSchema": {"type": "object"}},
     {"name": "headers", "description": "Shows request headers.", "inputSchema": {"type": "object"}},
 ]
+if MODE == "shapes":
+    TOOLS = [{
+        "name": "shapes",
+        "description": "Report the JSON type of each argument.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "formats": {"type": "array", "items": {"type": "string"}},
+                "options": {"type": "object"},
+                "text": {"type": "string"},
+            },
+        },
+    }]
 ADDED = {"name": "added", "description": "Appeared later.", "inputSchema": {"type": "object"}}
 
 STATE = {"changed": False, "headers": {}}
@@ -69,6 +83,10 @@ def call(name, arguments, meta, emit):
         return text(arguments["text"])
     if name == "add":
         return text(str(arguments["a"] + arguments["b"]))
+    if name == "shapes":
+        kinds = {list: "array", dict: "object", str: "string"}
+        return text(",".join(f"{key}={kinds.get(type(value), 'other')}"
+                             for key, value in sorted(arguments.items())))
     if name == "secret":
         return text("token=" + os.environ.get("MCP_TEST_TOKEN", "<unset>")
                     + " leaked=" + os.environ.get("AGENT86_TEST_LEAK", "<unset>"))
