@@ -39,7 +39,7 @@ Non-goals:
 | Approvals | When a prompt appears, what it shows (tool name, argument summary, tool detail such as the diff), the answers (approve, deny, Escape denies), deny on shutdown | Inline panel with numbered choices |
 | Status line | Segments, their text, and the order they are shed under width pressure (`status_segments`, `fit_status_line`) | Where it sits and its colours |
 | Files | `memory.db`, the history file, config write-back (comments preserved, secret guard, user/project scope), keyring entries | — |
-| Startup | Surface selection rules, startup notes, MCP notes, the compact banner's content (version and model) | The header: a gradient `AGENT 86` wordmark over the version and working directory |
+| Startup | Surface selection rules, startup notes, MCP notes, the compact banner's content (version and model) | The header: a half-block detective mascot beside a gradient `AGENT 86` wordmark, over the version and working directory |
 | Cancellation | Safe points, saved state, `turn_end` status `cancelled` | Key hints in the spinner line |
 
 Every change to a contract row is a bug. A change to a presentation row is allowed, but it is recorded as a known difference when Python's tests would notice it.
@@ -85,7 +85,7 @@ From top to bottom, the live region holds:
 
 | Entry | Python's full-screen app | Here |
 |---|---|---|
-| Banner | Compact Rich panel: `version`, `model` | Block-letter `AGENT 86` wordmark, cyan to violet, over `v<version> · <cwd>` (dim); no model, since a switch could not update it in scrollback; one line when the terminal is narrower than the wordmark (`src/ui/banner.rs`) |
+| Banner | Compact Rich panel: `version`, `model` | Block-letter `AGENT 86` wordmark, cyan to violet, over `v<version> · <cwd>` (dim); no model, since a switch could not update it in scrollback; a half-block detective mascot (the README logo's robot in a fedora, 16 cells by 8 rows, drawn from a pixel grid with `Style::Pixels`) beside the wordmark on a terminal 83 columns or wider, the wordmark alone from 64, one line below that (`src/ui/banner.rs`) |
 | User prompt | `> text` (bold) | `> text` (bold, grey background band, like Claude Code) |
 | Reply | `agent86 ` label (bold cyan), then text; Markdown when finished | `⏺ ` then the text, Markdown rendered per block; continuation lines indented two spaces |
 | Reasoning | not shown | `∴ ` then the model's reasoning, all dim, a paragraph at a time; the unfinished tail live (its last 8 rows); never in `run` or the plain loop (beyond Python) |
