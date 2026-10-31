@@ -320,7 +320,7 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 18] = [
+pub const COMMANDS: [CommandEntry; 20] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
@@ -430,6 +430,22 @@ pub const COMMANDS: [CommandEntry; 18] = [
         needs_choice: None,
         handler: |repl, arg| repl.secret(arg),
     },
+    // Beyond Python: how much of the model's reasoning and of each tool call the
+    // interface shows. They are interface settings; the plain loop only says so.
+    CommandEntry {
+        name: "/thinking",
+        usage: "/thinking [level|save]",
+        description: "Show/set reasoning: full, summary, hidden (Ctrl+T cycles)",
+        needs_choice: None,
+        handler: |_, _| CommandResult::message(INTERFACE_ONLY),
+    },
+    CommandEntry {
+        name: "/toolview",
+        usage: "/toolview [level|save]",
+        description: "Show/set tool calls: full, summary, hidden",
+        needs_choice: None,
+        handler: |_, _| CommandResult::message(INTERFACE_ONLY),
+    },
     CommandEntry {
         name: "/sessions",
         usage: "/sessions",
@@ -499,6 +515,9 @@ pub fn update_command(arg: &str, inherit: bool) -> CommandResult {
         Err(error) => CommandResult::handled(Text::styled(Style::Red, error)),
     }
 }
+
+const INTERFACE_ONLY: &str =
+    "this is a setting of the interactive interface; run agent86 without --plain to use it";
 
 const SECRET_USAGE: &str =
     "/secret NAME enters a secret, hidden, and can remember it for this project · /secret lists them · /secret forget NAME drops one";

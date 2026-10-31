@@ -95,6 +95,8 @@ history_file = "~/.agent86/history"
 history_size = 1000
 markdown = true
 update_check = true
+thinking = "summary"
+tool_use = "summary"
 
 [guardrails]
 approval = "ask"
@@ -207,6 +209,56 @@ pub struct UiConfig {
     /// interactive surfaces (beyond Python; see `crate::update`).
     #[serde(default = "default_true")]
     pub update_check: bool,
+    /// How much of the model's reasoning the interface shows (beyond Python).
+    #[serde(default = "default_summary")]
+    pub thinking: DisplayLevel,
+    /// How much of each tool call the interface shows (beyond Python).
+    #[serde(default = "default_summary")]
+    pub tool_use: DisplayLevel,
+}
+
+/// How much of something the interface shows, for the model's reasoning and for
+/// tool calls (beyond Python; `[ui] thinking` and `[ui] tool_use`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayLevel {
+    /// All of it: reasoning streamed dimmed; a tool call's arguments and result.
+    Full,
+    /// One line: how long the model thought; a tool call's name and a result summary.
+    Summary,
+    /// Nothing in the scrollback (failures and approvals still show).
+    Hidden,
+}
+
+impl DisplayLevel {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Summary, Self::Hidden];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Summary => "summary",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str() == text.trim().to_lowercase())
+    }
+
+    /// The next level, wrapping: full, summary, hidden, full.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Full => Self::Summary,
+            Self::Summary => Self::Hidden,
+            Self::Hidden => Self::Full,
+        }
+    }
+}
+
+fn default_summary() -> DisplayLevel {
+    DisplayLevel::Summary
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -858,6 +910,47 @@ mod tests {
             .unwrap()
             .contains_key("status_line"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_and_tool_use_default_to_summary_and_take_the_three_levels() {
+        let dir = temp_dir("display-levels");
+        let paths = paths_in(&dir);
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert_eq!(config.ui.thinking, DisplayLevel::Summary);
+        assert_eq!(config.ui.tool_use, DisplayLevel::Summary);
+
+        std::fs::write(
+            &paths.project,
+            "[ui]\nthinking = \"full\"\ntool_use = \"hidden\"\n",
+        )
+        .unwrap();
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert_eq!(config.ui.thinking, DisplayLevel::Full);
+        assert_eq!(config.ui.tool_use, DisplayLevel::Hidden);
+
+        // Anything else is refused, naming what is allowed.
+        std::fs::write(&paths.project, "[ui]\nthinking = \"loud\"\n").unwrap();
+        let error = load_config(&paths, &Overrides::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("loud") && error.contains("full") && error.contains("hidden"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_levels_parse_cycle_and_name_themselves() {
+        assert_eq!(DisplayLevel::parse(" Hidden "), Some(DisplayLevel::Hidden));
+        assert_eq!(DisplayLevel::parse("loud"), None);
+        let cycle: Vec<&str> =
+            std::iter::successors(Some(DisplayLevel::Full), |level| Some(level.next()))
+                .take(4)
+                .map(DisplayLevel::as_str)
+                .collect();
+        assert_eq!(cycle, ["full", "summary", "hidden", "full"]);
     }
 
     #[test]

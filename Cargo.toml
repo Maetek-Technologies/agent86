@@ -1,6 +1,6 @@
 [package]
 name = "agent86"
-version = "1.0.9"
+version = "1.0.10"
 edition = "2021"
 rust-version = "1.88"
 description = "agent86, an agentic harness on the command line"
