@@ -2,7 +2,7 @@
   <img src="docs/images/agent86-logo.png" alt="The agent86 logo: a robot detective in a fedora beside a seven-segment 86, on a retro badge reading AGENT 86" width="200">
 </p>
 
-# agent86
+# agent 86
 
 An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary.
 
