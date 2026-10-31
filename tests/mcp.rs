@@ -1061,3 +1061,34 @@ fn the_cli_lists_servers_and_their_tools() {
     );
     assert_eq!(lines.len(), 21);
 }
+
+#[test]
+fn json_strings_are_repaired_for_mcp_tools_too() {
+    // Beyond Python: an array or object sent as a JSON string is parsed when the
+    // server's schema wants one, even on the deferred first call.
+    let dir = TempDir::new("repair");
+    let Some(config) = server_config(&dir.0, "test", "shapes", "") else {
+        return;
+    };
+    let manager = McpManager::start(&config).unwrap();
+    let registry = agent86::tools::ToolRegistry::new();
+    for tool in manager.tools() {
+        registry.register_shared(tool);
+    }
+    let ctx = ToolContext::new(&dir.0).unwrap();
+    let run = |arguments: Value| registry.dispatch(&call("mcp__test__shapes", arguments), &ctx);
+
+    let repaired =
+        run(json!({"formats": "[\"markdown\"]", "options": "{\"a\": 1}", "text": "[1]"}));
+    assert!(repaired.ok, "{repaired:?}");
+    assert_eq!(repaired.content, "formats=array,options=object,text=string");
+    assert_eq!(
+        repaired.metadata["args_repaired"],
+        json!(["formats", "options"])
+    );
+    // A string that does not parse goes through as the model sent it.
+    assert_eq!(
+        run(json!({"formats": "markdown"})).content,
+        "formats=string"
+    );
+}

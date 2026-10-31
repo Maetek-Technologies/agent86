@@ -74,6 +74,9 @@ impl SecretStore for OsKeyring {
     }
 }
 
+/// A store the vault can hold on to and use from any thread.
+pub type SharedStore = std::sync::Arc<dyn SecretStore + Send + Sync>;
+
 /// A store with nothing in it, for callers that must not touch the OS keyring.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSecretStore;

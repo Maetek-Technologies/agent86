@@ -31,7 +31,7 @@ use crate::provider::catalog::CatalogEntry;
 use crate::pyjson::{python_json_dumps, python_json_dumps_indented};
 use crate::repl::{notice_text, Style, Text};
 use crate::types::{Message, Role};
-use crate::vault::SecretRequest;
+use crate::vault::{SecretAnswer, SecretRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
@@ -87,7 +87,7 @@ pub enum UiEvent {
     /// for the value on `reply`. Dropping `reply` unanswered declines.
     Secret {
         request: SecretRequest,
-        reply: mpsc::Sender<Option<String>>,
+        reply: mpsc::Sender<Option<SecretAnswer>>,
     },
     /// The turn ended: `None`, or the Python exception name and the message.
     Finished(Option<(String, String)>),
@@ -167,8 +167,8 @@ pub enum Request {
     Picked(PickerKind, String),
     /// The key entry was answered: the key, or `None` for nothing entered.
     Key(KeyPurpose, Option<String>),
-    /// `/secret NAME` was answered: the name, and the value or `None`.
-    Secret(String, Option<String>),
+    /// `/secret NAME` was answered: the name, and the answer or `None`.
+    Secret(String, Option<SecretAnswer>),
     /// The connection test ended.
     Tested(TestOutcome),
     /// The save panel was answered: the edit to apply, or `None` for a cancel.
@@ -265,7 +265,7 @@ pub struct App {
     /// The offer to raise a limit the turn reached.
     limit: Option<LimitPanel>,
     /// A secret the turn asks for, and where its thread waits for the value.
-    secret: Option<(KeyEntry, mpsc::Sender<Option<String>>)>,
+    secret: Option<(KeyEntry, mpsc::Sender<Option<SecretAnswer>>)>,
     /// A picker or a `/config model` panel.
     panel: Option<Panel>,
     /// The `/` or `@` completion menu under the input box.
@@ -612,8 +612,7 @@ impl App {
             }
             UiEvent::Secret { request, reply } => {
                 self.view = None;
-                let entry = KeyEntry::secret(&request.name, &request.reason, request.replacing);
-                self.secret = Some((entry, reply));
+                self.secret = Some((KeyEntry::secret(&request), reply));
             }
             UiEvent::Finished(error) => {
                 self.finish_reply();
@@ -920,8 +919,9 @@ impl App {
         }
         if let Some((entry, _)) = &mut self.secret {
             if let Some(answer) = entry.on_key(key) {
+                let remember = entry.remember();
                 if let Some((_, reply)) = self.secret.take() {
-                    let _ = reply.send(answer);
+                    let _ = reply.send(answer.map(|value| SecretAnswer { value, remember }));
                 }
             }
             return Effect::None;
@@ -970,7 +970,11 @@ impl App {
                 Panel::Key(entry) => match entry.on_key(key) {
                     None => return Effect::None,
                     Some(answer) if entry.purpose == KeyPurpose::Secret => {
-                        Some(Request::Secret(entry.provider.clone(), answer))
+                        let remember = entry.remember();
+                        Some(Request::Secret(
+                            entry.provider.clone(),
+                            answer.map(|value| SecretAnswer { value, remember }),
+                        ))
                     }
                     Some(answer) => Some(Request::Key(entry.purpose, answer)),
                 },
@@ -1787,6 +1791,8 @@ mod tests {
             name: "API_TOKEN".into(),
             reason: "to call the billing API".into(),
             replacing: false,
+            can_remember: false,
+            remembered: false,
         };
         let mut app = app_running();
         app.set_size(81, 30);
@@ -1806,7 +1812,13 @@ mod tests {
         assert!(!live.contains("tok_") && !live.contains("s3cr3t"), "{live}");
         assert!(app.editor.is_empty(), "nothing reaches the draft");
         app.on_key(key(KeyCode::Enter), &[]);
-        assert_eq!(answer.recv(), Ok(Some("tok_s3cr3t".to_owned())));
+        assert_eq!(
+            answer.recv(),
+            Ok(Some(SecretAnswer {
+                value: "tok_s3cr3t".to_owned(),
+                remember: false
+            }))
+        );
         assert!(!committed_text(&mut app).join("\n").contains("s3cr3t"));
 
         // Escape declines without cancelling the turn.
@@ -1841,15 +1853,95 @@ mod tests {
     #[test]
     fn slash_secret_answers_with_its_name() {
         let mut app = app();
-        app.open_panel(Panel::Key(KeyEntry::secret("API_TOKEN", "", true)));
+        app.open_panel(Panel::Key(KeyEntry::secret(&SecretRequest {
+            name: "API_TOKEN".into(),
+            reason: String::new(),
+            replacing: true,
+            can_remember: false,
+            remembered: false,
+        })));
         let live = live_text(&mut app).join("\n");
         assert!(live.contains("Replaces the value entered before"), "{live}");
+        // With no keyring, there is nothing to remember in, and Tab does nothing.
+        assert!(!live.contains("Remember"), "{live}");
         app.on_paste("v4lue");
+        app.on_key(key(KeyCode::Tab), &[]);
         app.on_key(key(KeyCode::Enter), &[]);
         assert_eq!(
             app.take_request(),
-            Some(Request::Secret("API_TOKEN".into(), Some("v4lue".into())))
+            Some(Request::Secret(
+                "API_TOKEN".into(),
+                Some(SecretAnswer {
+                    value: "v4lue".into(),
+                    remember: false
+                })
+            ))
         );
+    }
+
+    #[test]
+    fn tab_toggles_remembering_a_secret_for_the_project() {
+        let request = |remembered| SecretRequest {
+            name: "API_TOKEN".into(),
+            reason: "to call the billing API".into(),
+            replacing: remembered,
+            can_remember: true,
+            remembered,
+        };
+        // Off to begin with, for a name that is not remembered yet; Tab turns it on.
+        let mut app = app_running();
+        app.set_size(90, 30);
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(false),
+            reply,
+        });
+        let live = live_text(&mut app).join("\n");
+        assert!(
+            live.contains("[ ] Remember for this project (OS keyring)"),
+            "{live}"
+        );
+        assert!(live.contains("tab to toggle remember"), "{live}");
+        app.on_paste("s3cr3t");
+        app.on_key(key(KeyCode::Tab), &[]);
+        let live = live_text(&mut app).join("\n");
+        assert!(live.contains("[x] Remember for this project"), "{live}");
+        assert!(!live.contains("s3cr3t"), "{live}");
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(
+            answer.recv(),
+            Ok(Some(SecretAnswer {
+                value: "s3cr3t".into(),
+                remember: true
+            }))
+        );
+
+        // A name that is remembered starts on, so a new value replaces the old one;
+        // Tab turns it off, and declining answers nothing whatever the toggle says.
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(true),
+            reply,
+        });
+        assert!(live_text(&mut app).join("\n").contains("[x] Remember"));
+        app.on_paste("again");
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert_eq!(
+            answer.recv(),
+            Ok(Some(SecretAnswer {
+                value: "again".into(),
+                remember: false
+            }))
+        );
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Secret {
+            request: request(false),
+            reply,
+        });
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Esc), &[]);
+        assert_eq!(answer.recv(), Ok(None));
     }
 
     #[test]

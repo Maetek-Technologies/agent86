@@ -72,12 +72,17 @@ impl Tool for RequestSecretTool {
                 ),
             ));
         }
-        if !ctx.secrets.ask(&name, &reason) {
+        let Some(stored) = ctx.secrets.ask(&name, &reason) else {
             return Ok(failure(
                 self.name(),
                 format!("The user declined to enter the secret {name}."),
             ));
-        }
+        };
+        let kept = if stored.remembered {
+            " The user chose to remember it for this project, so it will be available in later sessions too."
+        } else {
+            ""
+        };
         Ok(success(
             self.name(),
             format!(
@@ -85,7 +90,7 @@ impl Tool for RequestSecretTool {
                  run_command and python_exec (${name} in sh, %{name}% in cmd.exe, \
                  os.environ[\"{name}\"] in Python), and write {0} in write_file or \
                  edit_file to put it in a file. Its value is hidden from you; tool output \
-                 shows {0} where it would appear.",
+                 shows {0} where it would appear.{kept}",
                 placeholder(&name)
             ),
         ))

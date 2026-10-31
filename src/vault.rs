@@ -13,8 +13,16 @@
 //! This keeps secrets out of transcripts, provider logs, traces, and memory. It is
 //! no defence against a hostile model, which could still get a transformed copy
 //! (base64, part of the value) past literal redaction.
+//!
+//! A secret may also be remembered for the project: the value goes into the OS
+//! keyring (service `agent86`, account `secret:<workspace hash>:<NAME>`, in the same
+//! layout as every other key), and a names-only index entry (`secret-index:<hash>`)
+//! lists what the workspace has remembered, since keyrings cannot be listed
+//! portably. At startup the remembered names are loaded back into the vault.
 
+use crate::secrets::{SecretStore, SharedStore, SERVICE_NAME};
 use serde_json::Value;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// What the user is asked for.
@@ -26,10 +34,58 @@ pub struct SecretRequest {
     pub reason: String,
     /// Whether a value is already held under `name` (entering one replaces it).
     pub replacing: bool,
+    /// Whether the value can be remembered for this project (a keyring is there).
+    pub can_remember: bool,
+    /// Whether `name` is remembered now, so the choice starts on "remember" and a
+    /// new value does not leave the old one in the keyring.
+    pub remembered: bool,
 }
 
-/// Asks the user for one secret: the value, or `None` when they declined.
-pub type SecretPrompt = Box<dyn Fn(&SecretRequest) -> Option<String> + Send + Sync>;
+/// What the user entered: the value, and whether to remember it for the project.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretAnswer {
+    pub value: String,
+    pub remember: bool,
+}
+
+impl std::fmt::Debug for SecretAnswer {
+    /// Never the value: an answer printed in a panic or a log must not leak it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretAnswer")
+            .field("value", &"<hidden>")
+            .field("remember", &self.remember)
+            .finish()
+    }
+}
+
+/// Where an answer ended up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// Whether the value is in the keyring for this project now.
+    pub remembered: bool,
+    /// Why the keyring did not do as asked, when it did not.
+    pub warning: Option<String>,
+}
+
+impl Stored {
+    /// The line telling the user what happened to `name`.
+    pub fn describe(&self, name: &str) -> String {
+        let mut line = if self.remembered {
+            format!("secret {name} set and remembered for this project")
+        } else {
+            format!("secret {name} set for this session")
+        };
+        line.push_str(" · the agent sees only its name");
+        if let Some(warning) = &self.warning {
+            line.push_str(&format!(" · {warning}"));
+        }
+        line
+    }
+}
+
+/// Asks the user for one secret: the answer, or `None` when they declined.
+pub type SecretPrompt = Box<dyn Fn(&SecretRequest) -> Option<SecretAnswer> + Send + Sync>;
 
 /// The session's secrets, by name, and the prompt that asks for one. Clones share
 /// both, so the tool context, its sub-agent forks, and the recorder see one vault.
@@ -43,6 +99,8 @@ struct Inner {
     /// In the order they were entered.
     values: RwLock<Vec<(String, String)>>,
     prompt: Mutex<Option<Arc<SecretPrompt>>>,
+    /// The keyring and the project's key in it, once attached.
+    keep: Mutex<Option<(SharedStore, String)>>,
 }
 
 impl std::fmt::Debug for SecretVault {
@@ -145,25 +203,153 @@ impl SecretVault {
             .clone()
     }
 
-    /// Ask the user for `name` and hold what they enter. False when they declined,
-    /// entered nothing, or nobody can be asked. The lock is not held while the user
-    /// types, so redaction elsewhere never waits on them.
-    pub fn ask(&self, name: &str, reason: &str) -> bool {
-        let Some(prompt) = self.prompt() else {
-            return false;
-        };
-        let request = SecretRequest {
+    /// The request the prompt shows for `name`.
+    pub fn request(&self, name: &str, reason: &str) -> SecretRequest {
+        SecretRequest {
             name: name.to_owned(),
             reason: reason.to_owned(),
             replacing: self.contains(name),
-        };
-        match prompt(&request).filter(|value| !value.is_empty()) {
-            Some(value) => {
-                self.set(name, value);
-                true
-            }
-            None => false,
+            can_remember: self.can_remember(),
+            remembered: self.is_remembered(name),
         }
+    }
+
+    /// Ask the user for `name` and hold what they enter; `None` when they declined,
+    /// entered nothing, or nobody can be asked. The lock is not held while the user
+    /// types, so redaction elsewhere never waits on them.
+    pub fn ask(&self, name: &str, reason: &str) -> Option<Stored> {
+        let prompt = self.prompt()?;
+        let answer =
+            prompt(&self.request(name, reason)).filter(|answer| !answer.value.is_empty())?;
+        Some(self.accept(name, answer))
+    }
+
+    /// Hold `answer` under `name`, and keep it in the keyring (or take it out) as
+    /// the user chose. A keyring that refuses leaves the secret in the session.
+    pub fn accept(&self, name: &str, answer: SecretAnswer) -> Stored {
+        self.set(name, answer.value);
+        let result = if answer.remember && self.can_remember() {
+            self.remember(name).map(|()| true)
+        } else if self.is_remembered(name) {
+            // "Just this once": the keyring must not keep an older value.
+            self.unremember(name).map(|_| false)
+        } else {
+            Ok(false)
+        };
+        match result {
+            Ok(remembered) => Stored {
+                remembered,
+                warning: None,
+            },
+            Err(error) => Stored {
+                remembered: self.is_remembered(name),
+                warning: Some(format!("the keyring refused: {error}")),
+            },
+        }
+    }
+
+    // ---- remembering ------------------------------------------------------
+
+    /// Keep secrets for the workspace in `store`, under a key derived from the
+    /// workspace's path.
+    pub fn attach_store(&self, store: SharedStore, workspace: &Path) {
+        let path = crate::tools::plain_path(workspace);
+        let project = format!("{:x}", md5::compute(path.to_string_lossy().as_bytes()));
+        *self
+            .inner
+            .keep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((store, project));
+    }
+
+    fn keep(&self) -> Option<(SharedStore, String)> {
+        self.inner
+            .keep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether a value can be remembered: a store is attached and works.
+    pub fn can_remember(&self) -> bool {
+        self.keep().is_some_and(|(store, _)| store.available())
+    }
+
+    /// The names remembered for this project (never values), in the order they were
+    /// remembered.
+    pub fn remembered_names(&self) -> Vec<String> {
+        self.keep()
+            .map(|(store, project)| read_index(store.as_ref(), &project))
+            .unwrap_or_default()
+    }
+
+    pub fn is_remembered(&self, name: &str) -> bool {
+        self.remembered_names().iter().any(|known| known == name)
+    }
+
+    /// Put the value held under `name` in the keyring and the project's index.
+    pub fn remember(&self, name: &str) -> Result<(), String> {
+        let (store, project) = self.keep().ok_or("no keyring to remember it in")?;
+        let value = self
+            .values()
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| format!("no secret named {name}"))?;
+        store
+            .set_password(SERVICE_NAME, &account(&project, name), &value)
+            .map_err(|error| error.to_string())?;
+        let mut names = read_index(store.as_ref(), &project);
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_owned());
+            write_index(store.as_ref(), &project, &names)?;
+        }
+        Ok(())
+    }
+
+    /// Take `name` out of the keyring and the index, keeping the session's value.
+    /// Whether it was remembered.
+    fn unremember(&self, name: &str) -> Result<bool, String> {
+        let Some((store, project)) = self.keep() else {
+            return Ok(false);
+        };
+        let mut names = read_index(store.as_ref(), &project);
+        let listed = names.iter().any(|known| known == name);
+        let deleted = store
+            .delete_password(SERVICE_NAME, &account(&project, name))
+            .map_err(|error| error.to_string())?;
+        if listed {
+            names.retain(|known| known != name);
+            write_index(store.as_ref(), &project, &names)?;
+        }
+        Ok(listed || deleted)
+    }
+
+    /// `/secret forget NAME`: drop `name` from the session and the keyring; whether
+    /// either had it. A keyring that refuses is an error, after the session has
+    /// already dropped the value.
+    pub fn forget(&self, name: &str) -> Result<bool, String> {
+        let held = self.remove(name);
+        let kept = self.unremember(name)?;
+        Ok(held || kept)
+    }
+
+    /// Load every secret remembered for this project into the session; the names
+    /// loaded. A name whose value the keyring no longer has is skipped.
+    pub fn load_remembered(&self) -> Vec<String> {
+        let Some((store, project)) = self.keep() else {
+            return Vec::new();
+        };
+        let mut loaded = Vec::new();
+        for name in read_index(store.as_ref(), &project) {
+            if let Some(value) = store.get_password(SERVICE_NAME, &account(&project, &name)) {
+                if !value.is_empty() {
+                    self.set(&name, value);
+                    loaded.push(name);
+                }
+            }
+        }
+        loaded
     }
 
     /// `text` with every held value replaced by its [`placeholder`]. Longer values
@@ -288,6 +474,49 @@ impl SecretVault {
     }
 }
 
+/// The keyring account of the secret `name` in the project `project`.
+fn account(project: &str, name: &str) -> String {
+    format!("secret:{project}:{name}")
+}
+
+/// The keyring account of the project's list of remembered names.
+fn index_account(project: &str) -> String {
+    format!("secret-index:{project}")
+}
+
+/// The names the project's index lists; only well-formed names count.
+fn read_index(store: &(dyn SecretStore + Send + Sync), project: &str) -> Vec<String> {
+    store
+        .get_password(SERVICE_NAME, &index_account(project))
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|name| valid_name(name))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the index, or delete it when nothing is remembered.
+fn write_index(
+    store: &(dyn SecretStore + Send + Sync),
+    project: &str,
+    names: &[String],
+) -> Result<(), String> {
+    let account = index_account(project);
+    if names.is_empty() {
+        store
+            .delete_password(SERVICE_NAME, &account)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        store
+            .set_password(SERVICE_NAME, &account, &names.join("\n"))
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// The error for a placeholder naming a secret that is not held.
 fn unknown_secret(name: &str, values: &[(String, String)]) -> String {
     let held = if values.is_empty() {
@@ -339,9 +568,10 @@ impl StreamRedactor {
 
 /// Ask at the terminal, input hidden, for `agent86 run` and the plain REPL: the
 /// reason first (on stderr, so `run --json` keeps stdout to one object), then the
-/// masked prompt. An empty entry or a failed read declines.
-pub fn terminal_prompt(request: &SecretRequest) -> Option<String> {
-    use std::io::Write;
+/// masked prompt, then whether to remember it for the project when a keyring is
+/// there. An empty entry or a failed read declines.
+pub fn terminal_prompt(request: &SecretRequest) -> Option<SecretAnswer> {
+    use std::io::{BufRead, Write};
     let mut err = std::io::stderr();
     let _ = writeln!(err);
     let _ = writeln!(
@@ -367,7 +597,28 @@ pub fn terminal_prompt(request: &SecretRequest) -> Option<String> {
     let value =
         crate::keys::prompt_hidden(&format!("{} (input is hidden): ", request.name)).ok()?;
     let value = value.trim().to_owned();
-    (!value.is_empty()).then_some(value)
+    if value.is_empty() {
+        return None;
+    }
+    let mut remember = false;
+    if request.can_remember {
+        let choices = if request.remembered { "[Y/n]" } else { "[y/N]" };
+        let _ = write!(
+            err,
+            "Remember it for this project, in the OS keyring? {choices} "
+        );
+        let _ = err.flush();
+        let mut line = String::new();
+        remember = match std::io::stdin().lock().read_line(&mut line) {
+            Ok(read) if read > 0 => match line.trim().to_lowercase().as_str() {
+                "y" | "yes" => true,
+                "n" | "no" => false,
+                _ => request.remembered,
+            },
+            _ => request.remembered,
+        };
+    }
+    Some(SecretAnswer { value, remember })
 }
 
 #[cfg(test)]
@@ -477,14 +728,252 @@ mod tests {
     fn asking_holds_what_the_user_entered() {
         let vault = SecretVault::default();
         assert!(!vault.can_ask());
-        assert!(!vault.ask("A", "why"));
+        assert!(vault.ask("A", "why").is_none());
         vault.set_prompt(Some(Box::new(|request| {
             assert_eq!(request.reason, "deploy");
-            (request.name == "A").then(|| "value".to_owned())
+            // No keyring is attached, so there is nothing to remember in.
+            assert!(!request.can_remember && !request.remembered);
+            (request.name == "A").then(|| SecretAnswer {
+                value: "value".to_owned(),
+                remember: true,
+            })
         })));
-        assert!(vault.ask("A", "deploy"));
-        assert!(!vault.ask("B", "deploy"));
+        let stored = vault.ask("A", "deploy").unwrap();
+        // Asked to remember, but nothing can: the session keeps it.
+        assert!(!stored.remembered && stored.warning.is_none());
+        assert!(vault.ask("B", "deploy").is_none());
         assert_eq!(vault.names(), ["A"]);
+    }
+
+    /// A keyring in memory, shared between "sessions" like the real one.
+    #[derive(Default)]
+    struct FakeKeyring {
+        entries: Mutex<Vec<((String, String), String)>>,
+        refuse_writes: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeKeyring {
+        fn accounts(&self) -> Vec<String> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|((_, account), _)| account.clone())
+                .collect()
+        }
+
+        fn dump(&self) -> String {
+            format!("{:?}", self.entries.lock().unwrap())
+        }
+    }
+
+    impl SecretStore for FakeKeyring {
+        fn get_password(&self, service: &str, account: &str) -> Option<String> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.0 == service && key.1 == account)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_password(
+            &self,
+            service: &str,
+            account: &str,
+            secret: &str,
+        ) -> Result<(), crate::secrets::SecretStoreError> {
+            if self.refuse_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::secrets::SecretStoreError("locked".to_owned()));
+            }
+            let mut entries = self.entries.lock().unwrap();
+            entries.retain(|(key, _)| !(key.0 == service && key.1 == account));
+            entries.push(((service.to_owned(), account.to_owned()), secret.to_owned()));
+            Ok(())
+        }
+
+        fn delete_password(
+            &self,
+            service: &str,
+            account: &str,
+        ) -> Result<bool, crate::secrets::SecretStoreError> {
+            let mut entries = self.entries.lock().unwrap();
+            let before = entries.len();
+            entries.retain(|(key, _)| !(key.0 == service && key.1 == account));
+            Ok(entries.len() != before)
+        }
+    }
+
+    fn kept_vault(keyring: &Arc<FakeKeyring>, workspace: &str) -> SecretVault {
+        let vault = SecretVault::default();
+        vault.attach_store(keyring.clone(), Path::new(workspace));
+        vault
+    }
+
+    fn answering(vault: &SecretVault, value: &'static str, remember: bool) {
+        vault.set_prompt(Some(Box::new(move |_| {
+            Some(SecretAnswer {
+                value: value.to_owned(),
+                remember,
+            })
+        })));
+    }
+
+    #[test]
+    fn a_remembered_secret_comes_back_in_a_new_session() {
+        let keyring = Arc::new(FakeKeyring::default());
+        let first = kept_vault(&keyring, ".");
+        answering(&first, "tok_1", true);
+        let stored = first.ask("API_TOKEN", "deploy").unwrap();
+        assert_eq!(
+            stored,
+            Stored {
+                remembered: true,
+                warning: None
+            }
+        );
+        assert_eq!(
+            stored.describe("API_TOKEN"),
+            "secret API_TOKEN set and remembered for this project · the agent sees only its name"
+        );
+        // A secret entered for the session only is not remembered.
+        answering(&first, "tok_2", false);
+        first.ask("ONCE", "").unwrap();
+        assert_eq!(first.remembered_names(), ["API_TOKEN"]);
+
+        // The keyring holds the value and a names-only index, and lists no other name.
+        let accounts = keyring.accounts();
+        assert!(accounts
+            .iter()
+            .any(|a| a.starts_with("secret:") && a.ends_with(":API_TOKEN")));
+        assert!(accounts.iter().any(|a| a.starts_with("secret-index:")));
+        assert!(!accounts.iter().any(|a| a.ends_with(":ONCE")));
+
+        let second = kept_vault(&keyring, ".");
+        assert!(second.is_empty());
+        assert_eq!(second.load_remembered(), ["API_TOKEN"]);
+        assert_eq!(
+            second.entries(),
+            [("API_TOKEN".to_owned(), "tok_1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn remembered_secrets_belong_to_their_workspace() {
+        let keyring = Arc::new(FakeKeyring::default());
+        let here = kept_vault(&keyring, "some/project");
+        answering(&here, "tok_1", true);
+        here.ask("API_TOKEN", "").unwrap();
+
+        let elsewhere = kept_vault(&keyring, "other/project");
+        assert!(elsewhere.remembered_names().is_empty());
+        assert!(elsewhere.load_remembered().is_empty());
+        assert!(elsewhere.is_empty());
+        assert_eq!(
+            kept_vault(&keyring, "some/project").load_remembered(),
+            ["API_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn forgetting_drops_the_session_value_and_the_keyring_entries() {
+        let keyring = Arc::new(FakeKeyring::default());
+        let vault = kept_vault(&keyring, ".");
+        answering(&vault, "tok_1", true);
+        vault.ask("A", "").unwrap();
+        vault.ask("B", "").unwrap();
+
+        assert_eq!(vault.forget("A"), Ok(true));
+        assert_eq!(vault.forget("A"), Ok(false));
+        assert_eq!(vault.names(), ["B"]);
+        assert_eq!(vault.remembered_names(), ["B"]);
+        assert_eq!(
+            keyring.accounts().len(),
+            2,
+            "B's value and the index: {:?}",
+            keyring.accounts()
+        );
+        // The last one out takes the index with it.
+        assert_eq!(vault.forget("B"), Ok(true));
+        assert!(keyring.accounts().is_empty());
+        // A name only the keyring had (a new session that did not load it) is forgotten too.
+        answering(&vault, "tok_1", true);
+        vault.ask("C", "").unwrap();
+        let fresh = kept_vault(&keyring, ".");
+        assert_eq!(fresh.forget("C"), Ok(true));
+        assert!(keyring.accounts().is_empty());
+    }
+
+    #[test]
+    fn a_new_value_replaces_the_remembered_one_or_stops_remembering() {
+        let keyring = Arc::new(FakeKeyring::default());
+        let vault = kept_vault(&keyring, ".");
+        answering(&vault, "old", true);
+        vault.ask("K", "").unwrap();
+
+        // The prompt starts on "remember" for a name that is remembered.
+        vault.set_prompt(Some(Box::new(|request| {
+            assert!(request.remembered && request.replacing && request.can_remember);
+            Some(SecretAnswer {
+                value: "new".to_owned(),
+                remember: true,
+            })
+        })));
+        vault.ask("K", "").unwrap();
+        assert_eq!(kept_vault(&keyring, ".").load_remembered(), ["K"]);
+        let reloaded = kept_vault(&keyring, ".");
+        reloaded.load_remembered();
+        assert_eq!(reloaded.entries()[0].1, "new");
+
+        // "Just this once" must not leave the old value in the keyring.
+        answering(&vault, "once", false);
+        let stored = vault.ask("K", "").unwrap();
+        assert!(!stored.remembered);
+        assert!(vault.remembered_names().is_empty());
+        assert!(!keyring.dump().contains("new"), "{}", keyring.dump());
+        assert_eq!(vault.entries(), [("K".to_owned(), "once".to_owned())]);
+    }
+
+    #[test]
+    fn a_keyring_that_refuses_leaves_the_secret_in_the_session() {
+        let keyring = Arc::new(FakeKeyring::default());
+        keyring
+            .refuse_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let vault = kept_vault(&keyring, ".");
+        answering(&vault, "tok_1", true);
+        let stored = vault.ask("K", "").unwrap();
+        assert!(!stored.remembered);
+        assert_eq!(
+            stored.warning.as_deref(),
+            Some("the keyring refused: locked")
+        );
+        assert!(stored
+            .describe("K")
+            .ends_with("· the keyring refused: locked"));
+        assert_eq!(vault.names(), ["K"]);
+        assert!(keyring.accounts().is_empty());
+    }
+
+    #[test]
+    fn a_store_that_cannot_keep_anything_is_not_offered() {
+        let vault = SecretVault::default();
+        vault.attach_store(Arc::new(crate::secrets::NoSecretStore), Path::new("."));
+        assert!(!vault.can_remember());
+        assert!(!vault.request("K", "").can_remember);
+        assert!(SecretVault::default().remembered_names().is_empty());
+        assert!(SecretVault::default().load_remembered().is_empty());
+        assert_eq!(SecretVault::default().forget("K"), Ok(false));
+    }
+
+    #[test]
+    fn answers_never_print_their_value() {
+        let answer = SecretAnswer {
+            value: "hunter2".to_owned(),
+            remember: true,
+        };
+        let printed = format!("{answer:?}");
+        assert!(!printed.contains("hunter2") && printed.contains("remember: true"));
     }
 
     #[test]

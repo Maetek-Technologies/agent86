@@ -82,11 +82,31 @@ pub struct Assembly {
     pub memory_note: Option<String>,
     /// Why the configured sandbox was replaced, as Python's `sandbox_note`.
     pub sandbox_note: Option<String>,
+    /// The names of the secrets remembered for this project and loaded into the
+    /// vault (beyond Python); never values.
+    pub remembered_secrets: Vec<String>,
 }
 
 /// Build the harness for `config.model.default`, jailed to the current directory,
 /// with the MCP servers started and `prompt` asking for approvals.
+///
+/// A terminal (`prompt` is set) gets the OS keyring for secrets the user chose to
+/// remember for the project; with none (piped input, CI) the keyring is never
+/// touched, so those runs read and write nothing there.
 pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assembly, SetupError> {
+    let keyring = prompt
+        .is_some()
+        .then(|| Arc::new(crate::secrets::OsKeyring) as crate::secrets::SharedStore);
+    assemble_with(config, prompt, keyring)
+}
+
+/// [`assemble`] with the store for remembered secrets given: tests pass a fake,
+/// and never the real keyring.
+pub fn assemble_with(
+    config: &Config,
+    prompt: Option<ApprovalPrompt>,
+    secret_store: Option<crate::secrets::SharedStore>,
+) -> Result<Assembly, SetupError> {
     let (provider, model_ref) =
         build_provider(config, &config.model.default).map_err(SetupError::Model)?;
 
@@ -133,6 +153,15 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
             .secrets
             .set_prompt(Some(Box::new(crate::vault::terminal_prompt)));
     }
+    // Secrets remembered for this project are loaded now, so the system message
+    // lists them and the tools can use them from the first turn.
+    let mut remembered_secrets = Vec::new();
+    if let Some(store) = secret_store {
+        context
+            .secrets
+            .attach_store(store, context.policy.workspace());
+        remembered_secrets = context.secrets.load_remembered();
+    }
 
     // MCP servers that fail to start contribute no tools; their notes say why.
     let registry = default_registry(
@@ -172,6 +201,7 @@ pub fn assemble(config: &Config, prompt: Option<ApprovalPrompt>) -> Result<Assem
         store,
         memory_note,
         sandbox_note,
+        remembered_secrets,
     })
 }
 

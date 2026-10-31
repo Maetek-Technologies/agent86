@@ -1746,3 +1746,52 @@ async fn an_unreachable_collector_is_a_note_not_a_failure() {
         "{note}"
     );
 }
+
+#[tokio::test]
+async fn a_repaired_argument_is_traced_and_the_call_is_kept_as_sent() {
+    // Beyond Python: a JSON string where the schema wants an array is repaired, a
+    // `tool_args_repaired` event says so, and the history keeps what the model sent.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("s1", "shapes", r#"{"formats": "[\"markdown\"]"}"#)]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("repair-args");
+    let traces = workspace.root.join("traces");
+    let harness = cancellable(
+        &server,
+        &workspace,
+        ask_gate(),
+        trace_recorder(&traces),
+        &CancelToken::default(),
+    );
+    harness
+        .registry
+        .register(Box::new(support::ShapesTool))
+        .unwrap();
+
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "go", |_| {}).await.unwrap();
+
+    let events = trace_events(&traces);
+    let repaired: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_args_repaired")
+        .collect();
+    assert_eq!(repaired.len(), 1, "{events:?}");
+    assert_eq!(repaired[0]["tool"], "shapes");
+    assert_eq!(repaired[0]["arguments"], json!(["formats"]));
+    let result = state
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("a tool result");
+    assert_eq!(result.content, "formats=array");
+    let call = state
+        .messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .next()
+        .expect("a tool call");
+    assert_eq!(call.arguments["formats"], "[\"markdown\"]");
+}

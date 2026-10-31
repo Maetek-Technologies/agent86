@@ -501,7 +501,7 @@ pub fn update_command(arg: &str, inherit: bool) -> CommandResult {
 }
 
 const SECRET_USAGE: &str =
-    "/secret NAME enters a secret, hidden · /secret lists them · /secret forget NAME drops one";
+    "/secret NAME enters a secret, hidden, and can remember it for this project · /secret lists them · /secret forget NAME drops one";
 
 /// The name `/secret <arg>` asks to enter, when that is what it asks.
 pub fn secret_to_enter(arg: &str) -> Option<&str> {
@@ -798,6 +798,28 @@ impl Repl {
         secrets: Box<dyn SecretStore>,
     ) -> Result<Self, SetupError> {
         let assembly = assemble(&config, prompt)?;
+        Ok(Self::from_assembly(config, resume, assembly, secrets))
+    }
+
+    /// [`Repl::new`] with the store for remembered secrets given, so tests never
+    /// reach the real keyring.
+    pub fn with_secret_store(
+        config: Config,
+        resume: Option<&str>,
+        prompt: Option<ApprovalPrompt>,
+        secrets: Box<dyn SecretStore>,
+        secret_store: Option<crate::secrets::SharedStore>,
+    ) -> Result<Self, SetupError> {
+        let assembly = crate::setup::assemble_with(&config, prompt, secret_store)?;
+        Ok(Self::from_assembly(config, resume, assembly, secrets))
+    }
+
+    fn from_assembly(
+        config: Config,
+        resume: Option<&str>,
+        assembly: crate::setup::Assembly,
+        secrets: Box<dyn SecretStore>,
+    ) -> Self {
         let mut resume_notes = Vec::new();
         let resumed = resume.and_then(|id| {
             let loaded = assembly
@@ -873,9 +895,15 @@ impl Repl {
         if let Some(note) = &assembly.sandbox_note {
             notes.push(format!("sandbox: {note}"));
         }
+        if !assembly.remembered_secrets.is_empty() {
+            notes.push(format!(
+                "secrets remembered for this project: {} · /secret forget NAME drops one",
+                assembly.remembered_secrets.join(", ")
+            ));
+        }
         notes.push(format!("session {}", repl.state.session_id));
         repl.startup_notes = notes;
-        Ok(repl)
+        repl
     }
 
     /// A fresh session, saved at once, as Python's `Harness.new_session`.
@@ -1041,22 +1069,33 @@ impl Repl {
             [] if vault.is_empty() => {
                 format!("no secrets this session · {SECRET_USAGE}")
             }
-            [] => format!("secrets (values hidden): {}", vault.names().join(", ")),
-            ["forget", name] => {
-                if vault.remove(name) {
-                    format!("secret {name} forgotten")
-                } else {
-                    format!("no secret named {name}")
-                }
+            [] => {
+                let remembered = vault.remembered_names();
+                let names: Vec<String> = vault
+                    .names()
+                    .into_iter()
+                    .map(|name| match remembered.contains(&name) {
+                        true => format!("{name} (remembered)"),
+                        false => name,
+                    })
+                    .collect();
+                format!("secrets (values hidden): {}", names.join(", "))
             }
+            ["forget", name] => match vault.forget(name) {
+                Ok(true) => format!("secret {name} forgotten"),
+                Ok(false) => format!("no secret named {name}"),
+                Err(error) => format!(
+                    "secret {name} dropped from this session, but the keyring refused: {error}"
+                ),
+            },
             _ => match secret_to_enter(arg) {
                 Some(name) if !vault.can_ask() => format!(
                     "secret {name} can only be entered at a terminal, where the input can be hidden"
                 ),
-                Some(name) if vault.ask(name, "") => {
-                    format!("secret {name} set for this session · the agent sees only its name")
-                }
-                Some(name) => format!("secret {name} not set"),
+                Some(name) => match vault.ask(name, "") {
+                    Some(stored) => stored.describe(name),
+                    None => format!("secret {name} not set"),
+                },
                 None if words.len() == 1 => format!(
                     "'{}' is not a valid name (letters, digits, and _, not starting with a digit)",
                     words[0]
@@ -1740,6 +1779,133 @@ mod tests {
         text.push(Style::Plain, " boom");
         assert_eq!(text.render(false), "error: boom");
         assert_eq!(text.render(true), "\x1b[31merror:\x1b[0m boom");
+    }
+
+    /// A keyring in memory that outlives one `Repl`, as the real one does.
+    #[derive(Default)]
+    struct SharedKeyring {
+        entries: std::sync::Mutex<Vec<((String, String), String)>>,
+    }
+
+    impl SecretStore for SharedKeyring {
+        fn get_password(&self, service: &str, account: &str) -> Option<String> {
+            let entries = self.entries.lock().unwrap();
+            entries
+                .iter()
+                .find(|(key, _)| key.0 == service && key.1 == account)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_password(
+            &self,
+            service: &str,
+            account: &str,
+            secret: &str,
+        ) -> Result<(), crate::secrets::SecretStoreError> {
+            let mut entries = self.entries.lock().unwrap();
+            entries.retain(|(key, _)| !(key.0 == service && key.1 == account));
+            entries.push(((service.to_owned(), account.to_owned()), secret.to_owned()));
+            Ok(())
+        }
+
+        fn delete_password(
+            &self,
+            service: &str,
+            account: &str,
+        ) -> Result<bool, crate::secrets::SecretStoreError> {
+            let mut entries = self.entries.lock().unwrap();
+            let before = entries.len();
+            entries.retain(|(key, _)| !(key.0 == service && key.1 == account));
+            Ok(entries.len() != before)
+        }
+    }
+
+    #[test]
+    fn remembered_secrets_load_at_startup_list_and_forget() {
+        use crate::vault::SecretAnswer;
+        let root = std::env::temp_dir().join(format!("agent86-repl-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = crate::config::ConfigPaths {
+            user: Some(root.join("user.toml")),
+            project: root.join("project.toml"),
+        };
+        let mut config =
+            crate::config::load_config(&paths, &crate::config::Overrides::default()).unwrap();
+        config.memory.enabled = false;
+        config.providers.insert(
+            "local".into(),
+            crate::config::ProviderConfig {
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                ..Default::default()
+            },
+        );
+        config.model.default = "local:m".into();
+        let keyring = std::sync::Arc::new(SharedKeyring::default());
+        let start = || {
+            Repl::with_secret_store(
+                config.clone(),
+                None,
+                None,
+                Box::new(crate::secrets::NoSecretStore),
+                Some(keyring.clone()),
+            )
+            .unwrap()
+        };
+
+        // One session remembers a secret and holds another for itself only.
+        let mut first = start();
+        assert!(!first
+            .startup_notes
+            .iter()
+            .any(|note| note.contains("remembered")));
+        let vault = first.harness.context.secrets.clone();
+        let answer = |remember| {
+            Some(SecretAnswer {
+                value: "v4lue".to_owned(),
+                remember,
+            })
+        };
+        vault.set_prompt(Some(Box::new(move |request| {
+            answer(request.name == "KEPT")
+        })));
+        assert!(vault.ask("KEPT", "").unwrap().remembered);
+        assert!(!vault.ask("ONCE", "").unwrap().remembered);
+        let said = |repl: &mut Repl, line: &str| {
+            repl.handle_command(line)
+                .render
+                .map(|text| text.plain_text())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            said(&mut first, "/secret"),
+            "secrets (values hidden): KEPT (remembered), ONCE"
+        );
+
+        // The next session loads it, says so, and lists it; the other one is gone.
+        let mut second = start();
+        assert!(
+            second.startup_notes.iter().any(|note| note
+                == "secrets remembered for this project: KEPT · /secret forget NAME drops one"),
+            "{:?}",
+            second.startup_notes
+        );
+        assert_eq!(
+            said(&mut second, "/secret"),
+            "secrets (values hidden): KEPT (remembered)"
+        );
+        // Forgetting reaches the keyring, so a third session starts empty.
+        assert_eq!(
+            said(&mut second, "/secret forget KEPT"),
+            "secret KEPT forgotten"
+        );
+        assert_eq!(
+            said(&mut second, "/secret forget KEPT"),
+            "no secret named KEPT"
+        );
+        let third = start();
+        assert!(third.harness.context.secrets.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct FakeKeyring;
