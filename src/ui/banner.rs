@@ -97,12 +97,19 @@ pub fn header(version: &str, cwd: &str, width: usize) -> Text {
             text.push(Style::Plain, "\n");
         }
         text.push(Style::Dim, format!("  {info}"));
+        text.push(Style::Plain, "\n");
+        text.push(Style::Dim, format!("  {COPYRIGHT}"));
     } else {
         text.push(Style::BoldColor(GRADIENT[0]), "agent86");
         text.push(Style::Dim, format!(" {info}"));
+        text.push(Style::Plain, "\n");
+        text.push(Style::Dim, COPYRIGHT);
     }
     text
 }
+
+/// The line under the version, matching the LICENSE.
+const COPYRIGHT: &str = "Copyright © 2026 Maetek Technologies";
 
 #[cfg(test)]
 mod tests {
@@ -121,9 +128,11 @@ mod tests {
         let text = header("1.0.0", "~/work", 100);
         let plain = text.plain_text();
         let lines: Vec<&str> = plain.lines().collect();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         assert!(lines[0].starts_with("  █████╗"), "{plain}");
         assert_eq!(lines[6], "  v1.0.0 · ~/work");
+        // The copyright sits under the version; the session line follows the header.
+        assert_eq!(lines[7], "  Copyright © 2026 Maetek Technologies");
         assert!(lines.iter().all(|line| line.width() < 100));
         let colors: Vec<Style> = text
             .spans()
@@ -137,6 +146,9 @@ mod tests {
     #[test]
     fn a_narrow_terminal_gets_one_line() {
         let plain = header("1.0.0", "~/work", 40).plain_text();
-        assert_eq!(plain, "agent86 v1.0.0 · ~/work");
+        assert_eq!(
+            plain,
+            "agent86 v1.0.0 · ~/work\nCopyright © 2026 Maetek Technologies"
+        );
     }
 }

@@ -62,6 +62,12 @@ impl ToolEntry {
 
     /// Python's `body_lines`: the full arguments, then the (capped) result.
     pub fn body_lines(&self) -> Vec<String> {
+        self.body_lines_capped(Some(RESULT_LINE_LIMIT))
+    }
+
+    /// [`ToolEntry::body_lines`] with the result cut to `cap` lines, or whole for `None`.
+    pub fn body_lines_capped(&self, cap: Option<usize>) -> Vec<String> {
+        let cap = cap.unwrap_or(usize::MAX);
         let mut lines = vec!["  args:".to_owned()];
         let args = if self.args.is_empty() {
             "{}"
@@ -80,17 +86,20 @@ impl ToolEntry {
             lines.push("    (no output)".to_owned());
         } else {
             let all: Vec<&str> = body.lines().collect();
-            lines.extend(
-                all.iter()
-                    .take(RESULT_LINE_LIMIT)
-                    .map(|line| format!("    {line}")),
-            );
-            if all.len() > RESULT_LINE_LIMIT {
-                lines.push(format!(
-                    "    … truncated ({} more lines)",
-                    all.len() - RESULT_LINE_LIMIT
-                ));
+            lines.extend(all.iter().take(cap).map(|line| format!("    {line}")));
+            if all.len() > cap {
+                lines.push(format!("    … truncated ({} more lines)", all.len() - cap));
             }
+        }
+        lines
+    }
+
+    /// The block as `[ui] tool_use = "full"` prints it into scrollback: the call,
+    /// then the arguments and the whole result, which the transcript view caps.
+    pub fn full(&self, width: usize) -> Vec<Line> {
+        let mut lines = self.collapsed(width);
+        for row in self.body_lines_capped(None) {
+            lines.extend(Line::styled(Style::Dim, sanitize(&row)).hard_wrap(width));
         }
         lines
     }

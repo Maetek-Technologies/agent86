@@ -25,6 +25,7 @@ use super::status::{fit_status_line, StatusState};
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
+use crate::config::DisplayLevel;
 use crate::config_writer::ConfigEdit;
 use crate::limits::LimitHit;
 use crate::provider::catalog::CatalogEntry;
@@ -46,6 +47,24 @@ pub const STREAM_TAIL_LIMIT: usize = 2000;
 pub const THINKING_LIVE_ROWS: usize = 8;
 /// How long the "press Ctrl+C again" offer stays open.
 pub const EXIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// The summary line for reasoning that is not shown in full:
+/// `∴ thought for 12s · 2.1k chars`.
+pub fn thought_summary(elapsed: Duration, chars: usize) -> String {
+    let seconds = elapsed.as_secs_f64().round() as u64;
+    let time = match seconds {
+        0 if elapsed.is_zero() => "0s".to_owned(),
+        0 => "<1s".to_owned(),
+        1..=59 => format!("{seconds}s"),
+        _ => format!("{}m {:02}s", seconds / 60, seconds % 60),
+    };
+    let size = if chars < 1000 {
+        format!("{chars} chars")
+    } else {
+        format!("{:.1}k chars", chars as f64 / 1000.0)
+    };
+    format!("∴ thought for {time} · {size}")
+}
 
 const SPINNER: [&str; 6] = ["·", "✢", "✳", "∗", "✻", "✽"];
 
@@ -254,6 +273,15 @@ pub struct App {
     thinking: String,
     /// The current reasoning has committed its first paragraph (with the `∴` marker).
     thinking_started: bool,
+    /// How much reasoning is shown (`[ui] thinking`, then Ctrl+T and `/thinking`).
+    thinking_level: DisplayLevel,
+    /// How much of each tool call is shown (`[ui] tool_use`, then `/toolview`).
+    tool_level: DisplayLevel,
+    /// Reasoning received while it is not shown in full, kept for the transcript
+    /// view and for the summary line's size.
+    think_held: String,
+    /// When the held reasoning began, for the summary line's duration.
+    think_since: Option<Instant>,
     /// The current reply has committed its first chunk (with the `⏺` marker).
     reply_started: bool,
     /// The tail was split off at a block boundary, so a blank line comes first.
@@ -299,6 +327,10 @@ impl App {
             stream: String::new(),
             thinking: String::new(),
             thinking_started: false,
+            thinking_level: DisplayLevel::Summary,
+            tool_level: DisplayLevel::Summary,
+            think_held: String::new(),
+            think_since: None,
             reply_started: false,
             blank_before_chunk: false,
             tools: Vec::new(),
@@ -440,10 +472,58 @@ impl App {
         self.dirty = true;
     }
 
-    /// Print a tool call, collapsed; the transcript view can show it in full.
+    /// Print a tool call as `[ui] tool_use` says: in full, collapsed, or not at all.
+    /// A call that failed, or that the turn ended without seeing answered, is
+    /// printed collapsed even when tool use is hidden, since hiding it would hide
+    /// why the turn went wrong. The transcript view keeps every call at every level.
     fn commit_tool(&mut self, tool: ToolEntry) {
-        self.committed.extend(tool.collapsed(self.width));
+        let remarkable = !tool.ok || tool.summary.is_none();
+        match self.tool_level {
+            DisplayLevel::Full => self.committed.extend(tool.full(self.width)),
+            DisplayLevel::Summary => self.committed.extend(tool.collapsed(self.width)),
+            DisplayLevel::Hidden if remarkable => {
+                self.committed.extend(tool.collapsed(self.width));
+            }
+            DisplayLevel::Hidden => {}
+        }
         self.entries.push(Entry::Tool(tool));
+        self.dirty = true;
+    }
+
+    pub fn thinking_level(&self) -> DisplayLevel {
+        self.thinking_level
+    }
+
+    pub fn tool_level(&self) -> DisplayLevel {
+        self.tool_level
+    }
+
+    /// Show reasoning at `level` from now on. What is already printed stays; the
+    /// unfinished tail follows the new level at once.
+    pub fn set_thinking_level(&mut self, level: DisplayLevel) {
+        if level == self.thinking_level {
+            return;
+        }
+        if level == DisplayLevel::Full {
+            // What was held streams again, as if it had just arrived.
+            self.thinking_level = level;
+            self.think_since = None;
+            let held = std::mem::take(&mut self.think_held);
+            self.take_thinking(&held);
+        } else if self.thinking_level == DisplayLevel::Full {
+            // The live tail is no longer shown; it is held for the summary instead.
+            let tail = std::mem::take(&mut self.thinking);
+            self.hold_thinking(&tail);
+            self.thinking_level = level;
+        } else {
+            self.thinking_level = level;
+        }
+        self.dirty = true;
+    }
+
+    /// Show tool calls at `level` from now on.
+    pub fn set_tool_level(&mut self, level: DisplayLevel) {
+        self.tool_level = level;
         self.dirty = true;
     }
 
@@ -515,6 +595,8 @@ impl App {
         self.stream.clear();
         self.thinking.clear();
         self.thinking_started = false;
+        self.think_held.clear();
+        self.think_since = None;
         self.reply_started = false;
         self.tools.clear();
         self.menu = None;
@@ -546,9 +628,8 @@ impl App {
                 if !self.stream.is_empty() || self.reply_started {
                     self.finish_reply();
                 }
-                self.thinking.push_str(&sanitize(&text));
+                self.take_thinking(&sanitize(&text));
                 self.status.phase = "thinking".into();
-                self.drain_thinking();
             }
             UiEvent::ToolCall {
                 id,
@@ -808,11 +889,52 @@ impl App {
             .collect()
     }
 
+    /// Take a piece of reasoning: streamed when shown in full, else held.
+    fn take_thinking(&mut self, text: &str) {
+        if self.thinking_level == DisplayLevel::Full {
+            self.thinking.push_str(text);
+            self.drain_thinking();
+        } else {
+            self.hold_thinking(text);
+        }
+    }
+
+    fn hold_thinking(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.think_since.get_or_insert_with(Instant::now);
+        self.think_held.push_str(text);
+    }
+
     /// End the reasoning in progress: commit its tail.
     fn finish_thinking(&mut self) {
         let tail = std::mem::take(&mut self.thinking);
         self.commit_thinking(&tail);
+        self.finish_held_thinking();
         self.thinking_started = false;
+    }
+
+    /// Reasoning that was held: the summary line goes to scrollback (unless it is
+    /// hidden), and the whole text to the transcript view's entries, so hiding is
+    /// display-only.
+    fn finish_held_thinking(&mut self) {
+        let held = std::mem::take(&mut self.think_held);
+        let since = self.think_since.take();
+        let rows = self.thinking_rows(&held);
+        if rows.is_empty() {
+            return;
+        }
+        if self.thinking_level == DisplayLevel::Summary {
+            let elapsed = since.map_or(Duration::ZERO, |since| since.elapsed());
+            let summary = thought_summary(elapsed, held.trim().chars().count());
+            self.committed
+                .extend([Line::default(), Line::styled(Style::Dim, summary)]);
+        }
+        let mut full = vec![Line::default()];
+        full.extend(rows);
+        self.entries.push(Entry::Lines(full));
+        self.dirty = true;
     }
 
     /// End the reply in progress: commit its tail.
@@ -949,6 +1071,12 @@ impl App {
         }
         if self.view.is_some() {
             self.view_key(key);
+            return Effect::None;
+        }
+        if ctrl && key.code == KeyCode::Char('t') && self.panel.is_none() {
+            let level = self.thinking_level.next();
+            self.set_thinking_level(level);
+            self.note(Style::Dim, &format!("thinking: {}", level.as_str()));
             return Effect::None;
         }
         if ctrl && key.code == KeyCode::Char('o') && self.panel.is_none() {
@@ -1243,7 +1371,12 @@ impl App {
                 }
                 top.extend(rows);
             }
-            for (_, tool) in &self.tools {
+            let shown_tools = if self.tool_level == DisplayLevel::Hidden {
+                &[][..]
+            } else {
+                &self.tools[..]
+            };
+            for (_, tool) in shown_tools {
                 top.push(Line::default());
                 top.push(
                     Line::styled(Style::Dim, "⏺ ")
@@ -1501,6 +1634,7 @@ mod tests {
     #[test]
     fn reasoning_is_dimmed_and_committed_before_the_reply() {
         let mut app = app();
+        app.set_thinking_level(DisplayLevel::Full);
         app.start_turn();
         app.on_turn_event(UiEvent::Thinking("Let me see.\n\nThe".into()));
         let lines = app.take_committed();
@@ -1518,6 +1652,7 @@ mod tests {
     #[test]
     fn unfinished_reasoning_shows_only_its_last_rows() {
         let mut app = app();
+        app.set_thinking_level(DisplayLevel::Full);
         app.start_turn();
         let long: Vec<String> = (0..20).map(|n| format!("line {n}")).collect();
         app.on_turn_event(UiEvent::Thinking(long.join("\n")));
@@ -1532,6 +1667,7 @@ mod tests {
     #[test]
     fn empty_answer_notices_are_set_apart() {
         let mut app = app();
+        app.set_thinking_level(DisplayLevel::Full);
         app.start_turn();
         app.on_turn_event(UiEvent::Thinking("Hmm.".into()));
         app.on_turn_event(UiEvent::Text(crate::agent::EMPTY_ANSWER_NOTICE.into()));
@@ -1539,6 +1675,229 @@ mod tests {
             committed_text(&mut app),
             ["", "∴ Hmm.", "[no answer; asking the model again]"]
         );
+    }
+
+    /// The transcript view's rows, as text: what Ctrl+O would show.
+    fn transcript(app: &App) -> Vec<String> {
+        view_lines(&app.entries, 80, true)
+            .iter()
+            .map(Line::plain_text)
+            .collect()
+    }
+
+    #[test]
+    fn summary_reasoning_prints_one_line_and_the_transcript_keeps_all_of_it() {
+        let mut app = app();
+        assert_eq!(app.thinking_level(), DisplayLevel::Summary);
+        app.start_turn();
+        app.on_turn_event(UiEvent::Thinking("Let me see.\n\nMore".into()));
+        // Nothing is printed or drawn while it thinks; the status line says so.
+        assert!(committed_text(&mut app).is_empty());
+        assert!(!live_text(&mut app).iter().any(|row| row.contains("Let me")));
+        assert_eq!(app.status.phase, "thinking");
+        app.on_turn_event(UiEvent::Text("Answer.".into()));
+        let printed = committed_text(&mut app);
+        assert_eq!(printed.len(), 2, "{printed:?}");
+        assert_eq!(printed[0], "");
+        assert!(printed[1].starts_with("∴ thought for "), "{printed:?}");
+        assert!(printed[1].ends_with(" · 17 chars"), "{printed:?}");
+        let transcript = transcript(&app);
+        assert!(
+            transcript.contains(&"∴ Let me see.".to_owned()),
+            "{transcript:?}"
+        );
+        assert!(transcript.contains(&"  More".to_owned()), "{transcript:?}");
+    }
+
+    #[test]
+    fn hidden_reasoning_prints_nothing_but_the_transcript_keeps_it() {
+        let mut app = app();
+        app.set_thinking_level(DisplayLevel::Hidden);
+        app.start_turn();
+        app.on_turn_event(UiEvent::Thinking("Secretly\n\nthinking".into()));
+        app.on_turn_event(UiEvent::Text("Answer.".into()));
+        app.on_turn_event(UiEvent::Finished(None));
+        let printed = committed_text(&mut app);
+        assert!(
+            !printed
+                .iter()
+                .any(|row| row.contains("thought") || row.contains("Secretly")),
+            "{printed:?}"
+        );
+        assert!(printed.iter().any(|row| row == "⏺ Answer."), "{printed:?}");
+        assert!(transcript(&app).contains(&"∴ Secretly".to_owned()));
+    }
+
+    #[test]
+    fn reasoning_follows_a_level_change_from_then_on() {
+        let mut app = app();
+        app.set_thinking_level(DisplayLevel::Full);
+        app.start_turn();
+        app.on_turn_event(UiEvent::Thinking("First.\n\nTail".into()));
+        assert_eq!(committed_text(&mut app), ["", "∴ First."]);
+        assert!(live_text(&mut app).contains(&"  Tail".to_owned()));
+        // Summary: what is printed stays, the live tail goes, and the rest is held.
+        app.set_thinking_level(DisplayLevel::Summary);
+        assert!(!live_text(&mut app).iter().any(|row| row.contains("Tail")));
+        app.on_turn_event(UiEvent::Thinking(" more".into()));
+        app.on_turn_event(UiEvent::Text("Done.".into()));
+        let printed = committed_text(&mut app);
+        assert!(printed[1].ends_with(" · 9 chars"), "{printed:?}");
+        // And back to full: held text streams again at once.
+        app.on_turn_event(UiEvent::Finished(None));
+        app.take_committed();
+        app.start_turn();
+        app.on_turn_event(UiEvent::Thinking("Held then shown".into()));
+        app.set_thinking_level(DisplayLevel::Full);
+        assert!(live_text(&mut app).contains(&"∴ Held then shown".to_owned()));
+    }
+
+    #[test]
+    fn the_thinking_summary_reads_in_seconds_and_sizes() {
+        let line = |secs: f64, chars| thought_summary(Duration::from_secs_f64(secs), chars);
+        assert_eq!(line(12.0, 2100), "∴ thought for 12s · 2.1k chars");
+        assert_eq!(line(0.2, 842), "∴ thought for <1s · 842 chars");
+        assert_eq!(line(0.0, 5), "∴ thought for 0s · 5 chars");
+        assert_eq!(line(59.4, 999), "∴ thought for 59s · 999 chars");
+        assert_eq!(line(65.0, 1000), "∴ thought for 1m 05s · 1.0k chars");
+        assert_eq!(line(600.0, 12_345), "∴ thought for 10m 00s · 12.3k chars");
+    }
+
+    fn tool_call(app: &mut App, id: &str) {
+        app.on_turn_event(UiEvent::ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            preview: r#"{"path": "a.txt"}"#.into(),
+            args: "{\n  \"path\": \"a.txt\"\n}".into(),
+        });
+    }
+
+    fn tool_result(app: &mut App, id: &str, ok: bool, result: &str) {
+        app.on_turn_event(UiEvent::ToolResult {
+            id: id.into(),
+            name: "read_file".into(),
+            ok,
+            summary: result.lines().next().unwrap_or_default().into(),
+            result: result.into(),
+        });
+    }
+
+    #[test]
+    fn tool_use_is_shown_in_full_collapsed_or_not_at_all() {
+        let text = "line one\nline two\nline three";
+        // Summary, the default: the call and one summary line.
+        let mut app = app();
+        assert_eq!(app.tool_level(), DisplayLevel::Summary);
+        app.start_turn();
+        tool_call(&mut app, "c1");
+        tool_result(&mut app, "c1", true, text);
+        let summary = committed_text(&mut app);
+        assert_eq!(summary.len(), 3, "{summary:?}");
+        assert!(summary[1].starts_with("⏺ read_file("), "{summary:?}");
+
+        // Full: the arguments and the whole result, uncapped.
+        app.set_tool_level(DisplayLevel::Full);
+        let long: String = (0..250).map(|n| format!("row {n}\n")).collect();
+        tool_call(&mut app, "c2");
+        tool_result(&mut app, "c2", true, &long);
+        let full = committed_text(&mut app);
+        assert!(full.iter().any(|row| row == "  args:"), "{full:?}");
+        assert!(full.iter().any(|row| row == "    row 249"), "{full:?}");
+        assert!(
+            !full.iter().any(|row| row.contains("truncated")),
+            "{full:?}"
+        );
+
+        // Hidden: nothing printed for a call that worked, and none drawn while it runs.
+        app.set_tool_level(DisplayLevel::Hidden);
+        tool_call(&mut app, "c3");
+        assert_eq!(app.status.phase, "running read_file");
+        // The status line still names it; only the tool block is not drawn.
+        let live = live_text(&mut app);
+        assert!(
+            live.iter().any(|row| row.contains("running read_file")),
+            "{live:?}"
+        );
+        assert!(
+            !live.iter().any(|row| row.starts_with("⏺ read_file")),
+            "{live:?}"
+        );
+        tool_result(&mut app, "c3", true, text);
+        assert!(committed_text(&mut app).is_empty());
+    }
+
+    #[test]
+    fn hidden_tool_use_still_shows_failures_and_the_transcript_keeps_every_call() {
+        let mut app = app();
+        app.set_tool_level(DisplayLevel::Hidden);
+        app.start_turn();
+        tool_call(&mut app, "ok");
+        tool_result(&mut app, "ok", true, "fine");
+        tool_call(&mut app, "bad");
+        tool_result(&mut app, "bad", false, "Not executed: declined by user.");
+        // A call the turn ended without seeing answered is shown too.
+        tool_call(&mut app, "lost");
+        app.on_turn_event(UiEvent::Finished(None));
+        let printed = committed_text(&mut app);
+        let heads = printed
+            .iter()
+            .filter(|row| row.starts_with("⏺ read_file("))
+            .count();
+        assert_eq!(heads, 2, "{printed:?}");
+        assert!(
+            printed.iter().any(|row| row.contains("Not executed")),
+            "{printed:?}"
+        );
+        assert!(
+            printed.iter().any(|row| row.contains("(no result)")),
+            "{printed:?}"
+        );
+        let calls = transcript(&app)
+            .iter()
+            .filter(|row| row.starts_with("⏺ read_file("))
+            .count();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn an_approval_shows_whatever_the_levels() {
+        let mut app = app_running();
+        app.set_tool_level(DisplayLevel::Hidden);
+        app.set_thinking_level(DisplayLevel::Hidden);
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Approval {
+            tool: "write_file".into(),
+            preview: crate::approval::ApprovalPreview {
+                summary: "write_file(a.txt)".into(),
+                detail: None,
+                lexer: None,
+            },
+            reply,
+        });
+        let live = live_text(&mut app).join("\n");
+        assert!(live.contains("write_file"), "{live}");
+        app.on_key(key(KeyCode::Char('y')), &[]);
+        assert!(answer.recv().unwrap());
+    }
+
+    #[test]
+    fn ctrl_t_cycles_reasoning_and_says_which() {
+        let mut app = app();
+        assert_eq!(app.thinking_level(), DisplayLevel::Summary);
+        app.on_key(ctrl('t'), &[]);
+        assert_eq!(app.thinking_level(), DisplayLevel::Hidden);
+        assert_eq!(committed_text(&mut app), ["thinking: hidden"]);
+        app.on_key(ctrl('t'), &[]);
+        assert_eq!(app.thinking_level(), DisplayLevel::Full);
+        app.on_key(ctrl('t'), &[]);
+        assert_eq!(app.thinking_level(), DisplayLevel::Summary);
+        assert_eq!(
+            committed_text(&mut app),
+            ["thinking: full", "thinking: summary"]
+        );
+        // The prompt is untouched, and tool use has no key.
+        assert!(app.editor.is_empty());
+        assert_eq!(app.tool_level(), DisplayLevel::Summary);
     }
 
     #[test]

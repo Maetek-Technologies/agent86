@@ -81,6 +81,8 @@ pub enum SavePurpose {
     McpUnmount,
     /// `/limits save`.
     Limits,
+    /// `/thinking save` and `/toolview save`.
+    Display,
 }
 
 /// Masked entry of one API key. The key is never drawn: only one dot per

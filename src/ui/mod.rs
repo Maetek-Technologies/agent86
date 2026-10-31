@@ -15,6 +15,7 @@
 mod app;
 mod banner;
 mod diff;
+mod display;
 mod entries;
 mod input;
 mod limits;
@@ -302,6 +303,8 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     app.set_size(usize::from(width), usize::from(height));
     app.workspace = Some(repl.harness.context.policy.workspace().to_path_buf());
     app.markdown = repl.config.ui.markdown;
+    app.set_thinking_level(repl.config.ui.thinking);
+    app.set_tool_level(repl.config.ui.tool_use);
     commit_header(&mut app);
     for note in &repl.startup_notes {
         app.note(Style::Dim, note);
@@ -394,6 +397,10 @@ fn run(repl: &mut Repl) -> io::Result<()> {
                 limits::on_saved(&mut app, repl, edit);
                 None
             }
+            Request::Saved(SavePurpose::Display, edit) => {
+                display::on_saved(&mut app, repl, edit);
+                None
+            }
             Request::Saved(SavePurpose::McpUnmount, edit) => {
                 manager.mcp.on_unmount_saved(&mut app, repl, edit);
                 None
@@ -466,6 +473,11 @@ fn dispatch(
         // Saving shows the diff first, as `/config model` does.
         if entry.name == "/limits" && arg.trim() == "save" {
             limits::open_save(app, repl);
+            return Ok(true);
+        }
+        // How much reasoning and tool use the interface shows is its own setting.
+        if let Some(setting) = display::Setting::of_command(entry.name) {
+            display::command(app, repl, setting, &arg);
             return Ok(true);
         }
         // Checking and installing take a while, so they run off the drawing thread.
