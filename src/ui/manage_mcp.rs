@@ -397,6 +397,7 @@ mod tests {
         let paths = ConfigPaths {
             user: Some(root.join("user.toml")),
             project: root.join("project.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         let mut config = load_config(&paths, &Overrides::default()).unwrap();
         config.memory.enabled = false;

@@ -335,6 +335,7 @@ fn ollama_refs_get_the_ollama_adapter_without_a_key() {
     let paths = ConfigPaths {
         user: None,
         project: std::path::PathBuf::from("no-such-dir/config.toml"),
+        project_trust: agent86::config::ProjectTrust::Trusted,
     };
     let config = load_config(&paths, &Overrides::default()).unwrap();
     let reference = ModelRef::parse("ollama:llama3.1:8b").unwrap();

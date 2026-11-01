@@ -594,6 +594,7 @@ mod tests {
         let paths = ConfigPaths {
             user: None,
             project: std::path::PathBuf::from("no-such-dir/config.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         let mut config = load_config(&paths, &Overrides::default()).unwrap();
         config.memory.enabled = false;

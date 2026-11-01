@@ -89,6 +89,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Beyond Python: the path this call would write if it is agent86's own
+    /// configuration or skills ([`SandboxPolicy::guarded`]), as the model gave it.
+    /// Such a write changes what agent86 runs from then on, so the approval gate
+    /// asks about it even in `auto` mode, and declines it with nobody to ask.
+    /// Receives the raw arguments and must never fail.
+    fn guarded_target(&self, _args: &Map<String, Value>, _ctx: &ToolContext) -> Option<String> {
+        None
+    }
+
     /// What [`Tool::preview`] is written in (`diff`, `bash`, `python`), as Python's
     /// `preview_lexer`, so the interface can colour it.
     fn preview_lexer(&self) -> Option<&'static str> {
@@ -374,6 +383,9 @@ pub struct SandboxPolicy {
     /// files can be read. (The jail has no read/write split, as in Python; a write
     /// there still passes the approval gate.)
     allow_paths: Vec<PathBuf>,
+    /// Beyond Python: further roots that hold agent86's own files (the user's
+    /// `~/.agent86`), for [`SandboxPolicy::guarded`]. They add nothing to the jail.
+    guarded_roots: Vec<PathBuf>,
     pub max_output_chars: usize,
     /// How long one sandboxed process may run before its tree is killed.
     pub timeout: Duration,
@@ -389,6 +401,7 @@ impl SandboxPolicy {
         Ok(Self {
             workspace: std::fs::canonicalize(workspace)?,
             allow_paths: Vec::new(),
+            guarded_roots: Vec::new(),
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
             timeout: Duration::from_secs(30),
             env_passthrough: Vec::new(),
@@ -407,6 +420,60 @@ impl SandboxPolicy {
             if !root.starts_with(&self.workspace) && !self.allow_paths.contains(&root) {
                 self.allow_paths.push(root);
             }
+        }
+    }
+
+    /// Also count `roots` as agent86's own files for [`SandboxPolicy::guarded`],
+    /// resolved as the jail resolves paths, so a workspace inside one (or equal to
+    /// it) is covered. The jail itself is unchanged.
+    pub fn guard(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        for root in roots {
+            let root = resolve(&root);
+            if !self.guarded_roots.contains(&root) {
+                self.guarded_roots.push(root);
+            }
+        }
+    }
+
+    /// Beyond Python: whether `target` (as [`SandboxPolicy::resolve_within`] gave it)
+    /// is agent86's own configuration or skills: the workspace's `.agent86/` or
+    /// `.claude/skills/`, a skill root outside the workspace (such as
+    /// `~/.agent86/skills`, which every project loads), or a root given to
+    /// [`SandboxPolicy::guard`] (the user's `~/.agent86`, so running in that very
+    /// directory still guards its `config.toml`). What is written there runs, or is
+    /// read as instructions, from then on.
+    ///
+    /// Names are compared as Windows and macOS do (ignoring ASCII case, and on
+    /// Windows the trailing dots and spaces it drops), so `.AGENT86./` is caught
+    /// too; on Linux that only asks about a little more than it must.
+    pub fn guarded(&self, target: &Path) -> bool {
+        if self
+            .allow_paths
+            .iter()
+            .chain(&self.guarded_roots)
+            .any(|root| target.starts_with(root))
+        {
+            return true;
+        }
+        let Ok(inside) = target.strip_prefix(&self.workspace) else {
+            return false;
+        };
+        let names: Vec<String> = inside
+            .components()
+            .take(2)
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(
+                    name.to_string_lossy()
+                        .trim_end_matches(['.', ' '])
+                        .to_ascii_lowercase(),
+                ),
+                _ => None,
+            })
+            .collect();
+        match names.as_slice() {
+            [first, ..] if first == ".agent86" => true,
+            [first, second] => first == ".claude" && second == "skills",
+            _ => false,
         }
     }
 

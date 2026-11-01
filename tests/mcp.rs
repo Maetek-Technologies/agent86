@@ -43,6 +43,7 @@ fn config_from(dir: &Path, toml: &str) -> Result<Config, String> {
     let paths = ConfigPaths {
         user: None,
         project: path,
+        project_trust: agent86::config::ProjectTrust::Trusted,
     };
     load_config(&paths, &Overrides::default()).map_err(|error| error.to_string())
 }
@@ -1017,16 +1018,46 @@ fn the_cli_lists_servers_and_their_tools() {
         ),
     )
     .unwrap();
-    let agent86 = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_agent86"))
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent86"));
+        command
             .args(args)
             .current_dir(&project)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
             .env("NO_COLOR", "1")
+            .env_remove("AGENT86_TRUST_PROJECT");
+        command
+    };
+
+    // Beyond Python: servers in an untrusted project file are neither listed nor
+    // started, and the note says why.
+    for args in [["mcp", "list"], ["mcp", "tools"]] {
+        let untrusted = command(&args).output().unwrap();
+        assert!(untrusted.status.success());
+        let stdout = String::from_utf8(untrusted.stdout).unwrap();
+        assert!(stdout.starts_with("No MCP servers configured"), "{stdout}");
+        let stderr = String::from_utf8(untrusted.stderr).unwrap();
+        assert!(
+            stderr.starts_with(
+                "project config: ignored 4 settings that need trust (mcp_servers.test.command, "
+            ),
+            "{stderr}"
+        );
+    }
+
+    let agent86 = |args: &[&str]| {
+        command(args)
+            .env("AGENT86_TRUST_PROJECT", "1")
             .output()
             .unwrap()
     };
+    let flagged = command(&["--trust-project", "mcp", "list"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(flagged.stdout)
+        .unwrap()
+        .starts_with("Name  Transport"));
 
     let listed = agent86(&["mcp", "list"]);
     assert!(listed.status.success());

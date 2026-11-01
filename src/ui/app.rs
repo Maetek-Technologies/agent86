@@ -1491,6 +1491,9 @@ fn approval_panel(panel: &ApprovalPanel, width: usize, budget: usize) -> Vec<Lin
         Style::Bold,
         format!("Approve tool: {}?", sanitize(&panel.tool)),
     )];
+    if let Some(warning) = &panel.preview.warning {
+        content.push(Line::styled(Style::Yellow, sanitize(warning)));
+    }
     for row in sanitize(&panel.preview.summary).split('\n') {
         content.push(Line::plain(row));
     }
@@ -1871,6 +1874,7 @@ mod tests {
                 summary: "write_file(a.txt)".into(),
                 detail: None,
                 lexer: None,
+                warning: None,
             },
             reply,
         });
@@ -2011,6 +2015,7 @@ mod tests {
                 summary: "{}".into(),
                 detail: None,
                 lexer: None,
+                warning: None,
             },
             reply,
         });
@@ -2037,6 +2042,7 @@ mod tests {
                 summary: "{}".into(),
                 detail: None,
                 lexer: None,
+                warning: None,
             },
             reply,
         });
@@ -2058,6 +2064,7 @@ mod tests {
                 summary: "{}".into(),
                 detail: Some("--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-old\n+new".into()),
                 lexer: Some("diff"),
+                warning: None,
             },
             reply,
         });
@@ -2361,6 +2368,7 @@ mod tests {
                 summary: r#"{"path": "a.txt"}"#.into(),
                 detail: Some("--- a.txt\n+++ a.txt\n+hello".into()),
                 lexer: Some("diff"),
+                warning: None,
             },
             reply,
         });
@@ -2382,6 +2390,7 @@ mod tests {
                 summary: "{}".into(),
                 detail: None,
                 lexer: None,
+                warning: None,
             },
             reply,
         });
@@ -2395,6 +2404,7 @@ mod tests {
                 summary: "{}".into(),
                 detail: None,
                 lexer: None,
+                warning: None,
             },
             reply,
         });
@@ -2413,6 +2423,7 @@ mod tests {
                 summary: "{}".into(),
                 detail: Some(detail.join("\n")),
                 lexer: Some("diff"),
+                warning: None,
             },
             reply,
         });

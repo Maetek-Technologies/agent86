@@ -37,6 +37,7 @@ fn config_for(server: &MockServer, name: &str) -> agent86::config::Config {
     let paths = ConfigPaths {
         user: None,
         project,
+        project_trust: agent86::config::ProjectTrust::Trusted,
     };
     load_config(&paths, &Overrides::default()).unwrap()
 }

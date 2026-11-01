@@ -413,6 +413,7 @@ fn the_factory_needs_a_key_and_names_its_variable() {
     let paths = ConfigPaths {
         user: None,
         project: std::path::PathBuf::from("no-such-dir/config.toml"),
+        project_trust: agent86::config::ProjectTrust::Trusted,
     };
     let mut config = load_config(&paths, &Overrides::default()).unwrap();
     config.providers.get_mut("anthropic").unwrap().api_key_env =

@@ -27,6 +27,18 @@ pub struct ApprovalPreview {
     pub detail: Option<String>,
     /// What `detail` is written in (`diff`, `bash`, `python`), as Python's `lexer`.
     pub lexer: Option<&'static str>,
+    /// Beyond Python: a caution shown above the detail, for a write into agent86's
+    /// own configuration or skills ([`guarded_warning`]).
+    pub warning: Option<String>,
+}
+
+/// The caution for a write into agent86's own configuration or skills.
+pub fn guarded_warning(path: &str) -> String {
+    format!(
+        "This writes agent86's own configuration or skills ({}), which changes what \
+         agent86 runs or is told from now on. Asked even in auto mode.",
+        crate::escape::show_controls(path)
+    )
 }
 
 /// Asks whether one side-effecting call may run: `(tool name, preview) -> approved`.
@@ -66,6 +78,27 @@ impl ApprovalGate {
         let decision = |approved, reason| ApprovalDecision { approved, reason };
         if !tool.side_effecting() {
             return decision(true, "read-only");
+        }
+        // Beyond Python: agent86's own files are asked about whatever the mode,
+        // except that `deny` still denies.
+        if let Some(path) = tool.guarded_target(&call.arguments, ctx) {
+            if self.mode() == ApprovalMode::Deny {
+                return decision(false, "blocked by approval policy (deny)");
+            }
+            let Some(prompt) = &self.prompt else {
+                return decision(
+                    false,
+                    "writing agent86's own configuration or skills needs approval, and no \
+                     prompt is available",
+                );
+            };
+            let mut preview = build_preview(tool, call, ctx);
+            preview.warning = Some(guarded_warning(&path));
+            return if prompt(tool.name(), &preview) {
+                decision(true, "approved by user")
+            } else {
+                decision(false, "declined by user")
+            };
         }
         match self.mode() {
             ApprovalMode::Auto => decision(true, "auto-approved"),
@@ -110,6 +143,7 @@ pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> App
             .map(|detail| ctx.secrets.redact(&detail))
             .filter(|detail| !detail.is_empty()),
         lexer: tool.preview_lexer(),
+        warning: None,
     }
 }
 
@@ -145,6 +179,13 @@ fn color_allowed() -> bool {
 fn ask(out: &mut dyn Write, color: bool, tool_name: &str, preview: &ApprovalPreview) -> bool {
     let detail = preview.detail.as_deref().unwrap_or(&preview.summary);
     let _ = writeln!(out);
+    if let Some(warning) = &preview.warning {
+        if color {
+            let _ = writeln!(out, "\x1b[1;33mwarning:\x1b[0m {warning}");
+        } else {
+            let _ = writeln!(out, "warning: {warning}");
+        }
+    }
     let _ = writeln!(out, "{}", cap_lines(detail, APPROVAL_DETAIL_LINES));
     if color {
         let _ = writeln!(out, "\x1b[1;33mapprove \x1b[0m\x1b[1m{tool_name}?\x1b[0m");

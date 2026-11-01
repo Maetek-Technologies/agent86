@@ -153,6 +153,9 @@ pub struct Config {
     /// The config files that contributed, in the order they were read.
     #[serde(skip)]
     pub sources: Vec<PathBuf>,
+    /// Settings in an untrusted project file that were left out, as dotted keys.
+    #[serde(skip)]
+    pub untrusted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -654,14 +657,32 @@ impl Config {
 pub struct ConfigPaths {
     pub user: Option<PathBuf>,
     pub project: PathBuf,
+    /// Whether the project file's settings that need trust count (beyond Python;
+    /// see `crate::trust`).
+    pub project_trust: ProjectTrust,
+}
+
+/// How far the project config file is trusted (beyond Python, which honors all of
+/// it). A file in a repository someone else wrote can start MCP servers, send API
+/// keys to a server of its choosing, or turn approvals off, so only the settings in
+/// [`crate::trust::TRUST_FREE`] count until the user trusts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectTrust {
+    /// Every setting counts: the user trusted this file, or the run said to.
+    Trusted,
+    /// Only the settings that need no trust; the rest are left out and listed in
+    /// [`Config::untrusted`].
+    Restricted,
 }
 
 impl ConfigPaths {
-    /// `~/.agent86/config.toml` and `./.agent86/config.toml`, as in Python.
+    /// `~/.agent86/config.toml` and `./.agent86/config.toml`, as in Python. The
+    /// project file starts restricted; `crate::trust::decide` says otherwise.
     pub fn discover() -> Self {
         Self {
             user: home_dir().map(|home| home.join(".agent86").join("config.toml")),
             project: Path::new(".agent86").join("config.toml"),
+            project_trust: ProjectTrust::Restricted,
         }
     }
 }
@@ -716,9 +737,16 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
     let mut merged: Table = DEFAULTS.parse().expect("built-in defaults are valid TOML");
     let mut sources = Vec::new();
 
+    let mut untrusted = Vec::new();
     let files = paths.user.iter().chain(std::iter::once(&paths.project));
     for path in files {
-        let layer = normalize(read_toml(path)?);
+        let mut layer = normalize(read_toml(path)?);
+        if path == &paths.project && paths.project_trust == ProjectTrust::Restricted {
+            untrusted = crate::trust::take_untrusted(&mut layer)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+        }
         if !layer.is_empty() {
             deep_merge(&mut merged, layer);
             sources.push(path.clone());
@@ -754,7 +782,18 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
     validate(&mut config)?;
     config.sources = sources;
     config.table = merged;
+    config.untrusted = untrusted;
     Ok(config)
+}
+
+/// One config file as a table, as loading reads it (empty when absent).
+pub(crate) fn read_toml_layer(path: &Path) -> Result<Table, ConfigError> {
+    read_toml(path)
+}
+
+/// A layer with `[mcp.servers.<name>]` mapped onto `mcp_servers`, as loading does.
+pub(crate) fn normalize_layer(layer: Table) -> Table {
+    normalize(layer)
 }
 
 /// Checks serde cannot express, matching the Python schema's constraints.
@@ -875,6 +914,7 @@ mod tests {
         ConfigPaths {
             user: Some(dir.join("user.toml")),
             project: dir.join("project.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         }
     }
 

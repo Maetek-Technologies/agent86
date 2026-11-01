@@ -456,3 +456,138 @@ fn the_gate_follows_the_approval_mode() {
         Some("new file: x.txt (1 line)\nhi")
     );
 }
+
+#[test]
+fn writes_into_agent86s_own_files_are_asked_about_even_in_auto_mode() {
+    let workspace = Workspace::new("guarded");
+    let ctx = workspace.context();
+    let registry = builtin_registry();
+    let write = registry.get("write_file").unwrap();
+    let edit = registry.get("edit_file").unwrap();
+    let decide = |gate: &ApprovalGate, call: &ToolCall| {
+        let tool = if call.name == "edit_file" {
+            &edit
+        } else {
+            &write
+        };
+        let decision = gate.decide(tool.as_ref(), call, &ctx);
+        (decision.approved, decision.reason)
+    };
+    let config = call(
+        "write_file",
+        json!({"path": ".agent86/config.toml", "content": "[mcp_servers.x]\ncommand = \"sh\"\n"}),
+    );
+
+    // Nobody to ask: declined, though the mode is auto.
+    let auto = ApprovalGate::new(ApprovalMode::Auto, None);
+    assert_eq!(
+        decide(&auto, &config),
+        (
+            false,
+            "writing agent86's own configuration or skills needs approval, and no prompt is available"
+        )
+    );
+    let deny = ApprovalGate::new(ApprovalMode::Deny, None);
+    assert_eq!(
+        decide(&deny, &config),
+        (false, "blocked by approval policy (deny)")
+    );
+
+    // Someone to ask: asked, with the warning, in auto mode too.
+    let seen: Arc<Mutex<Vec<ApprovalPreview>>> = Arc::default();
+    let record = Arc::clone(&seen);
+    let prompt: ApprovalPrompt = Box::new(move |_, preview| {
+        record.lock().unwrap().push(preview.clone());
+        true
+    });
+    let asking = ApprovalGate::new(ApprovalMode::Auto, Some(prompt));
+    assert_eq!(decide(&asking, &config), (true, "approved by user"));
+    // Spelled as Windows and macOS would still find it, and project skills.
+    for path in [
+        ".AGENT86/skills/x/SKILL.md",
+        "src/../.agent86./config.toml",
+        ".claude/skills/x/SKILL.md",
+    ] {
+        let sneaky = call("write_file", json!({"path": path, "content": "x"}));
+        assert_eq!(
+            decide(&asking, &sneaky),
+            (true, "approved by user"),
+            "{path}"
+        );
+    }
+    workspace.write("notes.txt", b"a\n");
+    let edit_call = call(
+        "edit_file",
+        json!({"path": "notes.txt", "old_string": "a", "new_string": "b"}),
+    );
+    assert_eq!(decide(&asking, &edit_call), (true, "auto-approved"));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "the ordinary write was not asked about");
+    assert_eq!(
+        seen[0].warning.as_deref(),
+        Some(
+            "This writes agent86's own configuration or skills (.agent86/config.toml), which \
+             changes what agent86 runs or is told from now on. Asked even in auto mode."
+        )
+    );
+    assert!(seen[0]
+        .detail
+        .as_deref()
+        .unwrap()
+        .starts_with("new file: .agent86/config.toml"));
+
+    // An ordinary write in auto mode is still not asked about.
+    let plain = call("write_file", json!({"path": "x.txt", "content": "hi"}));
+    let quiet = ApprovalGate::new(ApprovalMode::Auto, None);
+    assert_eq!(decide(&quiet, &plain), (true, "auto-approved"));
+}
+
+#[test]
+fn the_users_agent86_directory_is_guarded_even_as_the_workspace() {
+    // agent86 started in ~/.agent86 itself: its config.toml is at the workspace root.
+    let home = Workspace::new("guarded-home");
+    std::fs::create_dir_all(home.root.join(".agent86").join("skills")).unwrap();
+    let agent_dir = home.root.join(".agent86");
+    let registry = builtin_registry();
+    let write = registry.get("write_file").unwrap();
+    let asked: Arc<Mutex<usize>> = Arc::default();
+    let count = Arc::clone(&asked);
+    let prompt: ApprovalPrompt = Box::new(move |_, preview| {
+        assert!(preview.warning.is_some());
+        *count.lock().unwrap() += 1;
+        false
+    });
+    let gate = ApprovalGate::new(ApprovalMode::Auto, Some(prompt));
+
+    for (workspace, path) in [
+        (agent_dir.clone(), "config.toml"),
+        (agent_dir.clone(), "trusted-projects.json"),
+        (agent_dir.join("skills"), "x/SKILL.md"),
+        (home.root.clone(), ".agent86/config.toml"),
+    ] {
+        let mut ctx = ToolContext::new(&workspace).unwrap();
+        ctx.policy.guard([agent_dir.clone()]);
+        let decision = gate.decide(
+            write.as_ref(),
+            &call("write_file", json!({"path": path, "content": "x"})),
+            &ctx,
+        );
+        assert_eq!(
+            (decision.approved, decision.reason),
+            (false, "declined by user"),
+            "{path} in {}",
+            workspace.display()
+        );
+    }
+    assert_eq!(*asked.lock().unwrap(), 4);
+
+    // Elsewhere in that workspace, auto still means auto.
+    let mut ctx = ToolContext::new(&home.root).unwrap();
+    ctx.policy.guard([agent_dir]);
+    let decision = gate.decide(
+        write.as_ref(),
+        &call("write_file", json!({"path": "notes.txt", "content": "x"})),
+        &ctx,
+    );
+    assert_eq!(decision.reason, "auto-approved");
+}

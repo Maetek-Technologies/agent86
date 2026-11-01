@@ -143,6 +143,14 @@ pub fn assemble_with(
         .policy
         .allow(skill_roots(config, &workspace, home.as_deref()));
     context.skills = Arc::clone(&skills);
+    // Beyond Python: the user's own agent86 directory (config, trusted projects,
+    // memory, traces) and skills are agent86's own files wherever the workspace is,
+    // including when it is that directory.
+    if let Some(home) = &home {
+        context
+            .policy
+            .guard([home.join(".agent86"), home.join(".claude").join("skills")]);
+    }
 
     // Secrets are asked for where approvals are: at a terminal, hidden. With nobody
     // there, `request_secret` is not offered at all (the interface installs its own
