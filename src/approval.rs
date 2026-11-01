@@ -176,23 +176,38 @@ fn color_allowed() -> bool {
     std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
-fn ask(out: &mut dyn Write, color: bool, tool_name: &str, preview: &ApprovalPreview) -> bool {
+/// What the terminal prompt prints before reading the answer.
+///
+/// Beyond Python: the detail, the summary it falls back to, and the tool's name
+/// come from the model (an MCP server names its own tools), so their control
+/// characters are shown, not sent ([`crate::escape::show_controls`]). Otherwise a
+/// `\r` or an escape sequence could draw a harmless command over the one that runs.
+pub fn prompt_text(color: bool, tool_name: &str, preview: &ApprovalPreview) -> String {
+    use crate::escape::show_controls;
     let detail = preview.detail.as_deref().unwrap_or(&preview.summary);
-    let _ = writeln!(out);
+    let tool_name = show_controls(tool_name);
+    let mut text = String::from("\n");
     if let Some(warning) = &preview.warning {
-        if color {
-            let _ = writeln!(out, "\x1b[1;33mwarning:\x1b[0m {warning}");
+        let warning = show_controls(warning);
+        text.push_str(&if color {
+            format!("\x1b[1;33mwarning:\x1b[0m {warning}\n")
         } else {
-            let _ = writeln!(out, "warning: {warning}");
-        }
+            format!("warning: {warning}\n")
+        });
     }
-    let _ = writeln!(out, "{}", cap_lines(detail, APPROVAL_DETAIL_LINES));
-    if color {
-        let _ = writeln!(out, "\x1b[1;33mapprove \x1b[0m\x1b[1m{tool_name}?\x1b[0m");
+    text.push_str(&show_controls(&cap_lines(detail, APPROVAL_DETAIL_LINES)));
+    text.push('\n');
+    text.push_str(&if color {
+        format!("\x1b[1;33mapprove \x1b[0m\x1b[1m{tool_name}?\x1b[0m\n")
     } else {
-        let _ = writeln!(out, "approve {tool_name}?");
-    }
-    let _ = write!(out, "  [y/N] ");
+        format!("approve {tool_name}?\n")
+    });
+    text.push_str("  [y/N] ");
+    text
+}
+
+fn ask(out: &mut dyn Write, color: bool, tool_name: &str, preview: &ApprovalPreview) -> bool {
+    let _ = write!(out, "{}", prompt_text(color, tool_name, preview));
     let _ = out.flush();
 
     let mut answer = String::new();
@@ -232,5 +247,49 @@ mod tests {
             "{capped}"
         );
         assert_eq!(cap_lines("short", 40), "short");
+    }
+
+    fn preview(summary: &str, detail: Option<&str>) -> ApprovalPreview {
+        ApprovalPreview {
+            summary: summary.to_owned(),
+            detail: detail.map(str::to_owned),
+            lexer: None,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn the_prompt_shows_control_characters_instead_of_obeying_them() {
+        // `\r` would return the cursor and draw `echo hi` over `rm -rf x`.
+        let text = prompt_text(
+            false,
+            "run_command",
+            &preview("{}", Some("rm -rf x\recho hi")),
+        );
+        assert_eq!(text, "\nrm -rf x␍echo hi\napprove run_command?\n  [y/N] ");
+
+        // The summary it falls back to, an escape sequence, and a bidi override.
+        let text = prompt_text(
+            false,
+            "mcp\u{1b}[8m_tool",
+            &preview("{\"path\": \"a\u{202e}txt.sh\"}\u{1b}[2K", None),
+        );
+        assert_eq!(
+            text,
+            "\n{\"path\": \"a<U+202E>txt.sh\"}␛[2K\napprove mcp␛[8m_tool?\n  [y/N] "
+        );
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn the_prompts_own_colours_survive() {
+        let mut shown = preview("{}", Some("ls"));
+        shown.warning = Some("careful".to_owned());
+        let text = prompt_text(true, "run_command", &shown);
+        assert_eq!(
+            text,
+            "\n\u{1b}[1;33mwarning:\u{1b}[0m careful\nls\n\
+             \u{1b}[1;33mapprove \u{1b}[0m\u{1b}[1mrun_command?\u{1b}[0m\n  [y/N] "
+        );
     }
 }

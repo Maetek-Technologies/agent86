@@ -451,6 +451,41 @@ fn file_tools_write_the_value_a_placeholder_names() {
 }
 
 #[test]
+fn a_file_tools_diff_metadata_never_holds_the_value() {
+    // The diff in a result's metadata is kept in the session's steps (state_json)
+    // and the transcript; it is built from the expanded arguments, so it must be
+    // redacted like the content.
+    let workspace = Workspace::new("metadata");
+    let ctx = context(&workspace.root);
+    ctx.secrets.set("API_TOKEN", VALUE.to_owned());
+    let registry = default_registry(false, false, false, false);
+    std::fs::write(workspace.root.join(".env"), "API_TOKEN=old\nOTHER=1\n").unwrap();
+
+    let written = registry.dispatch(
+        &call(
+            "write_file",
+            json!({"path": ".env", "content": format!("API_TOKEN={PLACEHOLDER}\nOTHER=1\n")}),
+        ),
+        &ctx,
+    );
+    assert!(written.ok, "{:?}", written.error);
+    let edited = registry.dispatch(
+        &call(
+            "edit_file",
+            json!({"path": ".env", "old_string": "OTHER=1", "new_string": format!("OTHER={PLACEHOLDER}")}),
+        ),
+        &ctx,
+    );
+    assert!(edited.ok, "{:?}", edited.error);
+    for result in [&written, &edited] {
+        let stored = serde_json::to_string(result).unwrap();
+        assert!(result.metadata.contains_key("diff"), "{stored}");
+        assert!(!stored.contains(VALUE), "{stored}");
+        assert!(stored.contains(PLACEHOLDER), "{stored}");
+    }
+}
+
+#[test]
 fn an_unknown_placeholder_fails_and_writes_nothing() {
     let workspace = Workspace::new("unknown");
     let ctx = context(&workspace.root);
