@@ -530,7 +530,20 @@ impl SandboxPolicy {
 /// Each existing prefix is canonicalized (following symlinks) before the next
 /// component is applied, so `..` acts on the real location; components past the
 /// last existing directory are appended lexically.
+///
+/// A symlink whose target does not exist (yet) is followed too, as Python's
+/// `Path.resolve()` follows it: `canonicalize` fails on it, and keeping the link's
+/// own path would let `notes -> ~/.ssh/authorized_keys` pass the jail while a
+/// write through it lands outside. Links are followed at most [`MAX_LINKS`] deep,
+/// past which the OS refuses the path anyway.
 fn resolve(path: &Path) -> PathBuf {
+    resolve_following(path, 0)
+}
+
+/// How many dangling symlinks [`resolve`] follows in a chain, as Linux's limit.
+const MAX_LINKS: usize = 40;
+
+fn resolve_following(path: &Path, links: usize) -> PathBuf {
     let mut resolved = PathBuf::new();
     for component in path.components() {
         match component {
@@ -543,11 +556,26 @@ fn resolve(path: &Path) -> PathBuf {
                 resolved.push(part);
                 if let Ok(real) = std::fs::canonicalize(&resolved) {
                     resolved = real;
+                } else if links < MAX_LINKS {
+                    if let Ok(target) = std::fs::read_link(&resolved) {
+                        let base = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+                        resolved = resolve_following(&base.join(target), links + 1);
+                    }
                 }
             }
         }
     }
     resolved
+}
+
+/// Every string in `value`, however deep, with the user's secrets taken out.
+fn redact_value(value: &mut Value, ctx: &ToolContext) {
+    match value {
+        Value::String(text) => *text = ctx.secrets.redact(text),
+        Value::Array(items) => items.iter_mut().for_each(|item| redact_value(item, ctx)),
+        Value::Object(map) => map.values_mut().for_each(|item| redact_value(item, ctx)),
+        _ => {}
+    }
 }
 
 /// `path` without Windows' `\\?\` verbatim prefix, for handing to other programs:
@@ -767,6 +795,11 @@ impl ToolRegistry {
         if !ctx.secrets.is_empty() {
             result.content = ctx.secrets.redact(&result.content);
             result.error = result.error.map(|error| ctx.secrets.redact(&error));
+            // The metadata is kept too (the session's steps, the transcript), and a
+            // file tool's diff in it comes from the expanded arguments.
+            for value in result.metadata.values_mut() {
+                redact_value(value, ctx);
+            }
         }
         result
     }

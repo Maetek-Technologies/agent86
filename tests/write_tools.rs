@@ -591,3 +591,71 @@ fn the_users_agent86_directory_is_guarded_even_as_the_workspace() {
     );
     assert_eq!(decision.reason, "auto-approved");
 }
+
+/// Make `link` point at `target`, or `false` where this platform will not
+/// (Windows without Developer Mode or elevation).
+fn symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    match made {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipping: cannot create a symlink here ({error})");
+            false
+        }
+    }
+}
+
+#[test]
+fn a_dangling_symlink_cannot_carry_a_write_out_of_the_jail() {
+    let workspace = Workspace::new("dangling");
+    let outside = Workspace::new("dangling-outside");
+    let ctx = workspace.context();
+    let escape = outside.root.join("authorized_keys");
+    if !symlink(&escape, &workspace.root.join("notes")) {
+        return;
+    }
+    // A chain of links ends outside too.
+    assert!(symlink(
+        &workspace.root.join("notes"),
+        &workspace.root.join("alias")
+    ));
+    std::fs::create_dir_all(workspace.root.join("sub")).unwrap();
+    assert!(symlink(
+        &workspace.root.join("sub").join("later.txt"),
+        &workspace.root.join("inside")
+    ));
+
+    for path in ["notes", "alias"] {
+        let result = dispatch(
+            &ctx,
+            "write_file",
+            json!({"path": path, "content": "ssh-rsa x\n"}),
+        );
+        let error = error_of(&result);
+        assert!(
+            error.starts_with(&format!(
+                "PolicyError: Path '{path}' resolves outside the workspace jail"
+            )),
+            "{error}"
+        );
+        let edited = dispatch(
+            &ctx,
+            "edit_file",
+            json!({"path": path, "old_string": "a", "new_string": "b"}),
+        );
+        assert!(error_of(&edited).starts_with("PolicyError: "), "{edited:?}");
+    }
+    assert!(!escape.exists(), "nothing was written outside");
+
+    // A dangling link that stays inside still works, writing its target.
+    let result = dispatch(
+        &ctx,
+        "write_file",
+        json!({"path": "inside", "content": "ok\n"}),
+    );
+    assert!(result.ok, "{result:?}");
+    assert_eq!(workspace.read("sub/later.txt"), on_disk("ok\n"));
+}
