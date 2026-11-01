@@ -20,7 +20,7 @@ use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::router::{RoutedModel, Router};
 use agent86::session::AgentState;
 use agent86::tools::{builtin_registry, ToolContext};
-use agent86::turn::RunOutput;
+use agent86::turn::{final_answer, RunOutput};
 use agent86::types::{AgentPhase, ApprovalMode, Message, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -172,6 +172,7 @@ async fn run_with(
         steps: state.step_count() as u64,
         usage: state.usage,
         turn: state.last_turn.clone(),
+        final_answer: final_answer(&state.messages).to_owned(),
     })
 }
 
@@ -315,6 +316,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
             streamed.push_str(event.text());
             seen.push(match event {
                 TurnEvent::Text(text) => format!("text {text:?}"),
+                TurnEvent::Notice(text) => format!("notice {text:?}"),
                 TurnEvent::Thinking(text) => format!("thinking {text:?}"),
                 TurnEvent::ToolCall { call, .. } => format!("call {} {}", call.id, call.name),
                 TurnEvent::ToolResult {
@@ -332,6 +334,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         streamed, output,
         "the events carry exactly the streamed text"
     );
+    assert_eq!(final_answer(&state.messages), "done");
     assert_eq!(
         seen,
         [
