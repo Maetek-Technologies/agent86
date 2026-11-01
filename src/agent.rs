@@ -132,8 +132,12 @@ impl CancelToken {
 /// plain REPL stream for it, so every surface sees the same output.
 #[derive(Debug, Clone, Copy)]
 pub enum TurnEvent<'a> {
-    /// The model's answer, or a notice from the harness (`[cancelled]`, `[guardrail] ...`).
+    /// The model's text (or the ingress guardrail's refusal, which stands in for it).
     Text(&'a str),
+    /// A notice from the harness (`[cancelled]`, `[guardrail] ...`, a continuation or
+    /// compaction note): part of the output, but never part of the answer, so `run`
+    /// can keep it off stdout.
+    Notice(&'a str),
     /// A piece of the model's reasoning, already redacted. Not part of the turn's
     /// output: only the interface shows it.
     Thinking(&'a str),
@@ -153,7 +157,10 @@ impl<'a> TurnEvent<'a> {
     /// The text this event adds to the turn's output.
     pub fn text(&self) -> &'a str {
         match *self {
-            Self::Text(text) | Self::ToolCall { text, .. } | Self::ToolResult { text, .. } => text,
+            Self::Text(text)
+            | Self::Notice(text)
+            | Self::ToolCall { text, .. }
+            | Self::ToolResult { text, .. } => text,
             Self::Thinking(_) => "",
         }
     }
@@ -606,7 +613,7 @@ impl Harness {
                 emit(TurnEvent::Text(&refusal));
                 return Ok(output);
             }
-            emit(TurnEvent::Text(&format!(
+            emit(TurnEvent::Notice(&format!(
                 "[guardrail] input flagged: {}\n",
                 report.summary()
             )));
@@ -689,7 +696,7 @@ impl Harness {
                 }
                 // Said out loud: a conversation that quietly lost its oldest turns
                 // looks, from the user's seat, like a model that forgot.
-                emit(TurnEvent::Text(&notice));
+                emit(TurnEvent::Notice(&notice));
             }
 
             let mut completion = {
@@ -819,7 +826,7 @@ impl Harness {
             );
 
             if completion.stop_reason.as_deref() == Some(REASONING_LOOP) {
-                emit(TurnEvent::Text(REASONING_LOOP_NOTICE));
+                emit(TurnEvent::Notice(REASONING_LOOP_NOTICE));
             }
 
             // Beyond Python: a reply that ends cleanly with nothing to say (a thinking
@@ -859,15 +866,15 @@ impl Harness {
                             usage: completion.usage,
                         },
                     );
-                    emit(TurnEvent::Text(EMPTY_ANSWER_NOTICE));
+                    emit(TurnEvent::Notice(EMPTY_ANSWER_NOTICE));
                     continue;
                 }
                 if unanswered_thinking.trim().is_empty() {
-                    emit(TurnEvent::Text(NO_ANSWER_NOTICE));
+                    emit(TurnEvent::Notice(NO_ANSWER_NOTICE));
                 } else {
                     completion.text = std::mem::take(&mut unanswered_thinking);
                     from_thinking = true;
-                    emit(TurnEvent::Text(THINKING_ANSWER_NOTICE));
+                    emit(TurnEvent::Notice(THINKING_ANSWER_NOTICE));
                 }
             }
 
@@ -896,7 +903,7 @@ impl Harness {
                         ("findings", json!(egress.summary())),
                     ],
                 );
-                emit(TurnEvent::Text(&format!(
+                emit(TurnEvent::Notice(&format!(
                     "\n[guardrail] output flagged: {}\n",
                     egress.summary()
                 )));
@@ -967,7 +974,9 @@ impl Harness {
                             ),
                         ],
                     );
-                    emit(TurnEvent::Text(&continuation_notice(summary.continuations)));
+                    emit(TurnEvent::Notice(&continuation_notice(
+                        summary.continuations,
+                    )));
                     continue;
                 }
                 if let Some(start) = continuation_start {
@@ -1090,7 +1099,7 @@ impl Harness {
                 ("steps", json!(steps)),
             ],
         );
-        emit(TurnEvent::Text(CANCELLED_NOTICE));
+        emit(TurnEvent::Notice(CANCELLED_NOTICE));
     }
 
     /// Run a step's tool calls and return their results in call order.

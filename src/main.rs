@@ -1,6 +1,6 @@
-use agent86::agent::HarnessError;
+use agent86::agent::{HarnessError, TurnEvent};
 use agent86::approval::terminal_prompt_if_interactive;
-use agent86::config::{home_dir, load_config, Config, ConfigPaths, Overrides};
+use agent86::config::{home_dir, load_config, Config, ConfigPaths, Overrides, RunOutputMode};
 use agent86::keys;
 use agent86::limits::{LimitKind, LimitOverrides};
 use agent86::mcp::McpManager;
@@ -17,7 +17,7 @@ use agent86::setup::{assemble, open_memory, SetupError, MODEL_HELP};
 use agent86::skills::{default_skill_paths, discover_skills};
 use agent86::tools::memory::format_2f;
 use agent86::trust;
-use agent86::turn::{format_turn_summary, RunOutput};
+use agent86::turn::{final_answer, format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
 use agent86::ui::run_interactive;
 use clap::{Parser, Subcommand};
@@ -73,6 +73,12 @@ enum Command {
         /// Emit structured JSON output.
         #[arg(long = "json")]
         json: bool,
+
+        /// final: the answer on stdout, tool calls and notices on stderr; full:
+        /// everything on stdout, as it streams; quiet: the answer only. In place of
+        /// AGENT86_RUN_OUTPUT and [run] output.
+        #[arg(long, value_name = "MODE", value_parser = ["final", "full", "quiet"])]
+        output: Option<String>,
 
         /// Auto-approve side-effecting tools (non-interactive).
         #[arg(short, long)]
@@ -322,6 +328,7 @@ fn main() -> ExitCode {
         Some(Command::Run {
             goal,
             json,
+            output,
             yes,
             session,
             max_steps,
@@ -331,6 +338,9 @@ fn main() -> ExitCode {
             let mut config = config;
             if yes {
                 config.guardrails.approval = ApprovalMode::Auto;
+            }
+            if let Some(mode) = output.as_deref().and_then(RunOutputMode::parse) {
+                config.run.output = mode;
             }
             let limits = LimitOverrides {
                 steps: max_steps,
@@ -433,13 +443,9 @@ fn run(
         }
     };
 
-    let mut stdout = std::io::stdout().lock();
-    let result = runtime.block_on(harness.run_turn(&mut state, goal, |text| {
-        if !as_json {
-            // Raw write + flush streams partial lines reliably across terminals.
-            let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
-        }
+    let mut printer = RunPrinter::new((!as_json).then_some(config.run.output), stderr);
+    let result = runtime.block_on(harness.run_turn_events(&mut state, goal, goal, |event| {
+        printer.event(event);
     }));
     // Saved whether the turn finished or failed, so the session stays resumable.
     persist(store.as_ref(), &state, as_json, stderr);
@@ -447,6 +453,7 @@ fn run(
     let streamed = match result {
         Ok(streamed) => streamed,
         Err(error) => {
+            printer.release(true);
             stderr.error_after_stream(&error.to_string());
             // Python adds the model hint for provider failures only.
             if matches!(error, HarnessError::Provider(_)) {
@@ -462,11 +469,16 @@ fn run(
         steps: state.step_count() as u64,
         usage: state.usage,
         turn: state.last_turn.clone(),
+        final_answer: harness
+            .guardrails
+            .inspect_egress(final_answer(&state.messages))
+            .1,
     };
 
     if as_json {
         match serde_json::to_string_pretty(&output) {
             Ok(document) => {
+                let mut stdout = std::io::stdout().lock();
                 let _ = writeln!(stdout, "{document}");
             }
             Err(error) => {
@@ -475,8 +487,7 @@ fn run(
             }
         }
     } else {
-        let _ = writeln!(stdout);
-        let _ = stdout.flush();
+        printer.finish(&output.final_answer);
         if let Some(turn) = &output.turn {
             // stderr: stdout is the answer, and `agent86 run ... > out.txt` must keep only that.
             // Priced under the model the turn was routed to, as Python's `config_ref`.
@@ -486,6 +497,99 @@ fn run(
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Where `run` sends what a turn streams, as `[run] output` says.
+///
+/// `full` streams everything to stdout, as Python does. `final` and `quiet` cannot
+/// know a step's text is the answer until the step ends without calling a tool, so
+/// they hold each step's text and notices: a tool call releases them to stderr as
+/// narration (`final`) or drops them (`quiet`), and the turn's end prints the answer
+/// on stdout with only the notices on stderr.
+struct RunPrinter<'a> {
+    /// `None` for `--json`, which prints only its document.
+    mode: Option<RunOutputMode>,
+    stderr: &'a Stderr,
+    /// The current step's pieces, in order: (is it a notice, its text).
+    held: Vec<(bool, String)>,
+    /// Whether stderr's progress ended mid-line, so the summary starts a fresh one.
+    mid_line: bool,
+}
+
+impl<'a> RunPrinter<'a> {
+    fn new(mode: Option<RunOutputMode>, stderr: &'a Stderr) -> Self {
+        Self {
+            mode,
+            stderr,
+            held: Vec::new(),
+            mid_line: false,
+        }
+    }
+
+    fn event(&mut self, event: TurnEvent<'_>) {
+        match (self.mode, event) {
+            (None, _) | (_, TurnEvent::Thinking(_)) => {}
+            (Some(RunOutputMode::Full), event) => {
+                // Raw write + flush streams partial lines reliably across terminals.
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(event.text().as_bytes());
+                let _ = stdout.flush();
+            }
+            (Some(_), TurnEvent::Text(text)) => self.held.push((false, text.to_owned())),
+            (Some(_), TurnEvent::Notice(text)) => self.held.push((true, text.to_owned())),
+            (Some(_), event) => {
+                // Tools follow, so what the step said was narration, not the answer.
+                self.release(true);
+                self.progress(event.text());
+            }
+        }
+    }
+
+    /// Send what is held to stderr: all of it, or with `text` false only the notices.
+    fn release(&mut self, text: bool) {
+        for (notice, piece) in std::mem::take(&mut self.held) {
+            if notice || text {
+                self.progress(&piece);
+            }
+        }
+    }
+
+    /// Progress on stderr, dimmed at a terminal, in `final` mode only.
+    fn progress(&mut self, text: &str) {
+        if self.mode != Some(RunOutputMode::Final) || text.is_empty() {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        let _ = if self.stderr.color {
+            write!(stderr, "\x1b[2m{text}\x1b[0m")
+        } else {
+            stderr.write_all(text.as_bytes())
+        };
+        let _ = stderr.flush();
+        self.mid_line = !text.ends_with('\n');
+    }
+
+    /// The turn finished: end the stream, or print its answer.
+    fn finish(mut self, answer: &str) {
+        let mut stdout = std::io::stdout().lock();
+        match self.mode {
+            None => return,
+            Some(RunOutputMode::Full) => {
+                let _ = writeln!(stdout);
+            }
+            Some(_) => {
+                // No answer (cancelled, say): what the step said is all there is.
+                self.release(answer.is_empty());
+                if self.mid_line {
+                    eprintln!();
+                }
+                if !answer.is_empty() {
+                    let _ = writeln!(stdout, "{answer}");
+                }
+            }
+        }
+        let _ = stdout.flush();
+    }
 }
 
 /// Styled text on stdout, coloured as `Styled` colours it.
