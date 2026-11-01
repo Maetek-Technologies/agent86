@@ -67,6 +67,8 @@ impl Workspace {
             .env_remove("AGENT86_MODEL")
             .env_remove("AGENT86_SANDBOX")
             .env_remove("AGENT86_APPROVAL")
+            // The tests write their own project file; the trust tests remove this.
+            .env("AGENT86_TRUST_PROJECT", "1")
             .env_remove("AGENT86_RUN_OUTPUT")
             // No test may reach the Hugging Face hub or read the real cache.
             .env_remove("HF_HUB_CACHE")
@@ -905,6 +907,118 @@ async fn piped_runs_decline_side_effects_unless_told_otherwise() {
         stderr(&output)
     );
     assert!(!workspace.project().join("made.txt").exists());
+}
+
+/// A workspace whose mock provider is in the user's own config, so the project
+/// file holds only what a repository would ship.
+fn untrusted_workspace(name: &str, server: &MockServer, project: &str) -> Workspace {
+    let workspace = Workspace::new(name);
+    let user = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("config.toml");
+    let existing = std::fs::read_to_string(&user).unwrap();
+    std::fs::write(
+        &user,
+        format!(
+            "{existing}\n[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    workspace.write_project_config(project);
+    workspace
+}
+
+#[tokio::test]
+async fn an_untrusted_project_file_cannot_turn_approvals_off() {
+    let server =
+        MockServer::start(write_request().into_iter().chain(write_request()).collect()).await;
+    let workspace = untrusted_workspace(
+        "trust-untrusted",
+        &server,
+        "[guardrails]\napproval = \"auto\"\n\n[limits]\nmax_steps = 5\n",
+    );
+
+    let mut command = workspace.command(&["run", "make a file"]);
+    command.env_remove("AGENT86_TRUST_PROJECT");
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).starts_with(
+            "project config: ignored 1 setting that needs trust (guardrails.approval)."
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("Not executed: approval required but no prompt available."),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!workspace.project().join("made.txt").exists());
+
+    // --trust-project keeps it, for this run.
+    let mut command = workspace.command(&["--trust-project", "run", "make a file"]);
+    command.env_remove("AGENT86_TRUST_PROJECT");
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !stderr(&output).contains("project config:"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(workspace.project().join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn a_remembered_trust_holds_until_the_file_changes() {
+    let server = MockServer::start(vec![sse_text("ok", "stop"), sse_text("ok", "stop")]).await;
+    let project = "[guardrails]\napproval = \"auto\"\n";
+    let workspace = untrusted_workspace("trust-remembered", &server, project);
+    let file =
+        std::fs::canonicalize(workspace.project().join(".agent86").join("config.toml")).unwrap();
+    std::fs::write(
+        workspace
+            .root
+            .join("home")
+            .join(".agent86")
+            .join("trusted-projects.json"),
+        json!({
+            "version": 1,
+            "projects": {
+                file.display().to_string(): agent86::trust::sha256_hex(project.as_bytes()),
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = || {
+        let mut command = workspace.command(&["run", "hi"]);
+        command.env_remove("AGENT86_TRUST_PROJECT");
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+    };
+
+    let trusted = run().await.unwrap();
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    assert!(
+        !stderr(&trusted).contains("project config:"),
+        "{}",
+        stderr(&trusted)
+    );
+
+    // A model's write_file, say, changed one byte: no longer trusted.
+    workspace.write_project_config("[guardrails]\napproval = \"auto\" \n");
+    let changed = run().await.unwrap();
+    assert!(
+        stderr(&changed).starts_with("project config: ignored 1 setting"),
+        "{}",
+        stderr(&changed)
+    );
 }
 
 #[tokio::test]

@@ -144,6 +144,13 @@ fn preview_target(path: &str, ctx: &ToolContext) -> Option<PathBuf> {
     ctx.policy.resolve_within(path).ok()
 }
 
+/// The `path` argument, when it lands in agent86's own configuration or skills.
+fn guarded_path(args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {
+    let path = string_arg(args, &["path"])?;
+    let target = preview_target(path, ctx)?;
+    ctx.policy.guarded(&target).then(|| path.to_owned())
+}
+
 fn string_arg<'a>(args: &'a Map<String, Value>, names: &[&str]) -> Option<&'a str> {
     names
         .iter()
@@ -253,6 +260,10 @@ impl Tool for WriteFileTool {
 
     fn preview_lexer(&self) -> Option<&'static str> {
         Some("diff")
+    }
+
+    fn guarded_target(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {
+        guarded_path(args, ctx)
     }
 
     fn preview(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {
@@ -382,6 +393,10 @@ impl Tool for EditFileTool {
 
     fn preview_lexer(&self) -> Option<&'static str> {
         Some("diff")
+    }
+
+    fn guarded_target(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {
+        guarded_path(args, ctx)
     }
 
     fn preview(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {

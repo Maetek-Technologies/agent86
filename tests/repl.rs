@@ -59,6 +59,8 @@ impl Workspace {
             .env_remove("AGENT86_MODEL")
             .env_remove("AGENT86_SANDBOX")
             .env_remove("AGENT86_APPROVAL")
+            // The tests write their own project file.
+            .env("AGENT86_TRUST_PROJECT", "1")
             .env_remove("NO_COLOR")
             // No test may reach the Hugging Face hub or read the real cache.
             .env_remove("HF_HUB_CACHE")

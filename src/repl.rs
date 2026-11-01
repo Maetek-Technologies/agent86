@@ -1741,6 +1741,7 @@ mod tests {
             &crate::config::ConfigPaths {
                 user: None,
                 project: std::path::PathBuf::from("does-not-exist.toml"),
+                project_trust: crate::config::ProjectTrust::Trusted,
             },
             &crate::config::Overrides::default(),
         )
@@ -1860,6 +1861,7 @@ mod tests {
         let paths = crate::config::ConfigPaths {
             user: Some(root.join("user.toml")),
             project: root.join("project.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         let mut config =
             crate::config::load_config(&paths, &crate::config::Overrides::default()).unwrap();
@@ -1953,6 +1955,7 @@ mod tests {
             &crate::config::ConfigPaths {
                 user: None,
                 project: std::path::PathBuf::from("does-not-exist.toml"),
+                project_trust: crate::config::ProjectTrust::Trusted,
             },
             &crate::config::Overrides::default(),
         )
@@ -1990,6 +1993,7 @@ mod tests {
             &crate::config::ConfigPaths {
                 user: None,
                 project: std::path::PathBuf::from("does-not-exist.toml"),
+                project_trust: crate::config::ProjectTrust::Trusted,
             },
             &crate::config::Overrides::default(),
         )

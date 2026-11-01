@@ -196,6 +196,7 @@ mod tests {
         let paths = ConfigPaths {
             user: Some(root.join("user.toml")),
             project: root.join("project.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         std::fs::write(
             &paths.project,

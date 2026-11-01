@@ -18,6 +18,7 @@ fn the_prompt_is_the_identity_plus_the_environment_line() {
     let paths = ConfigPaths {
         user: Some(dir.join("missing-user.toml")),
         project: dir.join("missing-project.toml"),
+        project_trust: agent86::config::ProjectTrust::Trusted,
     };
     let overrides = Overrides {
         model: Some("openrouter:openai/gpt-4o-mini".to_owned()),

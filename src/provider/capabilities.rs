@@ -182,6 +182,7 @@ mod tests {
         let paths = crate::config::ConfigPaths {
             user: None,
             project: std::path::PathBuf::from("no-such-dir/config.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         let mut config = crate::config::load_config(&paths, &Default::default()).unwrap();
         assert_eq!(
@@ -246,6 +247,7 @@ mod tests {
         let paths = crate::config::ConfigPaths {
             user: None,
             project: std::path::PathBuf::from("no-such-dir/config.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         let mut config = crate::config::load_config(&paths, &Default::default()).unwrap();
         let window = context_window_with("ollama:qwen3.5:latest", &config, |provider, model| {

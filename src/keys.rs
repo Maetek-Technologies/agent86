@@ -125,6 +125,7 @@ mod tests {
         let paths = ConfigPaths {
             user: None,
             project: dir.join("absent.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         load_config(&paths, &Overrides::default()).unwrap()
     }

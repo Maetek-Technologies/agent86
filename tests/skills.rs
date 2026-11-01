@@ -40,6 +40,7 @@ impl Dir {
             &ConfigPaths {
                 user: None,
                 project,
+                project_trust: agent86::config::ProjectTrust::Trusted,
             },
             &Overrides::default(),
         )

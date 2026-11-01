@@ -16,6 +16,7 @@ use agent86::session::{expand_home, AgentState, SessionStore, StoreCounts};
 use agent86::setup::{assemble, open_memory, SetupError, MODEL_HELP};
 use agent86::skills::{default_skill_paths, discover_skills};
 use agent86::tools::memory::format_2f;
+use agent86::trust;
 use agent86::turn::{final_answer, format_turn_summary, RunOutput};
 use agent86::types::ApprovalMode;
 use agent86::ui::run_interactive;
@@ -52,6 +53,11 @@ struct Cli {
     /// Force the plain REPL (no status line / spinner / hotkeys).
     #[arg(long)]
     plain: bool,
+
+    /// Honor every setting in ./.agent86/config.toml for this run, without asking
+    /// (for CI; also AGENT86_TRUST_PROJECT=1).
+    #[arg(long)]
+    trust_project: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -284,8 +290,24 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let stderr = Stderr::new();
 
+    // Beyond Python: an untrusted project file's riskier settings are left out
+    // until the user trusts it. The question comes only from the commands that act
+    // on them (the agent, and starting MCP servers), and only at a terminal.
+    let mut paths = ConfigPaths::discover();
+    let acts = matches!(
+        cli.command,
+        None | Some(Command::Run { .. }) | Some(Command::Mcp(McpCommand::Tools))
+    );
+    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let ask: &dyn Fn(&trust::Review) -> bool = &trust::ask_at_terminal;
+    trust::decide(
+        &mut paths,
+        cli.trust_project || trust::forced_by_env(),
+        (acts && terminal).then_some(ask),
+    );
+
     let config = match load_config(
-        &ConfigPaths::discover(),
+        &paths,
         &Overrides::from_env(cli.model, cli.sandbox, cli.approval),
     ) {
         Ok(config) => config,
@@ -298,6 +320,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some(note) = trust::untrusted_note(&config.untrusted) {
+        stderr.warn(&note);
+    }
 
     match cli.command {
         Some(Command::Run {
@@ -337,7 +362,7 @@ fn main() -> ExitCode {
         None => {
             run_interactive(
                 config,
-                ConfigPaths::discover(),
+                paths,
                 cli.resume.as_deref(),
                 cli.plain,
                 Box::new(OsKeyring),

@@ -573,6 +573,7 @@ mod tests {
         let paths = ConfigPaths {
             user: Some(root.join("user.toml")),
             project: root.join("project.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&paths.project, "[model]\ndefault = \"a:b\"\n").unwrap();

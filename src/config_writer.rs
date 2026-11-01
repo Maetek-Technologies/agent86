@@ -249,8 +249,19 @@ fn set(table: &mut Table, parents: &[String], leaf: &str, mut value: Value) -> R
 /// `--model` or `--approval`.
 pub fn apply_edit(edit: &ConfigEdit, paths: &ConfigPaths) -> Result<Config, ConfigWriteError> {
     write_atomic(&edit.path, &edit.after_text)?;
+    // The user's own change to a project file they trusted keeps it trusted.
+    if same_file(&edit.path, &paths.project) {
+        crate::trust::refresh(paths);
+    }
     load_config(paths, &Overrides::from_env(None, None, None))
         .map_err(|error| ConfigWriteError(error.to_string()))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// The file's text with Python's universal newlines, or empty when it does not exist.
@@ -299,6 +310,7 @@ mod tests {
         let paths = ConfigPaths {
             user: Some(root.join("home").join(".agent86").join("config.toml")),
             project: root.join("project").join(".agent86").join("config.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         (root, paths)
     }

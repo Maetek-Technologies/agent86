@@ -361,6 +361,7 @@ mod tests {
         let paths = ConfigPaths {
             user: None,
             project: root.join("config.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
         };
         let config = load_config(&paths, &Overrides::default()).unwrap();
         let _ = std::fs::remove_dir_all(&root);
