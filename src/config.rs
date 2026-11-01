@@ -98,6 +98,9 @@ update_check = true
 thinking = "summary"
 tool_use = "summary"
 
+[run]
+output = "final"
+
 [guardrails]
 approval = "ask"
 ingress = "warn"
@@ -147,6 +150,7 @@ pub struct Config {
     #[serde(default)]
     pub pricing: PricingConfig,
     pub ui: UiConfig,
+    pub run: RunConfig,
     /// Every layer merged, before deserializing; `/config` shows it.
     #[serde(skip)]
     pub table: Table,
@@ -215,6 +219,48 @@ pub struct UiConfig {
     /// How much of each tool call the interface shows (beyond Python).
     #[serde(default = "default_summary")]
     pub tool_use: DisplayLevel,
+}
+
+/// `agent86 run` settings (`[run]`, beyond Python).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RunConfig {
+    /// What `run` prints, and where (`AGENT86_RUN_OUTPUT` and `run --output` override it).
+    #[serde(default = "default_run_output")]
+    pub output: RunOutputMode,
+}
+
+fn default_run_output() -> RunOutputMode {
+    RunOutputMode::Final
+}
+
+/// What `agent86 run` writes to stdout and stderr (beyond Python, which streams
+/// everything to stdout, as `full` does). `run --json` is the same in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOutputMode {
+    /// The answer on stdout; the `[tool] ...` lines, the text of steps that called
+    /// tools, and the harness's notices on stderr, so a pipe gets only the answer.
+    Final,
+    /// Everything on stdout as it streams, as Python's `run` does.
+    Full,
+    /// The answer on stdout and nothing else but the summary line and errors.
+    Quiet,
+}
+
+impl RunOutputMode {
+    pub const ALL: [Self; 3] = [Self::Final, Self::Full, Self::Quiet];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::Full => "full",
+            Self::Quiet => "quiet",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == text)
+    }
 }
 
 /// How much of something the interface shows, for the model's reasoning and for
@@ -675,6 +721,8 @@ pub struct Overrides {
     pub env_sandbox: Option<String>,
     /// `AGENT86_APPROVAL`.
     pub env_approval: Option<String>,
+    /// `AGENT86_RUN_OUTPUT` (beyond Python). `run --output` is applied by `run` itself.
+    pub env_run_output: Option<String>,
     /// `--model`.
     pub model: Option<String>,
     /// `--sandbox`.
@@ -696,6 +744,7 @@ impl Overrides {
             env_model: non_empty_env("AGENT86_MODEL"),
             env_sandbox: non_empty_env("AGENT86_SANDBOX"),
             env_approval: non_empty_env("AGENT86_APPROVAL"),
+            env_run_output: non_empty_env("AGENT86_RUN_OUTPUT"),
             model,
             sandbox,
             approval,
@@ -730,6 +779,7 @@ pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config,
         ("model", "default", &overrides.env_model),
         ("sandbox", "mode", &overrides.env_sandbox),
         ("guardrails", "approval", &overrides.env_approval),
+        ("run", "output", &overrides.env_run_output),
         ("model", "default", &overrides.model),
         ("sandbox", "mode", &overrides.sandbox),
         ("guardrails", "approval", &overrides.approval),

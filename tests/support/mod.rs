@@ -125,6 +125,25 @@ pub fn sse_tool_calls(calls: &[(&str, &str, &str)]) -> Reply {
     Reply::Sse(sse_body(&chunks))
 }
 
+/// An OpenAI-style SSE reply that says `text` and then asks for one tool call,
+/// `(id, name, raw arguments)`, as a model narrating its next step does.
+pub fn sse_text_then_tool_call(text: &str, call: (&str, &str, &str)) -> Reply {
+    let (id, name, arguments) = call;
+    let fragment = serde_json::json!({
+        "index": 0,
+        "id": id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    });
+    let chunks = [
+        serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [fragment]}, "finish_reason": null}]}),
+        serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        serde_json::json!({"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 8}}),
+    ];
+    Reply::Sse(sse_body(&chunks))
+}
+
 fn sse_body(chunks: &[serde_json::Value]) -> String {
     let mut body = String::new();
     for chunk in chunks {

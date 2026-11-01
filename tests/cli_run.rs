@@ -5,7 +5,7 @@ mod support;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use support::{fixture, sse_text, sse_tool_calls, MockServer, Reply};
+use support::{fixture, sse_text, sse_text_then_tool_call, sse_tool_calls, MockServer, Reply};
 
 const TEST_KEY: &str = "sk-test-0123456789abcdefghij";
 
@@ -67,6 +67,7 @@ impl Workspace {
             .env_remove("AGENT86_MODEL")
             .env_remove("AGENT86_SANDBOX")
             .env_remove("AGENT86_APPROVAL")
+            .env_remove("AGENT86_RUN_OUTPUT")
             // No test may reach the Hugging Face hub or read the real cache.
             .env_remove("HF_HUB_CACHE")
             .env_remove("HF_HOME")
@@ -326,7 +327,11 @@ async fn run_json_emits_exactly_one_object_with_the_contract_fields() {
 
     // serde_json's preserve_order keeps document order, so this checks Python's order.
     let keys: Vec<&String> = document.as_object().unwrap().keys().collect();
-    assert_eq!(keys, ["session_id", "output", "steps", "usage", "turn"]);
+    // `final` is beyond Python, appended after its fields.
+    assert_eq!(
+        keys,
+        ["session_id", "output", "steps", "usage", "turn", "final"]
+    );
     let turn_keys: Vec<&String> = document["turn"].as_object().unwrap().keys().collect();
     assert_eq!(
         turn_keys,
@@ -710,38 +715,150 @@ fn keys_set_rejects_empty_and_repeated_pastes() {
     );
 }
 
+/// `turns` scripted turns, each narrating a `list_dir` call and then answering.
+fn narrated_turns(turns: usize) -> Vec<Reply> {
+    (0..turns)
+        .flat_map(|_| {
+            [
+                sse_text_then_tool_call("Let me look.", ("call_1", "list_dir", "{}")),
+                sse_text("There is a config folder.", "stop"),
+            ]
+        })
+        .collect()
+}
+
+/// Everything a narrated turn streams, as Python's `run` prints it.
+const NARRATED_STREAM: &str =
+    "Let me look.\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\nThere is a config folder.";
+
 #[tokio::test]
-async fn run_uses_workspace_tools_and_reports_them_inline() {
-    let server = MockServer::start(vec![
-        sse_tool_calls(&[("call_1", "list_dir", "{}")]),
-        sse_text("There is a config folder.", "stop"),
-        sse_tool_calls(&[("call_1", "list_dir", "{}")]),
-        sse_text("There is a config folder.", "stop"),
-    ])
-    .await;
+async fn run_prints_the_answer_on_stdout_and_its_progress_on_stderr() {
+    let server = MockServer::start(narrated_turns(4)).await;
     let workspace = Workspace::with_mock_provider("tools", &server);
 
+    // The default, `final`: a pipe gets the answer alone.
     let text = workspace.run(&["run", "What is here?"]).await;
     assert!(text.status.success(), "{}", stderr(&text));
-    assert_eq!(
-        stdout(&text),
-        "\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\nThere is a config folder.\n"
-    );
+    assert_eq!(stdout(&text), "There is a config folder.\n");
     assert!(
-        stderr(&text).starts_with("— 2 steps · 1 tool · "),
+        stderr(&text).starts_with(
+            "Let me look.\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\n— 2 steps · 1 tool · "
+        ),
         "{}",
         stderr(&text)
     );
 
-    let json = workspace.run(&["run", "--json", "What is here?"]).await;
-    let document: Value = serde_json::from_str(&stdout(&json)).unwrap();
-    // As in Python, the JSON output carries the tool notices too.
-    assert_eq!(
-        document["output"],
-        "\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\nThere is a config folder."
+    // `full` is Python's stream, all on stdout.
+    let full = workspace
+        .run(&["run", "--output", "full", "What is here?"])
+        .await;
+    assert!(full.status.success(), "{}", stderr(&full));
+    assert_eq!(stdout(&full), format!("{NARRATED_STREAM}\n"));
+    assert!(
+        stderr(&full).starts_with("— 2 steps · 1 tool · "),
+        "{}",
+        stderr(&full)
     );
+
+    // `quiet`: the answer, and on stderr only the summary.
+    let quiet = workspace
+        .run(&["run", "--output", "quiet", "What is here?"])
+        .await;
+    assert!(quiet.status.success(), "{}", stderr(&quiet));
+    assert_eq!(stdout(&quiet), "There is a config folder.\n");
+    assert!(
+        stderr(&quiet).starts_with("— 2 steps · 1 tool · "),
+        "{}",
+        stderr(&quiet)
+    );
+
+    // JSON is the same in every mode: `output` keeps Python's stream, and `final`
+    // holds the answer alone.
+    let json = workspace
+        .run(&["run", "--json", "--output", "quiet", "What is here?"])
+        .await;
+    assert_eq!(stderr(&json), "");
+    let document: Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(document["output"], NARRATED_STREAM);
+    assert_eq!(document["final"], "There is a config folder.");
     assert_eq!(document["steps"], 2);
     assert_eq!(document["turn"]["tool_calls"], 1);
+}
+
+#[tokio::test]
+async fn run_output_comes_from_the_flag_then_the_environment_then_the_config() {
+    let server = MockServer::start(narrated_turns(3)).await;
+    let workspace = Workspace::with_mock_provider("run-output-layers", &server);
+    workspace.append_project_config("\n[run]\noutput = \"quiet\"\n");
+    let run = |args: &[&str], env: Option<&str>| {
+        let mut command = workspace.command(args);
+        if let Some(mode) = env {
+            command.env("AGENT86_RUN_OUTPUT", mode);
+        }
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+    };
+
+    let config = run(&["run", "What is here?"], None).await.unwrap();
+    assert_eq!(stdout(&config), "There is a config folder.\n");
+    assert!(!stderr(&config).contains("[tool]"), "{}", stderr(&config));
+
+    let env = run(&["run", "What is here?"], Some("full")).await.unwrap();
+    assert_eq!(stdout(&env), format!("{NARRATED_STREAM}\n"));
+
+    let flag = run(&["run", "--output", "final", "What is here?"], Some("full"))
+        .await
+        .unwrap();
+    assert_eq!(stdout(&flag), "There is a config folder.\n");
+    assert!(
+        stderr(&flag).contains("[tool] list_dir"),
+        "{}",
+        stderr(&flag)
+    );
+}
+
+#[test]
+fn unknown_run_output_modes_are_refused() {
+    let workspace = Workspace::new("run-output-bad");
+
+    let flag = workspace
+        .command(&["run", "--output", "loud", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(flag.status.code(), Some(2), "{}", stderr(&flag));
+
+    let env = workspace
+        .command(&["run", "hi"])
+        .env("AGENT86_RUN_OUTPUT", "loud")
+        .output()
+        .unwrap();
+    assert_eq!(env.status.code(), Some(1));
+    assert!(
+        stderr(&env).starts_with("error: Invalid config: "),
+        "{}",
+        stderr(&env)
+    );
+}
+
+#[tokio::test]
+async fn a_turn_without_an_answer_prints_nothing_on_stdout() {
+    // Out of steps after the tool call: the narration is all there is, so it goes
+    // to stderr with the error, and stdout stays empty.
+    let server = MockServer::start(vec![sse_text_then_tool_call(
+        "Let me look.",
+        ("call_1", "list_dir", "{}"),
+    )])
+    .await;
+    let workspace = Workspace::with_mock_provider("run-output-none", &server);
+    workspace.append_project_config("\n[limits]\nmax_steps = 1\n");
+
+    let output = workspace.run(&["run", "loop"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "Let me look.\n[tool] list_dir({})\n[tool] list_dir -> .agent86/\n\
+         \nerror: Circuit tripped: step budget reached (1 steps)\n"
+    );
 }
 
 #[tokio::test]
@@ -750,7 +867,8 @@ async fn a_tripped_circuit_exits_1_without_the_model_hint() {
     let workspace = Workspace::with_mock_provider("circuit", &server);
     workspace.append_project_config("\n[limits]\nmax_steps = 1\n");
 
-    let output = workspace.run(&["run", "loop"]).await;
+    // Python's stream, so stderr holds the error alone.
+    let output = workspace.run(&["run", "--output", "full", "loop"]).await;
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
@@ -780,11 +898,11 @@ async fn piped_runs_decline_side_effects_unless_told_otherwise() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
-        stdout(&output).contains(
+        stderr(&output).contains(
             "[tool] write_file -> error: Not executed: approval required but no prompt available."
         ),
         "{}",
-        stdout(&output)
+        stderr(&output)
     );
     assert!(!workspace.project().join("made.txt").exists());
 }
@@ -813,9 +931,9 @@ async fn yes_and_auto_approve_side_effects() {
 
         assert!(output.status.success(), "{name}: {}", stderr(&output));
         assert!(
-            stdout(&output).contains("[tool] write_file -> Wrote 5 bytes to made.txt (new file)."),
+            stderr(&output).contains("[tool] write_file -> Wrote 5 bytes to made.txt (new file)."),
             "{name}: {}",
-            stdout(&output)
+            stderr(&output)
         );
         assert!(workspace.project().join("made.txt").exists(), "{name}");
     }
@@ -831,7 +949,7 @@ async fn approval_deny_blocks_side_effects() {
         .await;
 
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("Not executed: blocked by approval policy (deny)."));
+    assert!(stderr(&output).contains("Not executed: blocked by approval policy (deny)."));
     assert!(!workspace.project().join("made.txt").exists());
 }
 
@@ -861,9 +979,12 @@ async fn redact_mode_from_config_covers_text_and_json_output() {
 
     let text = workspace.run(&["run", "who?"]).await;
     assert!(text.status.success(), "{}", stderr(&text));
-    assert_eq!(
-        stdout(&text),
-        "Contact [REDACTED:email] today.\n[guardrail] output flagged: pii:email\n\n"
+    // The answer alone on stdout; the guardrail's notice goes to stderr.
+    assert_eq!(stdout(&text), "Contact [REDACTED:email] today.\n");
+    assert!(
+        stderr(&text).starts_with("\n[guardrail] output flagged: pii:email\n"),
+        "{}",
+        stderr(&text)
     );
 
     let json = workspace.run(&["run", "--json", "who?"]).await;
@@ -872,6 +993,7 @@ async fn redact_mode_from_config_covers_text_and_json_output() {
         document["output"],
         "Contact [REDACTED:email] today.\n[guardrail] output flagged: pii:email\n"
     );
+    assert_eq!(document["final"], "Contact [REDACTED:email] today.");
     assert!(!stdout(&json).contains("jane@example.com"));
 }
 
@@ -892,11 +1014,11 @@ async fn shell_commands_need_approval_like_any_side_effect() {
     let workspace = Workspace::with_mock_provider("shell-piped", &server);
     let piped = workspace.run(&["run", "run it"]).await;
     assert!(
-        stdout(&piped).contains(
+        stderr(&piped).contains(
             "[tool] run_command -> error: Not executed: approval required but no prompt available."
         ),
         "{}",
-        stdout(&piped)
+        stderr(&piped)
     );
 
     let server = MockServer::start(command_then_answer()).await;
@@ -904,9 +1026,9 @@ async fn shell_commands_need_approval_like_any_side_effect() {
     let approved = workspace.run(&["run", "--yes", "run it"]).await;
     assert!(approved.status.success(), "{}", stderr(&approved));
     assert!(
-        stdout(&approved).contains("[tool] run_command -> exit code: 0\n"),
+        stderr(&approved).contains("[tool] run_command -> exit code: 0\n"),
         "{}",
-        stdout(&approved)
+        stderr(&approved)
     );
     let observed = server.requests()[1].body["messages"][3]["content"].clone();
     assert_eq!(observed, "exit code: 0\nstdout:\nfrom-the-sandbox");
@@ -1600,9 +1722,11 @@ async fn long_sessions_are_compacted_into_a_summary() {
         .run(&["run", "-s", &session, "fourth question"])
         .await;
     assert!(fourth.status.success(), "{}", stderr(&fourth));
-    assert_eq!(
-        stdout(&fourth),
-        "\n[compacted 1 messages into a summary]\nok 4\n"
+    assert_eq!(stdout(&fourth), "ok 4\n");
+    assert!(
+        stderr(&fourth).starts_with("\n[compacted 1 messages into a summary]\n"),
+        "{}",
+        stderr(&fourth)
     );
     assert!(
         stderr(&fourth).contains("1 compaction"),
@@ -1715,9 +1839,11 @@ async fn a_failed_summary_falls_back_to_dropping_the_oldest_turns() {
         .run(&["run", "-s", &session, "fourth question"])
         .await;
     assert!(fourth.status.success(), "{}", stderr(&fourth));
-    assert_eq!(
-        stdout(&fourth),
-        "\n[compaction failed; dropped 1 messages]\nok 4\n"
+    assert_eq!(stdout(&fourth), "ok 4\n");
+    assert!(
+        stderr(&fourth).starts_with("\n[compaction failed; dropped 1 messages]\n"),
+        "{}",
+        stderr(&fourth)
     );
     // The request was fitted instead: the long goal is gone, nothing replaced it.
     assert_eq!(

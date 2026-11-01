@@ -26,7 +26,7 @@ This is the standard agent86. It replaced the original [Python implementation](h
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
 - Python's system prompt (identity plus environment line), checked against text extracted from the Python source
 - API keys from the provider's environment variable or, failing that, the OS keyring (service `agent86`, account = provider name), compatible with keys stored by the Python implementation
-- A one-shot CLI: `agent86 --model provider:model run <goal>` streams the answer, and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, and `turn`
+- A one-shot CLI: `agent86 --model provider:model run <goal>` prints the answer on stdout, with the tool calls and notices on stderr (`--output full` gives Python's single stream, `--output quiet` the answer alone; also `AGENT86_RUN_OUTPUT` and `[run] output`), and `run --json` prints one JSON object with `session_id`, `output`, `steps`, `usage`, `turn`, and `final` (the answer alone, beyond Python)
 - An interactive interface (`agent86` with no subcommand), inline in Claude Code's style:
   - the conversation in your terminal's scrollback, a bordered input box, a spinner, a live status line, and approval panels
   - Python's slash commands with a `/` menu, `@file` mentions with path completion, and shared prompt history
@@ -80,7 +80,7 @@ agent86 began in Python and was rewritten in Rust for one native binary that nee
 
 The rewrite reproduced the Python version's observable behavior, checked by tests against fixtures produced from Python's own sources and CPython. What the two share stays compatible:
 
-- CLI output streams, exit codes, and `run --json`
+- CLI output streams (except `run`'s default, which keeps the tool calls off stdout; `run --output full` is Python's), exit codes, and `run --json`
 - TOML configuration semantics
 - The session and memory database, the trace format, the prompt history, and the keyring layout
 

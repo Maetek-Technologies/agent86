@@ -2,7 +2,7 @@
 //! and the summary line printed on stderr. The loop itself is in `agent`.
 
 use crate::pricing::format_cost;
-use crate::types::Usage;
+use crate::types::{Message, Role, Usage};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -44,6 +44,22 @@ pub struct RunOutput {
     pub steps: u64,
     pub usage: Usage,
     pub turn: Option<TurnSummary>,
+    /// The turn's answer alone: its last assistant message, without the `[tool] ...`
+    /// lines, notices, or the text of earlier steps that `output` holds. Empty when the
+    /// turn ended without one (cancelled, out of steps). Beyond Python, and appended
+    /// last so readers of Python's fields are unaffected.
+    #[serde(rename = "final")]
+    pub final_answer: String,
+}
+
+/// The answer a finished turn left in `messages`: the last message, when it is the
+/// assistant's and asks for no tools. A turn that returns `Ok` always pushed its user
+/// message first, so an earlier turn's answer is never mistaken for this one's.
+pub fn final_answer(messages: &[Message]) -> &str {
+    match messages.last() {
+        Some(last) if last.role == Role::Assistant && last.tool_calls.is_empty() => &last.content,
+        _ => "",
+    }
 }
 
 /// A new ephemeral session id: 12 lowercase hex characters, like Python's `uuid4().hex[:12]`.
