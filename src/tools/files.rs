@@ -158,10 +158,50 @@ fn binary_size(target: &Path) -> Option<u64> {
 /// including its text-mode newline translation (`\n` becomes `\r\n` on Windows).
 fn write_text(target: &Path, content: &str) -> std::io::Result<()> {
     if cfg!(windows) {
-        std::fs::write(target, content.replace('\n', "\r\n"))
+        replace_file(target, content.replace('\n', "\r\n").as_bytes())
     } else {
-        std::fs::write(target, content)
+        replace_file(target, content.as_bytes())
     }
+}
+
+/// Beyond Python: write `bytes` to `target` through a temporary file beside it and
+/// a rename, so a crash or a full disk mid-write leaves the old file whole rather
+/// than truncated. An existing file keeps its permissions. A read-only file is
+/// written directly, so it fails exactly as a plain write would; and if the rename
+/// itself fails (Windows refuses to replace a file another program holds open), a
+/// plain write is tried, so nothing that used to work stops working.
+fn replace_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let existing = std::fs::metadata(target).ok().filter(|meta| meta.is_file());
+    if existing
+        .as_ref()
+        .is_some_and(|meta| meta.permissions().readonly())
+    {
+        return std::fs::write(target, bytes);
+    }
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return std::fs::write(target, bytes);
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let temporary = parent.join(format!(
+        ".{}.agent86-{}-{nanos}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let staged = std::fs::write(&temporary, bytes).and_then(|()| match &existing {
+        Some(meta) => std::fs::set_permissions(&temporary, meta.permissions()),
+        None => Ok(()),
+    });
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if std::fs::rename(&temporary, target).is_ok() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&temporary);
+    std::fs::write(target, bytes)
 }
 
 /// Resolve a path for a preview: never failing, `None` when it cannot resolve.
@@ -570,8 +610,7 @@ impl Tool for EditFileTool {
             (document.text.replacen(&old, &new, 1), 1)
         };
         let diff = unified_diff_for(&path, &document.text, &updated);
-        std::fs::write(&target, document.encode(&updated))
-            .map_err(|error| ToolError::io(&error))?;
+        replace_file(&target, &document.encode(&updated)).map_err(|error| ToolError::io(&error))?;
         let header = format!(
             "Edited {path} ({replaced} replacement{}).",
             plural_s(replaced)

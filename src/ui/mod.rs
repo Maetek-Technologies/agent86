@@ -364,8 +364,11 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             Request::Secret(name, value) => {
                 match value {
                     Some(answer) => {
-                        let stored = repl.harness.context.secrets.accept(&name, answer);
-                        app.note(Style::Dim, &stored.describe(&name));
+                        let line = match repl.harness.context.secrets.accept(&name, answer) {
+                            Ok(stored) => stored.describe(&name),
+                            Err(not_set) => not_set.describe(&name),
+                        };
+                        app.note(Style::Dim, &line);
                     }
                     None => app.note(Style::Dim, &format!("secret {name} not set")),
                 }

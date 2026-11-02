@@ -3,7 +3,9 @@
 
 use super::{failure, success, Arguments, Tool, ToolContext, ToolError};
 use crate::types::ToolResult;
-use crate::vault::{placeholder, valid_name, NAME_PATTERN};
+use crate::vault::{
+    placeholder, reserved_name, valid_name, NotSet, MIN_SECRET_CHARS, NAME_PATTERN,
+};
 use serde_json::{json, Map, Value};
 
 pub struct RequestSecretTool;
@@ -62,6 +64,16 @@ impl Tool for RequestSecretTool {
                 "name: String should match pattern '{NAME_PATTERN}'"
             )]));
         }
+        if reserved_name(&name) {
+            return Ok(failure(
+                self.name(),
+                format!(
+                    "{name} cannot be a secret's name: set as an environment variable for \
+                     run_command and python_exec, it would change how programs run. Choose \
+                     another name, such as MY_{name}."
+                ),
+            ));
+        }
 
         if !ctx.secrets.can_ask() {
             return Ok(failure(
@@ -72,11 +84,23 @@ impl Tool for RequestSecretTool {
                 ),
             ));
         }
-        let Some(stored) = ctx.secrets.ask(&name, &reason) else {
-            return Ok(failure(
-                self.name(),
-                format!("The user declined to enter the secret {name}."),
-            ));
+        let stored = match ctx.secrets.ask(&name, &reason) {
+            Ok(stored) => stored,
+            Err(NotSet::Declined) => {
+                return Ok(failure(
+                    self.name(),
+                    format!("The user declined to enter the secret {name}."),
+                ))
+            }
+            Err(NotSet::TooShort) => {
+                return Ok(failure(
+                    self.name(),
+                    format!(
+                        "The value entered for {name} was shorter than {MIN_SECRET_CHARS} \
+                         characters, too short to keep out of text safely, so it was not set."
+                    ),
+                ))
+            }
         };
         let kept = if stored.remembered {
             " The user chose to remember it for this project, so it will be available in later sessions too."

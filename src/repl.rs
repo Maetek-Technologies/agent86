@@ -1124,8 +1124,8 @@ impl Repl {
                     "secret {name} can only be entered at a terminal, where the input can be hidden"
                 ),
                 Some(name) => match vault.ask(name, "") {
-                    Some(stored) => stored.describe(name),
-                    None => format!("secret {name} not set"),
+                    Ok(stored) => stored.describe(name),
+                    Err(not_set) => not_set.describe(name),
                 },
                 None if words.len() == 1 => format!(
                     "'{}' is not a valid name (letters, digits, and _, not starting with a digit)",
@@ -1895,7 +1895,7 @@ mod tests {
         let vault = first.harness.context.secrets.clone();
         let answer = |remember| {
             Some(SecretAnswer {
-                value: "v4lue".to_owned(),
+                value: "v4lue-1".to_owned(),
                 remember,
             })
         };

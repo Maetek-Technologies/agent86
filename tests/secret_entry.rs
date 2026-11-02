@@ -346,6 +346,49 @@ fn a_name_must_be_an_environment_variable_name() {
             "Invalid arguments for 'request_secret': name: Field required; reason: Field required"
         )
     );
+
+    // Beyond Python: a name that would change how programs run is refused before
+    // the user is asked (the prompt above panics if it is reached).
+    let reserved = registry.dispatch(
+        &call(
+            "request_secret",
+            json!({"name": "LD_PRELOAD", "reason": "r"}),
+        ),
+        &ctx,
+    );
+    assert_eq!(
+        reserved.error.as_deref(),
+        Some(
+            "LD_PRELOAD cannot be a secret's name: set as an environment variable for \
+             run_command and python_exec, it would change how programs run. Choose another \
+             name, such as MY_LD_PRELOAD."
+        )
+    );
+}
+
+#[test]
+fn a_value_too_short_to_hide_is_refused_and_the_model_is_told() {
+    let workspace = Workspace::new("short");
+    let registry = default_registry(false, false, false, true);
+    let ctx = context(&workspace.root);
+    ctx.secrets.set_prompt(Some(Box::new(|_| {
+        Some(agent86::vault::SecretAnswer {
+            value: "1234".to_owned(),
+            remember: false,
+        })
+    })));
+    let result = registry.dispatch(
+        &call("request_secret", json!({"name": "PIN", "reason": "r"})),
+        &ctx,
+    );
+    assert_eq!(
+        result.error.as_deref(),
+        Some(
+            "The value entered for PIN was shorter than 6 characters, too short to keep out \
+             of text safely, so it was not set."
+        )
+    );
+    assert!(ctx.secrets.names().is_empty());
 }
 
 #[test]
