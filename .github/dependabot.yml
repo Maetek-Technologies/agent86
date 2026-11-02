@@ -1,0 +1,11 @@
+# Keeps the SHA-pinned actions in the workflows current: each update moves the
+# pin and its version comment together, as a pull request CI checks.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

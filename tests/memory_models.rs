@@ -111,6 +111,16 @@ fn a_local_directory_loads_without_the_hub() {
 
 /// The files the hub would serve for the tiny model, with the revision listing.
 fn hub_replies(commit: &str) -> (Vec<Reply>, Vec<&'static str>) {
+    hub_replies_listing(commit, None)
+}
+
+/// [`hub_replies`], with the listing's SHA-256 for the weights replaced when given.
+/// As on the hub, every file lists its size, and the weights (stored with LFS)
+/// their SHA-256 too.
+fn hub_replies_listing(
+    commit: &str,
+    weights_sha256: Option<&str>,
+) -> (Vec<Reply>, Vec<&'static str>) {
     let files = [
         "config.json",
         "modules.json",
@@ -122,7 +132,18 @@ fn hub_replies(commit: &str) -> (Vec<Reply>, Vec<&'static str>) {
     ];
     let mut siblings: Vec<Value> = files
         .iter()
-        .map(|file| json!({"rfilename": file}))
+        .map(|file| {
+            let bytes = std::fs::read(tiny_dir().join(file)).unwrap();
+            let size = bytes.len();
+            if *file == "model.safetensors" {
+                let sha256 = weights_sha256
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| agent86::trust::sha256_hex(&bytes));
+                json!({"rfilename": file, "size": size, "lfs": {"sha256": sha256, "size": size}})
+            } else {
+                json!({"rfilename": file, "size": size})
+            }
+        })
         .collect();
     // Files sentence-transformers never reads are not fetched.
     siblings.push(json!({"rfilename": "onnx/model.onnx"}));
@@ -140,6 +161,44 @@ fn hub_replies(commit: &str) -> (Vec<Reply>, Vec<&'static str>) {
         });
     }
     (replies, files.to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn weights_that_do_not_match_the_listed_sha256_never_reach_the_cache() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let wrong = "0".repeat(64);
+    let (replies, _) = hub_replies_listing(commit, Some(&wrong));
+    let server = MockServer::start(replies).await;
+    let temp = TempDir::new("download-tampered");
+    let hub = Hub {
+        root: temp.0.join("hub"),
+        endpoint: server.base_url.clone(),
+        offline: false,
+    };
+
+    let loaded = tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || SentenceTransformerEmbedder::load_from(&hub, "acme/tiny", true)
+    })
+    .await
+    .unwrap();
+    let Err(error) = loaded else {
+        panic!("a tampered download must fail");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("model.safetensors does not match its listed SHA-256"),
+        "{message}"
+    );
+
+    // Neither the file nor its partial download is left where a load would find
+    // it, and the snapshot is not recorded as the model's.
+    let repo = hub.root.join("models--acme--tiny");
+    let snapshot = repo.join("snapshots").join(commit);
+    assert!(!snapshot.join("model.safetensors").exists());
+    assert!(!snapshot.join("model.incomplete").exists());
+    assert!(!repo.join("refs/main").exists());
+    assert_eq!(cached_snapshot(&hub.root, "acme/tiny"), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -171,7 +230,8 @@ async fn a_missing_model_is_downloaded_into_the_python_cache_layout() {
         .into_iter()
         .map(|request| request.request_line)
         .collect();
-    let mut expected = vec!["GET /api/models/acme/tiny/revision/main HTTP/1.1".to_owned()];
+    let mut expected =
+        vec!["GET /api/models/acme/tiny/revision/main?blobs=true HTTP/1.1".to_owned()];
     expected.extend(
         files
             .iter()

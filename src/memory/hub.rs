@@ -8,6 +8,7 @@
 //! the snapshot instead of linking them to `blobs/`; this writes them the same
 //! way everywhere, which both libraries read.)
 
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -156,7 +157,9 @@ async fn fetch_snapshot(base: &str, root: &Path, repo: &str) -> Result<PathBuf, 
         .map_err(|error| HubError(error.to_string()))?;
     let fail = |error: reqwest::Error| HubError(format!("Could not reach {base}: {error}"));
 
-    let info_url = format!("{base}/api/models/{repo}/revision/main");
+    // `blobs=true` adds each file's size, and an LFS file's SHA-256, as
+    // `huggingface_hub`'s `model_info(files_metadata=True)` asks.
+    let info_url = format!("{base}/api/models/{repo}/revision/main?blobs=true");
     let response = client.get(&info_url).send().await.map_err(fail)?;
     if !response.status().is_success() {
         return Err(HubError(format!(
@@ -172,20 +175,33 @@ async fn fetch_snapshot(base: &str, root: &Path, repo: &str) -> Result<PathBuf, 
         .filter(|sha| !sha.is_empty() && sha.chars().all(|c| c.is_ascii_alphanumeric()))
         .ok_or_else(|| HubError(format!("{info_url} named no commit")))?
         .to_owned();
-    let siblings: Vec<&str> = info["siblings"]
+    let listed: Vec<&serde_json::Value> = info["siblings"]
         .as_array()
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|file| file["rfilename"].as_str())
-                .collect()
-        })
+        .map(|files| files.iter().collect())
         .unwrap_or_default();
+    let siblings: Vec<&str> = listed
+        .iter()
+        .filter_map(|file| file["rfilename"].as_str())
+        .collect();
     let wanted: Vec<&str> = siblings
         .iter()
         .copied()
         .filter(|file| ROOT_FILES.contains(file) || is_module_config(file))
         .collect();
+    let expected = |name: &str| {
+        let entry = listed
+            .iter()
+            .find(|file| file["rfilename"].as_str() == Some(name));
+        let lfs = entry.map(|file| &file["lfs"]);
+        Expected {
+            size: lfs
+                .and_then(|lfs| lfs["size"].as_u64())
+                .or_else(|| entry.and_then(|file| file["size"].as_u64())),
+            sha256: lfs
+                .and_then(|lfs| lfs["sha256"].as_str())
+                .map(str::to_ascii_lowercase),
+        }
+    };
     if let Some(missing) = REQUIRED_FILES.iter().find(|file| !wanted.contains(file)) {
         return Err(HubError(format!("{repo} has no {missing}")));
     }
@@ -211,17 +227,68 @@ async fn fetch_snapshot(base: &str, root: &Path, repo: &str) -> Result<PathBuf, 
         // download never leaves a truncated file a later load would trust.
         let partial = target.with_extension("incomplete");
         let mut out = std::fs::File::create(&partial).map_err(|error| io_error(&partial, error))?;
-        while let Some(chunk) = response.chunk().await.map_err(fail)? {
-            std::io::Write::write_all(&mut out, &chunk)
-                .map_err(|error| io_error(&partial, error))?;
+        // Beyond Python: checked against what the listing says while streaming,
+        // so a file that runs past its size (or the cap) is cut off, and one whose
+        // bytes do not hash to the listed SHA-256 is never moved into the cache.
+        let want = expected(file);
+        let limit = want
+            .size
+            .unwrap_or(MAX_DOWNLOAD_BYTES)
+            .min(MAX_DOWNLOAD_BYTES);
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        let streamed: Result<(), HubError> = async {
+            while let Some(chunk) = response.chunk().await.map_err(fail)? {
+                received += chunk.len() as u64;
+                if received > limit {
+                    return Err(HubError(format!(
+                        "{url} sent more than {limit} bytes; the download was stopped"
+                    )));
+                }
+                hasher.update(&chunk);
+                std::io::Write::write_all(&mut out, &chunk)
+                    .map_err(|error| io_error(&partial, error))?;
+            }
+            if let Some(size) = want.size.filter(|size| *size != received) {
+                return Err(HubError(format!(
+                    "{url} sent {received} bytes where the listing says {size}"
+                )));
+            }
+            let digest: String = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if let Some(sha256) = want.sha256.as_deref().filter(|sha256| *sha256 != digest) {
+                return Err(HubError(format!(
+                    "{url} does not match its listed SHA-256 (expected {sha256}, got {digest})"
+                )));
+            }
+            Ok(())
         }
+        .await;
         drop(out);
+        if let Err(error) = streamed {
+            let _ = std::fs::remove_file(&partial);
+            return Err(error);
+        }
         std::fs::rename(&partial, &target).map_err(|error| io_error(&target, error))?;
     }
     let refs = dir.join("refs");
     std::fs::create_dir_all(&refs).map_err(|error| io_error(&refs, error))?;
     std::fs::write(refs.join("main"), &commit).map_err(|error| io_error(&refs, error))?;
     Ok(snapshot)
+}
+
+/// The most one downloaded file may be (beyond Python): a sentence-transformers
+/// model's weights are tens to hundreds of megabytes, so this only stops a
+/// runaway or hostile answer from filling the disk.
+pub const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// What the revision listing says one file should be.
+struct Expected {
+    size: Option<u64>,
+    sha256: Option<String>,
 }
 
 /// `<n>_<Module>/config.json`, a sentence-transformers module's settings.

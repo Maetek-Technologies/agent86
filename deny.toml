@@ -1,0 +1,17 @@
+# cargo-deny, run in CI (`cargo deny check advisories`): fail on any dependency,
+# however deep, with a RustSec vulnerability or unsoundness advisory, and on any
+# direct dependency marked unmaintained. An exception goes in `ignore` with the
+# advisory id and, in its `reason`, why agent86 is not affected; revisit each when
+# its dependency moves.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Unmaintained crates deeper in the tree are noted upstream, not here: agent86
+# cannot replace them itself. As of 2026-11-01 that is `paste` (through candle's
+# `gemm`) and `zvariant`, `zvariant_derive`, and `zbus_names` (through the Linux
+# keyring's `zbus`).
+unmaintained = "workspace"
+ignore = []
