@@ -13,6 +13,7 @@ use crate::difflib::{splitlines, unified_diff};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// How many lines of a brand-new file the approval preview shows.
@@ -43,6 +44,19 @@ pub fn head_of(text: &str, limit: usize) -> String {
         "{}\n... [{} more lines]",
         lines[..limit].join("\n"),
         lines.len() - limit
+    )
+}
+
+/// Beyond Python: what a write over a file that is not UTF-8 text (a binary, say)
+/// would do. There is no diff to show, so the preview says what is lost; calling
+/// it a new file would hide that something is overwritten.
+pub fn replaced_binary_summary(path: &str, size: u64, content: &str) -> String {
+    let count = splitlines(content).len();
+    format!(
+        "overwrite: {path} is not a UTF-8 text file ({size} bytes); all of it is replaced \
+         with {count} line{}\n{}",
+        plural_s(count),
+        head_of(content, PREVIEW_HEAD_LINES)
     )
 }
 
@@ -129,6 +143,17 @@ fn existing_text(target: &Path) -> Option<String> {
     read_file_text(target).ok().map(|file| file.text)
 }
 
+/// The size of `target` when it is a file that [`existing_text`] cannot read as
+/// text, so a write over it is an overwrite, not a new file.
+fn binary_size(target: &Path) -> Option<u64> {
+    if !target.is_file() || existing_text(target).is_some() {
+        return None;
+    }
+    std::fs::metadata(target)
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
 /// Write `content` the way Python's `Path.write_text(encoding="utf-8")` does,
 /// including its text-mode newline translation (`\n` becomes `\r\n` on Windows).
 fn write_text(target: &Path, content: &str) -> std::io::Result<()> {
@@ -199,10 +224,32 @@ impl Tool for ReadFileTool {
         if !target.is_file() {
             return Ok(failure(self.name(), format!("Not a file: {path}")));
         }
-        let bytes = std::fs::read(&target).map_err(|error| ToolError::io(&error))?;
+        // Beyond Python: a file far past the output cap is read only as far as the
+        // cap can reach (four bytes a character at most, plus a split `\r\n`), so a
+        // multi-gigabyte file cannot exhaust memory. Below that, it is read whole
+        // and capped as Python caps it.
+        let limit = (ctx.policy.max_output_chars as u64).saturating_mul(4) + 4;
+        let size = std::fs::metadata(&target)
+            .map_err(|error| ToolError::io(&error))?
+            .len();
+        if size <= limit {
+            let bytes = std::fs::read(&target).map_err(|error| ToolError::io(&error))?;
+            return Ok(success(
+                self.name(),
+                ctx.policy.truncate(decode_text(&bytes)),
+            ));
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(&target)
+            .and_then(|file| file.take(limit).read_to_end(&mut bytes))
+            .map_err(|error| ToolError::io(&error))?;
+        let kept: String = decode_text(&bytes)
+            .chars()
+            .take(ctx.policy.max_output_chars)
+            .collect();
         Ok(success(
             self.name(),
-            ctx.policy.truncate(decode_text(&bytes)),
+            format!("{kept}\n... [truncated; the file is {size} bytes]"),
         ))
     }
 }
@@ -269,8 +316,12 @@ impl Tool for WriteFileTool {
     fn preview(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<String> {
         let path = string_arg(args, &["path"])?;
         let content = string_arg(args, &["content"])?;
-        let current = preview_target(path, ctx).and_then(|target| existing_text(&target));
+        let target = preview_target(path, ctx);
+        let current = target.as_deref().and_then(existing_text);
         let Some(current) = current else {
+            if let Some(size) = target.as_deref().and_then(binary_size) {
+                return Some(replaced_binary_summary(path, size, content));
+            }
             return Some(new_file_summary(path, content));
         };
         let diff = unified_diff_for(path, &current, content);
@@ -293,12 +344,24 @@ impl Tool for WriteFileTool {
 
         let target = ctx.policy.resolve_within(&path)?;
         let existed = existing_text(&target);
+        let replaced_binary = existed.is_none().then(|| binary_size(&target)).flatten();
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|error| ToolError::io(&error))?;
         }
         write_text(&target, &content).map_err(|error| ToolError::io(&error))?;
 
         let (detail, diff) = match &existed {
+            None if replaced_binary.is_some() => {
+                let count = splitlines(&content).len();
+                (
+                    format!(
+                        "replaced a file that was not UTF-8 text ({} bytes) with {count} line{}",
+                        replaced_binary.unwrap_or_default(),
+                        plural_s(count)
+                    ),
+                    String::new(),
+                )
+            }
             None => {
                 let count = splitlines(&content).len();
                 (
@@ -316,11 +379,8 @@ impl Tool for WriteFileTool {
                 (detail, diff)
             }
         };
-        let kind = if existed.is_none() {
-            "new file"
-        } else {
-            "overwrite"
-        };
+        let created = existed.is_none() && replaced_binary.is_none();
+        let kind = if created { "new file" } else { "overwrite" };
         let header = format!(
             "Wrote {} bytes to {path} ({kind}).",
             content.chars().count()
@@ -331,9 +391,7 @@ impl Tool for WriteFileTool {
         );
         result.metadata.insert("path".to_owned(), json!(path));
         result.metadata.insert("diff".to_owned(), json!(diff));
-        result
-            .metadata
-            .insert("created".to_owned(), json!(existed.is_none()));
+        result.metadata.insert("created".to_owned(), json!(created));
         Ok(result)
     }
 }

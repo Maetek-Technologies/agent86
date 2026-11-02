@@ -659,3 +659,26 @@ fn a_dangling_symlink_cannot_carry_a_write_out_of_the_jail() {
     assert!(result.ok, "{result:?}");
     assert_eq!(workspace.read("sub/later.txt"), on_disk("ok\n"));
 }
+
+#[test]
+fn writing_over_a_binary_file_is_called_an_overwrite() {
+    let workspace = Workspace::new("binary-overwrite");
+    workspace.write("logo.png", &[0x89, b'P', b'N', b'G', 0xff, 0x00]);
+    let ctx = workspace.context();
+    let arguments = json!({"path": "logo.png", "content": "oops\n"});
+
+    let shown = preview(&ctx, "write_file", arguments.clone()).unwrap();
+    assert_eq!(
+        shown,
+        "overwrite: logo.png is not a UTF-8 text file (6 bytes); all of it is replaced with 1 line\noops\n"
+    );
+
+    let result = dispatch(&ctx, "write_file", arguments);
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        result.content,
+        "Wrote 5 bytes to logo.png (overwrite).\nreplaced a file that was not UTF-8 text (6 bytes) with 1 line"
+    );
+    assert_eq!(result.metadata["created"], json!(false));
+    assert_eq!(workspace.read("logo.png"), on_disk("oops\n"));
+}

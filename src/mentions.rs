@@ -162,14 +162,34 @@ fn expand_one(
         let block = expand_dir(&resolved, &label).map_err(unreadable)?;
         return Ok((block, resolved));
     }
+    // Beyond Python: a FIFO, socket, or device reports no size and could be read
+    // forever, so only regular files are inlined.
+    if !metadata.is_file() {
+        return Err("not a regular file".to_owned());
+    }
     let size = metadata.len();
-    if max_bytes > 0 && size > max_bytes {
-        return Err(format!(
+    let over_cap = |size: u64| {
+        format!(
             "{size} bytes is over the {max_bytes}-byte mention cap; \
              read it with a tool instead of inlining it"
-        ));
+        )
+    };
+    if max_bytes > 0 && size > max_bytes {
+        return Err(over_cap(size));
     }
-    let data = std::fs::read(&resolved).map_err(unreadable)?;
+    // Read no further than the cap, in case the file grew since it was measured.
+    use std::io::Read;
+    let file = std::fs::File::open(&resolved).map_err(unreadable)?;
+    let mut reader: Box<dyn Read> = if max_bytes > 0 {
+        Box::new(file.take(max_bytes + 1))
+    } else {
+        Box::new(file)
+    };
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).map_err(unreadable)?;
+    if max_bytes > 0 && data.len() as u64 > max_bytes {
+        return Err(over_cap(data.len() as u64));
+    }
     let text = decode(&data).ok_or_else(|| "looks like a binary file".to_owned())?;
     let lines = crate::difflib::splitlines(&text).len();
     let header = format!("--- @{label} ({lines} lines) ---");
@@ -349,6 +369,41 @@ mod tests {
         assert_eq!(find_mentions("@a@b @c"), ["a@b", "c"]);
         assert_eq!(find_mentions("@x?!"), ["x"]);
         assert_eq!(find_mentions("@),"), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_rather_than_read_forever() {
+        let dir = std::env::temp_dir().join(format!("agent86-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("pipe"))
+            .status()
+            .is_ok_and(|status| status.success());
+        if made {
+            let policy = SandboxPolicy::new(&dir).unwrap();
+            assert_eq!(
+                expand_one("pipe", &policy, 200_000).unwrap_err(),
+                "not a regular file"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_refused() {
+        let dir = std::env::temp_dir().join(format!("agent86-mention-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.txt"), "x".repeat(20)).unwrap();
+        let policy = SandboxPolicy::new(&dir).unwrap();
+        assert_eq!(
+            expand_one("big.txt", &policy, 10).unwrap_err(),
+            "20 bytes is over the 10-byte mention cap; read it with a tool instead of inlining it"
+        );
+        assert!(expand_one("big.txt", &policy, 20).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -67,12 +67,56 @@ fn golden() -> Value {
     serde_json::from_str(&fixture("web/golden.json")).unwrap()
 }
 
+/// Where the guard deliberately blocks what Python 3.12's `ipaddress` lets through
+/// (see the plan): the shared address space, which holds Alibaba Cloud's metadata
+/// service, and the 6to4 relay anycast range.
+const BEYOND_PYTHON: &[(&str, &str)] = &[
+    (
+        "100.64.0.1",
+        "shared (carrier-grade NAT and cloud metadata range) address 100.64.0.1",
+    ),
+    (
+        "100.100.100.200",
+        "shared (carrier-grade NAT and cloud metadata range) address 100.100.100.200",
+    ),
+    (
+        "100.127.255.255",
+        "shared (carrier-grade NAT and cloud metadata range) address 100.127.255.255",
+    ),
+    (
+        "::ffff:100.100.100.200",
+        "shared (carrier-grade NAT and cloud metadata range) address 100.100.100.200 via ::ffff:6464:64c8",
+    ),
+    ("192.88.99.1", "reserved address 192.88.99.1"),
+];
+
 #[test]
 fn addresses_are_classified_like_python_ipaddress() {
     let golden = golden();
     for (address, expected) in golden["classify"].as_object().unwrap() {
+        if BEYOND_PYTHON.iter().any(|(differs, _)| differs == address) {
+            continue;
+        }
         let ip: IpAddr = address.parse().unwrap();
         assert_eq!(block_reason(ip).as_deref(), expected.as_str(), "{address}");
+    }
+}
+
+#[test]
+fn the_shared_address_space_and_6to4_relays_are_blocked_beyond_python() {
+    for (address, expected) in BEYOND_PYTHON {
+        let ip: IpAddr = address.parse().unwrap();
+        assert_eq!(block_reason(ip).as_deref(), Some(*expected), "{address}");
+    }
+    // The edges of the shared range stay public.
+    for address in [
+        "100.63.255.255",
+        "100.128.0.0",
+        "192.88.98.255",
+        "192.88.100.0",
+    ] {
+        let ip: IpAddr = address.parse().unwrap();
+        assert_eq!(block_reason(ip), None, "{address}");
     }
 }
 
@@ -82,6 +126,28 @@ fn html_is_reduced_like_the_python_regex_reducer() {
         let html = page["html"].as_str().unwrap();
         assert_eq!(html_to_text(html), page["text"].as_str().unwrap(), "{html}");
     }
+}
+
+#[test]
+fn a_page_of_unclosed_tags_is_reduced_in_linear_time() {
+    // About 2 MB, the body cap: before, each unclosed tag scanned to the end.
+    let mut html = String::from("<p>kept</p>");
+    while html.len() < 2_000_000 {
+        html.push_str("<form><table>x");
+    }
+    let started = std::time::Instant::now();
+    let text = html_to_text(&html);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(text.starts_with("kept"), "{}", &text[..40.min(text.len())]);
+    // A tag that does close is still dropped with what it holds.
+    assert_eq!(
+        html_to_text("<form>a<form>b</form>c<script>x</script>d"),
+        "c d"
+    );
 }
 
 #[test]

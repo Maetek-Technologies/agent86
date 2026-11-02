@@ -366,7 +366,10 @@ pub fn validate_api_key(raw: &str) -> Result<String, String> {
     let probe_len = 16;
     if key.len() >= probe_len * 2 && key.is_char_boundary(probe_len) {
         let probe = &key[..probe_len];
-        if key[1..].contains(probe) {
+        // From the second character, not the second byte: a paste that starts with
+        // a multi-byte character (a smart quote) must not panic the slice.
+        let first = key.chars().next().map_or(0, char::len_utf8);
+        if key[first..].contains(probe) {
             return Err(format!(
                 "The key looks like it was pasted more than once (its first {probe_len} characters \
                  appear again). Paste it once and try again."
@@ -681,6 +684,13 @@ mod tests {
         let repeated = key.repeat(4);
         let error = validate_api_key(&repeated).unwrap_err();
         assert!(error.contains("pasted more than once"), "{error}");
+
+        // A paste wrapped in smart quotes starts with a three-byte character; this
+        // used to panic slicing at byte 1.
+        let quoted = format!("\u{201c}{key}\u{201d}");
+        assert_eq!(validate_api_key(&quoted).unwrap(), quoted);
+        let doubled = format!("\u{201c}{key}\u{201c}{key}");
+        assert!(validate_api_key(&doubled).is_err());
     }
 
     #[test]
