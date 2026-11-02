@@ -84,6 +84,76 @@ impl Stored {
     }
 }
 
+/// Why nothing was stored for an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSet {
+    /// The user declined, entered nothing, or nobody could be asked.
+    Declined,
+    /// Shorter than [`MIN_SECRET_CHARS`] (beyond Python, which has no vault).
+    TooShort,
+}
+
+impl NotSet {
+    /// The line telling the user why `name` was not set.
+    pub fn describe(self, name: &str) -> String {
+        match self {
+            Self::Declined => format!("secret {name} not set"),
+            Self::TooShort => format!(
+                "secret {name} not set: it needs at least {MIN_SECRET_CHARS} characters, or \
+                 hiding it would rewrite ordinary text wherever those characters appear"
+            ),
+        }
+    }
+}
+
+/// The shortest value the vault holds. Every occurrence of a value is replaced in
+/// what the model, the session, and the trace see, so a one- or two-character
+/// secret would mangle ordinary text.
+pub const MIN_SECRET_CHARS: usize = 6;
+
+/// Names the model may not ask a secret for (beyond Python): set as environment
+/// variables for `run_command` and `python_exec`, they would change how programs
+/// run (what is executed, what is loaded into it) rather than hand them a value.
+/// Matched ignoring case; entries ending in `_` are prefixes. `/secret NAME`, where
+/// the user picks the name, is not restricted.
+pub const RESERVED_NAMES: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "SHELL",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "IFS",
+    "PS4",
+    "ENV",
+    "BASH_ENV",
+    "CDPATH",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "JAVA_TOOL_OPTIONS",
+    "LD_",
+    "DYLD_",
+    "PYTHON",
+    "GIT_",
+];
+
+/// Whether `name` is one the model may not ask for ([`RESERVED_NAMES`]).
+pub fn reserved_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    RESERVED_NAMES.iter().any(|reserved| {
+        if reserved.ends_with('_') || *reserved == "PYTHON" {
+            name.starts_with(reserved)
+        } else {
+            name == *reserved
+        }
+    })
+}
+
 /// Asks the user for one secret: the answer, or `None` when they declined.
 pub type SecretPrompt = Box<dyn Fn(&SecretRequest) -> Option<SecretAnswer> + Send + Sync>;
 
@@ -217,16 +287,21 @@ impl SecretVault {
     /// Ask the user for `name` and hold what they enter; `None` when they declined,
     /// entered nothing, or nobody can be asked. The lock is not held while the user
     /// types, so redaction elsewhere never waits on them.
-    pub fn ask(&self, name: &str, reason: &str) -> Option<Stored> {
-        let prompt = self.prompt()?;
-        let answer =
-            prompt(&self.request(name, reason)).filter(|answer| !answer.value.is_empty())?;
-        Some(self.accept(name, answer))
+    pub fn ask(&self, name: &str, reason: &str) -> Result<Stored, NotSet> {
+        let prompt = self.prompt().ok_or(NotSet::Declined)?;
+        let answer = prompt(&self.request(name, reason))
+            .filter(|answer| !answer.value.is_empty())
+            .ok_or(NotSet::Declined)?;
+        self.accept(name, answer)
     }
 
     /// Hold `answer` under `name`, and keep it in the keyring (or take it out) as
-    /// the user chose. A keyring that refuses leaves the secret in the session.
-    pub fn accept(&self, name: &str, answer: SecretAnswer) -> Stored {
+    /// the user chose. A keyring that refuses leaves the secret in the session. A
+    /// value shorter than [`MIN_SECRET_CHARS`] is not held.
+    pub fn accept(&self, name: &str, answer: SecretAnswer) -> Result<Stored, NotSet> {
+        if answer.value.chars().count() < MIN_SECRET_CHARS {
+            return Err(NotSet::TooShort);
+        }
         self.set(name, answer.value);
         let result = if answer.remember && self.can_remember() {
             self.remember(name).map(|()| true)
@@ -236,7 +311,7 @@ impl SecretVault {
         } else {
             Ok(false)
         };
-        match result {
+        Ok(match result {
             Ok(remembered) => Stored {
                 remembered,
                 warning: None,
@@ -245,7 +320,7 @@ impl SecretVault {
                 remembered: self.is_remembered(name),
                 warning: Some(format!("the keyring refused: {error}")),
             },
-        }
+        })
     }
 
     // ---- remembering ------------------------------------------------------
@@ -728,21 +803,66 @@ mod tests {
     fn asking_holds_what_the_user_entered() {
         let vault = SecretVault::default();
         assert!(!vault.can_ask());
-        assert!(vault.ask("A", "why").is_none());
+        assert!(vault.ask("A", "why") == Err(NotSet::Declined));
         vault.set_prompt(Some(Box::new(|request| {
             assert_eq!(request.reason, "deploy");
             // No keyring is attached, so there is nothing to remember in.
             assert!(!request.can_remember && !request.remembered);
             (request.name == "A").then(|| SecretAnswer {
-                value: "value".to_owned(),
+                value: "value-1".to_owned(),
                 remember: true,
             })
         })));
         let stored = vault.ask("A", "deploy").unwrap();
         // Asked to remember, but nothing can: the session keeps it.
         assert!(!stored.remembered && stored.warning.is_none());
-        assert!(vault.ask("B", "deploy").is_none());
+        assert!(vault.ask("B", "deploy") == Err(NotSet::Declined));
         assert_eq!(vault.names(), ["A"]);
+    }
+
+    #[test]
+    fn a_value_too_short_to_hide_safely_is_not_held() {
+        let vault = SecretVault::default();
+        let answer = |value: &str| SecretAnswer {
+            value: value.to_owned(),
+            remember: false,
+        };
+        assert_eq!(vault.accept("PIN", answer("12345")), Err(NotSet::TooShort));
+        assert!(vault.names().is_empty());
+        // Characters, not bytes: five accented letters are still five.
+        assert_eq!(vault.accept("PIN", answer("ééééé")), Err(NotSet::TooShort));
+        assert!(vault.accept("PIN", answer("123456")).is_ok());
+        assert_eq!(vault.names(), ["PIN"]);
+        assert!(NotSet::TooShort
+            .describe("PIN")
+            .starts_with("secret PIN not set: it needs at least 6 characters"));
+    }
+
+    #[test]
+    fn names_that_change_how_programs_run_are_reserved() {
+        for name in [
+            "PATH",
+            "path",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "NODE_OPTIONS",
+            "BASH_ENV",
+            "GIT_SSH_COMMAND",
+            "IFS",
+        ] {
+            assert!(reserved_name(name), "{name}");
+        }
+        for name in [
+            "API_TOKEN",
+            "MY_PATH",
+            "OPENAI_API_KEY",
+            "PATHS",
+            "GITHUB_TOKEN",
+        ] {
+            assert!(!reserved_name(name), "{name}");
+        }
     }
 
     /// A keyring in memory, shared between "sessions" like the real one.
@@ -823,7 +943,7 @@ mod tests {
     fn a_remembered_secret_comes_back_in_a_new_session() {
         let keyring = Arc::new(FakeKeyring::default());
         let first = kept_vault(&keyring, ".");
-        answering(&first, "tok_1", true);
+        answering(&first, "tok_1111", true);
         let stored = first.ask("API_TOKEN", "deploy").unwrap();
         assert_eq!(
             stored,
@@ -837,7 +957,7 @@ mod tests {
             "secret API_TOKEN set and remembered for this project · the agent sees only its name"
         );
         // A secret entered for the session only is not remembered.
-        answering(&first, "tok_2", false);
+        answering(&first, "tok_2222", false);
         first.ask("ONCE", "").unwrap();
         assert_eq!(first.remembered_names(), ["API_TOKEN"]);
 
@@ -854,7 +974,7 @@ mod tests {
         assert_eq!(second.load_remembered(), ["API_TOKEN"]);
         assert_eq!(
             second.entries(),
-            [("API_TOKEN".to_owned(), "tok_1".to_owned())]
+            [("API_TOKEN".to_owned(), "tok_1111".to_owned())]
         );
     }
 
@@ -862,7 +982,7 @@ mod tests {
     fn remembered_secrets_belong_to_their_workspace() {
         let keyring = Arc::new(FakeKeyring::default());
         let here = kept_vault(&keyring, "some/project");
-        answering(&here, "tok_1", true);
+        answering(&here, "tok_1111", true);
         here.ask("API_TOKEN", "").unwrap();
 
         let elsewhere = kept_vault(&keyring, "other/project");
@@ -879,7 +999,7 @@ mod tests {
     fn forgetting_drops_the_session_value_and_the_keyring_entries() {
         let keyring = Arc::new(FakeKeyring::default());
         let vault = kept_vault(&keyring, ".");
-        answering(&vault, "tok_1", true);
+        answering(&vault, "tok_1111", true);
         vault.ask("A", "").unwrap();
         vault.ask("B", "").unwrap();
 
@@ -897,7 +1017,7 @@ mod tests {
         assert_eq!(vault.forget("B"), Ok(true));
         assert!(keyring.accounts().is_empty());
         // A name only the keyring had (a new session that did not load it) is forgotten too.
-        answering(&vault, "tok_1", true);
+        answering(&vault, "tok_1111", true);
         vault.ask("C", "").unwrap();
         let fresh = kept_vault(&keyring, ".");
         assert_eq!(fresh.forget("C"), Ok(true));
@@ -908,14 +1028,14 @@ mod tests {
     fn a_new_value_replaces_the_remembered_one_or_stops_remembering() {
         let keyring = Arc::new(FakeKeyring::default());
         let vault = kept_vault(&keyring, ".");
-        answering(&vault, "old", true);
+        answering(&vault, "old-value", true);
         vault.ask("K", "").unwrap();
 
         // The prompt starts on "remember" for a name that is remembered.
         vault.set_prompt(Some(Box::new(|request| {
             assert!(request.remembered && request.replacing && request.can_remember);
             Some(SecretAnswer {
-                value: "new".to_owned(),
+                value: "new-value".to_owned(),
                 remember: true,
             })
         })));
@@ -923,15 +1043,15 @@ mod tests {
         assert_eq!(kept_vault(&keyring, ".").load_remembered(), ["K"]);
         let reloaded = kept_vault(&keyring, ".");
         reloaded.load_remembered();
-        assert_eq!(reloaded.entries()[0].1, "new");
+        assert_eq!(reloaded.entries()[0].1, "new-value");
 
         // "Just this once" must not leave the old value in the keyring.
-        answering(&vault, "once", false);
+        answering(&vault, "once-value", false);
         let stored = vault.ask("K", "").unwrap();
         assert!(!stored.remembered);
         assert!(vault.remembered_names().is_empty());
-        assert!(!keyring.dump().contains("new"), "{}", keyring.dump());
-        assert_eq!(vault.entries(), [("K".to_owned(), "once".to_owned())]);
+        assert!(!keyring.dump().contains("new-value"), "{}", keyring.dump());
+        assert_eq!(vault.entries(), [("K".to_owned(), "once-value".to_owned())]);
     }
 
     #[test]
@@ -941,7 +1061,7 @@ mod tests {
             .refuse_writes
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let vault = kept_vault(&keyring, ".");
-        answering(&vault, "tok_1", true);
+        answering(&vault, "tok_1111", true);
         let stored = vault.ask("K", "").unwrap();
         assert!(!stored.remembered);
         assert_eq!(

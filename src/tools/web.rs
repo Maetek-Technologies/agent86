@@ -624,9 +624,11 @@ pub fn html_to_text(html: &str) -> String {
     let text = TAG
         .replace_all(&html, " ")
         .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
-        .replace("&gt;", ">");
+        .replace("&gt;", ">")
+        // Beyond Python, which unescapes `&amp;` first: last, so the text
+        // `&amp;lt;` (an escaped `&lt;`) stays `&lt;` instead of becoming `<`.
+        .replace("&amp;", "&");
     let lines: Vec<&str> = crate::difflib::splitlines(&text)
         .into_iter()
         .map(str::trim)

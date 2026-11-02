@@ -338,6 +338,10 @@ fn main() -> ExitCode {
             let mut config = config;
             if yes {
                 config.guardrails.approval = ApprovalMode::Auto;
+                // Beyond Python: say once what --yes means, unless Docker contains it.
+                if config.sandbox.mode != agent86::config::SandboxMode::Docker {
+                    stderr.warn(YES_WARNING);
+                }
             }
             if let Some(mode) = output.as_deref().and_then(RunOutputMode::parse) {
                 config.run.output = mode;
@@ -498,6 +502,13 @@ fn run(
     }
     ExitCode::SUCCESS
 }
+
+/// The note `run --yes` prints (beyond Python), unless the Docker sandbox runs the
+/// commands: `run_command` and `python_exec` run as the user, with the network and
+/// the home directory, so text the model reads (a file, a web page) could steer it.
+const YES_WARNING: &str = "--yes: commands and Python snippets will run without asking, as \
+     you, with your network and files. Instructions hidden in a file or page the model reads \
+     could make use of that; [sandbox] mode = \"docker\" contains them.";
 
 /// Where `run` sends what a turn streams, as `[run] output` says.
 ///

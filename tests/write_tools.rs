@@ -682,3 +682,70 @@ fn writing_over_a_binary_file_is_called_an_overwrite() {
     assert_eq!(result.metadata["created"], json!(false));
     assert_eq!(workspace.read("logo.png"), on_disk("oops\n"));
 }
+
+#[test]
+fn writes_replace_the_file_whole_and_leave_nothing_behind() {
+    let workspace = Workspace::new("atomic");
+    let ctx = workspace.context();
+    workspace.write("notes.txt", b"old\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            workspace.root.join("notes.txt"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+    }
+
+    assert!(
+        dispatch(
+            &ctx,
+            "write_file",
+            json!({"path": "notes.txt", "content": "new\n"})
+        )
+        .ok
+    );
+    assert!(
+        dispatch(
+            &ctx,
+            "edit_file",
+            json!({"path": "notes.txt", "old_string": "new", "new_string": "newer"})
+        )
+        .ok
+    );
+    assert_eq!(workspace.read("notes.txt"), on_disk("newer\n"));
+    let names: Vec<String> = std::fs::read_dir(&workspace.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["notes.txt"], "no temporary file is left");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(workspace.root.join("notes.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640, "the file keeps its permissions");
+    }
+
+    // A read-only file is still refused, as a plain write refuses it.
+    let path = workspace.root.join("notes.txt");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    let refused = dispatch(
+        &ctx,
+        "write_file",
+        json!({"path": "notes.txt", "content": "x\n"}),
+    );
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert!(
+        error_of(&refused).starts_with("PermissionError: "),
+        "{refused:?}"
+    );
+    assert_eq!(workspace.read("notes.txt"), on_disk("newer\n"));
+}

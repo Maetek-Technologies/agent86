@@ -129,6 +129,16 @@ fn html_is_reduced_like_the_python_regex_reducer() {
 }
 
 #[test]
+fn an_escaped_entity_is_unescaped_once_beyond_python() {
+    // Python unescapes `&amp;` first, turning the text `&amp;lt;b&amp;gt;` into
+    // `<b>`; it reads `&lt;b&gt;`, as a browser shows it.
+    assert_eq!(
+        html_to_text("<p>Write &amp;lt;b&amp;gt; for bold, &lt;i&gt; for italic &amp; more</p>"),
+        "Write &lt;b&gt; for bold, <i> for italic & more"
+    );
+}
+
+#[test]
 fn a_page_of_unclosed_tags_is_reduced_in_linear_time() {
     // About 2 MB, the body cap: before, each unclosed tag scanned to the end.
     let mut html = String::from("<p>kept</p>");

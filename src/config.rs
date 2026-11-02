@@ -872,6 +872,12 @@ fn accept_legacy_status_line(merged: &mut Table) {
 }
 
 fn validate(config: &mut Config) -> Result<(), ConfigError> {
+    // Beyond Python: zero would time every command and fetch out at once.
+    if config.limits.tool_timeout_s == 0 {
+        return Err(ConfigError::Invalid {
+            detail: "limits.tool_timeout_s must be at least 1 second, not 0".to_owned(),
+        });
+    }
     for (name, server) in &mut config.mcp_servers {
         server
             .resolve_transport()
@@ -974,6 +980,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_zero_tool_timeout_is_invalid() {
+        let dir = temp_dir("timeout");
+        let paths = paths_in(&dir);
+        std::fs::write(&paths.project, "[limits]\ntool_timeout_s = 0\n").unwrap();
+        let error = load_config(&paths, &Overrides::default()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid config: limits.tool_timeout_s must be at least 1 second, not 0"
+        );
+        std::fs::write(&paths.project, "[limits]\ntool_timeout_s = 1\n").unwrap();
+        assert_eq!(
+            load_config(&paths, &Overrides::default())
+                .unwrap()
+                .limits
+                .tool_timeout_s,
+            1
+        );
     }
 
     #[test]

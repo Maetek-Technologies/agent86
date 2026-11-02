@@ -1044,6 +1044,15 @@ async fn yes_and_auto_approve_side_effects() {
             .unwrap();
 
         assert!(output.status.success(), "{name}: {}", stderr(&output));
+        // Beyond Python: --yes says once what it allows; --approval auto is
+        // already an explicit setting, and says nothing more.
+        assert_eq!(
+            stderr(&output)
+                .starts_with("--yes: commands and Python snippets will run without asking"),
+            args.contains(&"--yes") || args.contains(&"-y"),
+            "{name}: {}",
+            stderr(&output)
+        );
         assert!(
             stderr(&output).contains("[tool] write_file -> Wrote 5 bytes to made.txt (new file)."),
             "{name}: {}",

@@ -345,6 +345,23 @@ fn reader<R: Read + Send + 'static>(pipe: R, sender: mpsc::Sender<(usize, Vec<u8
     });
 }
 
+/// After a timed-out child was killed, wait up to `wait` ([`DRAIN_TIMEOUT`]) for its pipes to
+/// close. A pipe a surviving grandchild still holds is given up on (left empty);
+/// one that already closed keeps what it carried.
+fn drain(
+    receiver: &mpsc::Receiver<(usize, Vec<u8>)>,
+    outputs: &mut [Option<Vec<u8>>; 2],
+    wait: Duration,
+) {
+    let deadline = Instant::now() + wait;
+    while outputs.iter().any(Option::is_none) {
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((index, bytes)) => outputs[index] = Some(bytes),
+            Err(_) => break,
+        }
+    }
+}
+
 /// The first [`MAX_CAPTURE_BYTES`] of `pipe`; the rest is read and dropped, so
 /// the child never blocks on a full pipe and EOF still means it is done.
 fn capture(mut pipe: impl Read) -> Vec<u8> {
@@ -443,17 +460,7 @@ pub fn run_subprocess(
 
     // Timed out: kill the tree, then collect whatever it already wrote.
     kill_process_tree(&mut child);
-    let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-    while outputs.iter().any(Option::is_none) {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(remaining) {
-            Ok((index, bytes)) => outputs[index] = Some(bytes),
-            Err(_) => {
-                // A surviving grandchild still holds a pipe: give up on the output.
-                outputs = [Some(Vec::new()), Some(Vec::new())];
-            }
-        }
-    }
+    drain(&receiver, &mut outputs, DRAIN_TIMEOUT);
     let _ = child.wait();
     let [stdout, stderr] = outputs.map(Option::unwrap_or_default);
     let seconds = policy.timeout.as_secs();
@@ -518,6 +525,27 @@ impl DockerExecutor {
             &self.cpus,
             "--pids-limit",
             "256",
+            // Beyond Python: no capabilities but those writing the mounted workspace
+            // (owned by the user, not the container's root) and installing packages
+            // need, so no raw sockets, `mknod`, `chroot`, or capability games; and
+            // setuid binaries gain nothing.
+            "--cap-drop",
+            "ALL",
+            // One flag per capability: Docker refuses a comma-separated list.
+            "--cap-add",
+            "CHOWN",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--cap-add",
+            "FOWNER",
+            "--cap-add",
+            "FSETID",
+            "--cap-add",
+            "SETUID",
+            "--cap-add",
+            "SETGID",
+            "--security-opt",
+            "no-new-privileges",
             "-w",
             CONTAINER_WORKDIR,
             "-v",
@@ -619,10 +647,20 @@ impl DockerExecutor {
         } else {
             " (container may still be running)"
         };
+        // Beyond Python, which discards it: what the container printed before the
+        // timeout is kept, as the subprocess executor keeps it.
+        drain(&receiver, &mut outputs, DRAIN_TIMEOUT);
+        let [stdout, stderr] = outputs.map(Option::unwrap_or_default);
+        let stderr = policy.truncate(decode(&stderr));
+        let timed_out = format!("[timed out after {}s]{note}", policy.timeout.as_secs());
         ExecResult {
             returncode: 124,
-            stdout: String::new(),
-            stderr: format!("[timed out after {}s]{note}", policy.timeout.as_secs()),
+            stdout: policy.truncate(decode(&stdout)),
+            stderr: if stderr.is_empty() {
+                timed_out
+            } else {
+                format!("{stderr}\n{timed_out}")
+            },
             timed_out: true,
         }
     }
@@ -695,5 +733,17 @@ mod tests {
             "everything was read, so the child never blocks"
         );
         assert_eq!(capture(&b"short"[..]), b"short");
+    }
+
+    #[test]
+    fn a_pipe_still_held_after_a_timeout_does_not_wipe_the_one_that_finished() {
+        let (sender, receiver) = mpsc::channel();
+        // stdout finished; a grandchild keeps stderr open (its sender never sends).
+        sender.send((0, b"partial output".to_vec())).unwrap();
+        let _held = sender;
+        let mut outputs = [None, None];
+        drain(&receiver, &mut outputs, Duration::from_millis(50));
+        assert_eq!(outputs[0].as_deref(), Some(&b"partial output"[..]));
+        assert_eq!(outputs[1], None);
     }
 }
