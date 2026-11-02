@@ -19,14 +19,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-22.04-arm, macos-latest, windows-latest]
-        toolchain: [stable, "1.88"]
+        toolchain: [stable, "1.94"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test
         run: cargo test --all-targets --locked
       - name: Format
@@ -35,3 +35,14 @@ jobs:
       - name: Clippy
         if: matrix.toolchain == 'stable'
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  advisories:
+    name: advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Every dependency checked against the RustSec advisory database; deny.toml
+      # holds any exception, with the reason agent86 is not affected.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories

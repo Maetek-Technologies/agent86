@@ -2,7 +2,7 @@
 name = "agent86"
 version = "1.0.12"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 description = "agent86, an agentic harness on the command line"
 repository = "https://github.com/Maetek-Technologies/agent86"
 license = "MIT"
@@ -32,11 +32,13 @@ unicode-width = "0.2"
 url = "2.5.8"
 md5 = "0.8.1"
 sha2 = "0.11.1"
-# Pinned: candle 0.11's aarch64 NEON code uses float16 intrinsics that are not
-# stable in the MSRV (1.88), so it does not build on Apple silicon.
-candle-core = "=0.10.2"
-candle-nn = "=0.10.2"
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+# candle 0.11 sets the MSRV: on x86_64 it calls `__cpuid_count` outside an
+# `unsafe` block, which compiles only from Rust 1.94, where that intrinsic became
+# safe (it also needs the AVX-512 target features stabilized in 1.89). 0.10 pulled
+# in `zip` 7, with five advisories; 0.11 has `zip` 9.
+candle-core = "=0.11.1"
+candle-nn = "=0.11.1"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 
 [lints.rust]
 unsafe_code = "forbid"
