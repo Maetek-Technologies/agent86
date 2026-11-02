@@ -140,6 +140,27 @@ fn read_file_replaces_invalid_utf8() {
 }
 
 #[test]
+fn read_file_reads_a_huge_file_only_as_far_as_the_cap() {
+    let workspace = Workspace::new("read-huge");
+    let mut ctx = workspace.context();
+    ctx.policy.max_output_chars = 10;
+
+    // Within four bytes a character of the cap: read whole, capped as Python caps it.
+    workspace.write("small.txt", "a".repeat(30).as_bytes());
+    let small = dispatch(&ctx, "read_file", json!({"path": "small.txt"}));
+    assert_eq!(small.content, "aaaaaaaaaa\n... [truncated 20 bytes]");
+
+    // Far past it: only the start is read, and the note gives the file's size.
+    workspace.write("huge.txt", "b".repeat(1000).as_bytes());
+    let huge = dispatch(&ctx, "read_file", json!({"path": "huge.txt"}));
+    assert!(huge.ok, "{huge:?}");
+    assert_eq!(
+        huge.content,
+        "bbbbbbbbbb\n... [truncated; the file is 1000 bytes]"
+    );
+}
+
+#[test]
 fn read_file_reports_missing_files_and_directories() {
     let workspace = Workspace::new("read-missing");
     workspace.mkdir("sub");

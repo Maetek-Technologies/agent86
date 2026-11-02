@@ -189,6 +189,14 @@ pub fn block_reason(ip: IpAddr) -> Option<String> {
                 "loopback"
             } else if v4_in(v4, [169, 254, 0, 0], 16) {
                 "link-local (cloud metadata range)"
+            } else if v4_in(v4, [100, 64, 0, 0], 10) {
+                // Beyond Python, whose `ipaddress` calls this range neither private
+                // nor global: carrier-grade NAT, Tailscale peers, and Alibaba
+                // Cloud's metadata service at 100.100.100.200.
+                "shared (carrier-grade NAT and cloud metadata range)"
+            } else if v4_in(v4, [192, 88, 99, 0], 24) {
+                // Beyond Python: the deprecated 6to4 relay anycast range.
+                "reserved"
             } else if v4_private(v4) {
                 "private"
             } else if v4_in(v4, [224, 0, 0, 0], 4) {
@@ -434,7 +442,11 @@ async fn fetch(
     for _ in 0..=MAX_REDIRECTS {
         let (parsed, addresses) =
             vet_url(&current, settings.allow_private).map_err(FetchError::Blocked)?;
+        // Beyond Python: never through a proxy (reqwest reads HTTP(S)_PROXY by
+        // default). A proxy resolves the host itself, so it would connect wherever
+        // DNS says next, not to the addresses vetted above.
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .user_agent(&settings.user_agent);
@@ -550,13 +562,26 @@ fn drop_blocks(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut position = 0;
     let mut search_from = 0;
+    // Beyond Python: tags already known to have no closing tag further on. Without
+    // this, a page of unclosed `<form>`s scans to its end once per tag, which for
+    // a 2 MB body is enough to freeze the turn; the output is the same, since no
+    // close after one open means none after a later one.
+    let mut unclosed: Vec<String> = Vec::new();
     while search_from < html.len() {
         let Some(open) = DROP_OPEN.captures_at(html, search_from) else {
             break;
         };
         let whole = open.get(0).expect("group 0 always matches");
         let closing = format!("</{}>", open[1].to_ascii_lowercase());
-        match find_ignore_ascii_case(&html[whole.end()..], &closing) {
+        if unclosed.contains(&closing) {
+            search_from = next_char(html, whole.start());
+            continue;
+        }
+        let found = find_ignore_ascii_case(&html[whole.end()..], &closing);
+        if found.is_none() {
+            unclosed.push(closing.clone());
+        }
+        match found {
             Some(offset) => {
                 out.push_str(&html[position..whole.start()]);
                 out.push(' ');

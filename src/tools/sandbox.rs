@@ -333,17 +333,25 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// How much of one pipe is kept (beyond Python, which keeps all of it). The
+/// output is cut to `max_output_chars` afterwards anyway; this bounds what `yes`
+/// or `cat /dev/zero` can pile up in memory before the timeout ends them.
+pub const MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Read `pipe` to the end on a thread, reporting the bytes on `sender`.
-fn reader<R: Read + Send + 'static>(
-    mut pipe: R,
-    sender: mpsc::Sender<(usize, Vec<u8>)>,
-    index: usize,
-) {
+fn reader<R: Read + Send + 'static>(pipe: R, sender: mpsc::Sender<(usize, Vec<u8>)>, index: usize) {
     std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        let _ = sender.send((index, bytes));
+        let _ = sender.send((index, capture(pipe)));
     });
+}
+
+/// The first [`MAX_CAPTURE_BYTES`] of `pipe`; the rest is read and dropped, so
+/// the child never blocks on a full pipe and EOF still means it is done.
+fn capture(mut pipe: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = (&mut pipe).take(MAX_CAPTURE_BYTES).read_to_end(&mut bytes);
+    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+    bytes
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -652,5 +660,40 @@ pub fn mount_source(workspace: &Path) -> String {
         format!("/{}{}", (bytes[0] as char).to_ascii_lowercase(), &text[2..])
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that counts what was taken from it.
+    struct Counted<R> {
+        inner: R,
+        read: u64,
+    }
+
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            self.read += count as u64;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_flood_of_output_is_kept_to_the_cap_and_the_rest_drained() {
+        let total = MAX_CAPTURE_BYTES * 3;
+        let mut pipe = Counted {
+            inner: std::io::repeat(b'y').take(total),
+            read: 0,
+        };
+        let kept = capture(&mut pipe);
+        assert_eq!(kept.len() as u64, MAX_CAPTURE_BYTES);
+        assert_eq!(
+            pipe.read, total,
+            "everything was read, so the child never blocks"
+        );
+        assert_eq!(capture(&b"short"[..]), b"short");
     }
 }
