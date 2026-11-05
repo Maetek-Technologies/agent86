@@ -868,7 +868,14 @@ fn with_editor(
 ) -> (ToolContext, PathBuf) {
     let mut ctx = workspace.context();
     ctx.editor = Some(editor.clone());
-    let absolute = workspace.root.canonicalize().unwrap().join(relative);
+    // The plain form of the canonical path, which is what the tools hand an editor;
+    // on Windows `canonicalize` adds a `\\?\` prefix they strip.
+    let root = workspace.root.canonicalize().unwrap();
+    let root = match root.display().to_string().strip_prefix(r"\\?\") {
+        Some(plain) => PathBuf::from(plain),
+        None => root,
+    };
+    let absolute = root.join(relative);
     (ctx, absolute)
 }
 
@@ -1026,7 +1033,7 @@ fn an_editor_that_does_not_take_writes_leaves_them_to_the_disk() {
         json!({"path": "a.txt", "content": "new\n"}),
     );
     assert!(result.ok, "{result:?}");
-    assert_eq!(workspace.read("a.txt"), b"new\n");
+    assert_eq!(workspace.read("a.txt"), on_disk("new\n"));
     assert!(editor.writes.lock().unwrap().is_empty());
 }
 
@@ -1042,7 +1049,7 @@ fn without_an_editor_nothing_changes() {
         json!({"path": "a.txt", "content": "new\n"}),
     );
     assert!(result.ok);
-    assert_eq!(workspace.read("a.txt"), b"new\n");
+    assert_eq!(workspace.read("a.txt"), on_disk("new\n"));
     assert_eq!(
         dispatch(&ctx, "read_file", json!({"path": "a.txt"})).content,
         "new\n"

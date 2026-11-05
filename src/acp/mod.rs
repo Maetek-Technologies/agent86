@@ -91,6 +91,8 @@ pub enum Update {
     Message(String),
     /// A chunk of the model's reasoning (`agent_thought_chunk`).
     Thought(String),
+    /// The slash commands the session offers (`available_commands_update`).
+    Commands(Vec<CommandInfo>),
     /// The model asked for a tool call (`tool_call`, status `pending`).
     ToolCall {
         id: String,
@@ -102,6 +104,16 @@ pub enum Update {
     /// A tool call's outcome (`tool_call_update`, status `completed` or `failed`),
     /// with the text the model is shown.
     ToolResult { id: String, ok: bool, text: String },
+}
+
+/// A slash command the agent offers the editor to list, without the slash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    /// What to show while the user has typed no argument; `None` for a command that
+    /// takes none.
+    pub hint: Option<String>,
 }
 
 /// What the agent asks the editor to approve.
@@ -259,6 +271,19 @@ pub trait Backend: Send {
         mcp_servers: Vec<McpSpec>,
     ) -> Result<String, BackendError>;
 
+    /// The slash commands offered to the editor for a session. None by default.
+    fn commands(&self) -> Vec<CommandInfo> {
+        Vec::new()
+    }
+
+    /// Run `line` (starting with `/`) as a command on `session_id` and return what to
+    /// tell the user, or `None` when it is not one of this backend's commands, in
+    /// which case it goes to the model like any other prompt. Runs on the connection's
+    /// thread, between turns.
+    fn run_command(&mut self, _session_id: &str, _line: &str) -> Option<String> {
+        None
+    }
+
     /// Open an existing session and return its history as updates to replay, in
     /// order, or a `not_found` error when there is no such session. The client's
     /// `cwd` and servers are as for [`Backend::new_session`].
@@ -376,6 +401,10 @@ pub struct Server<B: Backend> {
     next_request: u64,
     /// The client is gone: the connection ends once the current line is handled.
     closed: bool,
+    /// Notifications to send right after the current response, which they follow
+    /// by design: a client learns a session's id from the response, so an update
+    /// naming it must not arrive first.
+    after: Vec<Value>,
 }
 
 impl<B: Backend> Server<B> {
@@ -389,6 +418,7 @@ impl<B: Backend> Server<B> {
             pending: HashMap::new(),
             next_request: 0,
             closed: false,
+            after: Vec::new(),
         }
     }
 
@@ -435,6 +465,9 @@ impl<B: Backend> Server<B> {
                     Err(error) => error_response(id, error.code, &error.message),
                 };
                 emit(response);
+                for message in std::mem::take(&mut self.after) {
+                    emit(message);
+                }
             }
             // A notification has no id and gets no reply, even when unknown.
             Inbound::Notification { .. } => {}
@@ -482,7 +515,17 @@ impl<B: Backend> Server<B> {
     fn session_new(&mut self, params: &Value) -> Result<Value, BackendError> {
         let (cwd, servers) = session_location(params)?;
         let session_id = self.backend.new_session(Path::new(&cwd), servers)?;
+        self.advertise_commands(&session_id);
         Ok(json!({ "sessionId": session_id }))
+    }
+
+    /// Queue the command list for after the response, when there is one to offer.
+    fn advertise_commands(&mut self, session_id: &str) {
+        let commands = self.backend.commands();
+        if !commands.is_empty() {
+            self.after
+                .push(session_update(session_id, &Update::Commands(commands)));
+        }
     }
 
     /// Reopen a session: its history is replayed as updates, in order, before the
@@ -505,6 +548,7 @@ impl<B: Backend> Server<B> {
         for update in &history {
             emit(session_update(session_id, update));
         }
+        self.advertise_commands(session_id);
         Ok(json!({}))
     }
 
@@ -527,6 +571,13 @@ impl<B: Backend> Server<B> {
                 BackendError::invalid_params("Invalid params: prompt must be an array")
             })?;
         let text = prompt_text(blocks).map_err(BackendError::invalid_params)?;
+        // A slash command the backend knows is answered here, with no model turn.
+        if text.trim_start().starts_with('/') {
+            if let Some(output) = self.backend.run_command(&session_id, text.trim()) {
+                emit(session_update(&session_id, &Update::Message(output)));
+                return Ok(json!({ "stopReason": Stop::EndTurn.as_str() }));
+            }
+        }
 
         let sink: Arc<dyn TurnSink> = Arc::new(ChannelSink {
             events: self.sender.clone(),
@@ -908,6 +959,19 @@ fn session_update(session_id: &str, update: &Update) -> Value {
             "sessionUpdate": "agent_thought_chunk",
             "content": text_content(text)
         }),
+        Update::Commands(commands) => json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": commands.iter().map(|command| {
+                let mut entry = json!({
+                    "name": command.name,
+                    "description": command.description
+                });
+                if let Some(hint) = &command.hint {
+                    entry["input"] = json!({ "hint": hint });
+                }
+                entry
+            }).collect::<Vec<_>>()
+        }),
         Update::ToolCall {
             id,
             title,
@@ -1139,9 +1203,21 @@ mod tests {
         capabilities: Option<ClientCapabilities>,
         /// What each `Act::Call` got back.
         call_results: Arc<Mutex<Vec<Result<Value, String>>>>,
+        /// The commands offered, and the one this backend answers (`/ping`).
+        offered: Vec<CommandInfo>,
+        commands_run: Vec<String>,
     }
 
     impl Backend for Script {
+        fn commands(&self) -> Vec<CommandInfo> {
+            self.offered.clone()
+        }
+
+        fn run_command(&mut self, _session_id: &str, line: &str) -> Option<String> {
+            self.commands_run.push(line.to_owned());
+            (line == "/ping" || line.starts_with("/ping ")).then(|| format!("pong from {line}"))
+        }
+
         fn client_capabilities(&mut self, capabilities: ClientCapabilities) {
             self.capabilities = Some(capabilities);
         }
@@ -2127,6 +2203,116 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(Result::is_err), "{results:?}");
         assert!(server.closed);
+    }
+
+    fn offer(server: &mut Server<Script>) {
+        server.backend.offered = vec![
+            CommandInfo {
+                name: "ping".into(),
+                description: "Pong".into(),
+                hint: Some("anything".into()),
+            },
+            CommandInfo {
+                name: "cost".into(),
+                description: "Cost".into(),
+                hint: None,
+            },
+        ];
+    }
+
+    #[test]
+    fn commands_are_advertised_after_the_session_response_never_before() {
+        let mut server = ready();
+        offer(&mut server);
+        let cwd = std::env::temp_dir();
+        let line = json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+            "params":{"cwd": cwd, "mcpServers": []}})
+        .to_string();
+        let out = replies(&mut server, &line);
+        assert_eq!(out.len(), 2, "{out:?}");
+        // The response first: a client learns the session id from it.
+        assert_eq!(out[0]["result"]["sessionId"], "sess_1");
+        let update = &out[1]["params"]["update"];
+        assert!(out[1].get("id").is_none());
+        assert_eq!(out[1]["params"]["sessionId"], "sess_1");
+        assert_eq!(update["sessionUpdate"], "available_commands_update");
+        assert_eq!(
+            update["availableCommands"],
+            json!([
+                {"name": "ping", "description": "Pong", "input": {"hint": "anything"}},
+                {"name": "cost", "description": "Cost"}
+            ])
+        );
+        // And only once: the next request carries none.
+        let again = replies(&mut server, &line);
+        assert_eq!(again.len(), 2);
+        let reply = one(&mut server, &prompt_line(HI));
+        assert!(reply.get("result").is_some());
+    }
+
+    #[test]
+    fn a_loaded_session_advertises_after_its_history_and_response() {
+        let mut server = ready();
+        offer(&mut server);
+        server.backend.history = vec![Update::User("hi".into())];
+        let cwd = std::env::temp_dir();
+        let out = replies(&mut server, &load_line("sess_9", cwd.to_str().unwrap()));
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|m| {
+                m["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap_or("response")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "user_message_chunk",
+                "response",
+                "available_commands_update"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_backend_with_no_commands_advertises_nothing() {
+        let mut server = ready();
+        let cwd = std::env::temp_dir();
+        let line = json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+            "params":{"cwd": cwd, "mcpServers": []}})
+        .to_string();
+        assert_eq!(replies(&mut server, &line).len(), 1);
+    }
+
+    #[test]
+    fn a_command_is_answered_without_a_model_turn_and_others_go_to_the_model() {
+        let mut server = ready();
+        let out = replies(
+            &mut server,
+            &prompt_line(r#"[{"type":"text","text":"  /ping now  "}]"#),
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(
+            out[0]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(
+            out[0]["params"]["update"]["content"]["text"],
+            "pong from /ping now"
+        );
+        assert_eq!(out[1]["result"]["stopReason"], "end_turn");
+        assert!(server.backend.prompts.is_empty(), "no turn ran");
+
+        // Not this backend's command, and not a command at all: both reach the model.
+        for text in ["/unknown thing", "see /ping later", "plain"] {
+            let line = prompt_line(&format!(r#"[{{"type":"text","text":"{text}"}}]"#));
+            let out = replies(&mut server, &line);
+            assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
+        }
+        assert_eq!(server.backend.prompts.len(), 3);
+        // Only text that starts with a slash is offered as a command.
+        assert_eq!(server.backend.commands_run, ["/ping now", "/unknown thing"]);
     }
 
     #[test]

@@ -60,7 +60,7 @@ Approvals follow the usual setting, `[guardrails] approval` (`ask` by default). 
 
 - **Settings come from where the editor starts agent86.** The project's `.agent86/config.toml` is the one in that directory, which is normally the project folder. A multi-folder window uses the folder the editor chose.
 - **The project file must be trusted.** agent86 never asks the trust question here (its input is the protocol), so a project file's riskier settings, such as MCP servers, providers, and approval changes, are ignored, with a note in the log, until the project is trusted. Open `agent86` in the project once at a terminal and answer `y` to the question it asks, or add `--trust-project` before `acp` in the editor's arguments.
-- **No slash commands and no `@` menu.** Those belong to the terminal interface; the editor has its own mentions, which arrive as links to the files (the model gets the link and can read the file). `/model`, `/mode`, `/limits`, and the rest are not available. Set them in the config or the arguments instead.
+- **Four slash commands, and no `@` menu.** agent86 offers `/mode [ask|auto|deny]`, `/model [provider:model]`, `/cost`, and `/tools` to the editor's command list (if the editor shows one), and answers them itself without a model turn, acting on that thread only. The rest of the terminal's commands (`/limits`, `/resume`, `/clear`, `/thinking`, `/secret`, and so on) are not available; set those in the config or the arguments. Text starting with a slash that is not one of the four goes to the model as written. The editor has its own mentions, which arrive as links to the files (the model gets the link and can read the file).
 - **No secret prompt.** `request_secret` is not offered, because the protocol has no masked entry. Secrets remembered for the project in the keyring are not loaded either.
 - **No update notice.**
 - **One turn at a time** in a connection. A second prompt sent while one runs is refused.
@@ -68,7 +68,7 @@ Approvals follow the usual setting, `[guardrails] approval` (`ask` by default). 
 ## What is not built
 
 - Terminals (`terminal/*`): commands run in agent86's own sandbox and their output comes back as text, not in the editor's terminal.
-- Modes, model pickers, slash-command lists, and a plan view in the editor's panel.
+- ACP session modes and config options (the editor's own mode or model pickers; `/mode` and `/model` are the substitute), and a plan view in the editor's panel.
 - Images, audio, and embedded resources in a prompt (it accepts text and file links).
 - Remembered permission choices.
 - Reconnection: if the editor goes away, the agent ends.

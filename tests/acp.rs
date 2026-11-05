@@ -47,8 +47,15 @@ impl Workspace {
     }
 
     fn project(&self) -> PathBuf {
-        // The canonical path: the session's jail is canonical too.
-        self.root.join("project").canonicalize().unwrap()
+        // The canonical path, in the plain form an editor would send: the session's
+        // jail is canonical too, and on Windows `canonicalize` adds a `\\?\` prefix
+        // that no editor uses.
+        let path = self.root.join("project").canonicalize().unwrap();
+        let text = path.display().to_string();
+        match text.strip_prefix(r"\\?\") {
+            Some(plain) => PathBuf::from(plain),
+            None => path,
+        }
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -104,6 +111,7 @@ impl Workspace {
             cancel_on_request: None,
             buffers: Default::default(),
             refuse_writes: None,
+            commands: Vec::new(),
         }
     }
 }
@@ -133,6 +141,8 @@ struct Client {
     buffers: std::collections::HashMap<String, String>,
     /// A message to refuse every `fs/write_text_file` with.
     refuse_writes: Option<&'static str>,
+    /// The commands the agent last advertised, kept out of every exchange's updates.
+    commands: Vec<Value>,
 }
 
 /// What came back for one request: the notifications before its response, and the
@@ -227,6 +237,13 @@ impl Client {
             }
             assert_eq!(message["method"], "session/update", "{message}");
             assert!(message.get("id").is_none(), "{message}");
+            if message["params"]["update"]["sessionUpdate"] == "available_commands_update" {
+                self.commands = message["params"]["update"]["availableCommands"]
+                    .as_array()
+                    .unwrap()
+                    .clone();
+                continue;
+            }
             updates.push(message);
             if let Some(session) = self.cancel_on_update.take() {
                 self.notify("session/cancel", json!({"sessionId": session}));
@@ -679,10 +696,7 @@ async fn an_approved_write_is_asked_about_then_done() {
         .collect();
     assert_eq!(ids, ["allow-once", "reject-once"]);
 
-    assert_eq!(
-        std::fs::read_to_string(workspace.project().join("out.txt")).unwrap(),
-        "hi\n"
-    );
+    assert_eq!(disk_text(&workspace.project().join("out.txt")), "hi\n");
     let done = &exchange.updates[1]["params"]["update"];
     assert_eq!(done["toolCallId"], "call_w");
     assert_eq!(done["status"], "completed");
@@ -1224,10 +1238,7 @@ async fn writes_land_in_the_editor_and_the_approval_shows_the_change_from_its_bu
     assert_eq!(writes[0]["params"]["content"], "replaced\n");
     let path = workspace.project().join("notes.txt").display().to_string();
     assert_eq!(held[&path], "replaced\n");
-    assert_eq!(
-        std::fs::read_to_string(workspace.project().join("notes.txt")).unwrap(),
-        "saved\n"
-    );
+    assert_eq!(disk_text(&workspace.project().join("notes.txt")), "saved\n");
     assert!(tool_result_text(&exchange).contains("Wrote"));
 }
 
@@ -1278,10 +1289,7 @@ async fn a_write_the_editor_refuses_fails_the_call_and_does_not_touch_the_disk()
         .unwrap();
     assert_eq!(done["status"], "failed");
     assert!(tool_result_text(&exchange).contains("the buffer is read-only"));
-    assert_eq!(
-        std::fs::read_to_string(workspace.project().join("notes.txt")).unwrap(),
-        "saved\n"
-    );
+    assert_eq!(disk_text(&workspace.project().join("notes.txt")), "saved\n");
 }
 
 #[tokio::test]
@@ -1307,7 +1315,7 @@ async fn only_what_the_editor_advertises_is_used() {
         .all(|request| request["method"] == "fs/read_text_file"));
     assert!(!exchange.files.is_empty());
     assert_eq!(
-        std::fs::read_to_string(workspace.project().join("notes.txt")).unwrap(),
+        disk_text(&workspace.project().join("notes.txt")),
         "replaced\n"
     );
     assert_eq!(held.values().cloned().collect::<Vec<_>>(), ["unsaved\n"]);
@@ -1324,4 +1332,117 @@ async fn only_what_the_editor_advertises_is_used() {
     .await;
     assert!(exchange.files.is_empty());
     assert_eq!(tool_result_text(&exchange), "saved\n");
+}
+
+/// A file's text with Windows line endings normalised: the write tools translate `\n`
+/// to `\r\n` there, as Python does.
+fn disk_text(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+}
+
+fn command_names(client: &Client) -> Vec<&str> {
+    client
+        .commands
+        .iter()
+        .map(|command| command["name"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_commands_are_advertised_and_run_without_the_model() {
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::new("commands", Some(&server));
+    let (names, hints, mode, bad, cost, tools, model_help, bad_model) =
+        tokio::task::spawn_blocking({
+            let project = workspace.project();
+            let mut client = workspace.connect();
+            move || {
+                client.initialize();
+                let session = client.new_session(&project);
+                // The list arrives after the response, so the next read picks it up.
+                let mode = client.prompt(&session, "/mode");
+                let names: Vec<String> = command_names(&client)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                let hints: Vec<Option<String>> = client
+                    .commands
+                    .iter()
+                    .map(|c| c["input"]["hint"].as_str().map(str::to_owned))
+                    .collect();
+                let bad = client.prompt(&session, "/mode sideways");
+                let cost = client.prompt(&session, "/cost");
+                let tools = client.prompt(&session, "/tools");
+                let model_help = client.prompt(&session, "/model");
+                let bad_model = client.prompt(&session, "/model nonsense");
+                client.finish();
+                (names, hints, mode, bad, cost, tools, model_help, bad_model)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(names, ["mode", "model", "cost", "tools"]);
+    assert_eq!(
+        hints,
+        [
+            Some("ask, auto, or deny".to_owned()),
+            Some("provider:model".to_owned()),
+            None,
+            None
+        ]
+    );
+    for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
+        assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
+        assert_eq!(exchange.kinds(), ["agent_message_chunk"]);
+    }
+    assert_eq!(mode.text_of("agent_message_chunk"), "approval mode: ask");
+    assert!(bad
+        .text_of("agent_message_chunk")
+        .contains("unknown mode 'sideways'"));
+    assert!(cost
+        .text_of("agent_message_chunk")
+        .starts_with("steps 0  in 0  out 0 tok"));
+    assert!(tools.text_of("agent_message_chunk").contains("read_file"));
+    let shown = model_help.text_of("agent_message_chunk");
+    assert!(
+        shown.contains("current model: ") && shown.contains(":test/model"),
+        "{shown}"
+    );
+    // A refused switch leaves things as they were, and none of it reached the model.
+    assert!(!bad_model.text_of("agent_message_chunk").is_empty());
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn setting_the_mode_changes_what_is_asked_and_unknown_slashes_reach_the_model() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[WRITE]),
+        sse_text("Written.", "stop"),
+        sse_text("The model saw it.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("commands-mode", Some(&server));
+    let (set, write, other) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let set = client.prompt(&session, "/mode auto");
+            let write = client.prompt(&session, "Write the file");
+            let other = client.prompt(&session, "/frobnicate now");
+            client.finish();
+            (set, write, other)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(set.text_of("agent_message_chunk"), "approval mode: auto");
+    // In `auto` nothing is asked, so the write just happened.
+    assert!(write.requests.is_empty());
+    assert!(workspace.project().join("out.txt").exists());
+    // A slash the agent does not own is an ordinary prompt.
+    assert_eq!(other.text_of("agent_message_chunk"), "The model saw it.");
+    let sent = server.requests().last().unwrap().body["messages"].to_string();
+    assert!(sent.contains("/frobnicate now"), "{sent}");
 }

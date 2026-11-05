@@ -30,7 +30,7 @@
 //! A server that fails to start is reported on stderr and the session goes on.
 
 use super::{
-    Backend, BackendError, CancelHandle, ClientCapabilities, McpSpec, Permission,
+    Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, McpSpec, Permission,
     PermissionRequest, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
@@ -43,7 +43,7 @@ use crate::secrets::NoSecretStore;
 use crate::session::{AgentState, SessionStore};
 use crate::setup::{assemble_in, SetupError};
 use crate::tools::EditorFiles;
-use crate::types::{Role, ToolCall, ToolResult};
+use crate::types::{ApprovalMode, Role, ToolCall, ToolResult};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -241,7 +241,144 @@ impl EditorFiles for AcpFiles {
     }
 }
 
+/// The slash commands an editor session offers: the ones that make sense with the
+/// editor owning the screen, and that act on this session alone. The rest of the
+/// terminal's commands (`/resume`, `/clear`, `/thinking`, `/secret`, ...) are the
+/// editor's to provide, or need a terminal.
+const COMMANDS: [(&str, &str, Option<&str>); 4] = [
+    (
+        "mode",
+        "Show or set the approval mode for this session",
+        Some("ask, auto, or deny"),
+    ),
+    (
+        "model",
+        "Show or switch the model for this session",
+        Some("provider:model"),
+    ),
+    ("cost", "Show token usage and cost this session", None),
+    ("tools", "List the tools the agent can use", None),
+];
+
+impl HarnessBackend {
+    /// `/model <ref>`, as the terminal's: the current model stays on a refusal, and a
+    /// chosen model is pinned, which stops triage routing.
+    fn switch_model(&self, session: &mut Session, arg: &str) -> String {
+        if arg.is_empty() {
+            let provider = session.harness.active_provider();
+            return format!(
+                "current model: {}:{}\nusage: /model <provider:model>",
+                provider.name(),
+                provider.model()
+            );
+        }
+        match crate::setup::build_provider(&self.config, arg) {
+            Err(message) => message,
+            Ok((provider, reference)) => {
+                let harness = &mut session.harness;
+                harness.configure_output(&self.config, &reference.provider);
+                harness.context_window =
+                    crate::setup::model_context_window(&self.config, &reference.to_string());
+                harness.provider = provider.into();
+                harness.router.pin();
+                format!(
+                    "model: {}:{}",
+                    harness.provider.name(),
+                    harness.provider.model()
+                )
+            }
+        }
+    }
+
+    /// `/cost`, as the terminal's.
+    fn cost(&self, session: &Session) -> String {
+        let usage = &session.state.usage;
+        let harness = &session.harness;
+        let reference = harness
+            .routed_ref()
+            .unwrap_or_else(|| format!("{}:{}", harness.provider.name(), harness.provider.model()));
+        let priced = crate::pricing::PriceTable::from_config(&self.config).is_priced(&reference);
+        let cost = crate::pricing::format_cost(usage.cost_usd, priced);
+        let cost_text = if cost == crate::pricing::UNPRICED_LABEL {
+            cost
+        } else {
+            format!("cost {cost}")
+        };
+        let mut line = format!(
+            "steps {}  in {}  out {} tok  {cost_text}",
+            session.state.step_count(),
+            usage.input_tokens,
+            usage.output_tokens
+        );
+        if usage.cache_read_tokens > 0 || usage.cache_creation_tokens > 0 {
+            line.push_str(&format!(
+                "\ncache read {}  written {} tok",
+                usage.cache_read_tokens, usage.cache_creation_tokens
+            ));
+        }
+        line
+    }
+}
+
 impl Backend for HarnessBackend {
+    fn commands(&self) -> Vec<CommandInfo> {
+        COMMANDS
+            .iter()
+            .map(|(name, description, hint)| CommandInfo {
+                name: (*name).to_owned(),
+                description: (*description).to_owned(),
+                hint: hint.map(str::to_owned),
+            })
+            .collect()
+    }
+
+    fn run_command(&mut self, session_id: &str, line: &str) -> Option<String> {
+        let (name, arg) = match line.split_once(char::is_whitespace) {
+            Some((name, arg)) => (name, arg.trim()),
+            None => (line, ""),
+        };
+        let name = name.strip_prefix('/')?;
+        if !COMMANDS.iter().any(|(known, _, _)| *known == name) {
+            return None;
+        }
+        // Take the session out so `self` can be borrowed beside it, and put it back.
+        let mut session = self.sessions.remove(session_id)?;
+        let output = match name {
+            "mode" => {
+                let gate = &session.harness.gate;
+                if arg.is_empty() {
+                    format!("approval mode: {}", gate.mode().as_str())
+                } else {
+                    match ApprovalMode::parse(arg) {
+                        Some(mode) => {
+                            gate.set_mode(mode);
+                            format!("approval mode: {}", gate.mode().as_str())
+                        }
+                        None => format!("unknown mode '{arg}' (ask|auto|deny)"),
+                    }
+                }
+            }
+            "model" => self.switch_model(&mut session, arg),
+            "cost" => self.cost(&session),
+            _ => {
+                let mut lines = vec![format!(
+                    "tools: {}",
+                    session.harness.registry.names().join(", ")
+                )];
+                if let Some(mcp) = &session.harness.mcp {
+                    lines.extend(
+                        mcp.server_statuses()
+                            .into_iter()
+                            .map(|(name, status)| format!("mcp {name}: {status}")),
+                    );
+                }
+                lines.join("\n")
+            }
+        };
+        self.sessions.insert(session_id.to_owned(), session);
+        Some(output)
+    }
+
     fn client_capabilities(&mut self, capabilities: ClientCapabilities) {
         self.client = capabilities;
     }
