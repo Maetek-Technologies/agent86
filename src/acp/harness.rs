@@ -13,11 +13,17 @@
 //! every mode but `deny`), and `deny` refuses them. The model never sees a vault
 //! secret in what the editor is shown: arguments and previews are redacted first.
 //!
-//! Not built yet: cancelling a turn mid-way, and connecting the client's MCP
-//! servers.
+//! A turn is cancelled through the harness's own [`CancelToken`], as Ctrl+C does in
+//! the interface: it stops at the next safe point, a running tool finishes, and every
+//! call in the history gets an answer. A loaded session replays its saved messages
+//! as updates; the saved state keeps no per-call status or reasoning, so a replayed
+//! call is shown `completed` and thoughts are not replayed.
+//!
+//! Not built yet: connecting the client's MCP servers.
 
 use super::{
-    Backend, BackendError, Permission, PermissionRequest, Stop, ToolKind, TurnSink, Update,
+    Backend, BackendError, CancelHandle, Permission, PermissionRequest, Stop, ToolKind, TurnSink,
+    Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
@@ -26,7 +32,7 @@ use crate::escape::show_controls;
 use crate::pyjson::python_json_dumps;
 use crate::session::{AgentState, SessionStore};
 use crate::setup::{assemble_in, SetupError};
-use crate::types::{ToolCall, ToolResult};
+use crate::types::{Role, ToolCall, ToolResult};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -66,8 +72,15 @@ impl HarnessBackend {
     }
 }
 
-impl Backend for HarnessBackend {
-    fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError> {
+impl HarnessBackend {
+    /// Build a session's harness for `cwd`, on `resume`'s saved state when given
+    /// (`not_found` when the store has none), else on a fresh one, and keep it.
+    fn open(
+        &mut self,
+        cwd: &Path,
+        mcp_servers: usize,
+        resume: Option<&str>,
+    ) -> Result<String, BackendError> {
         // No terminal prompt and no secret store: the editor is asked instead (below),
         // and the keyring is for a terminal. Without a terminal prompt,
         // `request_secret` is not offered.
@@ -113,7 +126,14 @@ impl Backend for HarnessBackend {
             },
         ));
 
-        let state = AgentState::new();
+        let state = match resume {
+            None => AgentState::new(),
+            Some(id) => match assembly.store.as_ref().map(|store| store.load(id)) {
+                Some(Ok(Some(state))) => state,
+                Some(Err(error)) => return Err(BackendError::internal(error.to_string())),
+                _ => return Err(BackendError::not_found(format!("Session not found: {id}"))),
+            },
+        };
         let session_id = state.session_id.clone();
         let session = Session {
             harness: assembly.harness,
@@ -124,6 +144,31 @@ impl Backend for HarnessBackend {
         persist(&session.store, &session.state);
         self.sessions.insert(session_id.clone(), session);
         Ok(session_id)
+    }
+}
+
+impl Backend for HarnessBackend {
+    fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError> {
+        self.open(cwd, mcp_servers, None)
+    }
+
+    fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: usize,
+    ) -> Result<Vec<Update>, BackendError> {
+        // Already open in this process: its harness stays, and its history replays.
+        if !self.sessions.contains_key(session_id) {
+            self.open(cwd, mcp_servers, Some(session_id))?;
+        }
+        let session = &self.sessions[session_id];
+        Ok(replay(&session.state, &session.harness.context.secrets))
+    }
+
+    fn cancel_handle(&self, session_id: &str) -> Option<CancelHandle> {
+        let token = self.sessions.get(session_id)?.harness.cancel.clone();
+        Some(Arc::new(move || token.cancel()))
     }
 
     fn prompt(
@@ -187,6 +232,45 @@ impl Backend for HarnessBackend {
             Err(error) => Err(BackendError::internal(error.to_string())),
         }
     }
+}
+
+/// A session's saved messages as the updates that tell them again: the user's
+/// words, the agent's replies, each call it made, and what came back. The system
+/// message is rebuilt per request and not part of the history.
+fn replay(state: &AgentState, secrets: &crate::vault::SecretVault) -> Vec<Update> {
+    let mut updates = Vec::new();
+    for message in &state.messages {
+        match message.role {
+            Role::User if !message.content.is_empty() => {
+                updates.push(Update::User(message.content.clone()))
+            }
+            Role::Assistant => {
+                if !message.content.is_empty() {
+                    updates.push(Update::Message(message.content.clone()));
+                }
+                for call in &message.tool_calls {
+                    updates.push(Update::ToolCall {
+                        id: call.id.clone(),
+                        title: title(call, secrets),
+                        name: call.name.clone(),
+                        kind: tool_kind(&call.name),
+                        raw_input: redacted_input(call, secrets),
+                    });
+                }
+            }
+            Role::Tool => {
+                if let Some(id) = &message.tool_call_id {
+                    updates.push(Update::ToolResult {
+                        id: id.clone(),
+                        ok: true,
+                        text: message.content.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    updates
 }
 
 fn persist(store: &Option<SessionStore>, state: &AgentState) {

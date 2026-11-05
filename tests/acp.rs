@@ -100,6 +100,8 @@ impl Workspace {
             stdout,
             next_id: 0,
             choose: Some("allow-once"),
+            cancel_on_update: None,
+            cancel_on_request: None,
         }
     }
 }
@@ -119,6 +121,11 @@ struct Client {
     /// How the user answers a permission request: the option to select, or `None`
     /// to cancel.
     choose: Option<&'static str>,
+    /// Send `session/cancel` for this session when the first update arrives.
+    cancel_on_update: Option<String>,
+    /// Send `session/cancel` for this session when a permission request arrives,
+    /// just before answering it.
+    cancel_on_request: Option<String>,
 }
 
 /// What came back for one request: the notifications before its response, and the
@@ -186,6 +193,9 @@ impl Client {
                 };
             }
             if message["method"] == "session/request_permission" {
+                if let Some(session) = self.cancel_on_request.take() {
+                    self.notify("session/cancel", json!({"sessionId": session}));
+                }
                 let outcome = match self.choose {
                     Some(option) => json!({"outcome": "selected", "optionId": option}),
                     None => json!({"outcome": "cancelled"}),
@@ -201,7 +211,24 @@ impl Client {
             assert_eq!(message["method"], "session/update", "{message}");
             assert!(message.get("id").is_none(), "{message}");
             updates.push(message);
+            if let Some(session) = self.cancel_on_update.take() {
+                self.notify("session/cancel", json!({"sessionId": session}));
+            }
         }
+    }
+
+    fn notify(&mut self, method: &str, params: Value) {
+        let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn load_session(&mut self, session: &str, cwd: &std::path::Path) -> Exchange {
+        self.request(
+            "session/load",
+            json!({"sessionId": session, "cwd": cwd.to_str().unwrap(), "mcpServers": []}),
+        )
     }
 
     fn initialize(&mut self) -> Value {
@@ -266,7 +293,7 @@ const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","param
 #[test]
 fn the_handshake_works_and_stdout_holds_only_protocol_messages() {
     let workspace = Workspace::new("handshake", None);
-    let input = format!("{INITIALIZE}\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/load\",\"params\":{{}}}}\n");
+    let input = format!("{INITIALIZE}\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/resume\",\"params\":{{}}}}\n");
     let output = workspace.run(&["acp"], &input);
     assert!(output.status.success(), "{output:?}");
 
@@ -629,4 +656,169 @@ async fn auto_mode_asks_nobody_and_deny_mode_refuses() {
     assert_eq!(deny.updates[1]["params"]["update"]["status"], "failed");
     let second = server.requests()[1].body["messages"].to_string();
     assert!(second.contains("blocked by approval policy"), "{second}");
+}
+
+/// An SSE reply that says `text` and then goes quiet, as a slow model does.
+fn stalling(text: &str) -> Reply {
+    let chunk =
+        json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]});
+    Reply::StallAfter(format!("data: {chunk}\n\n"))
+}
+
+#[tokio::test]
+async fn cancelling_stops_a_turn_that_is_streaming_and_the_session_goes_on() {
+    let server = MockServer::start(vec![
+        stalling("Thinking about"),
+        sse_text("Fresh start.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("cancel-stream", Some(&server));
+    let (cancelled, next) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.cancel_on_update = Some(session.clone());
+            let cancelled = client.prompt(&session, "Go on and on");
+            let next = client.prompt(&session, "Again");
+            client.finish();
+            (cancelled, next)
+        }
+    })
+    .await
+    .unwrap();
+    // What streamed before the cancel arrived, then `cancelled`: not an error.
+    assert!(cancelled
+        .text_of("agent_message_chunk")
+        .starts_with("Thinking about"));
+    assert_eq!(
+        cancelled.response["result"]["stopReason"], "cancelled",
+        "{}",
+        cancelled.response
+    );
+    // The next turn is not poisoned by the cancel.
+    assert_eq!(next.text_of("agent_message_chunk"), "Fresh start.");
+    assert_eq!(next.response["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test]
+async fn cancelling_while_a_permission_request_is_open_declines_it_and_ends_the_turn() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[WRITE]),
+        sse_text("Should not be asked.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("cancel-permission", Some(&server));
+    let exchange = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.cancel_on_request = Some(session.clone());
+            client.choose = None;
+            let exchange = client.prompt(&session, "Write the file");
+            client.finish();
+            exchange
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(exchange.requests.len(), 1);
+    assert_eq!(
+        exchange.response["result"]["stopReason"], "cancelled",
+        "{}",
+        exchange.response
+    );
+    assert!(!workspace.project().join("out.txt").exists());
+    // The turn stopped there: the model was not asked again.
+    assert_eq!(server.requests().len(), 1);
+    // The harness closes a cancelled turn without a result event for the call it
+    // never ran (the history still answers it), so the editor, which marks the
+    // turn's unfinished calls cancelled itself, sees the call and the notice.
+    assert_eq!(exchange.kinds()[0], "tool_call");
+    assert!(!exchange
+        .updates
+        .iter()
+        .any(|message| message["params"]["update"]["status"] == "completed"));
+    assert!(exchange
+        .text_of("agent_message_chunk")
+        .contains("[cancelled]"));
+}
+
+#[tokio::test]
+async fn a_saved_session_loads_with_its_history_replayed_and_goes_on() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("One directory.", "stop"),
+        sse_text("Same one.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("load", Some(&server));
+    let project = workspace.project();
+
+    // One process makes a session and leaves.
+    let session = tokio::task::spawn_blocking({
+        let project = project.clone();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.prompt(&session, "What is here?");
+            client.finish();
+            session
+        }
+    })
+    .await
+    .unwrap();
+
+    // Another loads it.
+    let (missing, loaded, next) = tokio::task::spawn_blocking({
+        let session = session.clone();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let missing = client.load_session("0123456789ab", &project);
+            let loaded = client.load_session(&session, &project);
+            let next = client.prompt(&session, "And again?");
+            client.finish();
+            (missing, loaded, next)
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        missing.response["error"]["code"], -32002,
+        "{}",
+        missing.response
+    );
+    assert_eq!(
+        loaded.kinds(),
+        [
+            "user_message_chunk",
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk"
+        ]
+    );
+    assert_eq!(loaded.response["result"], json!({}));
+    assert_eq!(loaded.text_of("user_message_chunk"), "What is here?");
+    assert_eq!(loaded.text_of("agent_message_chunk"), "One directory.");
+    let call = &loaded.updates[1]["params"]["update"];
+    assert_eq!(call["toolCallId"], "call_1");
+    assert_eq!(call["name"], "list_dir");
+    assert_eq!(call["kind"], "read");
+    assert_eq!(
+        loaded.updates[2]["params"]["update"]["toolCallId"],
+        "call_1"
+    );
+
+    // A prompt in the loaded session carries the earlier conversation to the model.
+    assert_eq!(next.text_of("agent_message_chunk"), "Same one.");
+    let sent = server.requests()[2].body["messages"].to_string();
+    assert!(sent.contains("What is here?"), "{sent}");
+    assert!(sent.contains("One directory."), "{sent}");
+    assert!(sent.contains("And again?"), "{sent}");
 }

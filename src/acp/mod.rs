@@ -5,11 +5,11 @@
 //! write nothing to stdout that is not a protocol message, so logging goes to
 //! stderr and nothing else in this process may print to stdout in this mode.
 //!
-//! Built so far (slices 1 to 3 of the plan): the transport, the `initialize`
+//! Built so far (slices 1 to 4 of the plan): the transport, the `initialize`
 //! handshake, `session/new`, `session/prompt` with streamed text and reasoning, tool
-//! calls reported as they happen, and `session/request_permission` for the calls the
-//! approval mode asks about. Cancellation, `session/load`, and editor-supplied MCP
-//! servers come in later slices, so for now every other method answers "method not
+//! calls reported as they happen, `session/request_permission` for the calls the
+//! approval mode asks about, `session/cancel`, and `session/load` with the history
+//! replayed. Editor-supplied MCP servers come in a later slice, so for now every other method answers "method not
 //! found" rather than pretending, and the capabilities advertised are only what is
 //! built.
 //!
@@ -18,7 +18,8 @@
 //! connection's thread pumps both, writing what the turn reports and passing the
 //! editor's replies to whoever waits for them. A permission request is the case that
 //! needs it: the turn blocks on the editor's answer while the connection keeps
-//! reading. While a turn runs, a second request is refused (one turn at a time).
+//! reading, and `session/cancel` is acted on at once. While a turn runs, a second
+//! request is refused (one turn at a time).
 //!
 //! The protocol is separate from the agent: [`Server`] speaks JSON-RPC and drives a
 //! [`Backend`], so the protocol is testable with a scripted backend and no process.
@@ -45,6 +46,8 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
+/// ACP's "resource not found": a session that does not exist.
+pub const RESOURCE_NOT_FOUND: i64 = -32002;
 
 /// The ids of the two options every permission request offers. Only `allow-once`
 /// approves; the agent keeps no remembered decisions yet, so there is no
@@ -77,6 +80,9 @@ impl ToolKind {
 /// Something the agent reports while a prompt runs, sent as a `session/update`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
+    /// A chunk of the user's message (`user_message_chunk`), when a loaded session's
+    /// history is replayed.
+    User(String),
     /// A chunk of the agent's reply (`agent_message_chunk`). The harness's own
     /// notices (`[cancelled]`, `[guardrail] ...`) travel here too.
     Message(String),
@@ -158,6 +164,13 @@ impl BackendError {
         }
     }
 
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: RESOURCE_NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             code: INTERNAL_ERROR,
@@ -166,11 +179,29 @@ impl BackendError {
     }
 }
 
+/// Stops a running turn; see [`Backend::cancel_handle`].
+pub type CancelHandle = Arc<dyn Fn() + Send + Sync>;
+
 /// The agent behind the protocol. `Send`, because a turn runs on a worker thread.
 pub trait Backend: Send {
     /// Open a session jailed to `cwd` (an absolute path) and return its id.
     /// `mcp_servers` is how many servers the client named; none are connected yet.
     fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError>;
+
+    /// Open an existing session and return its history as updates to replay, in
+    /// order, or a `not_found` error when there is no such session. The client's
+    /// `cwd` and server count are as for [`Backend::new_session`].
+    fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: usize,
+    ) -> Result<Vec<Update>, BackendError>;
+
+    /// How to stop `session_id`'s running turn at its next safe point, callable from
+    /// any thread while the turn runs; `None` for an unknown session. It must be
+    /// obtained before the turn starts, since the turn borrows the backend.
+    fn cancel_handle(&self, session_id: &str) -> Option<CancelHandle>;
 
     /// Run one turn on `session_id` with the user's `text`, reporting through
     /// `sink` as it goes. Runs on a worker thread, and may block on `sink.ask`.
@@ -304,7 +335,7 @@ impl<B: Backend> Server<B> {
                 emit(response);
             }
             // A notification has no id and gets no reply, even when unknown.
-            Inbound::Notification => {}
+            Inbound::Notification { .. } => {}
             // A response to a request this server sent; none is outstanding
             // outside a turn.
             Inbound::Response { .. } => {}
@@ -328,11 +359,14 @@ impl<B: Backend> Server<B> {
                 self.initialized = true;
                 Ok(result)
             }
-            "session/new" | "session/prompt" if !self.initialized => Err(BackendError {
-                code: INVALID_REQUEST,
-                message: "Not initialized: call initialize first".into(),
-            }),
+            "session/new" | "session/load" | "session/prompt" if !self.initialized => {
+                Err(BackendError {
+                    code: INVALID_REQUEST,
+                    message: "Not initialized: call initialize first".into(),
+                })
+            }
             "session/new" => self.session_new(params),
+            "session/load" => self.session_load(params, emit),
             "session/prompt" => self.session_prompt(params, emit),
             other => Err(BackendError {
                 code: METHOD_NOT_FOUND,
@@ -342,27 +376,32 @@ impl<B: Backend> Server<B> {
     }
 
     fn session_new(&mut self, params: &Value) -> Result<Value, BackendError> {
-        let cwd = params
-            .get("cwd")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BackendError::invalid_params("Invalid params: cwd must be a string"))?;
-        let cwd = Path::new(cwd);
-        if !cwd.is_absolute() {
-            return Err(BackendError::invalid_params(
-                "Invalid params: cwd must be an absolute path",
-            ));
-        }
-        let servers = match params.get("mcpServers") {
-            None | Some(Value::Null) => 0,
-            Some(Value::Array(servers)) => servers.len(),
-            Some(_) => {
-                return Err(BackendError::invalid_params(
-                    "Invalid params: mcpServers must be an array",
-                ))
-            }
-        };
-        let session_id = self.backend.new_session(cwd, servers)?;
+        let (cwd, servers) = session_location(params)?;
+        let session_id = self.backend.new_session(Path::new(&cwd), servers)?;
         Ok(json!({ "sessionId": session_id }))
+    }
+
+    /// Reopen a session: its history is replayed as updates, in order, before the
+    /// (empty) response, as the protocol asks.
+    fn session_load(
+        &mut self,
+        params: &Value,
+        emit: &mut dyn FnMut(Value),
+    ) -> Result<Value, BackendError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BackendError::invalid_params("Invalid params: sessionId must be a string")
+            })?;
+        let (cwd, servers) = session_location(params)?;
+        let history = self
+            .backend
+            .load_session(session_id, Path::new(&cwd), servers)?;
+        for update in &history {
+            emit(session_update(session_id, update));
+        }
+        Ok(json!({}))
     }
 
     fn session_prompt(
@@ -388,6 +427,11 @@ impl<B: Backend> Server<B> {
         let sink: Arc<dyn TurnSink> = Arc::new(ChannelSink {
             events: self.sender.clone(),
         });
+        let mut cancel = CancelState {
+            session_id: session_id.clone(),
+            handle: self.backend.cancel_handle(&session_id),
+            requested: false,
+        };
         let Self {
             backend,
             events,
@@ -410,7 +454,17 @@ impl<B: Backend> Server<B> {
             // Pump until the turn is done: write what it reports, and route what the
             // client sends meanwhile.
             loop {
-                match events.recv() {
+                let event = events.recv();
+                // A cancel that landed before the turn began waiting for one is
+                // cleared by the turn's entry, so it is asked again as the turn
+                // reports; the stop is asked of the turn until it ends.
+                if matches!(
+                    event,
+                    Ok(Event::Turn(TurnMsg::Update(_) | TurnMsg::Ask { .. }))
+                ) {
+                    cancel.repeat();
+                }
+                match event {
                     Ok(Event::Turn(TurnMsg::Update(update))) => {
                         emit(session_update(&session_id, &update))
                     }
@@ -425,7 +479,7 @@ impl<B: Backend> Server<B> {
                         emit(permission_request(id, &session_id, &request));
                     }
                     Ok(Event::Turn(TurnMsg::Done(result))) => break result,
-                    Ok(Event::Line(line)) => during_turn(&line, pending, emit),
+                    Ok(Event::Line(line)) => during_turn(&line, pending, &mut cancel, emit),
                     Ok(Event::Invalid) => {
                         emit(error_response(Value::Null, PARSE_ERROR, "Parse error"))
                     }
@@ -439,8 +493,37 @@ impl<B: Backend> Server<B> {
             }
         });
         pending.clear();
+        // A cancelled turn is not an error and not an end of turn: whatever the
+        // library underneath reported when its work was aborted, the answer is
+        // `cancelled`.
+        if cancel.requested {
+            return Ok(json!({ "stopReason": Stop::Cancelled.as_str() }));
+        }
         Ok(json!({ "stopReason": stop?.as_str() }))
     }
+}
+
+/// The `cwd` (absolute) and the number of `mcpServers` a session request names.
+fn session_location(params: &Value) -> Result<(String, usize), BackendError> {
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError::invalid_params("Invalid params: cwd must be a string"))?;
+    if !Path::new(cwd).is_absolute() {
+        return Err(BackendError::invalid_params(
+            "Invalid params: cwd must be an absolute path",
+        ));
+    }
+    let servers = match params.get("mcpServers") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Array(servers)) => servers.len(),
+        Some(_) => {
+            return Err(BackendError::invalid_params(
+                "Invalid params: mcpServers must be an array",
+            ))
+        }
+    };
+    Ok((cwd.to_owned(), servers))
 }
 
 /// How an inbound message reads.
@@ -449,7 +532,10 @@ enum Inbound {
         id: Value,
         method: String,
     },
-    Notification,
+    Notification {
+        method: String,
+        params: Value,
+    },
     Response {
         id: Value,
         object: Map<String, Value>,
@@ -468,7 +554,10 @@ fn classify(object: &Map<String, Value>) -> Inbound {
             id,
             method: method.to_owned(),
         },
-        (Some(_), None) => Inbound::Notification,
+        (Some(method), None) => Inbound::Notification {
+            method: method.to_owned(),
+            params: object.get("params").cloned().unwrap_or(Value::Null),
+        },
         (None, Some(id))
             if valid_id && (object.contains_key("result") || object.contains_key("error")) =>
         {
@@ -481,12 +570,34 @@ fn classify(object: &Map<String, Value>) -> Inbound {
     }
 }
 
+/// A prompt turn's cancellation: whether `session/cancel` has arrived for it, and
+/// how to stop it.
+struct CancelState {
+    session_id: String,
+    handle: Option<CancelHandle>,
+    requested: bool,
+}
+
+impl CancelState {
+    /// Ask the turn to stop, if a cancel has been requested.
+    fn repeat(&self) {
+        if self.requested {
+            if let Some(handle) = &self.handle {
+                handle();
+            }
+        }
+    }
+}
+
 /// Handle a line from the client while a turn runs. A response answers a
-/// permission request; a request has to wait, since one turn runs at a time;
-/// notifications are ignored until cancellation (slice 4) gives one a meaning.
+/// permission request; `session/cancel` for this turn's session stops the turn,
+/// and declines whatever it waits on, since the client's own answers to those
+/// are `cancelled` anyway; any other request has to wait, since one turn runs at
+/// a time; other notifications are ignored.
 fn during_turn(
     line: &str,
     pending: &mut HashMap<u64, Sender<Permission>>,
+    cancel: &mut CancelState,
     emit: &mut dyn FnMut(Value),
 ) {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -507,7 +618,16 @@ fn during_turn(
             INVALID_REQUEST,
             "A prompt turn is running; wait for its response",
         )),
-        Inbound::Notification => {}
+        Inbound::Notification { method, params } => {
+            if method == "session/cancel"
+                && params.get("sessionId").and_then(Value::as_str) == Some(&cancel.session_id)
+            {
+                cancel.requested = true;
+                cancel.repeat();
+                // Dropping the replies declines the calls the turn waits on.
+                pending.clear();
+            }
+        }
         Inbound::Invalid => emit(error_response(
             Value::Null,
             INVALID_REQUEST,
@@ -574,6 +694,10 @@ fn text_content(text: &str) -> Value {
 /// The `session/update` notification for `update`.
 fn session_update(session_id: &str, update: &Update) -> Value {
     let body = match update {
+        Update::User(text) => json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": text_content(text)
+        }),
         Update::Message(text) => json!({
             "sessionUpdate": "agent_message_chunk",
             "content": text_content(text)
@@ -655,7 +779,7 @@ fn initialize(params: &Value) -> Result<Value, String> {
     Ok(json!({
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": true,
             "promptCapabilities": {
                 "image": false,
                 "audio": false,
@@ -782,7 +906,9 @@ where
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     /// What a scripted turn does, in order.
     enum Act {
@@ -800,6 +926,16 @@ mod tests {
         answers: Arc<Mutex<Vec<Permission>>>,
         stop: Option<Result<Stop, BackendError>>,
         panic: bool,
+        /// What `load_session` replays, and whether it finds the session at all.
+        history: Vec<Update>,
+        missing: bool,
+        loads: Vec<(String, String, usize)>,
+        /// Set by the cancel handle.
+        cancelled: Arc<AtomicBool>,
+        /// After its acts, the turn waits (up to five seconds) for a cancel.
+        wait_for_cancel: bool,
+        /// Clear the cancel flag when the turn starts, as the harness does.
+        clear_on_entry: bool,
     }
 
     impl Backend for Script {
@@ -809,6 +945,30 @@ mod tests {
             Ok(format!("sess_{}", self.sessions.len()))
         }
 
+        fn load_session(
+            &mut self,
+            session_id: &str,
+            cwd: &Path,
+            mcp_servers: usize,
+        ) -> Result<Vec<Update>, BackendError> {
+            self.loads.push((
+                session_id.to_owned(),
+                cwd.to_string_lossy().into_owned(),
+                mcp_servers,
+            ));
+            if self.missing {
+                return Err(BackendError::not_found(format!(
+                    "Session not found: {session_id}"
+                )));
+            }
+            Ok(self.history.clone())
+        }
+
+        fn cancel_handle(&self, _session_id: &str) -> Option<CancelHandle> {
+            let flag = Arc::clone(&self.cancelled);
+            Some(Arc::new(move || flag.store(true, Ordering::SeqCst)))
+        }
+
         fn prompt(
             &mut self,
             session_id: &str,
@@ -816,6 +976,9 @@ mod tests {
             sink: Arc<dyn TurnSink>,
         ) -> Result<Stop, BackendError> {
             self.prompts.push((session_id.to_owned(), text.to_owned()));
+            if self.clear_on_entry {
+                self.cancelled.store(false, Ordering::SeqCst);
+            }
             if self.panic {
                 panic!("scripted panic");
             }
@@ -826,6 +989,16 @@ mod tests {
                         let answer = sink.ask(request);
                         self.answers.lock().unwrap().push(answer);
                     }
+                }
+            }
+            if self.wait_for_cancel {
+                let start = Instant::now();
+                while !self.cancelled.load(Ordering::SeqCst) {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "the turn was never asked to stop"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             }
             self.stop.take().unwrap_or(Ok(Stop::EndTurn))
@@ -864,7 +1037,7 @@ mod tests {
         assert_eq!(result["agentInfo"]["name"], "agent86");
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
         let capabilities = &result["agentCapabilities"];
-        assert_eq!(capabilities["loadSession"], false);
+        assert_eq!(capabilities["loadSession"], true);
         assert_eq!(capabilities["promptCapabilities"]["image"], false);
         assert_eq!(capabilities["promptCapabilities"]["audio"], false);
         assert_eq!(capabilities["promptCapabilities"]["embeddedContext"], false);
@@ -905,7 +1078,7 @@ mod tests {
     #[test]
     fn methods_not_built_yet_say_so() {
         let mut server = ready();
-        for method in ["session/load", "session/set_mode", "nonsense"] {
+        for method in ["session/resume", "session/set_mode", "nonsense"] {
             let line = format!(r#"{{"jsonrpc":"2.0","id":9,"method":"{method}","params":{{}}}}"#);
             let reply = one(&mut server, &line);
             assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
@@ -955,11 +1128,13 @@ mod tests {
         for line in [
             r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/w","mcpServers":[]}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"s","cwd":"/w","mcpServers":[]}}"#,
         ] {
             let reply = one(&mut server, line);
             assert_eq!(reply["error"]["code"], INVALID_REQUEST, "{line}");
         }
         assert!(server.backend.sessions.is_empty());
+        assert!(server.backend.loads.is_empty());
     }
 
     #[test]
@@ -1250,7 +1425,7 @@ mod tests {
                     // A response to nothing we asked.
                     selected(99, ALLOW_ONCE),
                     // A notification, and garbage.
-                    r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess_1"}}"#
+                    r#"{"jsonrpc":"2.0","method":"session/something_else","params":{"sessionId":"sess_1"}}"#
                         .to_owned(),
                     "{nope".to_owned(),
                     selected(0, ALLOW_ONCE),
@@ -1270,6 +1445,204 @@ mod tests {
         );
         assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
         assert_eq!(server.backend.prompts.len(), 1, "no second turn started");
+    }
+
+    fn cancel_line(session: &str) -> String {
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": session}})
+            .to_string()
+    }
+
+    /// Run a prompt whose turn reports one chunk and then waits to be stopped; the
+    /// "editor" sends `session/cancel` when it sees that chunk.
+    fn cancelled_turn(stop: Option<Result<Stop, BackendError>>) -> (Vec<Value>, Server<Script>) {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Update(Update::Message("partial".into()))];
+        server.backend.wait_for_cancel = true;
+        server.backend.stop = stop;
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "session/update" {
+                events.send(Event::Line(cancel_line("sess_1"))).unwrap();
+            }
+            out.push(message);
+        });
+        (out, server)
+    }
+
+    #[test]
+    fn cancelling_stops_the_turn_and_answers_cancelled_whatever_it_returned() {
+        for stop in [
+            None,
+            Some(Ok(Stop::MaxTurnRequests)),
+            // A library that was aborted often fails; that is not an error here.
+            Some(Err(BackendError::internal("stream aborted"))),
+        ] {
+            let (out, server) = cancelled_turn(stop);
+            assert!(server.backend.cancelled.load(Ordering::SeqCst));
+            // The update sent before the cancel still arrived, then the response.
+            assert_eq!(out[0]["params"]["update"]["content"]["text"], "partial");
+            let last = out.last().unwrap();
+            assert_eq!(last["id"], 5);
+            assert_eq!(last["result"]["stopReason"], "cancelled", "{last}");
+        }
+    }
+
+    #[test]
+    fn a_cancel_that_beat_the_turn_to_its_start_still_stops_it() {
+        // The harness clears its cancel flag as a turn begins, so a cancel already
+        // handled by then would be lost; the pump asks again as the turn reports.
+        let mut server = ready();
+        server.backend.acts = vec![Act::Update(Update::Message("partial".into()))];
+        server.backend.wait_for_cancel = true;
+        server.backend.clear_on_entry = true;
+        server
+            .sender()
+            .send(Event::Line(cancel_line("sess_1")))
+            .unwrap();
+        let out = replies(&mut server, &prompt_line(HI));
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn cancelling_declines_a_pending_permission_request() {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Ask(write_request())];
+        server.backend.wait_for_cancel = true;
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "session/request_permission" {
+                events.send(Event::Line(cancel_line("sess_1"))).unwrap();
+                // The client's own `cancelled` answer arrives too, and is not needed.
+                events
+                    .send(Event::Line(
+                        json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"cancelled"}}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+            }
+            out.push(message);
+        });
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Declined]
+        );
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn a_cancel_for_another_session_or_when_idle_changes_nothing() {
+        let mut server = ready();
+        // Idle: nothing runs, nothing is said, and nothing is left behind.
+        assert!(replies(&mut server, &cancel_line("sess_1")).is_empty());
+        assert!(!server.backend.cancelled.load(Ordering::SeqCst));
+
+        server.backend.acts = vec![Act::Ask(write_request())];
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "session/request_permission" {
+                events
+                    .send(Event::Line(cancel_line("someone-else")))
+                    .unwrap();
+                events.send(Event::Line(selected(0, ALLOW_ONCE))).unwrap();
+            }
+            out.push(message);
+        });
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Allowed]
+        );
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
+        assert!(!server.backend.cancelled.load(Ordering::SeqCst));
+    }
+
+    fn load_line(session: &str, cwd: &str) -> String {
+        json!({"jsonrpc":"2.0","id":8,"method":"session/load",
+            "params":{"sessionId": session, "cwd": cwd, "mcpServers":[{"name":"m"}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn loading_a_session_replays_its_history_before_the_empty_response() {
+        let mut server = ready();
+        let cwd = std::env::temp_dir();
+        server.backend.history = vec![
+            Update::User("What is here?".into()),
+            Update::ToolCall {
+                id: "c1".into(),
+                title: "list_dir(...)".into(),
+                name: "list_dir".into(),
+                kind: ToolKind::Read,
+                raw_input: json!({"path": "."}),
+            },
+            Update::ToolResult {
+                id: "c1".into(),
+                ok: true,
+                text: "a.txt".into(),
+            },
+            Update::Message("One file.".into()),
+        ];
+        let out = replies(&mut server, &load_line("sess_9", cwd.to_str().unwrap()));
+        let kinds: Vec<&str> = out
+            .iter()
+            .take(4)
+            .map(|m| m["params"]["update"]["sessionUpdate"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "user_message_chunk",
+                "tool_call",
+                "tool_call_update",
+                "agent_message_chunk"
+            ]
+        );
+        for message in &out[..4] {
+            assert_eq!(message["params"]["sessionId"], "sess_9");
+        }
+        assert_eq!(
+            out[0]["params"]["update"]["content"]["text"],
+            "What is here?"
+        );
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[4]["id"], 8);
+        assert_eq!(out[4]["result"], json!({}));
+        assert_eq!(
+            server.backend.loads,
+            vec![("sess_9".to_owned(), cwd.to_string_lossy().into_owned(), 1)]
+        );
+    }
+
+    #[test]
+    fn loading_an_unknown_session_is_resource_not_found_and_bad_params_are_refused() {
+        let mut server = ready();
+        server.backend.missing = true;
+        let cwd = std::env::temp_dir();
+        let reply = one(&mut server, &load_line("nope", cwd.to_str().unwrap()));
+        assert_eq!(reply["error"]["code"], RESOURCE_NOT_FOUND);
+        assert!(reply["error"]["message"].as_str().unwrap().contains("nope"));
+
+        for params in [
+            r#"{"cwd":"/w","mcpServers":[]}"#,
+            r#"{"sessionId":"s","mcpServers":[]}"#,
+            r#"{"sessionId":"s","cwd":"relative","mcpServers":[]}"#,
+            r#"{"sessionId":"s","cwd":"/w","mcpServers":7}"#,
+        ] {
+            let line =
+                format!(r#"{{"jsonrpc":"2.0","id":1,"method":"session/load","params":{params}}}"#);
+            assert_eq!(
+                one(&mut server, &line)["error"]["code"],
+                INVALID_PARAMS,
+                "{params}"
+            );
+        }
+        assert_eq!(
+            server.backend.loads.len(),
+            1,
+            "refused loads never reached it"
+        );
     }
 
     #[test]
