@@ -4,6 +4,7 @@
 //! keeps the formats the two share (config, sessions, memory, traces, keyring)
 //! compatible with it.
 
+pub mod acp;
 pub mod agent;
 pub mod approval;
 pub mod config;
