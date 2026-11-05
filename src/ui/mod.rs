@@ -13,6 +13,8 @@
 //! (Git Bash's mintty without winpty) falls back to the plain loop with a note.
 
 mod app;
+// The reasoning summary line, shared with the editor (ACP) surface.
+pub use app::thought_summary;
 mod banner;
 mod diff;
 mod display;

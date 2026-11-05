@@ -131,6 +131,10 @@ enum Command {
     /// Inspect long-term memory.
     #[command(subcommand)]
     Memory(MemoryCommand),
+
+    /// Speak the Agent Client Protocol on stdin and stdout, so an editor such as
+    /// Zed can drive agent86 (see docs/ACP.md).
+    Acp,
 }
 
 #[derive(Subcommand)]
@@ -363,6 +367,29 @@ fn main() -> ExitCode {
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
         Some(Command::Memory(command)) => memory_command(&config, command, &stderr),
+        Some(Command::Acp) => {
+            // Stdout belongs to the protocol: nothing else may print to it here.
+            let backend = match agent86::acp::harness::HarnessBackend::with_secret_store(
+                config,
+                agent86::acp::harness::default_secret_store(),
+            ) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    stderr.error(&format!("could not start the async runtime: {error}"));
+                    return ExitCode::from(1);
+                }
+            };
+            // The protocol is read on a thread of its own, so the reader is owned.
+            let stdin = std::io::BufReader::new(std::io::stdin());
+            let stdout = std::io::stdout();
+            match agent86::acp::serve(stdin, stdout.lock(), backend) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    stderr.error(&format!("acp: {error}"));
+                    ExitCode::from(1)
+                }
+            }
+        }
         None => {
             run_interactive(
                 config,

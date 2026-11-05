@@ -44,6 +44,11 @@ pub fn guarded_warning(path: &str) -> String {
 /// Asks whether one side-effecting call may run: `(tool name, preview) -> approved`.
 pub type ApprovalPrompt = Box<dyn Fn(&str, &ApprovalPreview) -> bool + Send + Sync>;
 
+/// [`ApprovalPrompt`] for a surface that has to say which call it asks about
+/// (beyond Python): the ACP server names the call's id in its permission request, so
+/// the editor can match the question to the tool call it already showed.
+pub type CallApprovalPrompt = Box<dyn Fn(&ToolCall, &ApprovalPreview) -> bool + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalDecision {
     pub approved: bool,
@@ -56,6 +61,8 @@ pub struct ApprovalGate {
     /// turn holds the harness; the next call is decided under the new mode, as in Python.
     mode: Mutex<ApprovalMode>,
     pub prompt: Option<ApprovalPrompt>,
+    /// Asked in place of `prompt` when set.
+    pub call_prompt: Option<CallApprovalPrompt>,
 }
 
 impl ApprovalGate {
@@ -63,7 +70,19 @@ impl ApprovalGate {
         Self {
             mode: Mutex::new(mode),
             prompt,
+            call_prompt: None,
         }
+    }
+
+    /// Ask `preview` of whichever prompt is installed, or `None` when nobody can be
+    /// asked.
+    fn ask(&self, tool: &dyn Tool, call: &ToolCall, preview: &ApprovalPreview) -> Option<bool> {
+        if let Some(prompt) = &self.call_prompt {
+            return Some(prompt(call, preview));
+        }
+        self.prompt
+            .as_ref()
+            .map(|prompt| prompt(tool.name(), preview))
     }
 
     pub fn mode(&self) -> ApprovalMode {
@@ -85,16 +104,16 @@ impl ApprovalGate {
             if self.mode() == ApprovalMode::Deny {
                 return decision(false, "blocked by approval policy (deny)");
             }
-            let Some(prompt) = &self.prompt else {
+            if self.prompt.is_none() && self.call_prompt.is_none() {
                 return decision(
                     false,
                     "writing agent86's own configuration or skills needs approval, and no \
                      prompt is available",
                 );
-            };
+            }
             let mut preview = build_preview(tool, call, ctx);
             preview.warning = Some(guarded_warning(&path));
-            return if prompt(tool.name(), &preview) {
+            return if self.ask(tool, call, &preview) == Some(true) {
                 decision(true, "approved by user")
             } else {
                 decision(false, "declined by user")
@@ -103,16 +122,16 @@ impl ApprovalGate {
         match self.mode() {
             ApprovalMode::Auto => decision(true, "auto-approved"),
             ApprovalMode::Deny => decision(false, "blocked by approval policy (deny)"),
-            ApprovalMode::Ask => match &self.prompt {
-                None => decision(false, "approval required but no prompt available"),
-                Some(prompt) => {
-                    if prompt(tool.name(), &build_preview(tool, call, ctx)) {
-                        decision(true, "approved by user")
-                    } else {
-                        decision(false, "declined by user")
-                    }
+            ApprovalMode::Ask => {
+                if self.prompt.is_none() && self.call_prompt.is_none() {
+                    return decision(false, "approval required but no prompt available");
                 }
-            },
+                if self.ask(tool, call, &build_preview(tool, call, ctx)) == Some(true) {
+                    decision(true, "approved by user")
+                } else {
+                    decision(false, "declined by user")
+                }
+            }
         }
     }
 }
