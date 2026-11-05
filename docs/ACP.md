@@ -6,7 +6,7 @@ This is beyond the Python version, which has no ACP support. The design and its 
 
 ## Status
 
-Every message exchanged in agent86's ACP tests was checked against the protocol's v1 JSON schema (285 messages on 2026-11-05, none invalid). It has been used by hand in Microsoft's Intelligent Terminal on Windows. It has **not** yet been tried in the editors below, so their settings are written from the editors' documentation, not from a session that worked. If one does not match your editor's current settings, the editor's own documentation wins; and please report what you find.
+Every message exchanged in agent86's ACP tests was checked against the protocol's v1 JSON schema (285 messages on 2026-11-05, none invalid). It has been used by hand in Zed and in Microsoft's Intelligent Terminal on Windows. It has **not** yet been tried in the other editors, so their settings are written from the editors' documentation, not from a session that worked. If one does not match your editor's current settings, the editor's own documentation wins; and please report what you find.
 
 ## Setting it up
 
@@ -34,7 +34,7 @@ Add agent86 as a custom external agent in Zed's `settings.json`:
 }
 ```
 
-Then pick it from the agent panel's new-thread menu. Zed has changed this setting's shape between versions (newer ones also want `"type": "custom"`), so check [Zed's external agents page](https://zed.dev/docs/ai/external-agents) for the current form. To choose the model for editor sessions, put it before the subcommand:
+Then pick it from the agent panel's new-thread menu. agent86 has been used in Zed by hand (2026-11-05) and works. Zed has changed this setting's shape between versions (newer ones also want `"type": "custom"`), so check [Zed's external agents page](https://zed.dev/docs/ai/external-agents) for the current form. To choose the model for editor sessions, put it before the subcommand:
 
 ```json
 "args": ["--model", "<provider>:<model>", "acp"]
