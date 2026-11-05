@@ -133,7 +133,7 @@ enum Command {
     Memory(MemoryCommand),
 
     /// Speak the Agent Client Protocol on stdin and stdout, so an editor such as
-    /// Zed can drive agent86. Slice 1: the handshake only; no sessions yet.
+    /// Zed can drive agent86. Slices so far: the handshake, sessions, and text prompts.
     Acp,
 }
 
@@ -369,9 +369,16 @@ fn main() -> ExitCode {
         Some(Command::Memory(command)) => memory_command(&config, command, &stderr),
         Some(Command::Acp) => {
             // Stdout belongs to the protocol: nothing else may print to it here.
+            let backend = match agent86::acp::harness::HarnessBackend::new(config) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    stderr.error(&format!("could not start the async runtime: {error}"));
+                    return ExitCode::from(1);
+                }
+            };
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            match agent86::acp::serve(stdin.lock(), stdout.lock()) {
+            match agent86::acp::serve(stdin.lock(), stdout.lock(), backend) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     stderr.error(&format!("acp: {error}"));

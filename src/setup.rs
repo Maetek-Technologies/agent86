@@ -107,12 +107,25 @@ pub fn assemble_with(
     prompt: Option<ApprovalPrompt>,
     secret_store: Option<crate::secrets::SharedStore>,
 ) -> Result<Assembly, SetupError> {
+    // Tools are jailed to the directory `agent86` runs in, as in Python.
+    let workspace = std::env::current_dir()
+        .map_err(|error| SetupError::Workspace(format!("could not open the workspace: {error}")))?;
+    assemble_in(config, &workspace, prompt, secret_store)
+}
+
+/// [`assemble_with`] jailed to `workspace` instead of the current directory: an
+/// ACP client names each session's working directory (beyond Python). The config
+/// is the one the process started with, not one read from `workspace`.
+pub fn assemble_in(
+    config: &Config,
+    workspace: &Path,
+    prompt: Option<ApprovalPrompt>,
+    secret_store: Option<crate::secrets::SharedStore>,
+) -> Result<Assembly, SetupError> {
     let (provider, model_ref) =
         build_provider(config, &config.model.default).map_err(SetupError::Model)?;
 
-    // Tools are jailed to the directory `agent86` runs in, as in Python.
-    let mut context = std::env::current_dir()
-        .and_then(|dir| ToolContext::new(&dir))
+    let mut context = ToolContext::new(workspace)
         .map_err(|error| SetupError::Workspace(format!("could not open the workspace: {error}")))?;
     context.policy.timeout = Duration::from_secs(config.limits.tool_timeout_s);
     context.policy.env_passthrough = config.sandbox.env_passthrough.clone();
