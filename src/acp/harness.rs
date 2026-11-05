@@ -39,14 +39,14 @@ use crate::config::{Config, DisplayLevel, McpServerConfig};
 use crate::escape::show_controls;
 use crate::mcp::{var_ref_names, McpManager};
 use crate::pyjson::python_json_dumps;
-use crate::secrets::NoSecretStore;
+use crate::secrets::{NoSecretStore, OsKeyring, SharedStore};
 use crate::session::{AgentState, SessionStore};
 use crate::setup::{assemble_in, SetupError};
 use crate::tools::EditorFiles;
 use crate::types::{ApprovalMode, Role, ToolCall, ToolResult};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -79,6 +79,55 @@ fn same_path_key(path: &str) -> String {
     }
     key
 }
+
+/// `/secret`: the names the session holds, or `forget NAME`. A secret is never
+/// entered here: what is typed into an editor's box is shown in its thread and kept
+/// in its history, and the protocol forbids asking for one through a form. So the
+/// way in is the terminal's `/secret NAME` with "remember for this project", which
+/// editor sessions in that project then load. Nothing typed after the command is
+/// stored or repeated back.
+fn secret_command(session: &Session, arg: &str) -> String {
+    let vault = &session.harness.context.secrets;
+    let words: Vec<&str> = arg.split_whitespace().collect();
+    match words.as_slice() {
+        [] => {
+            let remembered = vault.remembered_names();
+            let names: Vec<String> = vault
+                .names()
+                .into_iter()
+                .map(|name| {
+                    if remembered.contains(&name) {
+                        format!("{name} (remembered)")
+                    } else {
+                        name
+                    }
+                })
+                .collect();
+            if names.is_empty() {
+                format!("no secrets for this project · {SECRET_HOW}")
+            } else {
+                format!(
+                    "secrets (values hidden): {}\n{SECRET_HOW}",
+                    names.join(", ")
+                )
+            }
+        }
+        ["forget", name] if crate::vault::valid_name(name) => match vault.forget(name) {
+            Ok(true) => format!("secret {name} forgotten"),
+            Ok(false) => format!("no secret named {name}"),
+            Err(error) => {
+                format!("secret {name} dropped from this session, but the keyring refused: {error}")
+            }
+        },
+        ["forget", _] => "that is not a valid secret name (letters, digits, and _)".to_owned(),
+        // Not echoed: it may be the value itself.
+        _ => format!("nothing was stored. {SECRET_HOW}"),
+    }
+}
+
+const SECRET_HOW: &str = "Don't type a secret here: it would stay in this thread. Enter it \
+     at a terminal in this project with agent86 and /secret NAME, choose to remember it, \
+     and sessions here will have it; /secret forget NAME removes one.";
 
 /// `/thinking` and `/toolview`: show the level, or set it.
 fn show_level(name: &str, level: &mut DisplayLevel, arg: &str) -> String {
@@ -239,13 +288,53 @@ pub struct HarnessBackend {
     startup_cwd: String,
     /// The database, opened on its own for `session/list` when no session has yet.
     list_store: Option<SessionStore>,
+    /// The home directory the session-directory file lives under (`~/.agent86`).
+    home: Option<PathBuf>,
+    /// Where secrets remembered for a project are read from: the OS keyring in use,
+    /// `None` in tests that must not touch it.
+    secret_store: Option<SharedStore>,
     client: ClientCapabilities,
     runtime: tokio::runtime::Runtime,
     sessions: HashMap<String, Session>,
 }
 
+/// The keyring editor sessions read remembered secrets from, unless
+/// `AGENT86_ACP_SECRETS` is `off`: a secret entered at a terminal with `/secret`
+/// and remembered for the project is then available in that project's editor
+/// sessions, as in the terminal. The only change made to it from here is
+/// `/secret forget`.
+pub fn default_secret_store() -> Option<SharedStore> {
+    let off = std::env::var("AGENT86_ACP_SECRETS")
+        .is_ok_and(|setting| matches!(setting.trim(), "off" | "none" | "0" | "false"));
+    (!off).then(|| Arc::new(OsKeyring) as SharedStore)
+}
+
 impl HarnessBackend {
+    /// Keep the session-directory file under `home` instead of the user's, so a test
+    /// never writes to the real one.
+    pub fn with_home(mut self, home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self
+    }
+
+    /// The file recording each editor session's directory.
+    fn cwd_file(&self) -> Option<PathBuf> {
+        self.home
+            .as_ref()
+            .map(|home| home.join(".agent86").join("acp-sessions.json"))
+    }
+
+    /// A backend that reads no remembered secrets.
     pub fn new(config: Config) -> std::io::Result<Self> {
+        Self::with_secret_store(config, None)
+    }
+
+    /// A backend whose sessions load the secrets remembered for their project from
+    /// `secret_store` (see [`default_secret_store`]).
+    pub fn with_secret_store(
+        config: Config,
+        secret_store: Option<SharedStore>,
+    ) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -259,6 +348,8 @@ impl HarnessBackend {
                 .map(|dir| crate::tools::display_path(&dir))
                 .unwrap_or_default(),
             list_store: None,
+            home: crate::config::home_dir(),
+            secret_store,
             client: ClientCapabilities::default(),
             runtime,
             sessions: HashMap::new(),
@@ -278,8 +369,8 @@ impl HarnessBackend {
         // No terminal prompt and no secret store: the editor is asked instead (below),
         // and the keyring is for a terminal. Without a terminal prompt,
         // `request_secret` is not offered.
-        let mut assembly =
-            assemble_in(&self.config, cwd, None, None).map_err(|error| match error {
+        let mut assembly = assemble_in(&self.config, cwd, None, self.secret_store.clone())
+            .map_err(|error| match error {
                 SetupError::Model(message) => BackendError::internal(message),
                 SetupError::Workspace(message) => BackendError::invalid_params(message),
             })?;
@@ -430,7 +521,7 @@ impl EditorFiles for AcpFiles {
 /// editor owning the screen, and that act on this session alone. The rest of the
 /// terminal's commands (`/resume`, `/clear`, `/thinking`, `/secret`, ...) are the
 /// editor's to provide, or need a terminal.
-const COMMANDS: [(&str, &str, Option<&str>); 7] = [
+const COMMANDS: [(&str, &str, Option<&str>); 8] = [
     (
         "mode",
         "Show or set the approval mode for this session",
@@ -455,6 +546,11 @@ const COMMANDS: [(&str, &str, Option<&str>); 7] = [
         "resume",
         "List saved sessions, or continue one in this thread",
         Some("session id (or its first characters)"),
+    ),
+    (
+        "secret",
+        "List the secrets available to the agent (never their values), or forget one",
+        Some("forget NAME"),
     ),
     ("cost", "Show token usage and cost this session", None),
     ("tools", "List the tools the agent can use", None),
@@ -551,9 +647,7 @@ impl HarnessBackend {
     /// no such column, and it is shared with Python's. Best effort, in a small file
     /// beside it; a lost update only means the session shows the startup directory.
     fn remember_cwd(&self, session_id: &str, cwd: &Path) {
-        let Some(file) =
-            crate::config::home_dir().map(|home| home.join(".agent86").join("acp-sessions.json"))
-        else {
+        let Some(file) = self.cwd_file() else {
             return;
         };
         let mut known = read_cwds(&file);
@@ -765,8 +859,9 @@ impl Backend for HarnessBackend {
         let Some(store) = self.store_for_listing() else {
             return Vec::new();
         };
-        let known = crate::config::home_dir()
-            .map(|home| read_cwds(&home.join(".agent86").join("acp-sessions.json")))
+        let known = self
+            .cwd_file()
+            .map(|file| read_cwds(&file))
             .unwrap_or_default();
         let wanted = cwd.map(|cwd| same_path_key(&crate::tools::display_path(cwd)));
         store
@@ -892,6 +987,7 @@ impl Backend for HarnessBackend {
             "thinking" => show_level("thinking", &mut session.thinking, arg),
             "toolview" => show_level("toolview", &mut session.tool_view, arg),
             "resume" => self.resume(&mut session, arg),
+            "secret" => secret_command(&session, arg),
             "cost" => self.cost(&session),
             _ => {
                 let mut lines = vec![format!(

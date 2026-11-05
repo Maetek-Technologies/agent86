@@ -369,7 +369,10 @@ fn main() -> ExitCode {
         Some(Command::Memory(command)) => memory_command(&config, command, &stderr),
         Some(Command::Acp) => {
             // Stdout belongs to the protocol: nothing else may print to it here.
-            let backend = match agent86::acp::harness::HarnessBackend::new(config) {
+            let backend = match agent86::acp::harness::HarnessBackend::with_secret_store(
+                config,
+                agent86::acp::harness::default_secret_store(),
+            ) {
                 Ok(backend) => backend,
                 Err(error) => {
                     stderr.error(&format!("could not start the async runtime: {error}"));

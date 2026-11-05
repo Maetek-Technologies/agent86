@@ -78,6 +78,8 @@ impl Workspace {
             .env_remove("AGENT86_APPROVAL")
             .env("AGENT86_TRUST_PROJECT", "1")
             .env("AGENT86_ACP_MODEL_LISTS", self.model_lists)
+            // The real keyring is never read by a test.
+            .env("AGENT86_ACP_SECRETS", "off")
             .env("AGENT86_NO_UPDATE_CHECK", "1")
             .env_remove("NO_COLOR")
             // No test may reach the Hugging Face hub or read the real cache.
@@ -1406,15 +1408,16 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
         .unwrap();
     assert_eq!(
         names,
-        ["mode", "model", "thinking", "toolview", "resume", "cost", "tools"]
+        ["mode", "model", "thinking", "toolview", "resume", "secret", "cost", "tools"]
     );
-    assert_eq!(hints.len(), 7);
+    assert_eq!(hints.len(), 8);
     assert_eq!(hints[0].as_deref(), Some("ask, auto, or deny"));
     assert_eq!(hints[1].as_deref(), Some("provider:model"));
     assert_eq!(hints[2].as_deref(), Some("full, summary, or hidden"));
     assert_eq!(hints[3], hints[2]);
     assert!(hints[4].is_some());
-    assert_eq!((&hints[5], &hints[6]), (&None, &None));
+    assert_eq!(hints[5].as_deref(), Some("forget NAME"));
+    assert_eq!((&hints[6], &hints[7]), (&None, &None));
     for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
         assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
         // The answer, then the settings as they now stand (a command may change one).
@@ -1956,5 +1959,48 @@ async fn the_level_commands_report_and_refuse_like_the_terminals() {
         .text_of("agent_message_chunk")
         .contains("unknown level 'loud'"));
     assert_eq!(d.text_of("agent_message_chunk"), "thinking: summary");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn the_secret_command_never_takes_or_repeats_a_value() {
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::new("secret-command", Some(&server));
+    let (list, typed, forget_bad, forget_none) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let list = client.prompt(&session, "/secret");
+            let typed = client.prompt(&session, "/secret API_KEY sk-live-0123456789abcdef");
+            let forget_bad = client.prompt(&session, "/secret forget sk-live-0123456789!");
+            let forget_none = client.prompt(&session, "/secret forget NOT_HELD");
+            client.finish();
+            (list, typed, forget_bad, forget_none)
+        }
+    })
+    .await
+    .unwrap();
+    let shown = list.text_of("agent_message_chunk");
+    assert!(shown.starts_with("no secrets for this project"), "{shown}");
+    assert!(shown.contains("/secret NAME"), "{shown}");
+    let shown = typed.text_of("agent_message_chunk");
+    assert!(shown.starts_with("nothing was stored."), "{shown}");
+    assert!(
+        !shown.contains("sk-live") && !shown.contains("API_KEY"),
+        "{shown}"
+    );
+    assert!(forget_bad
+        .text_of("agent_message_chunk")
+        .contains("not a valid secret name"));
+    assert!(!forget_bad
+        .text_of("agent_message_chunk")
+        .contains("sk-live"));
+    assert_eq!(
+        forget_none.text_of("agent_message_chunk"),
+        "no secret named NOT_HELD"
+    );
+    // None of it reached the model.
     assert!(server.requests().is_empty());
 }
