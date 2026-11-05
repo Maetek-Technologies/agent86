@@ -366,7 +366,14 @@ impl Client {
         drop(self.stdin.take());
         let mut rest = String::new();
         std::io::Read::read_to_string(&mut self.stdout, &mut rest).unwrap();
-        assert_eq!(rest, "", "nothing more on stdout after the last response");
+        // Only notifications may still be on their way, such as the command list of a
+        // thread opened last; anything else is a message nobody asked for.
+        for line in rest.lines() {
+            let message: Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {line:?}"));
+            assert_eq!(message["method"], "session/update", "{message}");
+            assert!(message.get("id").is_none(), "{message}");
+        }
         let mut stderr = String::new();
         if let Some(mut pipe) = self.child.stderr.take() {
             std::io::Read::read_to_string(&mut pipe, &mut stderr).unwrap();
@@ -1397,16 +1404,17 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
         })
         .await
         .unwrap();
-    assert_eq!(names, ["mode", "model", "cost", "tools"]);
     assert_eq!(
-        hints,
-        [
-            Some("ask, auto, or deny".to_owned()),
-            Some("provider:model".to_owned()),
-            None,
-            None
-        ]
+        names,
+        ["mode", "model", "thinking", "toolview", "resume", "cost", "tools"]
     );
+    assert_eq!(hints.len(), 7);
+    assert_eq!(hints[0].as_deref(), Some("ask, auto, or deny"));
+    assert_eq!(hints[1].as_deref(), Some("provider:model"));
+    assert_eq!(hints[2].as_deref(), Some("full, summary, or hidden"));
+    assert_eq!(hints[3], hints[2]);
+    assert!(hints[4].is_some());
+    assert_eq!((&hints[5], &hints[6]), (&None, &None));
     for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
         assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
         // The answer, then the settings as they now stand (a command may change one).
@@ -1681,4 +1689,272 @@ fn choice_values_flat(option: &Value) -> Vec<String> {
         }
     }
     values
+}
+
+#[tokio::test]
+async fn saved_sessions_are_listed_with_their_directory_and_a_title_across_processes() {
+    let server = MockServer::start(vec![sse_text("Noted.", "stop")]).await;
+    let workspace = Workspace::new("list", Some(&server));
+    let (session, empty_one) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let used = client.new_session(&project);
+            client.prompt(&used, "Alpha question about the build");
+            // A thread opened and never used has nothing to come back to.
+            let unused = client.new_session(&project);
+            client.finish();
+            (used, unused)
+        }
+    })
+    .await
+    .unwrap();
+
+    // A new process lists before it has any session of its own.
+    let (all, here, elsewhere, relative) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let elsewhere = workspace.root.join("elsewhere");
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let all = client.request("session/list", json!({}));
+            let here = client.request("session/list", json!({"cwd": project.to_str().unwrap()}));
+            let elsewhere =
+                client.request("session/list", json!({"cwd": elsewhere.to_str().unwrap()}));
+            let relative = client.request("session/list", json!({"cwd": "nope"}));
+            client.finish();
+            (all, here, elsewhere, relative)
+        }
+    })
+    .await
+    .unwrap();
+
+    let sessions = all.response["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let listed = &sessions[0];
+    assert_eq!(listed["sessionId"], session);
+    assert_ne!(listed["sessionId"], empty_one);
+    assert!(listed["title"].as_str().unwrap().contains("Alpha question"));
+    assert_eq!(
+        listed["cwd"].as_str().unwrap().to_lowercase(),
+        workspace.project().display().to_string().to_lowercase()
+    );
+    let stamp = listed["updatedAt"].as_str().unwrap();
+    assert!(stamp.ends_with('Z') && stamp.len() == 20, "{stamp}");
+    assert_eq!(
+        here.response["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(elsewhere.response["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(relative.response["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn resume_lists_saved_sessions_and_continues_one_in_this_thread() {
+    let server = MockServer::start(vec![
+        sse_text("First answer.", "stop"),
+        sse_text("Second answer.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("resume", Some(&server));
+    let old = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.prompt(&session, "Alpha question about caching");
+            client.finish();
+            session
+        }
+    })
+    .await
+    .unwrap();
+    let short: String = old.chars().take(8).collect();
+
+    let (listing, bad, resumed, answer) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        let short = short.clone();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let listing = client.prompt(&session, "/resume");
+            let bad = client.prompt(&session, "/resume zzzzzzzz");
+            let resumed = client.prompt(&session, &format!("/resume {short}"));
+            let answer = client.prompt(&session, "And a follow up?");
+            client.finish();
+            (listing, bad, resumed, answer)
+        }
+    })
+    .await
+    .unwrap();
+
+    let shown = listing.text_of("agent_message_chunk");
+    assert!(
+        shown.contains(&short) && shown.contains("Alpha question"),
+        "{shown}"
+    );
+    assert!(shown.contains("usage: /resume <id>"));
+    assert!(bad
+        .text_of("agent_message_chunk")
+        .contains("no session 'zzzzzzzz'"));
+    let note = resumed.text_of("agent_message_chunk");
+    assert!(
+        note.starts_with(&format!("resumed session {old}")),
+        "{note}"
+    );
+    assert!(note.contains("Alpha question"), "{note}");
+    // Nothing reached the model for those three commands; the follow-up carried the
+    // resumed conversation with it.
+    assert_eq!(answer.text_of("agent_message_chunk"), "Second answer.");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let sent = requests[1].body["messages"].to_string();
+    assert!(sent.contains("Alpha question about caching"), "{sent}");
+    assert!(sent.contains("First answer."), "{sent}");
+    assert!(sent.contains("And a follow up?"), "{sent}");
+}
+
+/// A turn in which the model reasons, calls `list_dir`, and answers, at the
+/// `/thinking` and `/toolview` levels given.
+async fn display_turn(name: &str, thinking: &str, toolview: &str, path: &'static str) -> Exchange {
+    let server = MockServer::start(vec![
+        Reply::Sse(format!(
+            "{}{}",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"weighing the options carefully\"},\"finish_reason\":null}]}\n\n",
+            match sse_tool_calls(&[("c1", "read_file", path)]) {
+                Reply::Sse(body) => body,
+                _ => unreachable!(),
+            }
+        )),
+        sse_text("All done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new(name, Some(&server));
+    std::fs::write(workspace.project().join("here.txt"), "hello\n").unwrap();
+    let exchange = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        let (thinking, toolview) = (thinking.to_owned(), toolview.to_owned());
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            if !thinking.is_empty() {
+                client.prompt(&session, &format!("/thinking {thinking}"));
+            }
+            if !toolview.is_empty() {
+                client.prompt(&session, &format!("/toolview {toolview}"));
+            }
+            let exchange = client.prompt(&session, "Look at it");
+            client.finish();
+            exchange
+        }
+    })
+    .await
+    .unwrap();
+    exchange
+}
+
+#[tokio::test]
+async fn thinking_and_toolview_change_what_the_editor_is_shown() {
+    let read = r#"{"path":"here.txt"}"#;
+
+    // The default is everything.
+    let full = display_turn("view-full", "", "", read).await;
+    assert_eq!(
+        full.kinds(),
+        [
+            "agent_thought_chunk",
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk"
+        ]
+    );
+    assert_eq!(
+        full.updates[1]["params"]["update"]["rawInput"],
+        json!({"path": "here.txt"})
+    );
+
+    // Summary: one reasoning line (before the call it led to), the call without its
+    // arguments, and a one-line result.
+    let summary = display_turn("view-summary", "summary", "summary", read).await;
+    assert_eq!(
+        summary.kinds(),
+        [
+            "agent_thought_chunk",
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk"
+        ]
+    );
+    let line = summary.updates[0]["params"]["update"]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        line.starts_with("∴ thought for ") && line.ends_with("30 chars"),
+        "{line}"
+    );
+    assert!(summary.updates[1]["params"]["update"]["rawInput"].is_null());
+    assert_eq!(
+        summary.updates[2]["params"]["update"]["status"],
+        "completed"
+    );
+
+    // Hidden: only the answer.
+    let hidden = display_turn("view-hidden", "hidden", "hidden", read).await;
+    assert_eq!(hidden.kinds(), ["agent_message_chunk"]);
+    assert_eq!(hidden.text_of("agent_message_chunk"), "All done.");
+
+    // But a call that failed is shown even then.
+    let failed = display_turn(
+        "view-failed",
+        "hidden",
+        "hidden",
+        r#"{"path":"missing.txt"}"#,
+    )
+    .await;
+    assert_eq!(
+        failed.kinds(),
+        ["tool_call", "tool_call_update", "agent_message_chunk"]
+    );
+    assert_eq!(failed.updates[1]["params"]["update"]["status"], "failed");
+}
+
+#[tokio::test]
+async fn the_level_commands_report_and_refuse_like_the_terminals() {
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::new("levels", Some(&server));
+    let (a, b, c, d) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let a = client.prompt(&session, "/thinking");
+            let b = client.prompt(&session, "/thinking summary");
+            let c = client.prompt(&session, "/toolview loud");
+            let d = client.prompt(&session, "/thinking");
+            client.finish();
+            (a, b, c, d)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(a.text_of("agent_message_chunk"), "thinking: full");
+    assert!(b
+        .text_of("agent_message_chunk")
+        .starts_with("thinking: summary"));
+    assert!(c
+        .text_of("agent_message_chunk")
+        .contains("unknown level 'loud'"));
+    assert_eq!(d.text_of("agent_message_chunk"), "thinking: summary");
+    assert!(server.requests().is_empty());
 }

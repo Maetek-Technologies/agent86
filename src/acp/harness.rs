@@ -31,11 +31,11 @@
 
 use super::{
     Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, McpSpec,
-    Notifier, Permission, PermissionRequest, Stop, ToolKind, TurnSink, Update,
+    Notifier, Permission, PermissionRequest, SessionSummary, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
-use crate::config::{Config, McpServerConfig};
+use crate::config::{Config, DisplayLevel, McpServerConfig};
 use crate::escape::show_controls;
 use crate::mcp::{var_ref_names, McpManager};
 use crate::pyjson::python_json_dumps;
@@ -54,6 +54,147 @@ use std::time::Duration;
 /// it (a read falls back to the disk; a write fails).
 const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The saved working directories, by session id; empty when there is no file.
+fn read_cwds(file: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A directory as it is compared: slashes alike and no trailing one, and on Windows
+/// without regard to case.
+fn same_path_key(path: &str) -> String {
+    let mut key = if cfg!(windows) {
+        path.replace('\\', "/").to_lowercase()
+    } else {
+        path.to_owned()
+    };
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    key
+}
+
+/// `/thinking` and `/toolview`: show the level, or set it.
+fn show_level(name: &str, level: &mut DisplayLevel, arg: &str) -> String {
+    if arg.is_empty() {
+        return format!("{name}: {}", level.as_str());
+    }
+    match DisplayLevel::parse(arg) {
+        Some(new) => {
+            *level = new;
+            format!("{name}: {} (from the next turn)", new.as_str())
+        }
+        None => format!("unknown level '{arg}' (full|summary|hidden)"),
+    }
+}
+
+/// Turns a turn's events into what the editor is shown, at the session's levels:
+/// the terminal interface's `/thinking` and `/toolview`, beyond Python. Reasoning is
+/// streamed (`full`), reduced to one `∴ thought for 12s · 2.1k chars` line when it
+/// ends (`summary`), or dropped (`hidden`). A tool call shows its arguments and the
+/// whole result (`full`), its name and a one-line result (`summary`), or nothing
+/// unless it failed (`hidden`). Approval requests carry their own description of the
+/// call, so a hidden call is still asked about.
+struct Presenter {
+    thinking: DisplayLevel,
+    tools: DisplayLevel,
+    /// When the current reasoning began, and how many characters it has run to.
+    thought: Option<(std::time::Instant, usize)>,
+}
+
+impl Presenter {
+    fn new(thinking: DisplayLevel, tools: DisplayLevel) -> Self {
+        Self {
+            thinking,
+            tools,
+            thought: None,
+        }
+    }
+
+    /// Say that held reasoning ended, as its summary line.
+    fn end_thought(&mut self, sink: &dyn TurnSink) {
+        if let Some((started, chars)) = self.thought.take() {
+            sink.update(Update::Thought(crate::ui::thought_summary(
+                started.elapsed(),
+                chars,
+            )));
+        }
+    }
+
+    fn announce(&self, call: &ToolCall, sink: &dyn TurnSink, secrets: &crate::vault::SecretVault) {
+        sink.update(Update::ToolCall {
+            id: call.id.clone(),
+            title: title(call, secrets),
+            name: call.name.clone(),
+            kind: tool_kind(&call.name),
+            raw_input: if self.tools == DisplayLevel::Full {
+                redacted_input(call, secrets)
+            } else {
+                Value::Null
+            },
+        });
+    }
+
+    fn event(
+        &mut self,
+        event: TurnEvent<'_>,
+        sink: &dyn TurnSink,
+        secrets: &crate::vault::SecretVault,
+    ) {
+        if !matches!(event, TurnEvent::Thinking(_)) {
+            self.end_thought(sink);
+        }
+        match event {
+            TurnEvent::Text(chunk) | TurnEvent::Notice(chunk) if !chunk.is_empty() => {
+                sink.update(Update::Message(chunk.to_owned()))
+            }
+            TurnEvent::Thinking(chunk) if !chunk.is_empty() => match self.thinking {
+                DisplayLevel::Full => sink.update(Update::Thought(chunk.to_owned())),
+                DisplayLevel::Summary => {
+                    let held = self
+                        .thought
+                        .get_or_insert_with(|| (std::time::Instant::now(), 0));
+                    held.1 += chunk.chars().count();
+                }
+                DisplayLevel::Hidden => {}
+            },
+            TurnEvent::ToolCall { call, .. } if self.tools != DisplayLevel::Hidden => {
+                self.announce(call, sink, secrets)
+            }
+            TurnEvent::ToolResult {
+                call,
+                result,
+                observation,
+                ..
+            } => {
+                if self.tools == DisplayLevel::Hidden {
+                    // Only a failure is shown, and it needs the call announced first.
+                    if result.ok {
+                        return;
+                    }
+                    self.announce(call, sink, secrets);
+                }
+                let text = match (self.tools, result.ok) {
+                    (DisplayLevel::Full, _) | (_, false) => result_text(result, observation),
+                    _ => crate::agent::summarize(result),
+                };
+                sink.update(Update::ToolResult {
+                    id: call.id.clone(),
+                    ok: result.ok,
+                    text,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Model lists by provider, shared with the threads that fetch them.
 type Catalogs = Arc<Mutex<BTreeMap<String, Vec<(String, String)>>>>;
 
@@ -66,6 +207,11 @@ type SinkSlot = Arc<Mutex<Option<Arc<dyn TurnSink>>>>;
 
 struct Session {
     harness: Harness,
+    /// How much reasoning and tool use the editor is shown (`/thinking`, `/toolview`),
+    /// as in the terminal interface. Both start `full`: an editor folds long output
+    /// itself, and it is what editor sessions showed before these commands.
+    thinking: DisplayLevel,
+    tool_view: DisplayLevel,
     /// The `provider:model` the session runs on: the config's default until `/model`
     /// or the editor's picker switches it. Kept as the ref the user wrote, not read
     /// back from the provider, whose own name is the adapter's (`openai` for every
@@ -87,6 +233,12 @@ pub struct HarnessBackend {
     notifier: Option<Notifier>,
     /// Whether the lists have been asked for yet: once, on the first session.
     lists_started: bool,
+    /// Where agent86 was started: the directory shown for a saved session that no
+    /// editor session recorded one for (it was made at a terminal, or before this
+    /// was kept).
+    startup_cwd: String,
+    /// The database, opened on its own for `session/list` when no session has yet.
+    list_store: Option<SessionStore>,
     client: ClientCapabilities,
     runtime: tokio::runtime::Runtime,
     sessions: HashMap<String, Session>,
@@ -103,6 +255,10 @@ impl HarnessBackend {
             open: Arc::default(),
             notifier: None,
             lists_started: false,
+            startup_cwd: std::env::current_dir()
+                .map(|dir| crate::tools::display_path(&dir))
+                .unwrap_or_default(),
+            list_store: None,
             client: ClientCapabilities::default(),
             runtime,
             sessions: HashMap::new(),
@@ -182,7 +338,10 @@ impl HarnessBackend {
                 write: self.client.write_text_file,
             }));
         }
+        self.remember_cwd(&session_id, cwd);
         let session = Session {
+            thinking: DisplayLevel::Full,
+            tool_view: DisplayLevel::Full,
             model_ref: assembly.model_ref.to_string(),
             harness: assembly.harness,
             store: assembly.store,
@@ -271,7 +430,7 @@ impl EditorFiles for AcpFiles {
 /// editor owning the screen, and that act on this session alone. The rest of the
 /// terminal's commands (`/resume`, `/clear`, `/thinking`, `/secret`, ...) are the
 /// editor's to provide, or need a terminal.
-const COMMANDS: [(&str, &str, Option<&str>); 4] = [
+const COMMANDS: [(&str, &str, Option<&str>); 7] = [
     (
         "mode",
         "Show or set the approval mode for this session",
@@ -281,6 +440,21 @@ const COMMANDS: [(&str, &str, Option<&str>); 4] = [
         "model",
         "Show or switch the model for this session",
         Some("provider:model"),
+    ),
+    (
+        "thinking",
+        "Show or set how much of the model's reasoning is shown",
+        Some("full, summary, or hidden"),
+    ),
+    (
+        "toolview",
+        "Show or set how much of each tool call is shown",
+        Some("full, summary, or hidden"),
+    ),
+    (
+        "resume",
+        "List saved sessions, or continue one in this thread",
+        Some("session id (or its first characters)"),
     ),
     ("cost", "Show token usage and cost this session", None),
     ("tools", "List the tools the agent can use", None),
@@ -309,6 +483,111 @@ impl HarnessBackend {
                 format!("model: {}", session.model_ref)
             }
         }
+    }
+
+    /// `/resume`: list the saved sessions, or continue one in this thread (as the
+    /// terminal's does: the conversation becomes the model's context, and the
+    /// thread's new turns are saved under the resumed session).
+    fn resume(&self, session: &mut Session, arg: &str) -> String {
+        let Some(store) = session.store.clone() else {
+            return "memory is off, so there are no saved sessions".to_owned();
+        };
+        let recent = store.recent_sessions(200).unwrap_or_default();
+        let short = |id: &str| id.chars().take(8).collect::<String>();
+        if arg.is_empty() {
+            let now = crate::repl::now();
+            let lines: Vec<String> = recent
+                .iter()
+                .filter(|info| info.title.is_some())
+                .take(20)
+                .map(|info| {
+                    format!(
+                        "{}  {}  {}",
+                        short(&info.session_id),
+                        info.label(),
+                        crate::repl::relative_time(info.updated_at, now)
+                    )
+                })
+                .collect();
+            return if lines.is_empty() {
+                "no saved sessions yet".to_owned()
+            } else {
+                format!("{}\nusage: /resume <id>", lines.join("\n"))
+            };
+        }
+        let mut matches = recent.iter().filter(|info| info.session_id == arg).chain(
+            recent
+                .iter()
+                .filter(|info| info.session_id.starts_with(arg)),
+        );
+        let found = match (matches.next(), matches.next()) {
+            (Some(first), Some(second)) if first.session_id != second.session_id => None,
+            (Some(first), _) => Some(first.session_id.clone()),
+            _ => None,
+        };
+        let Some(id) = found else {
+            return format!("no session '{arg}' found (or '{arg}' matches more than one)");
+        };
+        match store.load(&id) {
+            Ok(Some(state)) => {
+                let title = store.title(&id).ok().flatten();
+                let note = format!(
+                    "resumed session {id} ({} messages){}",
+                    state.messages.len(),
+                    title.map(|title| format!(" - {title}")).unwrap_or_default()
+                );
+                self.remember_cwd(
+                    &id,
+                    &crate::tools::plain_path(session.harness.context.policy.workspace()),
+                );
+                session.state = state;
+                format!("{note}\nThe earlier conversation is in the model's context; it is not shown here.")
+            }
+            _ => format!("no session '{arg}' found"),
+        }
+    }
+
+    /// Note that `session_id` works in `cwd`, for `session/list`: the database has
+    /// no such column, and it is shared with Python's. Best effort, in a small file
+    /// beside it; a lost update only means the session shows the startup directory.
+    fn remember_cwd(&self, session_id: &str, cwd: &Path) {
+        let Some(file) =
+            crate::config::home_dir().map(|home| home.join(".agent86").join("acp-sessions.json"))
+        else {
+            return;
+        };
+        let mut known = read_cwds(&file);
+        known.insert(
+            session_id.to_owned(),
+            Value::String(crate::tools::display_path(cwd)),
+        );
+        let Ok(text) = serde_json::to_string(&Value::Object(known)) else {
+            return;
+        };
+        let staged = file.with_extension("json.tmp");
+        if std::fs::write(&staged, text).is_ok() && std::fs::rename(&staged, &file).is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+    }
+
+    /// The store `session/list` reads: an open session's, else the database opened
+    /// on its own (without the embedding model, which a read needs none of).
+    fn store_for_listing(&mut self) -> Option<SessionStore> {
+        if !self.config.memory.enabled {
+            return None;
+        }
+        if let Some(store) = self
+            .sessions
+            .values()
+            .find_map(|session| session.store.clone())
+        {
+            return Some(store);
+        }
+        if self.list_store.is_none() {
+            self.list_store =
+                SessionStore::open(&crate::session::expand_home(&self.config.memory.path)).ok();
+        }
+        self.list_store.clone()
     }
 
     /// `/cost`, as the terminal's.
@@ -482,6 +761,39 @@ impl HarnessBackend {
 }
 
 impl Backend for HarnessBackend {
+    fn list_sessions(&mut self, cwd: Option<&Path>) -> Vec<SessionSummary> {
+        let Some(store) = self.store_for_listing() else {
+            return Vec::new();
+        };
+        let known = crate::config::home_dir()
+            .map(|home| read_cwds(&home.join(".agent86").join("acp-sessions.json")))
+            .unwrap_or_default();
+        let wanted = cwd.map(|cwd| same_path_key(&crate::tools::display_path(cwd)));
+        store
+            .recent_sessions(200)
+            .unwrap_or_default()
+            .into_iter()
+            // A session with no title has no user message yet: nothing to come back to.
+            .filter(|info| info.title.is_some())
+            .map(|info| SessionSummary {
+                cwd: known
+                    .get(&info.session_id)
+                    .and_then(Value::as_str)
+                    .unwrap_or(&self.startup_cwd)
+                    .to_owned(),
+                session_id: info.session_id,
+                title: info.title,
+                updated_at: info.updated_at,
+            })
+            .filter(|summary| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == same_path_key(&summary.cwd))
+            })
+            .take(100)
+            .collect()
+    }
+
     fn set_notifier(&mut self, notify: Notifier) {
         self.notifier = Some(notify);
     }
@@ -577,6 +889,9 @@ impl Backend for HarnessBackend {
                 }
             }
             "model" => self.switch_model(&mut session, arg),
+            "thinking" => show_level("thinking", &mut session.thinking, arg),
+            "toolview" => show_level("toolview", &mut session.tool_view, arg),
+            "resume" => self.resume(&mut session, arg),
             "cost" => self.cost(&session),
             _ => {
                 let mut lines = vec![format!(
@@ -637,6 +952,7 @@ impl Backend for HarnessBackend {
         let session = self.sessions.get_mut(session_id).ok_or_else(|| {
             BackendError::invalid_params(format!("Unknown session: {session_id}"))
         })?;
+        let mut presenter = Presenter::new(session.thinking, session.tool_view);
         let Session {
             harness,
             store,
@@ -649,34 +965,10 @@ impl Backend for HarnessBackend {
 
         let result = self
             .runtime
-            .block_on(
-                harness.run_turn_events(state, text, text, |event| match event {
-                    TurnEvent::Text(chunk) | TurnEvent::Notice(chunk) if !chunk.is_empty() => {
-                        sink.update(Update::Message(chunk.to_owned()))
-                    }
-                    TurnEvent::Thinking(chunk) if !chunk.is_empty() => {
-                        sink.update(Update::Thought(chunk.to_owned()))
-                    }
-                    TurnEvent::ToolCall { call, .. } => sink.update(Update::ToolCall {
-                        id: call.id.clone(),
-                        title: title(call, &secrets),
-                        name: call.name.clone(),
-                        kind: tool_kind(&call.name),
-                        raw_input: redacted_input(call, &secrets),
-                    }),
-                    TurnEvent::ToolResult {
-                        call,
-                        result,
-                        observation,
-                        ..
-                    } => sink.update(Update::ToolResult {
-                        id: call.id.clone(),
-                        ok: result.ok,
-                        text: result_text(result, observation),
-                    }),
-                    _ => {}
-                }),
-            );
+            .block_on(harness.run_turn_events(state, text, text, |event| {
+                presenter.event(event, sink.as_ref(), &secrets)
+            }));
+        presenter.end_thought(sink.as_ref());
         // The turn is over: nothing may be asked of the editor until the next one.
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // Saved whether the turn finished or failed, so the session stays resumable.
@@ -902,6 +1194,159 @@ mod tests {
             id: "c1".into(),
             name: name.into(),
             arguments: arguments.as_object().unwrap().clone(),
+        }
+    }
+
+    /// Records what a turn tells the editor.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<Update>>);
+
+    impl TurnSink for Recorder {
+        fn update(&self, update: Update) {
+            self.0.lock().unwrap().push(update);
+        }
+        fn ask(&self, _: PermissionRequest) -> Permission {
+            Permission::Declined
+        }
+        fn call(&self, _: &str, _: Value, _: Option<Duration>) -> Result<Value, String> {
+            Err("no editor".into())
+        }
+    }
+
+    fn outcome(ok: bool, content: &str) -> ToolResult {
+        ToolResult {
+            call_id: "c1".into(),
+            name: "list_dir".into(),
+            ok,
+            content: content.into(),
+            error: (!ok).then(|| "it broke".to_owned()),
+            metadata: Default::default(),
+        }
+    }
+
+    /// Run a turn of events through a presenter at these levels.
+    fn presented(thinking: DisplayLevel, tools: DisplayLevel, ok: bool) -> Vec<Update> {
+        let sink = Recorder::default();
+        let secrets = crate::vault::SecretVault::default();
+        let mut presenter = Presenter::new(thinking, tools);
+        let call = call("list_dir", json!({"path": "."}));
+        let result = outcome(ok, "a.txt\nb.txt");
+        for event in [
+            TurnEvent::Thinking("let me "),
+            TurnEvent::Thinking("look"),
+            TurnEvent::ToolCall {
+                call: &call,
+                text: "[tool] list_dir(...)",
+            },
+            TurnEvent::ToolResult {
+                call: &call,
+                result: &result,
+                observation: "a.txt\nb.txt",
+                text: "[tool] list_dir -> ok",
+            },
+            TurnEvent::Text("Done."),
+        ] {
+            presenter.event(event, &sink, &secrets);
+        }
+        presenter.end_thought(&sink);
+        sink.0.into_inner().unwrap()
+    }
+
+    fn kinds(updates: &[Update]) -> Vec<&'static str> {
+        updates
+            .iter()
+            .map(|update| match update {
+                Update::Thought(_) => "thought",
+                Update::ToolCall { .. } => "call",
+                Update::ToolResult { .. } => "result",
+                Update::Message(_) => "message",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_shows_everything_as_it_arrives() {
+        let updates = presented(DisplayLevel::Full, DisplayLevel::Full, true);
+        assert_eq!(
+            kinds(&updates),
+            ["thought", "thought", "call", "result", "message"]
+        );
+        let Update::ToolCall { raw_input, .. } = &updates[2] else {
+            panic!()
+        };
+        assert_eq!(raw_input, &json!({"path": "."}));
+        let Update::ToolResult { text, .. } = &updates[3] else {
+            panic!()
+        };
+        assert_eq!(text, "a.txt\nb.txt");
+    }
+
+    #[test]
+    fn summary_folds_reasoning_to_one_line_and_a_call_to_its_name_and_a_result_line() {
+        let updates = presented(DisplayLevel::Summary, DisplayLevel::Summary, true);
+        // The reasoning ended at the tool call, so its line comes before it.
+        assert_eq!(kinds(&updates), ["thought", "call", "result", "message"]);
+        let Update::Thought(line) = &updates[0] else {
+            panic!()
+        };
+        assert!(line.starts_with("∴ thought for "), "{line}");
+        assert!(line.ends_with("11 chars"), "{line}");
+        let Update::ToolCall {
+            raw_input, title, ..
+        } = &updates[1]
+        else {
+            panic!()
+        };
+        assert_eq!(raw_input, &Value::Null, "no arguments in the summary");
+        assert!(title.starts_with("list_dir("));
+        let Update::ToolResult { text, .. } = &updates[2] else {
+            panic!()
+        };
+        assert_ne!(text, "a.txt\nb.txt");
+        assert!(!text.contains('\n'), "{text}");
+    }
+
+    #[test]
+    fn hidden_shows_only_the_answer_and_a_failed_call() {
+        let updates = presented(DisplayLevel::Hidden, DisplayLevel::Hidden, true);
+        assert_eq!(kinds(&updates), ["message"]);
+
+        // A failure is the user's to see, so the call comes with it.
+        let updates = presented(DisplayLevel::Hidden, DisplayLevel::Hidden, false);
+        assert_eq!(kinds(&updates), ["call", "result", "message"]);
+        let Update::ToolResult { ok, text, .. } = &updates[1] else {
+            panic!()
+        };
+        assert!(!ok);
+        assert!(
+            text.contains("a.txt") || text.contains("it broke"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn levels_are_set_shown_and_checked() {
+        let mut level = DisplayLevel::Full;
+        assert_eq!(show_level("thinking", &mut level, ""), "thinking: full");
+        assert_eq!(
+            show_level("thinking", &mut level, "hidden"),
+            "thinking: hidden (from the next turn)"
+        );
+        assert_eq!(level, DisplayLevel::Hidden);
+        assert_eq!(
+            show_level("thinking", &mut level, "loud"),
+            "unknown level 'loud' (full|summary|hidden)"
+        );
+        assert_eq!(level, DisplayLevel::Hidden);
+    }
+
+    #[test]
+    fn directories_compare_the_way_the_platform_does() {
+        assert_eq!(same_path_key("/a/b/"), same_path_key("/a/b"));
+        assert_ne!(same_path_key("/a/b"), same_path_key("/a/c"));
+        if cfg!(windows) {
+            assert_eq!(same_path_key(r"C:\Proj\X\"), same_path_key("c:/proj/x"));
         }
     }
 

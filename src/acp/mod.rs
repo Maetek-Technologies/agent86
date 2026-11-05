@@ -140,6 +140,17 @@ pub struct ConfigOption {
     pub groups: Vec<(String, Vec<(String, String)>)>,
 }
 
+/// One saved session, as `session/list` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// Absolute: where the session works.
+    pub cwd: String,
+    pub title: Option<String>,
+    /// Seconds since the Unix epoch.
+    pub updated_at: f64,
+}
+
 /// What the agent asks the editor to approve.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRequest {
@@ -310,6 +321,12 @@ pub trait Backend: Send {
     /// thread, between turns.
     fn run_command(&mut self, _session_id: &str, _line: &str) -> Option<String> {
         None
+    }
+
+    /// The saved sessions, newest first, limited to those working in `cwd` when given.
+    /// None by default.
+    fn list_sessions(&mut self, _cwd: Option<&Path>) -> Vec<SessionSummary> {
+        Vec::new()
     }
 
     /// Given once, before any session opens: how to say a session's options changed.
@@ -551,7 +568,11 @@ impl<B: Backend> Server<B> {
                     .client_capabilities(ClientCapabilities::from_params(params));
                 Ok(result)
             }
-            "session/new" | "session/load" | "session/prompt" | "session/set_config_option"
+            "session/new"
+            | "session/load"
+            | "session/list"
+            | "session/prompt"
+            | "session/set_config_option"
                 if !self.initialized =>
             {
                 Err(BackendError {
@@ -563,6 +584,7 @@ impl<B: Backend> Server<B> {
             "session/load" => self.session_load(params, emit),
             "session/prompt" => self.session_prompt(params, emit),
             "session/set_config_option" => self.set_config_option(params),
+            "session/list" => self.session_list(params),
             other => Err(BackendError {
                 code: METHOD_NOT_FOUND,
                 message: format!("Method not found: {other}"),
@@ -577,6 +599,41 @@ impl<B: Backend> Server<B> {
         let mut result = json!({ "sessionId": session_id });
         self.add_config_options(&mut result, &session_id);
         Ok(result)
+    }
+
+    /// `session/list`. One page: every session fits (the list is capped), so there
+    /// is never a `nextCursor`, and a request that carries a cursor has reached the
+    /// end.
+    fn session_list(&mut self, params: &Value) -> Result<Value, BackendError> {
+        let cwd = match params.get("cwd") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(cwd)) if Path::new(cwd).is_absolute() => Some(cwd.as_str()),
+            Some(_) => {
+                return Err(BackendError::invalid_params(
+                    "Invalid params: cwd must be an absolute path",
+                ))
+            }
+        };
+        if params.get("cursor").is_some_and(|cursor| !cursor.is_null()) {
+            return Ok(json!({ "sessions": [] }));
+        }
+        let sessions: Vec<Value> = self
+            .backend
+            .list_sessions(cwd.map(Path::new))
+            .iter()
+            .map(|session| {
+                let mut entry = json!({
+                    "sessionId": session.session_id,
+                    "cwd": session.cwd,
+                    "updatedAt": iso8601(session.updated_at)
+                });
+                if let Some(title) = &session.title {
+                    entry["title"] = json!(title);
+                }
+                entry
+            })
+            .collect();
+        Ok(json!({ "sessions": sessions }))
     }
 
     /// Put the session's settings in `result` when it has any.
@@ -1048,6 +1105,33 @@ fn text_content(text: &str) -> Value {
     json!({ "type": "text", "text": text })
 }
 
+/// `seconds` since the Unix epoch as `2025-10-29T14:22:15Z`.
+pub fn iso8601(seconds: f64) -> String {
+    let whole = seconds.max(0.0) as i64;
+    let (days, rest) = (whole.div_euclid(86_400), whole.rem_euclid(86_400));
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60
+    )
+}
+
 /// `options` as the protocol writes them.
 fn config_options_json(options: &[ConfigOption]) -> Value {
     Value::Array(
@@ -1193,6 +1277,7 @@ fn initialize(params: &Value) -> Result<Value, String> {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
             "loadSession": true,
+            "sessionCapabilities": { "list": {} },
             "promptCapabilities": {
                 "image": false,
                 "audio": false,
@@ -1371,6 +1456,9 @@ mod tests {
         notify: Arc<Mutex<Option<Notifier>>>,
         /// Whether the turn should announce a change to its options.
         announce_during_turn: bool,
+        /// The sessions listed, and the `cwd` each request asked about.
+        saved: Vec<SessionSummary>,
+        listed_for: Vec<Option<String>>,
     }
 
     impl Backend for Script {
@@ -1380,6 +1468,12 @@ mod tests {
 
         fn set_notifier(&mut self, notify: Notifier) {
             *self.notify.lock().unwrap() = Some(notify);
+        }
+
+        fn list_sessions(&mut self, cwd: Option<&Path>) -> Vec<SessionSummary> {
+            self.listed_for
+                .push(cwd.map(|cwd| cwd.to_string_lossy().into_owned()));
+            self.saved.clone()
         }
 
         fn config_options(&self, _session_id: &str) -> Vec<ConfigOption> {
@@ -2623,6 +2717,78 @@ mod tests {
         // Told twice, sent once.
         assert_eq!(kinds, ["config_option_update", "response"]);
         assert_eq!(out[0]["params"]["sessionId"], "sess_1");
+    }
+
+    #[test]
+    fn timestamps_are_iso_8601_in_utc() {
+        assert_eq!(iso8601(0.0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601(951_782_400.0), "2000-02-29T00:00:00Z");
+        assert_eq!(iso8601(1_700_000_000.9), "2023-11-14T22:13:20Z");
+        assert_eq!(iso8601(4_102_444_799.0), "2099-12-31T23:59:59Z");
+        assert_eq!(iso8601(-5.0), "1970-01-01T00:00:00Z");
+    }
+
+    fn saved(id: &str, title: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            session_id: id.into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            title: title.map(str::to_owned),
+            updated_at: 1_700_000_000.0,
+        }
+    }
+
+    fn list_line(params: Value) -> String {
+        json!({"jsonrpc":"2.0","id":6,"method":"session/list","params":params}).to_string()
+    }
+
+    #[test]
+    fn the_session_list_is_advertised_and_answers_in_the_protocols_shape() {
+        let mut server = Server::new(Script::default());
+        let init = one(&mut server, INITIALIZE);
+        assert_eq!(
+            init["result"]["agentCapabilities"]["sessionCapabilities"],
+            json!({"list": {}})
+        );
+        server.backend.saved = vec![saved("a1", Some("Fix the build")), saved("b2", None)];
+        let reply = one(&mut server, &list_line(json!({})));
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        assert_eq!(
+            reply["result"],
+            json!({"sessions": [
+                {"sessionId": "a1", "cwd": cwd, "updatedAt": "2023-11-14T22:13:20Z",
+                 "title": "Fix the build"},
+                {"sessionId": "b2", "cwd": cwd, "updatedAt": "2023-11-14T22:13:20Z"}
+            ]})
+        );
+        assert!(reply["result"].get("nextCursor").is_none());
+        assert_eq!(server.backend.listed_for, [None]);
+    }
+
+    #[test]
+    fn the_session_list_passes_the_directory_and_ends_at_a_cursor() {
+        let mut server = ready();
+        server.backend.saved = vec![saved("a1", Some("t"))];
+        let dir = std::env::temp_dir();
+        let reply = one(&mut server, &list_line(json!({"cwd": dir})));
+        assert_eq!(reply["result"]["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            server.backend.listed_for,
+            [Some(dir.to_string_lossy().into_owned())]
+        );
+        // One page only: asking for the next is asking for nothing.
+        let reply = one(&mut server, &list_line(json!({"cursor": "x"})));
+        assert_eq!(reply["result"], json!({"sessions": []}));
+        assert_eq!(server.backend.listed_for.len(), 1, "not even asked");
+        // A null cursor is no cursor, and a relative directory is refused.
+        let reply = one(&mut server, &list_line(json!({"cursor": null})));
+        assert_eq!(reply["result"]["sessions"].as_array().unwrap().len(), 1);
+        for bad in [json!({"cwd": "relative"}), json!({"cwd": 5})] {
+            let reply = one(&mut server, &list_line(bad));
+            assert_eq!(reply["error"]["code"], INVALID_PARAMS);
+        }
+        let mut early = Server::new(Script::default());
+        let reply = one(&mut early, &list_line(json!({})));
+        assert_eq!(reply["error"]["code"], INVALID_REQUEST);
     }
 
     #[test]
