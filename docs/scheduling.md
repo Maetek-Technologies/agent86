@@ -120,7 +120,7 @@ marked `missed` and disabled.
 - **`src/repl.rs` / `src/ui/`** (later): a `/schedule` command and, in the
   interface, a schedule panel + the in-process due-job check.
 - **Tests** (see below) and **docs** (README status/roadmap,
-  `PROJECT_PLAN.md`, `CLAUDE.md`, and a new **ADR 0002** — this is a significant
+  `PROJECT_PLAN.md`, `CLAUDE.md`, and a new ADR (the next number; 0002 is the ACP server) — this is a significant
   design decision, matching how ADR 0001 handled the interface).
 
 ## Phased implementation (each a testable vertical slice)
@@ -145,7 +145,7 @@ marked `missed` and disabled.
    events; the daemon logs runs to a file and the interface shows a note when a
    job fires in-process.
 6. **Docs + ADR + plan.** README, `PROJECT_PLAN.md` (recorded as a deliberate
-   addition), `CLAUDE.md` architecture note, ADR 0002.
+   addition), `CLAUDE.md` architecture note, an ADR (the next number).
 
 ## Testing strategy (matching the repo's conventions)
 

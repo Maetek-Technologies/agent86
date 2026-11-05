@@ -133,7 +133,7 @@ enum Command {
     Memory(MemoryCommand),
 
     /// Speak the Agent Client Protocol on stdin and stdout, so an editor such as
-    /// Zed can drive agent86. Slices so far: the handshake, sessions, and text prompts.
+    /// Zed can drive agent86 (see docs/ACP.md).
     Acp,
 }
 

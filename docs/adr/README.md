@@ -18,3 +18,4 @@ When an ADR departs from Python, add the difference to the matching "Known ... d
 | ADR | Ruling |
 |---|---|
 | [0001 — The interactive interface renders inline, in Claude Code's style](0001-inline-terminal-interface.md) | Stage 9's interface renders inline (native scrollback plus a live region at the bottom), on crossterm, in Claude Code's visual style. It keeps Python's commands, messages, approvals, files, and cancellation, and covers every Python screen in stages. |
+| [0002 — agent86 speaks the Agent Client Protocol as a server, on its own harness](0002-acp-server.md) | `agent86 acp` serves ACP v1 over stdio on agent86's own harness, session store, tools, and approval gate, written by hand against the published schema, advertising only what is built, and treating everything the editor sends as data. |

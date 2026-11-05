@@ -179,9 +179,7 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let stdin = self.stdin.as_mut().unwrap();
-        writeln!(stdin, "{line}").unwrap();
-        stdin.flush().unwrap();
+        self.send(&line);
         let mut updates = Vec::new();
         let mut requests = Vec::new();
         let mut files = Vec::new();
@@ -195,6 +193,7 @@ impl Client {
             // The protocol forbids any stdout line that is not a message.
             let message: Value = serde_json::from_str(&text)
                 .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {text:?}"));
+            self.log("A>", &message);
             if message.get("id") == Some(&json!(id)) && message.get("method").is_none() {
                 return Exchange {
                     updates,
@@ -213,9 +212,7 @@ impl Client {
                 };
                 let reply =
                     json!({"jsonrpc": "2.0", "id": message["id"], "result": {"outcome": outcome}});
-                let stdin = self.stdin.as_mut().unwrap();
-                writeln!(stdin, "{reply}").unwrap();
-                stdin.flush().unwrap();
+                self.send(&reply);
                 requests.push(message);
                 continue;
             }
@@ -224,9 +221,7 @@ impl Client {
                 .filter(|method| method.starts_with("fs/"))
             {
                 let reply = self.serve_file(method, &message);
-                let stdin = self.stdin.as_mut().unwrap();
-                writeln!(stdin, "{reply}").unwrap();
-                stdin.flush().unwrap();
+                self.send(&reply);
                 files.push(message);
                 continue;
             }
@@ -267,11 +262,35 @@ impl Client {
         }
     }
 
+    /// Write one message to the agent, and to the transcript if one is being kept.
+    fn send(&mut self, message: &Value) {
+        self.log("C>", message);
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// With `AGENT86_ACP_TRANSCRIPT` set to a path, append every message exchanged,
+    /// tagged with the agent's process id and the direction (`C>` client to agent,
+    /// `A>` agent to client), for checking against the protocol's schema.
+    fn log(&self, direction: &str, message: &Value) {
+        let Some(path) = std::env::var_os("AGENT86_ACP_TRANSCRIPT") else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            // One write per line, so tests running in parallel do not interleave.
+            let _ =
+                file.write_all(format!("{} {direction} {message}\n", self.child.id()).as_bytes());
+        }
+    }
+
     fn notify(&mut self, method: &str, params: Value) {
         let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        let stdin = self.stdin.as_mut().unwrap();
-        writeln!(stdin, "{line}").unwrap();
-        stdin.flush().unwrap();
+        self.send(&line);
     }
 
     fn load_session(&mut self, session: &str, cwd: &std::path::Path) -> Exchange {
