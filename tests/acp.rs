@@ -12,6 +12,10 @@ use support::{fixture, sse_reasoning, sse_text, sse_tool_calls, MockServer, Repl
 
 struct Workspace {
     root: PathBuf,
+    /// `AGENT86_ACP_MODEL_LISTS` for the agent: `off` unless a test asks for lists,
+    /// and then only for the providers it names. Never the real providers or the
+    /// real keyring.
+    model_lists: &'static str,
 }
 
 impl Workspace {
@@ -43,7 +47,10 @@ impl Workspace {
             )
             .unwrap();
         }
-        Self { root }
+        Self {
+            root,
+            model_lists: "off",
+        }
     }
 
     fn project(&self) -> PathBuf {
@@ -70,6 +77,7 @@ impl Workspace {
             .env_remove("AGENT86_SANDBOX")
             .env_remove("AGENT86_APPROVAL")
             .env("AGENT86_TRUST_PROJECT", "1")
+            .env("AGENT86_ACP_MODEL_LISTS", self.model_lists)
             .env("AGENT86_NO_UPDATE_CHECK", "1")
             .env_remove("NO_COLOR")
             // No test may reach the Hugging Face hub or read the real cache.
@@ -1576,4 +1584,101 @@ async fn the_editors_pickers_get_the_mode_and_the_models_and_can_change_them() {
         option(&update["configOptions"], "model")["currentValue"],
         "mock:cheap/model"
     );
+}
+
+/// Read messages until a `session/update` of `kind` arrives; returns its update.
+fn next_update(client: &mut Client, kind: &str) -> Value {
+    loop {
+        let mut text = String::new();
+        let read = client.stdout.read_line(&mut text).unwrap();
+        assert!(read > 0, "the agent closed stdout waiting for {kind}");
+        let message: Value = serde_json::from_str(&text).unwrap();
+        client.log("A>", &message);
+        if message["params"]["update"]["sessionUpdate"] == kind {
+            return message["params"]["update"].clone();
+        }
+    }
+}
+
+fn group_names(model: &Value) -> Vec<String> {
+    model["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|group| group["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_models_a_provider_lists_arrive_in_the_picker_under_their_own_heading() {
+    let server = MockServer::start(vec![Reply::Status {
+        status: 200,
+        headers: vec![("content-type", "application/json".to_owned())],
+        body: r#"{"data":[{"id":"vendor/alpha"},{"id":"vendor/beta","name":"Beta, the second"}]}"#
+            .to_owned(),
+    }])
+    .await;
+    let mut workspace = Workspace::new("model-lists", Some(&server));
+    workspace.model_lists = "mock";
+    let (first, last, set) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let created = client.request(
+                "session/new",
+                json!({"cwd": project.to_str().unwrap(), "mcpServers": []}),
+            );
+            let session = created.response["result"]["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let first = option(&created.response["result"]["configOptions"], "model").clone();
+            // The list is fetched behind the session, and an update always says when
+            // it is in, even if it won the race with the session's own response.
+            let update = next_update(&mut client, "config_option_update");
+            let last = option(&update["configOptions"], "model").clone();
+            let set = client.request(
+                "session/set_config_option",
+                json!({"sessionId": session, "configId": "model", "value": "mock:vendor/beta"}),
+            );
+            client.finish();
+            (first, last, set)
+        }
+    })
+    .await
+    .unwrap();
+
+    // The session never waited for the network: its own list had the configured models.
+    assert!(choice_values_flat(&first).contains(&"mock:test/model".to_owned()));
+    assert_eq!(group_names(&last), ["Configured", "mock"]);
+    let groups = last["options"].as_array().unwrap();
+    assert_eq!(groups[0]["group"], "configured");
+    assert!(groups[0]["options"][0]["value"] == "mock:test/model");
+    assert_eq!(
+        groups[1]["options"],
+        json!([
+            {"value": "mock:vendor/alpha", "name": "mock:vendor/alpha"},
+            {"value": "mock:vendor/beta", "name": "Beta, the second"}
+        ])
+    );
+    // And one of the fetched models can be picked.
+    let chosen = option(&set.response["result"]["configOptions"], "model");
+    assert_eq!(chosen["currentValue"], "mock:vendor/beta");
+}
+
+/// Every value in an option, whether its choices are flat or grouped.
+fn choice_values_flat(option: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    for entry in option["options"].as_array().unwrap() {
+        match entry["options"].as_array() {
+            Some(members) => values.extend(
+                members
+                    .iter()
+                    .map(|m| m["value"].as_str().unwrap().to_owned()),
+            ),
+            None => values.push(entry["value"].as_str().unwrap().to_owned()),
+        }
+    }
+    values
 }

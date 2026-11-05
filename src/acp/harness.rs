@@ -31,7 +31,7 @@
 
 use super::{
     Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, McpSpec,
-    Permission, PermissionRequest, Stop, ToolKind, TurnSink, Update,
+    Notifier, Permission, PermissionRequest, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
@@ -45,7 +45,7 @@ use crate::setup::{assemble_in, SetupError};
 use crate::tools::EditorFiles;
 use crate::types::{ApprovalMode, Role, ToolCall, ToolResult};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -53,6 +53,9 @@ use std::time::Duration;
 /// How long the editor has to answer a file request before the tool goes on without
 /// it (a read falls back to the disk; a write fails).
 const FILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Model lists by provider, shared with the threads that fetch them.
+type Catalogs = Arc<Mutex<BTreeMap<String, Vec<(String, String)>>>>;
 
 /// How many characters of a call's arguments go into its title.
 const TITLE_ARGS: usize = 100;
@@ -76,6 +79,14 @@ struct Session {
 /// Sessions on agent86's harness, driven on one single-threaded runtime.
 pub struct HarnessBackend {
     config: Config,
+    /// Model lists fetched from providers, by provider, as `provider:id` refs with
+    /// their labels. Filled by background threads; read when options are built.
+    catalogs: Catalogs,
+    /// The sessions that are open, so a list arriving late can be sent to each.
+    open: Arc<Mutex<Vec<String>>>,
+    notifier: Option<Notifier>,
+    /// Whether the lists have been asked for yet: once, on the first session.
+    lists_started: bool,
     client: ClientCapabilities,
     runtime: tokio::runtime::Runtime,
     sessions: HashMap<String, Session>,
@@ -88,6 +99,10 @@ impl HarnessBackend {
             .build()?;
         Ok(Self {
             config,
+            catalogs: Arc::default(),
+            open: Arc::default(),
+            notifier: None,
+            lists_started: false,
             client: ClientCapabilities::default(),
             runtime,
             sessions: HashMap::new(),
@@ -153,6 +168,11 @@ impl HarnessBackend {
             },
         };
         let session_id = state.session_id.clone();
+        self.open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session_id.clone());
+        self.start_model_lists();
         // The file tools use the editor's files when it offers any.
         if self.client.read_text_file || self.client.write_text_file {
             assembly.harness.context.editor = Some(Arc::new(AcpFiles {
@@ -322,6 +342,69 @@ impl HarnessBackend {
 }
 
 impl HarnessBackend {
+    /// Ask each provider that can answer for its model list, in the background, once.
+    /// A provider is asked when its key resolves (the environment, then the keyring),
+    /// or when it is Ollama, which has none. Each list that arrives is kept and every
+    /// open session told, so the picker fills in after the session is already usable;
+    /// a failure is a line on stderr and nothing else. `AGENT86_ACP_MODEL_LISTS`
+    /// narrows it: `off` asks nobody (a picker of just the configured models), and a
+    /// comma-separated list of provider names asks only those.
+    fn start_model_lists(&mut self) {
+        if std::mem::replace(&mut self.lists_started, true) {
+            return;
+        }
+        let setting = std::env::var("AGENT86_ACP_MODEL_LISTS").unwrap_or_default();
+        let only: Option<Vec<String>> = match setting.trim() {
+            "" => None,
+            "off" | "none" | "0" | "false" => return,
+            names => Some(
+                names
+                    .split(',')
+                    .map(|name| name.trim().to_owned())
+                    .collect(),
+            ),
+        };
+        for (name, section) in &self.config.providers {
+            if name == "llamacpp" || only.as_ref().is_some_and(|only| !only.contains(name)) {
+                continue;
+            }
+            // Resolved here: the keyring handle is not for other threads.
+            let key = crate::secrets::resolve_api_key(
+                name,
+                section.api_key_env.as_deref(),
+                &crate::secrets::OsKeyring,
+            );
+            if key.is_none() && name != "ollama" {
+                continue;
+            }
+            let (name, section) = (name.clone(), section.clone());
+            let catalogs = Arc::clone(&self.catalogs);
+            let open = Arc::clone(&self.open);
+            let notifier = self.notifier.clone();
+            std::thread::spawn(move || {
+                match crate::provider::catalog::fetch_catalog(&name, &section, key.as_deref()) {
+                    Ok(entries) => {
+                        let entries =
+                            crate::provider::catalog::prefix_catalog_refs(&name, &entries);
+                        catalogs
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(name, entries);
+                        let sessions = open.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                        if let Some(notify) = notifier {
+                            for id in sessions {
+                                notify(&id);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("acp: model list for '{name}' unavailable: {}", error.0)
+                    }
+                }
+            });
+        }
+    }
+
     /// The selectors an editor shows: the approval mode, and the models the config
     /// names (the default and the two routes, which is all the config lists) with
     /// the one in use, which `/model` may have set to something else.
@@ -338,6 +421,34 @@ impl HarnessBackend {
             }
         }
         let mode = session.harness.gate.mode();
+        // The configured models first, then each provider's own list, minus what is
+        // already above (a value must be listed once).
+        let labelled: Vec<(String, String)> = models
+            .iter()
+            .map(|model| (model.clone(), model.clone()))
+            .collect();
+        let mut groups = vec![("Configured".to_owned(), labelled.clone())];
+        let mut choices = labelled;
+        for (provider, entries) in self
+            .catalogs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let fresh: Vec<(String, String)> = entries
+                .iter()
+                .filter(|(value, _)| !choices.iter().any(|(known, _)| known == value))
+                .cloned()
+                .collect();
+            if !fresh.is_empty() {
+                choices.extend(fresh.iter().cloned());
+                groups.push((provider.clone(), fresh));
+            }
+        }
+        // One group would only add a heading to the short list.
+        if groups.len() == 1 {
+            groups.clear();
+        }
         vec![
             ConfigOption {
                 id: "mode".into(),
@@ -352,6 +463,7 @@ impl HarnessBackend {
                     .iter()
                     .map(|value| ((*value).to_owned(), (*value).to_owned()))
                     .collect(),
+                groups: Vec::new(),
             },
             ConfigOption {
                 id: "model".into(),
@@ -362,16 +474,18 @@ impl HarnessBackend {
                 ),
                 category: "model",
                 current: session.model_ref.clone(),
-                choices: models
-                    .into_iter()
-                    .map(|model| (model.clone(), model))
-                    .collect(),
+                choices,
+                groups,
             },
         ]
     }
 }
 
 impl Backend for HarnessBackend {
+    fn set_notifier(&mut self, notify: Notifier) {
+        self.notifier = Some(notify);
+    }
+
     fn config_options(&self, session_id: &str) -> Vec<ConfigOption> {
         self.sessions
             .get(session_id)

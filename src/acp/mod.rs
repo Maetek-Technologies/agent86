@@ -132,8 +132,12 @@ pub struct ConfigOption {
     pub category: &'static str,
     /// The value in force. Always one of `choices`.
     pub current: String,
-    /// `(value, label)` pairs.
+    /// Every `(value, label)` pair, flat: what a value is checked against.
     pub choices: Vec<(String, String)>,
+    /// The same choices under headings, `(heading, pairs)`, for a long list. When
+    /// there are groups the editor is sent these instead of `choices`, and they must
+    /// hold exactly the same values.
+    pub groups: Vec<(String, Vec<(String, String)>)>,
 }
 
 /// What the agent asks the editor to approve.
@@ -274,6 +278,10 @@ impl ClientCapabilities {
     }
 }
 
+/// Tells the connection that a session's config options changed on their own (a
+/// model list arrived), so it can send them again. Callable from any thread.
+pub type Notifier = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Stops a running turn; see [`Backend::cancel_handle`].
 pub type CancelHandle = Arc<dyn Fn() + Send + Sync>;
 
@@ -303,6 +311,9 @@ pub trait Backend: Send {
     fn run_command(&mut self, _session_id: &str, _line: &str) -> Option<String> {
         None
     }
+
+    /// Given once, before any session opens: how to say a session's options changed.
+    fn set_notifier(&mut self, _notify: Notifier) {}
 
     /// The settings the editor may show for a session, current values included.
     fn config_options(&self, _session_id: &str) -> Vec<ConfigOption> {
@@ -360,6 +371,8 @@ pub enum Event {
     ReadError(String),
     /// From the running turn.
     Turn(TurnMsg),
+    /// A session's config options changed outside any request (see [`Notifier`]).
+    OptionsChanged(String),
 }
 
 /// What a running turn tells the connection.
@@ -446,8 +459,12 @@ pub struct Server<B: Backend> {
 }
 
 impl<B: Backend> Server<B> {
-    pub fn new(backend: B) -> Self {
+    pub fn new(mut backend: B) -> Self {
         let (sender, events) = channel();
+        let notify = sender.clone();
+        backend.set_notifier(Arc::new(move |session_id| {
+            let _ = notify.send(Event::OptionsChanged(session_id.to_owned()));
+        }));
         Self {
             backend,
             initialized: false,
@@ -670,6 +687,9 @@ impl<B: Backend> Server<B> {
             closed,
             ..
         } = self;
+        // Sessions whose options changed while the turn ran: the backend is busy with
+        // the turn, so they are sent once it ends.
+        let mut changed: Vec<String> = Vec::new();
         let stop = std::thread::scope(|scope| {
             let done = sender.clone();
             let turn_session = session_id.clone();
@@ -718,6 +738,11 @@ impl<B: Backend> Server<B> {
                     }
                     Ok(Event::Turn(TurnMsg::Done(result))) => break result,
                     Ok(Event::Line(line)) => during_turn(&line, pending, &mut cancel, emit),
+                    Ok(Event::OptionsChanged(id)) => {
+                        if !changed.contains(&id) {
+                            changed.push(id);
+                        }
+                    }
                     Ok(Event::Invalid) => {
                         emit(error_response(Value::Null, PARSE_ERROR, "Parse error"))
                     }
@@ -731,6 +756,12 @@ impl<B: Backend> Server<B> {
             }
         });
         pending.clear();
+        for id in changed {
+            let options = self.backend.config_options(&id);
+            if !options.is_empty() {
+                emit(session_update(&id, &Update::Config(options)));
+            }
+        }
         // A cancelled turn is not an error and not an end of turn: whatever the
         // library underneath reported when its work was aborted, the answer is
         // `cancelled`.
@@ -1023,15 +1054,34 @@ fn config_options_json(options: &[ConfigOption]) -> Value {
         options
             .iter()
             .map(|option| {
+                let pairs = |pairs: &[(String, String)]| {
+                    pairs
+                        .iter()
+                        .map(|(value, name)| json!({ "value": value, "name": name }))
+                        .collect::<Vec<_>>()
+                };
+                let choices = if option.groups.is_empty() {
+                    pairs(&option.choices)
+                } else {
+                    option
+                        .groups
+                        .iter()
+                        .map(|(heading, members)| {
+                            json!({
+                                "group": heading.to_lowercase().replace(' ', "-"),
+                                "name": heading,
+                                "options": pairs(members)
+                            })
+                        })
+                        .collect()
+                };
                 let mut entry = json!({
                     "id": option.id,
                     "name": option.name,
                     "category": option.category,
                     "type": "select",
                     "currentValue": option.current,
-                    "options": option.choices.iter().map(|(value, name)| {
-                        json!({ "value": value, "name": name })
-                    }).collect::<Vec<_>>()
+                    "options": choices
                 });
                 if let Some(description) = &option.description {
                     entry["description"] = json!(description);
@@ -1254,6 +1304,12 @@ where
             Ok(Event::Eof) | Err(_) => break,
             // A turn's leftovers: the turn is over.
             Ok(Event::Turn(_)) => {}
+            Ok(Event::OptionsChanged(id)) => {
+                let options = server.backend.config_options(&id);
+                if !options.is_empty() {
+                    writer.send(session_update(&id, &Update::Config(options)));
+                }
+            }
         }
     }
     if let Some(error) = writer.failed {
@@ -1311,11 +1367,19 @@ mod tests {
         /// The settings offered; `set_config_option` changes `current` of the one
         /// named, if the value is one of its choices.
         options: Vec<ConfigOption>,
+        /// How the backend was told to say its options changed.
+        notify: Arc<Mutex<Option<Notifier>>>,
+        /// Whether the turn should announce a change to its options.
+        announce_during_turn: bool,
     }
 
     impl Backend for Script {
         fn commands(&self) -> Vec<CommandInfo> {
             self.offered.clone()
+        }
+
+        fn set_notifier(&mut self, notify: Notifier) {
+            *self.notify.lock().unwrap() = Some(notify);
         }
 
         fn config_options(&self, _session_id: &str) -> Vec<ConfigOption> {
@@ -1390,6 +1454,11 @@ mod tests {
             sink: Arc<dyn TurnSink>,
         ) -> Result<Stop, BackendError> {
             self.prompts.push((session_id.to_owned(), text.to_owned()));
+            if self.announce_during_turn {
+                let notify = self.notify.lock().unwrap().clone().unwrap();
+                notify(session_id);
+                notify(session_id);
+            }
             if self.clear_on_entry {
                 self.cancelled.store(false, Ordering::SeqCst);
             }
@@ -2347,6 +2416,7 @@ mod tests {
                 category: "mode",
                 current: "ask".into(),
                 choices: choices(&["ask", "auto", "deny"]),
+                groups: Vec::new(),
             },
             ConfigOption {
                 id: "model".into(),
@@ -2355,6 +2425,7 @@ mod tests {
                 category: "model",
                 current: "p:a".into(),
                 choices: choices(&["p:a", "p:b"]),
+                groups: Vec::new(),
             },
         ]
     }
@@ -2424,6 +2495,134 @@ mod tests {
         assert_eq!(reply["error"]["code"], INVALID_PARAMS);
         // Still as set before the refusals.
         assert_eq!(server.backend.options[1].current, "p:b");
+    }
+
+    #[test]
+    fn a_long_list_is_sent_under_headings_with_the_same_values() {
+        let mut options = mode_and_model();
+        options[1].groups = vec![
+            ("Configured".into(), vec![("p:a".into(), "p:a".into())]),
+            (
+                "Open Router".into(),
+                vec![("p:b".into(), "B, long name".into())],
+            ),
+        ];
+        let json = config_options_json(&options);
+        assert_eq!(
+            json[1]["options"],
+            json!([
+                {"group": "configured", "name": "Configured",
+                 "options": [{"value": "p:a", "name": "p:a"}]},
+                {"group": "open-router", "name": "Open Router",
+                 "options": [{"value": "p:b", "name": "B, long name"}]}
+            ])
+        );
+        // The short option is still flat.
+        assert_eq!(
+            json[0]["options"][0],
+            json!({"value": "ask", "name": "ASK"})
+        );
+    }
+
+    /// A reader the test feeds by hand, so the connection can sit idle.
+    struct Fed(std::sync::mpsc::Receiver<Vec<u8>>, Vec<u8>);
+
+    impl io::Read for Fed {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.1.is_empty() {
+                match self.0.recv() {
+                    Ok(bytes) => self.1 = bytes,
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = out.len().min(self.1.len());
+            out[..n].copy_from_slice(&self.1[..n]);
+            self.1.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// Collects what the connection writes, readable while it runs.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        fn wait_for(&self, needle: &str) {
+            let start = Instant::now();
+            while !self.text().contains(needle) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "never saw {needle}: {}",
+                    self.text()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn an_idle_connection_sends_new_options_when_the_backend_says_they_changed() {
+        let script = Script {
+            options: mode_and_model(),
+            ..Script::default()
+        };
+        let notify = Arc::clone(&script.notify);
+        let (feed, reader) = std::sync::mpsc::channel();
+        let output = Shared::default();
+        let writer = output.clone();
+        let connection = std::thread::spawn(move || {
+            serve(io::BufReader::new(Fed(reader, Vec::new())), writer, script).unwrap();
+        });
+        feed.send(format!("{INITIALIZE}\n").into_bytes()).unwrap();
+        output.wait_for("\"protocolVersion\"");
+        // Nothing asked: the backend alone decides when to say it.
+        let notifier = notify.lock().unwrap().clone().expect("given a notifier");
+        notifier("sess_7");
+        output.wait_for("config_option_update");
+        drop(feed);
+        connection.join().unwrap();
+        let text = output.text();
+        let update: Value = serde_json::from_str(
+            text.lines()
+                .find(|line| line.contains("config_option_update"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(update["params"]["sessionId"], "sess_7");
+        assert_eq!(update["params"]["update"]["configOptions"][0]["id"], "mode");
+    }
+
+    #[test]
+    fn a_change_during_a_turn_is_sent_once_after_it_before_the_response() {
+        let mut server = ready();
+        server.backend.options = mode_and_model();
+        server.backend.announce_during_turn = true;
+        let out = replies(&mut server, &prompt_line(HI));
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|m| {
+                m["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap_or("response")
+            })
+            .collect();
+        // Told twice, sent once.
+        assert_eq!(kinds, ["config_option_update", "response"]);
+        assert_eq!(out[0]["params"]["sessionId"], "sess_1");
     }
 
     #[test]
