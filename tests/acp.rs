@@ -240,9 +240,14 @@ impl Client {
     }
 
     fn new_session(&mut self, cwd: &std::path::Path) -> String {
+        self.new_session_with(cwd, json!([]))
+    }
+
+    /// `session/new` naming MCP servers, as an editor does.
+    fn new_session_with(&mut self, cwd: &std::path::Path, servers: Value) -> String {
         let exchange = self.request(
             "session/new",
-            json!({"cwd": cwd.to_str().unwrap(), "mcpServers": []}),
+            json!({"cwd": cwd.to_str().unwrap(), "mcpServers": servers}),
         );
         exchange.response["result"]["sessionId"]
             .as_str()
@@ -821,4 +826,193 @@ async fn a_saved_session_loads_with_its_history_replayed_and_goes_on() {
     assert!(sent.contains("What is here?"), "{sent}");
     assert!(sent.contains("One directory."), "{sent}");
     assert!(sent.contains("And again?"), "{sent}");
+}
+
+/// `python3` or `python`, whichever runs; the live-server tests skip without one.
+fn python() -> Option<&'static str> {
+    ["python3", "python"].into_iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+}
+
+fn mcp_script() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp/server.py")
+        .display()
+        .to_string()
+}
+
+/// One turn against a session that names `servers`; the model makes `calls` (each its
+/// own step) and then says "Done.". The user allows what is asked. Returns the
+/// exchange, the requests the model received, and what the agent said on stderr.
+async fn mcp_turn(
+    name: &str,
+    servers: Value,
+    calls: Vec<(&'static str, &'static str, String)>,
+) -> (Exchange, Vec<support::Recorded>, String) {
+    let mut replies: Vec<Reply> = calls
+        .iter()
+        .map(|(id, tool, arguments)| sse_tool_calls(&[(id, tool, arguments.as_str())]))
+        .collect();
+    replies.push(sse_text("Done.", "stop"));
+    let server = MockServer::start(replies).await;
+    let workspace = Workspace::new(name, Some(&server));
+    let (exchange, output) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session_with(&project, servers);
+            let exchange = client.prompt(&session, "Use the tools");
+            (exchange, client.finish())
+        }
+    })
+    .await
+    .unwrap();
+    (
+        exchange,
+        server.requests(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn a_stdio_server_the_editor_names_is_started_and_its_tools_are_used() {
+    let Some(python) = python() else { return };
+    let servers = json!([{
+        "name": "fx", "command": python, "args": [mcp_script(), "normal"], "env": []
+    }]);
+    let (exchange, requests, _) = mcp_turn(
+        "mcp-stdio",
+        servers,
+        vec![
+            ("c_add", "mcp__fx__add", r#"{"a":2,"b":3}"#.to_owned()),
+            ("c_echo", "mcp__fx__echo", r#"{"text":"hello"}"#.to_owned()),
+        ],
+    )
+    .await;
+
+    // The model was offered the editor's server's tools.
+    assert!(requests[0].body["tools"]
+        .to_string()
+        .contains("mcp__fx__add"));
+    // The read-only one ran unasked; the other was put to the user.
+    assert_eq!(exchange.requests.len(), 1);
+    assert_eq!(
+        exchange.requests[0]["params"]["toolCall"]["toolCallId"],
+        "c_echo"
+    );
+    assert_eq!(exchange.requests[0]["params"]["toolCall"]["kind"], "other");
+    let results: Vec<&Value> = exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "tool_call_update")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["status"], "completed");
+    assert!(results[0]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains('5'));
+    assert!(results[1]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("hello"));
+    assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test]
+async fn values_the_editor_sends_are_literal_and_never_expanded_from_the_agents_environment() {
+    let Some(python) = python() else { return };
+    // The test's environment holds AGENT86_TEST_MOCK_KEY; a `${...}` reference to it
+    // in a value from the editor must reach the server as the text it is.
+    let servers = json!([{
+        "name": "fx", "command": python, "args": [mcp_script(), "normal"],
+        "env": [{"name": "MCP_TEST_TOKEN", "value": "${AGENT86_TEST_MOCK_KEY}"}]
+    }]);
+    let (exchange, _, _) = mcp_turn(
+        "mcp-literal",
+        servers,
+        vec![("c1", "mcp__fx__secret", "{}".to_owned())],
+    )
+    .await;
+    let result = exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "tool_call_update")
+        .expect("the call finished");
+    let text = result["content"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("token=${AGENT86_TEST_MOCK_KEY}"), "{text}");
+    assert!(!text.contains("sk-test-"), "{text}");
+}
+
+/// The fixture server speaking streamable HTTP, stopped when dropped.
+struct HttpServer {
+    child: Child,
+    port: u16,
+}
+
+impl HttpServer {
+    fn start(python: &str) -> Self {
+        let mut child = Command::new(python)
+            .args([mcp_script().as_str(), "http"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port = line.trim().strip_prefix("PORT ").unwrap().parse().unwrap();
+        Self { child, port }
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn an_http_server_the_editor_names_gets_the_editors_headers() {
+    let Some(python) = python() else { return };
+    let http = HttpServer::start(python);
+    let servers = json!([{
+        "type": "http", "name": "web", "url": format!("http://127.0.0.1:{}/mcp", http.port),
+        "headers": [{"name": "Authorization", "value": "Bearer from-the-editor"}]
+    }]);
+    let (exchange, _, _) = mcp_turn(
+        "mcp-http",
+        servers,
+        vec![("c1", "mcp__web__headers", "{}".to_owned())],
+    )
+    .await;
+    let result = exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "tool_call_update")
+        .expect("the call finished");
+    let text = result["content"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("Bearer from-the-editor"), "{text}");
+}
+
+#[tokio::test]
+async fn a_server_that_will_not_start_does_not_stop_the_session() {
+    let servers = json!([
+        {"name": "broken", "command": "/definitely/not/a/program", "args": [], "env": []}
+    ]);
+    let (exchange, _, stderr) = mcp_turn("mcp-broken", servers, vec![]).await;
+    assert_eq!(exchange.text_of("agent_message_chunk"), "Done.");
+    assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
+    assert!(stderr.contains("MCP server 'broken'"), "{stderr}");
+    assert!(stderr.contains("failed to start"), "{stderr}");
 }

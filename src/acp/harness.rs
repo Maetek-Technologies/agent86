@@ -19,17 +19,22 @@
 //! as updates; the saved state keeps no per-call status or reasoning, so a replayed
 //! call is shown `completed` and thoughts are not replayed.
 //!
-//! Not built yet: connecting the client's MCP servers.
+//! The MCP servers the client names are started for the session and their tools
+//! registered beside the built-ins and the configured servers', behind the same
+//! approvals. They run as the user, like configured ones; the editor chose them.
+//! A server that fails to start is reported on stderr and the session goes on.
 
 use super::{
-    Backend, BackendError, CancelHandle, Permission, PermissionRequest, Stop, ToolKind, TurnSink,
-    Update,
+    Backend, BackendError, CancelHandle, McpSpec, Permission, PermissionRequest, Stop, ToolKind,
+    TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
-use crate::config::Config;
+use crate::config::{Config, McpServerConfig};
 use crate::escape::show_controls;
+use crate::mcp::{var_ref_names, McpManager};
 use crate::pyjson::python_json_dumps;
+use crate::secrets::NoSecretStore;
 use crate::session::{AgentState, SessionStore};
 use crate::setup::{assemble_in, SetupError};
 use crate::types::{Role, ToolCall, ToolResult};
@@ -78,7 +83,7 @@ impl HarnessBackend {
     fn open(
         &mut self,
         cwd: &Path,
-        mcp_servers: usize,
+        mcp_servers: Vec<McpSpec>,
         resume: Option<&str>,
     ) -> Result<String, BackendError> {
         // No terminal prompt and no secret store: the editor is asked instead (below),
@@ -95,12 +100,7 @@ impl HarnessBackend {
         if let Some(note) = &assembly.sandbox_note {
             eprintln!("sandbox: {note}");
         }
-        if mcp_servers > 0 {
-            eprintln!(
-                "acp: the client named {mcp_servers} MCP server(s); connecting them is not \
-                 supported yet, so only the configured servers are used"
-            );
-        }
+        start_client_servers(&self.config, &mut assembly.harness, &mcp_servers);
 
         // Approvals go to the editor, through whichever sink the running turn has.
         let sink: SinkSlot = Arc::default();
@@ -148,7 +148,11 @@ impl HarnessBackend {
 }
 
 impl Backend for HarnessBackend {
-    fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError> {
+    fn new_session(
+        &mut self,
+        cwd: &Path,
+        mcp_servers: Vec<McpSpec>,
+    ) -> Result<String, BackendError> {
         self.open(cwd, mcp_servers, None)
     }
 
@@ -156,7 +160,7 @@ impl Backend for HarnessBackend {
         &mut self,
         session_id: &str,
         cwd: &Path,
-        mcp_servers: usize,
+        mcp_servers: Vec<McpSpec>,
     ) -> Result<Vec<Update>, BackendError> {
         // Already open in this process: its harness stays, and its history replays.
         if !self.sessions.contains_key(session_id) {
@@ -232,6 +236,101 @@ impl Backend for HarnessBackend {
             Err(error) => Err(BackendError::internal(error.to_string())),
         }
     }
+}
+
+/// Start the servers the client named and register their tools. A session with no
+/// configured servers has no manager yet, so one is made. A server the client names
+/// replaces a configured one of the same name for this session only: each session
+/// has its own manager.
+fn start_client_servers(config: &Config, harness: &mut Harness, servers: &[McpSpec]) {
+    if servers.is_empty() {
+        return;
+    }
+    let manager = match &harness.mcp {
+        Some(manager) => Arc::clone(manager),
+        None => {
+            let manager = Arc::new(McpManager::empty(config));
+            manager.attach(&harness.registry);
+            harness.mcp = Some(Arc::clone(&manager));
+            manager
+        }
+    };
+    for spec in servers {
+        let (server, literal) = server_config(spec);
+        let name = spec.name();
+        match manager.start_server(
+            name,
+            &server,
+            &literal,
+            &NoSecretStore,
+            server.connect_timeout_s,
+        ) {
+            Ok(_) => {
+                let (_, collisions) = manager.mount(name);
+                if !collisions.is_empty() {
+                    eprintln!(
+                        "acp: MCP server '{name}': tools already taken by another server \
+                         were skipped: {}",
+                        collisions.join(", ")
+                    );
+                }
+            }
+            Err(reason) => {
+                eprintln!("acp: MCP server '{name}' from the client failed to start: {reason}");
+            }
+        }
+    }
+}
+
+/// The config for a server the client named, and the overrides that keep every
+/// `${VAR}` in its values literal. The config layer expands `${VAR}` from the
+/// environment and the keyring, which is right for a file the user wrote and wrong
+/// for a value that arrives over the protocol: it must not be able to ask for the
+/// agent's own keys. An override wins over both, so each reference maps to itself.
+fn server_config(spec: &McpSpec) -> (McpServerConfig, HashMap<String, String>) {
+    let mut texts: Vec<&str> = Vec::new();
+    let value = match spec {
+        McpSpec::Stdio {
+            command, args, env, ..
+        } => {
+            texts.extend(args.iter().map(String::as_str));
+            texts.extend(env.iter().map(|(_, value)| value.as_str()));
+            serde_json::json!({
+                "command": command,
+                "args": args,
+                "env": pairs_object(env),
+                "transport": "stdio",
+            })
+        }
+        McpSpec::Remote {
+            url, sse, headers, ..
+        } => {
+            texts.push(url);
+            texts.extend(headers.iter().map(|(_, value)| value.as_str()));
+            serde_json::json!({
+                "url": url,
+                "headers": pairs_object(headers),
+                "transport": if *sse { "sse" } else { "http" },
+            })
+        }
+    };
+    let literal = texts
+        .iter()
+        .flat_map(|text| var_ref_names(text))
+        .map(|name| (name.clone(), format!("${{{name}}}")))
+        .collect();
+    let config = serde_json::from_value(value).expect("a server config always deserializes");
+    (config, literal)
+}
+
+/// `[(name, value)]` as a JSON object, in order.
+fn pairs_object(pairs: &[(String, String)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect(),
+    )
 }
 
 /// A session's saved messages as the updates that tell them again: the user's

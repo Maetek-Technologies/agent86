@@ -179,23 +179,56 @@ impl BackendError {
     }
 }
 
+/// An MCP server the client asked the agent to connect to, as `session/new` and
+/// `session/load` name it. Values are literal: the client wrote them, and
+/// `${VAR}` in one is not a reference to the agent's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpSpec {
+    /// A local subprocess speaking MCP on its stdin and stdout.
+    Stdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    /// A remote server over streamable HTTP, or over the older SSE transport.
+    Remote {
+        name: String,
+        url: String,
+        sse: bool,
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl McpSpec {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Stdio { name, .. } | Self::Remote { name, .. } => name,
+        }
+    }
+}
+
 /// Stops a running turn; see [`Backend::cancel_handle`].
 pub type CancelHandle = Arc<dyn Fn() + Send + Sync>;
 
 /// The agent behind the protocol. `Send`, because a turn runs on a worker thread.
 pub trait Backend: Send {
     /// Open a session jailed to `cwd` (an absolute path) and return its id.
-    /// `mcp_servers` is how many servers the client named; none are connected yet.
-    fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError>;
+    /// `mcp_servers` are the servers the client asked the agent to connect to.
+    fn new_session(
+        &mut self,
+        cwd: &Path,
+        mcp_servers: Vec<McpSpec>,
+    ) -> Result<String, BackendError>;
 
     /// Open an existing session and return its history as updates to replay, in
     /// order, or a `not_found` error when there is no such session. The client's
-    /// `cwd` and server count are as for [`Backend::new_session`].
+    /// `cwd` and servers are as for [`Backend::new_session`].
     fn load_session(
         &mut self,
         session_id: &str,
         cwd: &Path,
-        mcp_servers: usize,
+        mcp_servers: Vec<McpSpec>,
     ) -> Result<Vec<Update>, BackendError>;
 
     /// How to stop `session_id`'s running turn at its next safe point, callable from
@@ -503,8 +536,8 @@ impl<B: Backend> Server<B> {
     }
 }
 
-/// The `cwd` (absolute) and the number of `mcpServers` a session request names.
-fn session_location(params: &Value) -> Result<(String, usize), BackendError> {
+/// The `cwd` (absolute) and the `mcpServers` a session request names.
+fn session_location(params: &Value) -> Result<(String, Vec<McpSpec>), BackendError> {
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
@@ -515,8 +548,12 @@ fn session_location(params: &Value) -> Result<(String, usize), BackendError> {
         ));
     }
     let servers = match params.get("mcpServers") {
-        None | Some(Value::Null) => 0,
-        Some(Value::Array(servers)) => servers.len(),
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(servers)) => servers
+            .iter()
+            .map(parse_mcp_server)
+            .collect::<Result<_, _>>()
+            .map_err(BackendError::invalid_params)?,
         Some(_) => {
             return Err(BackendError::invalid_params(
                 "Invalid params: mcpServers must be an array",
@@ -524,6 +561,78 @@ fn session_location(params: &Value) -> Result<(String, usize), BackendError> {
         }
     };
     Ok((cwd.to_owned(), servers))
+}
+
+/// One entry of `mcpServers`: `stdio` (no `type`, with a `command`), `http`, or `sse`.
+fn parse_mcp_server(server: &Value) -> Result<McpSpec, String> {
+    let object = server
+        .as_object()
+        .ok_or("Invalid params: an MCP server must be an object")?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    let name = text("name").ok_or("Invalid params: an MCP server needs a name")?;
+    match object.get("type").and_then(Value::as_str) {
+        Some(kind @ ("http" | "sse")) => Ok(McpSpec::Remote {
+            name: name.to_owned(),
+            url: text("url")
+                .ok_or_else(|| format!("Invalid params: MCP server '{name}' needs a url"))?
+                .to_owned(),
+            sse: kind == "sse",
+            headers: name_value_pairs(object.get("headers"), name, "headers")?,
+        }),
+        Some(other) => Err(format!(
+            "Invalid params: MCP server '{name}' has unknown type '{other}'"
+        )),
+        None => Ok(McpSpec::Stdio {
+            name: name.to_owned(),
+            command: text("command")
+                .ok_or_else(|| format!("Invalid params: MCP server '{name}' needs a command"))?
+                .to_owned(),
+            args: match object.get("args") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(args)) => args
+                    .iter()
+                    .map(|arg| {
+                        arg.as_str().map(str::to_owned).ok_or_else(|| {
+                            format!("Invalid params: MCP server '{name}' args must be strings")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => {
+                    return Err(format!(
+                        "Invalid params: MCP server '{name}' args must be an array"
+                    ))
+                }
+            },
+            env: name_value_pairs(object.get("env"), name, "env")?,
+        }),
+    }
+}
+
+/// `[{"name": .., "value": ..}]`, as `env` and `headers` are written.
+fn name_value_pairs(
+    value: Option<&Value>,
+    server: &str,
+    field: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let bad =
+        || format!("Invalid params: MCP server '{server}' {field} must be name and value pairs");
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let name = item.get("name").and_then(Value::as_str).ok_or_else(bad)?;
+                let value = item.get("value").and_then(Value::as_str).ok_or_else(bad)?;
+                Ok((name.to_owned(), value.to_owned()))
+            })
+            .collect(),
+        Some(_) => Err(bad()),
+    }
 }
 
 /// How an inbound message reads.
@@ -786,8 +895,8 @@ fn initialize(params: &Value) -> Result<Value, String> {
                 "embeddedContext": false
             },
             "mcpCapabilities": {
-                "http": false,
-                "sse": false
+                "http": true,
+                "sse": true
             }
         },
         "agentInfo": {
@@ -920,7 +1029,7 @@ mod tests {
     /// queued, then ends the way it says.
     #[derive(Default)]
     struct Script {
-        sessions: Vec<(String, usize)>,
+        sessions: Vec<(String, Vec<McpSpec>)>,
         prompts: Vec<(String, String)>,
         acts: Vec<Act>,
         answers: Arc<Mutex<Vec<Permission>>>,
@@ -929,7 +1038,7 @@ mod tests {
         /// What `load_session` replays, and whether it finds the session at all.
         history: Vec<Update>,
         missing: bool,
-        loads: Vec<(String, String, usize)>,
+        loads: Vec<(String, String, Vec<McpSpec>)>,
         /// Set by the cancel handle.
         cancelled: Arc<AtomicBool>,
         /// After its acts, the turn waits (up to five seconds) for a cancel.
@@ -939,7 +1048,11 @@ mod tests {
     }
 
     impl Backend for Script {
-        fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError> {
+        fn new_session(
+            &mut self,
+            cwd: &Path,
+            mcp_servers: Vec<McpSpec>,
+        ) -> Result<String, BackendError> {
             self.sessions
                 .push((cwd.to_string_lossy().into_owned(), mcp_servers));
             Ok(format!("sess_{}", self.sessions.len()))
@@ -949,7 +1062,7 @@ mod tests {
             &mut self,
             session_id: &str,
             cwd: &Path,
-            mcp_servers: usize,
+            mcp_servers: Vec<McpSpec>,
         ) -> Result<Vec<Update>, BackendError> {
             self.loads.push((
                 session_id.to_owned(),
@@ -1041,8 +1154,8 @@ mod tests {
         assert_eq!(capabilities["promptCapabilities"]["image"], false);
         assert_eq!(capabilities["promptCapabilities"]["audio"], false);
         assert_eq!(capabilities["promptCapabilities"]["embeddedContext"], false);
-        assert_eq!(capabilities["mcpCapabilities"]["http"], false);
-        assert_eq!(capabilities["mcpCapabilities"]["sse"], false);
+        assert_eq!(capabilities["mcpCapabilities"]["http"], true);
+        assert_eq!(capabilities["mcpCapabilities"]["sse"], true);
         assert!(server.initialized());
     }
 
@@ -1142,15 +1255,83 @@ mod tests {
         let mut server = ready();
         let cwd = std::env::temp_dir();
         let line = json!({"jsonrpc":"2.0","id":1,"method":"session/new",
-            "params":{"cwd": cwd, "mcpServers":[{"name":"a"},{"name":"b"}]}})
+            "params":{"cwd": cwd, "mcpServers": mcp_servers_json()}})
         .to_string();
         let reply = one(&mut server, &line);
         assert_eq!(reply["id"], 1);
         assert_eq!(reply["result"]["sessionId"], "sess_1");
         assert_eq!(
             server.backend.sessions,
-            vec![(cwd.to_string_lossy().into_owned(), 2)]
+            vec![(cwd.to_string_lossy().into_owned(), mcp_specs())]
         );
+    }
+
+    /// One server of each kind, as an editor writes them.
+    fn mcp_servers_json() -> Value {
+        json!([
+            {"name": "files", "command": "/bin/mcp-files", "args": ["--stdio", "/w"],
+             "env": [{"name": "TOKEN", "value": "${HOME}/x"}]},
+            {"type": "http", "name": "docs", "url": "https://h.example/mcp",
+             "headers": [{"name": "Authorization", "value": "Bearer abc"}]},
+            {"type": "sse", "name": "legacy", "url": "https://h.example/sse", "headers": []},
+            {"name": "bare", "command": "mcp-bare"}
+        ])
+    }
+
+    fn mcp_specs() -> Vec<McpSpec> {
+        vec![
+            McpSpec::Stdio {
+                name: "files".into(),
+                command: "/bin/mcp-files".into(),
+                args: vec!["--stdio".into(), "/w".into()],
+                env: vec![("TOKEN".into(), "${HOME}/x".into())],
+            },
+            McpSpec::Remote {
+                name: "docs".into(),
+                url: "https://h.example/mcp".into(),
+                sse: false,
+                headers: vec![("Authorization".into(), "Bearer abc".into())],
+            },
+            McpSpec::Remote {
+                name: "legacy".into(),
+                url: "https://h.example/sse".into(),
+                sse: true,
+                headers: vec![],
+            },
+            McpSpec::Stdio {
+                name: "bare".into(),
+                command: "mcp-bare".into(),
+                args: vec![],
+                env: vec![],
+            },
+        ]
+    }
+
+    #[test]
+    fn bad_mcp_servers_are_refused_before_a_session_opens() {
+        let mut server = ready();
+        let cwd = std::env::temp_dir();
+        for bad in [
+            json!(["not an object"]),
+            json!([{"command": "x"}]),
+            json!([{"name": "", "command": "x"}]),
+            json!([{"name": "a"}]),
+            json!([{"name": "a", "command": ""}]),
+            json!([{"name": "a", "command": "x", "args": "no"}]),
+            json!([{"name": "a", "command": "x", "args": [1]}]),
+            json!([{"name": "a", "command": "x", "env": [{"name": "K"}]}]),
+            json!([{"name": "a", "command": "x", "env": "K=V"}]),
+            json!([{"type": "http", "name": "a"}]),
+            json!([{"type": "http", "name": "a", "url": "u", "headers": [{"value": "v"}]}]),
+            json!([{"type": "websocket", "name": "a", "url": "u"}]),
+        ] {
+            let line = json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+                "params":{"cwd": cwd, "mcpServers": bad}})
+            .to_string();
+            let reply = one(&mut server, &line);
+            assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{bad}");
+        }
+        assert!(server.backend.sessions.is_empty());
     }
 
     #[test]
@@ -1560,7 +1741,7 @@ mod tests {
 
     fn load_line(session: &str, cwd: &str) -> String {
         json!({"jsonrpc":"2.0","id":8,"method":"session/load",
-            "params":{"sessionId": session, "cwd": cwd, "mcpServers":[{"name":"m"}]}})
+            "params":{"sessionId": session, "cwd": cwd, "mcpServers": mcp_servers_json()}})
         .to_string()
     }
 
@@ -1611,7 +1792,11 @@ mod tests {
         assert_eq!(out[4]["result"], json!({}));
         assert_eq!(
             server.backend.loads,
-            vec![("sess_9".to_owned(), cwd.to_string_lossy().into_owned(), 1)]
+            vec![(
+                "sess_9".to_owned(),
+                cwd.to_string_lossy().into_owned(),
+                mcp_specs()
+            )]
         );
     }
 
