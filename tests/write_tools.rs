@@ -821,3 +821,230 @@ fn a_per_call_prompt_is_given_the_call_and_the_modes_still_apply() {
     assert_eq!(reason(&auto, &write, &config), (true, "approved by user"));
     assert_eq!(*asked.lock().unwrap(), ["call-1"]);
 }
+
+/// An editor's files, for the tests: what it holds in buffers, what it was asked to
+/// write, and whether it takes writes at all.
+#[derive(Debug, Default)]
+struct FakeEditor {
+    buffers: Mutex<std::collections::HashMap<PathBuf, String>>,
+    writes: Mutex<Vec<(PathBuf, String)>>,
+    reads: Mutex<Vec<PathBuf>>,
+    /// `None`: writes are not offered; `Some(message)`: the editor refuses.
+    refuse_with: Mutex<Option<String>>,
+    takes_writes: bool,
+}
+
+impl agent86::tools::EditorFiles for FakeEditor {
+    fn read_text(&self, path: &std::path::Path) -> Option<String> {
+        self.reads.lock().unwrap().push(path.to_owned());
+        self.buffers.lock().unwrap().get(path).cloned()
+    }
+
+    fn write_text(&self, path: &std::path::Path, content: &str) -> Option<Result<(), String>> {
+        if !self.takes_writes {
+            return None;
+        }
+        if let Some(message) = self.refuse_with.lock().unwrap().clone() {
+            return Some(Err(message));
+        }
+        self.writes
+            .lock()
+            .unwrap()
+            .push((path.to_owned(), content.to_owned()));
+        self.buffers
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), content.to_owned());
+        Some(Ok(()))
+    }
+}
+
+/// A workspace whose context has `editor` installed, and the path the file tools
+/// will name `relative` by.
+fn with_editor(
+    workspace: &Workspace,
+    editor: &Arc<FakeEditor>,
+    relative: &str,
+) -> (ToolContext, PathBuf) {
+    let mut ctx = workspace.context();
+    ctx.editor = Some(editor.clone());
+    let absolute = workspace.root.canonicalize().unwrap().join(relative);
+    (ctx, absolute)
+}
+
+#[test]
+fn with_an_editor_reads_see_its_buffer_and_fall_back_to_the_disk() {
+    let workspace = Workspace::new("editor-read");
+    workspace.write("a.txt", b"saved\n");
+    workspace.write("b.txt", b"only on disk\n");
+    let editor = Arc::new(FakeEditor::default());
+    let (ctx, a) = with_editor(&workspace, &editor, "a.txt");
+    editor
+        .buffers
+        .lock()
+        .unwrap()
+        .insert(a.clone(), "unsaved changes\n".into());
+
+    // The editor's buffer wins, and the tool asked for the absolute path.
+    let result = dispatch(&ctx, "read_file", json!({"path": "a.txt"}));
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.content, "unsaved changes\n");
+    assert_eq!(editor.reads.lock().unwrap().first(), Some(&a));
+    // A file the editor has nothing for is read from the disk.
+    let result = dispatch(&ctx, "read_file", json!({"path": "b.txt"}));
+    assert_eq!(result.content, "only on disk\n");
+    // A file that is on neither still says so.
+    let result = dispatch(&ctx, "read_file", json!({"path": "nope.txt"}));
+    assert!(!result.ok);
+    assert!(error_of(&result).contains("No such file"), "{result:?}");
+}
+
+#[test]
+fn with_an_editor_writes_go_through_it_and_diffs_are_against_its_buffer() {
+    let workspace = Workspace::new("editor-write");
+    workspace.write("a.txt", b"saved\n");
+    let editor = Arc::new(FakeEditor {
+        takes_writes: true,
+        ..FakeEditor::default()
+    });
+    let (ctx, a) = with_editor(&workspace, &editor, "a.txt");
+    editor
+        .buffers
+        .lock()
+        .unwrap()
+        .insert(a.clone(), "unsaved\n".into());
+
+    // The approval preview is the change from what the user sees.
+    let registry = builtin_registry();
+    let write = registry.get("write_file").unwrap();
+    let call = call(
+        "write_file",
+        json!({"path": "a.txt", "content": "replaced\n"}),
+    );
+    let preview = build_preview(write.as_ref(), &call, &ctx);
+    let detail = preview.detail.unwrap();
+    assert!(
+        detail.contains("-unsaved") && detail.contains("+replaced"),
+        "{detail}"
+    );
+
+    let result = dispatch(
+        &ctx,
+        "write_file",
+        json!({"path": "a.txt", "content": "replaced\n"}),
+    );
+    assert!(result.ok, "{result:?}");
+    assert!(result.content.contains("-unsaved"), "{}", result.content);
+    // The editor was asked to write; the disk was not touched.
+    assert_eq!(
+        *editor.writes.lock().unwrap(),
+        [(a.clone(), "replaced\n".to_owned())]
+    );
+    assert_eq!(workspace.read("a.txt"), b"saved\n");
+    assert_eq!(result.metadata["created"], json!(false));
+
+    // A file the editor does not know and the disk lacks is new, and still goes
+    // through the editor, with its parent directory made.
+    let result = dispatch(
+        &ctx,
+        "write_file",
+        json!({"path": "sub/new.txt", "content": "x\n"}),
+    );
+    assert_eq!(result.metadata["created"], json!(true), "{result:?}");
+    assert_eq!(editor.writes.lock().unwrap().len(), 2);
+    assert!(!workspace.root.join("sub/new.txt").exists());
+    assert!(workspace.root.join("sub").is_dir());
+}
+
+#[test]
+fn with_an_editor_edit_file_edits_its_buffer() {
+    let workspace = Workspace::new("editor-edit");
+    workspace.write("a.txt", b"on disk\n");
+    let editor = Arc::new(FakeEditor {
+        takes_writes: true,
+        ..FakeEditor::default()
+    });
+    let (ctx, a) = with_editor(&workspace, &editor, "a.txt");
+    // The text to replace is only in the unsaved buffer.
+    editor
+        .buffers
+        .lock()
+        .unwrap()
+        .insert(a.clone(), "one\ntwo\nthree\n".into());
+
+    let result = dispatch(
+        &ctx,
+        "edit_file",
+        json!({"path": "a.txt", "old_string": "two", "new_string": "2"}),
+    );
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        *editor.writes.lock().unwrap(),
+        [(a, "one\n2\nthree\n".to_owned())]
+    );
+    assert_eq!(workspace.read("a.txt"), b"on disk\n");
+}
+
+#[test]
+fn an_editor_that_refuses_a_write_fails_the_call_without_writing_the_disk() {
+    let workspace = Workspace::new("editor-refuse");
+    workspace.write("a.txt", b"saved\n");
+    let editor = Arc::new(FakeEditor {
+        takes_writes: true,
+        ..FakeEditor::default()
+    });
+    *editor.refuse_with.lock().unwrap() = Some("the buffer is read-only".into());
+    let (ctx, _) = with_editor(&workspace, &editor, "a.txt");
+
+    for (name, arguments) in [
+        ("write_file", json!({"path": "a.txt", "content": "x\n"})),
+        (
+            "edit_file",
+            json!({"path": "a.txt", "old_string": "saved", "new_string": "x"}),
+        ),
+    ] {
+        let result = dispatch(&ctx, name, arguments);
+        assert!(!result.ok, "{name}: {result:?}");
+        assert!(
+            error_of(&result).contains("the buffer is read-only"),
+            "{name}: {result:?}"
+        );
+        assert_eq!(workspace.read("a.txt"), b"saved\n", "{name}");
+    }
+}
+
+#[test]
+fn an_editor_that_does_not_take_writes_leaves_them_to_the_disk() {
+    let workspace = Workspace::new("editor-no-writes");
+    workspace.write("a.txt", b"saved\n");
+    let editor = Arc::new(FakeEditor::default());
+    let (ctx, _) = with_editor(&workspace, &editor, "a.txt");
+
+    let result = dispatch(
+        &ctx,
+        "write_file",
+        json!({"path": "a.txt", "content": "new\n"}),
+    );
+    assert!(result.ok, "{result:?}");
+    assert_eq!(workspace.read("a.txt"), b"new\n");
+    assert!(editor.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn without_an_editor_nothing_changes() {
+    let workspace = Workspace::new("no-editor");
+    workspace.write("a.txt", b"saved\n");
+    let ctx = workspace.context();
+    assert!(ctx.editor.is_none());
+    let result = dispatch(
+        &ctx,
+        "write_file",
+        json!({"path": "a.txt", "content": "new\n"}),
+    );
+    assert!(result.ok);
+    assert_eq!(workspace.read("a.txt"), b"new\n");
+    assert_eq!(
+        dispatch(&ctx, "read_file", json!({"path": "a.txt"})).content,
+        "new\n"
+    );
+}

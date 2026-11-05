@@ -102,6 +102,8 @@ impl Workspace {
             choose: Some("allow-once"),
             cancel_on_update: None,
             cancel_on_request: None,
+            buffers: Default::default(),
+            refuse_writes: None,
         }
     }
 }
@@ -126,6 +128,11 @@ struct Client {
     /// Send `session/cancel` for this session when a permission request arrives,
     /// just before answering it.
     cancel_on_request: Option<String>,
+    /// The files this editor holds, by absolute path, which it serves to the
+    /// agent's `fs/*` requests; writes land here too.
+    buffers: std::collections::HashMap<String, String>,
+    /// A message to refuse every `fs/write_text_file` with.
+    refuse_writes: Option<&'static str>,
 }
 
 /// What came back for one request: the notifications before its response, and the
@@ -134,6 +141,8 @@ struct Exchange {
     updates: Vec<Value>,
     /// The permission requests the agent made, as received.
     requests: Vec<Value>,
+    /// The `fs/*` requests the agent made, as received.
+    files: Vec<Value>,
     response: Value,
 }
 
@@ -175,6 +184,7 @@ impl Client {
         stdin.flush().unwrap();
         let mut updates = Vec::new();
         let mut requests = Vec::new();
+        let mut files = Vec::new();
         loop {
             let mut text = String::new();
             let read = self.stdout.read_line(&mut text).unwrap();
@@ -189,6 +199,7 @@ impl Client {
                 return Exchange {
                     updates,
                     requests,
+                    files,
                     response: message,
                 };
             }
@@ -208,12 +219,51 @@ impl Client {
                 requests.push(message);
                 continue;
             }
+            if let Some(method) = message["method"]
+                .as_str()
+                .filter(|method| method.starts_with("fs/"))
+            {
+                let reply = self.serve_file(method, &message);
+                let stdin = self.stdin.as_mut().unwrap();
+                writeln!(stdin, "{reply}").unwrap();
+                stdin.flush().unwrap();
+                files.push(message);
+                continue;
+            }
             assert_eq!(message["method"], "session/update", "{message}");
             assert!(message.get("id").is_none(), "{message}");
             updates.push(message);
             if let Some(session) = self.cancel_on_update.take() {
                 self.notify("session/cancel", json!({"sessionId": session}));
             }
+        }
+    }
+
+    /// Answer an `fs/*` request the way an editor does.
+    fn serve_file(&mut self, method: &str, request: &Value) -> Value {
+        let id = &request["id"];
+        let path = request["params"]["path"].as_str().unwrap().to_owned();
+        assert!(
+            std::path::Path::new(&path).is_absolute(),
+            "paths are absolute: {path}"
+        );
+        let error = |code: i64, message: &str| json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}});
+        match method {
+            "fs/read_text_file" => match self.buffers.get(&path) {
+                Some(content) => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"content": content}})
+                }
+                None => error(-32002, "no such file in the editor"),
+            },
+            "fs/write_text_file" => {
+                if let Some(message) = self.refuse_writes {
+                    return error(-32603, message);
+                }
+                let content = request["params"]["content"].as_str().unwrap().to_owned();
+                self.buffers.insert(path, content);
+                json!({"jsonrpc": "2.0", "id": id, "result": {}})
+            }
+            other => error(-32601, &format!("unknown method {other}")),
         }
     }
 
@@ -232,9 +282,14 @@ impl Client {
     }
 
     fn initialize(&mut self) -> Value {
+        self.initialize_with(json!({}))
+    }
+
+    /// `initialize` advertising `capabilities`, e.g. `{"fs": {"readTextFile": true}}`.
+    fn initialize_with(&mut self, capabilities: Value) -> Value {
         self.request(
             "initialize",
-            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+            json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
         )
         .response
     }
@@ -1015,4 +1070,239 @@ async fn a_server_that_will_not_start_does_not_stop_the_session() {
     assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
     assert!(stderr.contains("MCP server 'broken'"), "{stderr}");
     assert!(stderr.contains("failed to start"), "{stderr}");
+}
+
+const BOTH_FILE_METHODS: fn() -> Value =
+    || json!({"fs": {"readTextFile": true, "writeTextFile": true}});
+
+/// One turn in which the model makes `calls` (each its own step) and says "Done.",
+/// against an editor advertising `capabilities` and holding `buffers` (relative
+/// paths in the project). `refuse_writes` is how the editor answers a write.
+async fn editor_turn(
+    name: &str,
+    capabilities: Value,
+    buffers: &[(&str, &str)],
+    disk: &[(&str, &str)],
+    refuse_writes: Option<&'static str>,
+    calls: Vec<(&'static str, &'static str, &'static str)>,
+) -> (
+    Exchange,
+    Workspace,
+    std::collections::HashMap<String, String>,
+    MockServer,
+) {
+    let mut replies: Vec<Reply> = calls.iter().map(|call| sse_tool_calls(&[*call])).collect();
+    replies.push(sse_text("Done.", "stop"));
+    let server = MockServer::start(replies).await;
+    let workspace = Workspace::new(name, Some(&server));
+    for (path, content) in disk {
+        std::fs::write(workspace.project().join(path), content).unwrap();
+    }
+    let (exchange, held) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let buffers: Vec<(String, String)> = buffers
+            .iter()
+            .map(|(path, text)| (project.join(path).display().to_string(), (*text).to_owned()))
+            .collect();
+        let mut client = workspace.connect();
+        move || {
+            client.buffers.extend(buffers);
+            client.refuse_writes = refuse_writes;
+            client.initialize_with(capabilities);
+            let session = client.new_session(&project);
+            let exchange = client.prompt(&session, "Work on the files");
+            let held = client.buffers.clone();
+            client.finish();
+            (exchange, held)
+        }
+    })
+    .await
+    .unwrap();
+    (exchange, workspace, held, server)
+}
+
+fn tool_result_text(exchange: &Exchange) -> String {
+    exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "tool_call_update")
+        .expect("a call finished")["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn reads_come_from_the_editors_buffer_not_the_disk() {
+    let (exchange, _workspace, _, _) = editor_turn(
+        "fs-read",
+        BOTH_FILE_METHODS(),
+        &[("notes.txt", "unsaved changes\n")],
+        &[("notes.txt", "saved\n")],
+        None,
+        vec![("c1", "read_file", r#"{"path":"notes.txt"}"#)],
+    )
+    .await;
+    assert_eq!(tool_result_text(&exchange), "unsaved changes\n");
+    assert_eq!(exchange.files.len(), 1);
+    let request = &exchange.files[0];
+    assert_eq!(request["method"], "fs/read_text_file");
+    assert_eq!(request["params"]["sessionId"].as_str().unwrap().len(), 12);
+    assert!(request["params"]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("notes.txt"));
+    assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test]
+async fn a_file_the_editor_does_not_have_is_read_from_the_disk() {
+    let (exchange, _workspace, _, _) = editor_turn(
+        "fs-read-disk",
+        BOTH_FILE_METHODS(),
+        &[],
+        &[("only-on-disk.txt", "from the disk\n")],
+        None,
+        vec![("c1", "read_file", r#"{"path":"only-on-disk.txt"}"#)],
+    )
+    .await;
+    // Asked, answered with an error, and the disk read instead.
+    assert_eq!(exchange.files.len(), 1);
+    assert_eq!(tool_result_text(&exchange), "from the disk\n");
+}
+
+#[tokio::test]
+async fn writes_land_in_the_editor_and_the_approval_shows_the_change_from_its_buffer() {
+    let (exchange, workspace, held, _) = editor_turn(
+        "fs-write",
+        BOTH_FILE_METHODS(),
+        &[("notes.txt", "unsaved\n")],
+        &[("notes.txt", "saved\n")],
+        None,
+        vec![(
+            "c1",
+            "write_file",
+            r#"{"path":"notes.txt","content":"replaced\n"}"#,
+        )],
+    )
+    .await;
+    // The user was shown the change from what the editor holds.
+    let shown = exchange.requests[0]["params"]["toolCall"]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        shown.contains("-unsaved") && shown.contains("+replaced"),
+        "{shown}"
+    );
+    // The write went to the editor, not behind its back to the disk.
+    let writes: Vec<&Value> = exchange
+        .files
+        .iter()
+        .filter(|request| request["method"] == "fs/write_text_file")
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0]["params"]["content"], "replaced\n");
+    let path = workspace.project().join("notes.txt").display().to_string();
+    assert_eq!(held[&path], "replaced\n");
+    assert_eq!(
+        std::fs::read_to_string(workspace.project().join("notes.txt")).unwrap(),
+        "saved\n"
+    );
+    assert!(tool_result_text(&exchange).contains("Wrote"));
+}
+
+#[tokio::test]
+async fn edit_file_works_on_the_editors_buffer() {
+    let (exchange, workspace, held, _) = editor_turn(
+        "fs-edit",
+        BOTH_FILE_METHODS(),
+        &[("a.rs", "fn one() {}\nfn two() {}\n")],
+        &[("a.rs", "stale\n")],
+        None,
+        vec![(
+            "c1",
+            "edit_file",
+            r#"{"path":"a.rs","old_string":"two","new_string":"deux"}"#,
+        )],
+    )
+    .await;
+    let path = workspace.project().join("a.rs").display().to_string();
+    assert_eq!(held[&path], "fn one() {}\nfn deux() {}\n");
+    assert!(
+        tool_result_text(&exchange).contains("Edited"),
+        "{}",
+        tool_result_text(&exchange)
+    );
+}
+
+#[tokio::test]
+async fn a_write_the_editor_refuses_fails_the_call_and_does_not_touch_the_disk() {
+    let (exchange, workspace, _, _) = editor_turn(
+        "fs-refuse",
+        BOTH_FILE_METHODS(),
+        &[("notes.txt", "unsaved\n")],
+        &[("notes.txt", "saved\n")],
+        Some("the buffer is read-only"),
+        vec![(
+            "c1",
+            "write_file",
+            r#"{"path":"notes.txt","content":"replaced\n"}"#,
+        )],
+    )
+    .await;
+    let done = exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "tool_call_update")
+        .unwrap();
+    assert_eq!(done["status"], "failed");
+    assert!(tool_result_text(&exchange).contains("the buffer is read-only"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.project().join("notes.txt")).unwrap(),
+        "saved\n"
+    );
+}
+
+#[tokio::test]
+async fn only_what_the_editor_advertises_is_used() {
+    // Reads offered, writes not: the read comes from the editor, the write goes to
+    // the disk, and the editor is never sent a method it did not advertise.
+    let (exchange, workspace, held, _) = editor_turn(
+        "fs-read-only",
+        json!({"fs": {"readTextFile": true}}),
+        &[("notes.txt", "unsaved\n")],
+        &[("notes.txt", "saved\n")],
+        None,
+        vec![(
+            "c1",
+            "write_file",
+            r#"{"path":"notes.txt","content":"replaced\n"}"#,
+        )],
+    )
+    .await;
+    assert!(exchange
+        .files
+        .iter()
+        .all(|request| request["method"] == "fs/read_text_file"));
+    assert!(!exchange.files.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(workspace.project().join("notes.txt")).unwrap(),
+        "replaced\n"
+    );
+    assert_eq!(held.values().cloned().collect::<Vec<_>>(), ["unsaved\n"]);
+
+    // Nothing advertised: no `fs/*` request at all, as in every earlier test.
+    let (exchange, _workspace, _, _) = editor_turn(
+        "fs-none",
+        json!({}),
+        &[("notes.txt", "unsaved\n")],
+        &[("notes.txt", "saved\n")],
+        None,
+        vec![("c1", "read_file", r#"{"path":"notes.txt"}"#)],
+    )
+    .await;
+    assert!(exchange.files.is_empty());
+    assert_eq!(tool_result_text(&exchange), "saved\n");
 }

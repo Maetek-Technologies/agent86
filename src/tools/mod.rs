@@ -42,6 +42,11 @@ impl ToolError {
         }
     }
 
+    /// The editor refused or could not answer a file request (beyond Python).
+    pub fn editor(message: impl Into<String>) -> Self {
+        Self::raised("OSError", message)
+    }
+
     /// Map an I/O error onto the Python exception class it would raise.
     pub fn io(error: &std::io::Error) -> Self {
         let exception = match error.kind() {
@@ -597,6 +602,23 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
+/// Where the editor driving the agent keeps its files (beyond Python; the ACP
+/// server installs it). The file tools read and write text through it when it is
+/// set, so they see unsaved buffers and the editor sees what the agent wrote; with
+/// none, they use the disk exactly as before. Paths are absolute and inside the
+/// workspace: the tools resolve them through the jail first.
+pub trait EditorFiles: Send + Sync + std::fmt::Debug {
+    /// The editor's text of `path`, or `None` when it has none to give (the editor
+    /// does not offer reads, does not know the file, or did not answer): the tool
+    /// then reads the disk.
+    fn read_text(&self, path: &Path) -> Option<String>;
+
+    /// Write `content` through the editor. `None` means the editor does not offer
+    /// writes, so the tool writes the disk; `Some(Err)` is the editor refusing, which
+    /// fails the call rather than writing around it.
+    fn write_text(&self, path: &Path, content: &str) -> Option<Result<(), String>>;
+}
+
 /// Ambient state handed to every tool at execution time.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -615,6 +637,9 @@ pub struct ToolContext {
     /// Secrets the user entered (beyond Python): set in tool processes' environment,
     /// and redacted from every result. Shared by clones and sub-agent forks.
     pub secrets: crate::vault::SecretVault,
+    /// The editor's files, when an editor drives the agent. Shared by clones and
+    /// sub-agent forks.
+    pub editor: Option<Arc<dyn EditorFiles>>,
 }
 
 impl ToolContext {
@@ -628,6 +653,7 @@ impl ToolContext {
             skills: Arc::default(),
             active_skill: Arc::default(),
             secrets: crate::vault::SecretVault::default(),
+            editor: None,
         })
     }
 

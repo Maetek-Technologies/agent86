@@ -143,6 +143,28 @@ fn existing_text(target: &Path) -> Option<String> {
     read_file_text(target).ok().map(|file| file.text)
 }
 
+/// [`existing_text`], from the editor when one is driving the agent: its buffer is
+/// what the user sees, so a diff is made against that, not against what is saved.
+fn current_text(target: &Path, ctx: &ToolContext) -> Option<String> {
+    if let Some(text) = ctx
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.read_text(&super::plain_path(target)))
+    {
+        return Some(text);
+    }
+    existing_text(target)
+}
+
+/// Write `content` through the editor when there is one that takes writes, else
+/// `None`. The disk is not touched in the first case: the editor owns the file.
+fn editor_write(target: &Path, content: &str, ctx: &ToolContext) -> Option<Result<(), ToolError>> {
+    let editor = ctx.editor.as_ref()?;
+    editor
+        .write_text(&super::plain_path(target), content)
+        .map(|written| written.map_err(ToolError::editor))
+}
+
 /// The size of `target` when it is a file that [`existing_text`] cannot read as
 /// text, so a write over it is an overwrite, not a new file.
 fn binary_size(target: &Path) -> Option<u64> {
@@ -268,6 +290,15 @@ impl Tool for ReadFileTool {
         // cap can reach (four bytes a character at most, plus a split `\r\n`), so a
         // multi-gigabyte file cannot exhaust memory. Below that, it is read whole
         // and capped as Python caps it.
+        // With an editor driving the agent, what it holds (unsaved changes included)
+        // is what is read.
+        if let Some(text) = ctx
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.read_text(&super::plain_path(&target)))
+        {
+            return Ok(success(self.name(), ctx.policy.truncate(text)));
+        }
         let limit = (ctx.policy.max_output_chars as u64).saturating_mul(4) + 4;
         let size = std::fs::metadata(&target)
             .map_err(|error| ToolError::io(&error))?
@@ -357,7 +388,9 @@ impl Tool for WriteFileTool {
         let path = string_arg(args, &["path"])?;
         let content = string_arg(args, &["content"])?;
         let target = preview_target(path, ctx);
-        let current = target.as_deref().and_then(existing_text);
+        let current = target
+            .as_deref()
+            .and_then(|target| current_text(target, ctx));
         let Some(current) = current else {
             if let Some(size) = target.as_deref().and_then(binary_size) {
                 return Some(replaced_binary_summary(path, size, content));
@@ -383,12 +416,15 @@ impl Tool for WriteFileTool {
         arguments.finish()?;
 
         let target = ctx.policy.resolve_within(&path)?;
-        let existed = existing_text(&target);
+        let existed = current_text(&target, ctx);
         let replaced_binary = existed.is_none().then(|| binary_size(&target)).flatten();
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|error| ToolError::io(&error))?;
         }
-        write_text(&target, &content).map_err(|error| ToolError::io(&error))?;
+        match editor_write(&target, &content, ctx) {
+            Some(written) => written?,
+            None => write_text(&target, &content).map_err(|error| ToolError::io(&error))?,
+        }
 
         let (detail, diff) = match &existed {
             None if replaced_binary.is_some() => {
@@ -501,7 +537,7 @@ impl Tool for EditFileTool {
         let path = string_arg(args, &["path"])?;
         let old = string_arg(args, &["old_string", "old"])?;
         let new = string_arg(args, &["new_string", "new"])?;
-        let Some(current) = preview_target(path, ctx).and_then(|target| existing_text(&target))
+        let Some(current) = preview_target(path, ctx).and_then(|target| current_text(&target, ctx))
         else {
             return Some(format!(
                 "{path}: cannot be read (missing, or not a UTF-8 text file)."
@@ -560,7 +596,18 @@ impl Tool for EditFileTool {
                 "old_string must not be empty; use write_file to create a file.".to_owned(),
             ));
         }
-        let document = match read_file_text(&target) {
+        // The editor's buffer when there is one; it keeps its own line endings and
+        // byte order mark, so nothing here needs to remember them.
+        let from_editor = ctx
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.read_text(&super::plain_path(&target)))
+            .map(|text| FileText {
+                text,
+                crlf: false,
+                bom: false,
+            });
+        let document = match from_editor.map_or_else(|| read_file_text(&target), Ok) {
             Ok(document) => document,
             Err(ReadTextError::NotUtf8) => {
                 return Ok(failure(
@@ -610,7 +657,11 @@ impl Tool for EditFileTool {
             (document.text.replacen(&old, &new, 1), 1)
         };
         let diff = unified_diff_for(&path, &document.text, &updated);
-        replace_file(&target, &document.encode(&updated)).map_err(|error| ToolError::io(&error))?;
+        match editor_write(&target, &updated, ctx) {
+            Some(written) => written?,
+            None => replace_file(&target, &document.encode(&updated))
+                .map_err(|error| ToolError::io(&error))?,
+        }
         let header = format!(
             "Edited {path} ({replaced} replacement{}).",
             plural_s(replaced)

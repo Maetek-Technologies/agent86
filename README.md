@@ -108,7 +108,7 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] Arguments a model sends as JSON strings where the tool wants an array or an object are repaired (beyond Python)
 - [x] Show or hide thinking and tool use in the interface: `full`, `summary`, or `hidden` for each, Ctrl+T and commands, `[ui] thinking` and `[ui] tool_use` (beyond Python)
 - [ ] Scheduled jobs: the agent schedules work for itself, and `agent86 schedule daemon` runs it, with no session open (beyond Python; planned, see the project plan)
-- [ ] ACP server: `agent86 acp` for editors such as Zed that speak the Agent Client Protocol (beyond Python; in progress: `agent86 acp` opens and loads sessions, answers prompts with the reply, reasoning, and tool calls streamed, asks the editor before side-effecting calls, and cancels a turn on request; the editor's own MCP servers and files are not used yet, see the project plan)
+- [ ] ACP server: `agent86 acp` for editors such as Zed that speak the Agent Client Protocol (beyond Python; in progress: `agent86 acp` opens and loads sessions, answers prompts with the reply, reasoning, and tool calls streamed, asks the editor before side-effecting calls, cancels a turn on request, connects the MCP servers the editor names, and reads and writes files through the editor when it offers to; setup docs and a check against a real editor are still to do, see the project plan)
 - [x] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
 - [x] A notice when a newer release is out, and `/update` to install it (beyond Python)
 - [x] Install and update through npm (`npm install -g agent86`)

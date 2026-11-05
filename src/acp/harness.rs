@@ -19,14 +19,19 @@
 //! as updates; the saved state keeps no per-call status or reasoning, so a replayed
 //! call is shown `completed` and thoughts are not replayed.
 //!
+//! When the editor offers `fs/read_text_file` and `fs/write_text_file`, the file
+//! tools go through them (see [`AcpFiles`]): reads see unsaved buffers, diffs are
+//! made against them, and writes land in the editor, which owns the file. Anything
+//! else the agent runs (a command, a Python snippet) still sees the disk.
+//!
 //! The MCP servers the client names are started for the session and their tools
 //! registered beside the built-ins and the configured servers', behind the same
 //! approvals. They run as the user, like configured ones; the editor chose them.
 //! A server that fails to start is reported on stderr and the session goes on.
 
 use super::{
-    Backend, BackendError, CancelHandle, McpSpec, Permission, PermissionRequest, Stop, ToolKind,
-    TurnSink, Update,
+    Backend, BackendError, CancelHandle, ClientCapabilities, McpSpec, Permission,
+    PermissionRequest, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
@@ -37,11 +42,17 @@ use crate::pyjson::python_json_dumps;
 use crate::secrets::NoSecretStore;
 use crate::session::{AgentState, SessionStore};
 use crate::setup::{assemble_in, SetupError};
+use crate::tools::EditorFiles;
 use crate::types::{Role, ToolCall, ToolResult};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+/// How long the editor has to answer a file request before the tool goes on without
+/// it (a read falls back to the disk; a write fails).
+const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many characters of a call's arguments go into its title.
 const TITLE_ARGS: usize = 100;
@@ -60,6 +71,7 @@ struct Session {
 /// Sessions on agent86's harness, driven on one single-threaded runtime.
 pub struct HarnessBackend {
     config: Config,
+    client: ClientCapabilities,
     runtime: tokio::runtime::Runtime,
     sessions: HashMap<String, Session>,
 }
@@ -71,6 +83,7 @@ impl HarnessBackend {
             .build()?;
         Ok(Self {
             config,
+            client: ClientCapabilities::default(),
             runtime,
             sessions: HashMap::new(),
         })
@@ -135,6 +148,15 @@ impl HarnessBackend {
             },
         };
         let session_id = state.session_id.clone();
+        // The file tools use the editor's files when it offers any.
+        if self.client.read_text_file || self.client.write_text_file {
+            assembly.harness.context.editor = Some(Arc::new(AcpFiles {
+                sink: Arc::clone(&sink),
+                session_id: session_id.clone(),
+                read: self.client.read_text_file,
+                write: self.client.write_text_file,
+            }));
+        }
         let session = Session {
             harness: assembly.harness,
             store: assembly.store,
@@ -147,7 +169,83 @@ impl HarnessBackend {
     }
 }
 
+/// The editor's files, reached through the running turn's sink. Between turns there
+/// is no sink, so nothing is asked and the disk is used. Reads fall back to the disk
+/// when the editor cannot give the text (it does not know the file, or does not
+/// answer); a write the editor refuses fails the call instead, since writing the
+/// disk behind its back could lose the buffer's unsaved changes.
+struct AcpFiles {
+    sink: SinkSlot,
+    session_id: String,
+    read: bool,
+    write: bool,
+}
+
+impl std::fmt::Debug for AcpFiles {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpFiles")
+            .field("session_id", &self.session_id)
+            .field("read", &self.read)
+            .field("write", &self.write)
+            .finish()
+    }
+}
+
+impl AcpFiles {
+    fn running(&self) -> Option<Arc<dyn TurnSink>> {
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl EditorFiles for AcpFiles {
+    fn read_text(&self, path: &Path) -> Option<String> {
+        if !self.read {
+            return None;
+        }
+        let sink = self.running()?;
+        let result = sink
+            .call(
+                "fs/read_text_file",
+                serde_json::json!({ "sessionId": self.session_id, "path": path.to_str()? }),
+                Some(FILE_TIMEOUT),
+            )
+            .ok()?;
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    fn write_text(&self, path: &Path, content: &str) -> Option<Result<(), String>> {
+        if !self.write {
+            return None;
+        }
+        let sink = self.running()?;
+        let path = path.to_str()?;
+        Some(
+            sink.call(
+                "fs/write_text_file",
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "path": path,
+                    "content": content
+                }),
+                Some(FILE_TIMEOUT),
+            )
+            .map(|_| ()),
+        )
+    }
+}
+
 impl Backend for HarnessBackend {
+    fn client_capabilities(&mut self, capabilities: ClientCapabilities) {
+        self.client = capabilities;
+    }
+
     fn new_session(
         &mut self,
         cwd: &Path,

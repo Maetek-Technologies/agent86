@@ -5,11 +5,13 @@
 //! write nothing to stdout that is not a protocol message, so logging goes to
 //! stderr and nothing else in this process may print to stdout in this mode.
 //!
-//! Built so far (slices 1 to 4 of the plan): the transport, the `initialize`
+//! Built so far (slices 1 to 5 of the plan): the transport, the `initialize`
 //! handshake, `session/new`, `session/prompt` with streamed text and reasoning, tool
 //! calls reported as they happen, `session/request_permission` for the calls the
 //! approval mode asks about, `session/cancel`, and `session/load` with the history
-//! replayed. Editor-supplied MCP servers come in a later slice, so for now every other method answers "method not
+//! replayed, the MCP servers the editor names, and the editor's own files (`fs/read_text_file`
+//! and `fs/write_text_file`) for the file tools when it offers them. Slice 6 is
+//! documentation, so for now every other method answers "method not
 //! found" rather than pretending, and the capabilities advertised are only what is
 //! built.
 //!
@@ -34,6 +36,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The ACP major version this server speaks. Version negotiation: an agent that
 /// supports the requested version answers with it, and otherwise with the latest
@@ -129,6 +132,13 @@ pub trait TurnSink: Send + Sync {
 
     /// Ask the editor and wait for the answer.
     fn ask(&self, request: PermissionRequest) -> Permission;
+
+    /// Call a method on the editor and wait for its result. `Err` carries the
+    /// editor's error message, or why there was no answer (no reply within
+    /// `timeout`, the turn cancelled, the connection gone). A request with no
+    /// `timeout` waits as long as the editor takes.
+    fn call(&self, method: &str, params: Value, timeout: Option<Duration>)
+        -> Result<Value, String>;
 }
 
 /// Why a prompt turn ended: the protocol's `stopReason`.
@@ -208,11 +218,39 @@ impl McpSpec {
     }
 }
 
+/// What the client said it can do, from `initialize`. The agent must not call a
+/// file method the client did not advertise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientCapabilities {
+    /// `fs/read_text_file` is available.
+    pub read_text_file: bool,
+    /// `fs/write_text_file` is available.
+    pub write_text_file: bool,
+}
+
+impl ClientCapabilities {
+    fn from_params(params: &Value) -> Self {
+        let fs = params
+            .get("clientCapabilities")
+            .and_then(|capabilities| capabilities.get("fs"));
+        let flag =
+            |name: &str| fs.and_then(|fs| fs.get(name)).and_then(Value::as_bool) == Some(true);
+        Self {
+            read_text_file: flag("readTextFile"),
+            write_text_file: flag("writeTextFile"),
+        }
+    }
+}
+
 /// Stops a running turn; see [`Backend::cancel_handle`].
 pub type CancelHandle = Arc<dyn Fn() + Send + Sync>;
 
 /// The agent behind the protocol. `Send`, because a turn runs on a worker thread.
 pub trait Backend: Send {
+    /// What the client can do, told once after a successful `initialize`, before any
+    /// session opens. A backend that has no use for it need not override this.
+    fn client_capabilities(&mut self, _capabilities: ClientCapabilities) {}
+
     /// Open a session jailed to `cwd` (an absolute path) and return its id.
     /// `mcp_servers` are the servers the client asked the agent to connect to.
     fn new_session(
@@ -265,9 +303,12 @@ pub enum Event {
 #[derive(Debug)]
 pub enum TurnMsg {
     Update(Update),
-    Ask {
-        request: PermissionRequest,
-        reply: Sender<Permission>,
+    /// A request for the editor. The reply is the editor's result, or its error's
+    /// message; dropping it tells the caller there was no answer.
+    Call {
+        method: String,
+        params: Value,
+        reply: Sender<Result<Value, String>>,
     },
     Done(Result<Stop, BackendError>),
 }
@@ -275,6 +316,7 @@ pub enum TurnMsg {
 /// The [`TurnSink`] that hands everything to the connection's thread.
 struct ChannelSink {
     events: Sender<Event>,
+    session_id: String,
 }
 
 impl TurnSink for ChannelSink {
@@ -283,16 +325,43 @@ impl TurnSink for ChannelSink {
     }
 
     fn ask(&self, request: PermissionRequest) -> Permission {
-        let (reply, answer) = channel();
-        if self
-            .events
-            .send(Event::Turn(TurnMsg::Ask { request, reply }))
-            .is_err()
-        {
-            return Permission::Declined;
+        // No answer (the connection closed, the turn cancelled) declines.
+        match self.call(
+            "session/request_permission",
+            permission_params(&self.session_id, &request),
+            None,
+        ) {
+            Ok(result) => permission_from(&result),
+            Err(_) => Permission::Declined,
         }
-        // A dropped reply (the connection closed) declines.
-        answer.recv().unwrap_or(Permission::Declined)
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        let (reply, answer) = channel();
+        self.events
+            .send(Event::Turn(TurnMsg::Call {
+                method: method.to_owned(),
+                params,
+                reply,
+            }))
+            .map_err(|_| "the connection is closed".to_owned())?;
+        let gone = || "the connection closed or the turn was cancelled".to_owned();
+        let received = match timeout {
+            Some(timeout) => answer.recv_timeout(timeout).map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => format!(
+                    "the editor did not answer {method} within {} seconds",
+                    timeout.as_secs()
+                ),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => gone(),
+            })?,
+            None => answer.recv().map_err(|_| gone())?,
+        };
+        received
     }
 }
 
@@ -302,8 +371,8 @@ pub struct Server<B: Backend> {
     initialized: bool,
     events: Receiver<Event>,
     sender: Sender<Event>,
-    /// The permission requests sent and not yet answered, by request id.
-    pending: HashMap<u64, Sender<Permission>>,
+    /// The requests sent to the client and not yet answered, by request id.
+    pending: HashMap<u64, Sender<Result<Value, String>>>,
     next_request: u64,
     /// The client is gone: the connection ends once the current line is handled.
     closed: bool,
@@ -390,6 +459,8 @@ impl<B: Backend> Server<B> {
             "initialize" => {
                 let result = initialize(params).map_err(BackendError::invalid_params)?;
                 self.initialized = true;
+                self.backend
+                    .client_capabilities(ClientCapabilities::from_params(params));
                 Ok(result)
             }
             "session/new" | "session/load" | "session/prompt" if !self.initialized => {
@@ -459,6 +530,7 @@ impl<B: Backend> Server<B> {
 
         let sink: Arc<dyn TurnSink> = Arc::new(ChannelSink {
             events: self.sender.clone(),
+            session_id: session_id.clone(),
         });
         let mut cancel = CancelState {
             session_id: session_id.clone(),
@@ -493,7 +565,7 @@ impl<B: Backend> Server<B> {
                 // reports; the stop is asked of the turn until it ends.
                 if matches!(
                     event,
-                    Ok(Event::Turn(TurnMsg::Update(_) | TurnMsg::Ask { .. }))
+                    Ok(Event::Turn(TurnMsg::Update(_) | TurnMsg::Call { .. }))
                 ) {
                     cancel.repeat();
                 }
@@ -501,15 +573,24 @@ impl<B: Backend> Server<B> {
                     Ok(Event::Turn(TurnMsg::Update(update))) => {
                         emit(session_update(&session_id, &update))
                     }
-                    Ok(Event::Turn(TurnMsg::Ask { request, reply })) => {
+                    Ok(Event::Turn(TurnMsg::Call {
+                        method,
+                        params,
+                        reply,
+                    })) => {
                         if *closed {
-                            // Nobody to ask: dropping the reply declines.
+                            // Nobody to ask: dropping the reply is "no answer".
                             continue;
                         }
                         let id = *next_request;
                         *next_request += 1;
                         pending.insert(id, reply);
-                        emit(permission_request(id, &session_id, &request));
+                        emit(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": method,
+                            "params": params
+                        }));
                     }
                     Ok(Event::Turn(TurnMsg::Done(result))) => break result,
                     Ok(Event::Line(line)) => during_turn(&line, pending, &mut cancel, emit),
@@ -705,7 +786,7 @@ impl CancelState {
 /// a time; other notifications are ignored.
 fn during_turn(
     line: &str,
-    pending: &mut HashMap<u64, Sender<Permission>>,
+    pending: &mut HashMap<u64, Sender<Result<Value, String>>>,
     cancel: &mut CancelState,
     emit: &mut dyn FnMut(Value),
 ) {
@@ -719,7 +800,10 @@ fn during_turn(
     match classify(&object) {
         Inbound::Response { id, object } => {
             if let Some(reply) = id.as_u64().and_then(|id| pending.remove(&id)) {
-                let _ = reply.send(permission_from(&object));
+                let _ = reply.send(match object.get("error") {
+                    Some(error) => Err(error_text(error)),
+                    None => Ok(object.get("result").cloned().unwrap_or(Value::Null)),
+                });
             }
         }
         Inbound::Request { id, .. } => emit(error_response(
@@ -745,11 +829,20 @@ fn during_turn(
     }
 }
 
+/// The message of a JSON-RPC error object, for a caller that only reports it.
+fn error_text(error: &Value) -> String {
+    let message = error.get("message").and_then(Value::as_str);
+    match (message, error.get("code").and_then(Value::as_i64)) {
+        (Some(message), Some(code)) => format!("{message} (code {code})"),
+        (Some(message), None) => message.to_owned(),
+        (None, Some(code)) => format!("error code {code}"),
+        (None, None) => "the editor returned an error".to_owned(),
+    }
+}
+
 /// The user's answer to a permission request. Only choosing `allow-once` allows.
-fn permission_from(response: &Map<String, Value>) -> Permission {
-    let outcome = response
-        .get("result")
-        .and_then(|result| result.get("outcome"));
+fn permission_from(result: &Value) -> Permission {
+    let outcome = result.get("outcome");
     let selected = outcome.and_then(|outcome| outcome.get("outcome")) == Some(&json!("selected"));
     let option = outcome
         .and_then(|outcome| outcome.get("optionId"))
@@ -844,28 +937,23 @@ fn session_update(session_id: &str, update: &Update) -> Value {
     })
 }
 
-/// The `session/request_permission` request: the call, in full, and the two
+/// The parameters of `session/request_permission`: the call, in full, and the two
 /// choices. The text is what the user is deciding on, so it is the whole detail.
-fn permission_request(id: u64, session_id: &str, request: &PermissionRequest) -> Value {
+fn permission_params(session_id: &str, request: &PermissionRequest) -> Value {
     json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "session/request_permission",
-        "params": {
-            "sessionId": session_id,
-            "toolCall": {
-                "toolCallId": request.tool_call_id,
-                "title": request.title,
-                "kind": request.kind.as_str(),
-                "status": "pending",
-                "rawInput": request.raw_input,
-                "content": [{ "type": "content", "content": text_content(&request.text) }]
-            },
-            "options": [
-                { "optionId": ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
-                { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
-            ]
-        }
+        "sessionId": session_id,
+        "toolCall": {
+            "toolCallId": request.tool_call_id,
+            "title": request.title,
+            "kind": request.kind.as_str(),
+            "status": "pending",
+            "rawInput": request.raw_input,
+            "content": [{ "type": "content", "content": text_content(&request.text) }]
+        },
+        "options": [
+            { "optionId": ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
+            { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+        ]
     })
 }
 
@@ -1023,6 +1111,8 @@ mod tests {
     enum Act {
         Update(Update),
         Ask(PermissionRequest),
+        /// A method call on the editor, with how long to wait for it.
+        Call(&'static str, Value, Option<Duration>),
     }
 
     /// A scripted backend: sessions are numbered, and a prompt does what the test
@@ -1045,9 +1135,17 @@ mod tests {
         wait_for_cancel: bool,
         /// Clear the cancel flag when the turn starts, as the harness does.
         clear_on_entry: bool,
+        /// What `initialize` told the backend about the client.
+        capabilities: Option<ClientCapabilities>,
+        /// What each `Act::Call` got back.
+        call_results: Arc<Mutex<Vec<Result<Value, String>>>>,
     }
 
     impl Backend for Script {
+        fn client_capabilities(&mut self, capabilities: ClientCapabilities) {
+            self.capabilities = Some(capabilities);
+        }
+
         fn new_session(
             &mut self,
             cwd: &Path,
@@ -1101,6 +1199,10 @@ mod tests {
                     Act::Ask(request) => {
                         let answer = sink.ask(request);
                         self.answers.lock().unwrap().push(answer);
+                    }
+                    Act::Call(method, params, timeout) => {
+                        let result = sink.call(method, params, timeout);
+                        self.call_results.lock().unwrap().push(result);
                     }
                 }
             }
@@ -1828,6 +1930,203 @@ mod tests {
             1,
             "refused loads never reached it"
         );
+    }
+
+    fn initialize_with(capabilities: Value) -> String {
+        json!({"jsonrpc":"2.0","id":0,"method":"initialize",
+            "params":{"protocolVersion":1,"clientCapabilities":capabilities}})
+        .to_string()
+    }
+
+    #[test]
+    fn the_clients_file_capabilities_are_told_to_the_backend_exactly() {
+        for (capabilities, read, write) in [
+            (
+                json!({"fs": {"readTextFile": true, "writeTextFile": true}}),
+                true,
+                true,
+            ),
+            (json!({"fs": {"readTextFile": true}}), true, false),
+            (
+                json!({"fs": {"writeTextFile": true, "readTextFile": false}}),
+                false,
+                true,
+            ),
+            // Only a real `true` counts: capabilities omitted or odd are unsupported.
+            (
+                json!({"fs": {"readTextFile": "yes", "writeTextFile": 1}}),
+                false,
+                false,
+            ),
+            (json!({"fs": null}), false, false),
+            (json!({}), false, false),
+        ] {
+            let mut server = Server::new(Script::default());
+            one(&mut server, &initialize_with(capabilities.clone()));
+            assert_eq!(
+                server.backend.capabilities,
+                Some(ClientCapabilities {
+                    read_text_file: read,
+                    write_text_file: write
+                }),
+                "{capabilities}"
+            );
+        }
+        // Without `clientCapabilities` at all.
+        let mut server = Server::new(Script::default());
+        one(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}"#,
+        );
+        assert_eq!(
+            server.backend.capabilities,
+            Some(ClientCapabilities::default())
+        );
+        // A refused handshake tells it nothing.
+        let mut server = Server::new(Script::default());
+        one(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
+        );
+        assert_eq!(server.backend.capabilities, None);
+    }
+
+    /// Run a prompt whose turn makes `calls`, answering each with what `reply` gives
+    /// for its request (`None`: no answer). Returns what was written.
+    fn call_turn(
+        server: &mut Server<Script>,
+        calls: Vec<Act>,
+        reply: impl Fn(&Value) -> Option<String>,
+    ) -> Vec<Value> {
+        server.backend.acts = calls;
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message.get("method").is_some() && message.get("id").is_some() {
+                if let Some(line) = reply(&message) {
+                    events.send(Event::Line(line)).unwrap();
+                }
+            }
+            out.push(message);
+        });
+        out
+    }
+
+    fn result_line(request: &Value, result: Value) -> Option<String> {
+        Some(json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string())
+    }
+
+    #[test]
+    fn a_turn_can_call_the_editor_and_gets_its_result_or_its_error() {
+        let mut server = ready();
+        let params = json!({"sessionId": "sess_1", "path": "/w/a.rs"});
+        let out = call_turn(
+            &mut server,
+            vec![
+                Act::Call("fs/read_text_file", params.clone(), None),
+                Act::Ask(write_request()),
+                Act::Call("fs/write_text_file", json!({"path": "/w/b"}), None),
+            ],
+            |request| match request["method"].as_str().unwrap() {
+                "fs/read_text_file" => result_line(request, json!({"content": "fn main() {}\n"})),
+                "session/request_permission" => result_line(
+                    request,
+                    json!({"outcome": {"outcome": "selected", "optionId": ALLOW_ONCE}}),
+                ),
+                _ => Some(
+                    json!({"jsonrpc":"2.0","id":request["id"],
+                        "error":{"code":-32603,"message":"disk full"}})
+                    .to_string(),
+                ),
+            },
+        );
+        // Each request went out as written, under its own id, in order.
+        let requests: Vec<&Value> = out.iter().filter(|m| m.get("method").is_some()).collect();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["method"], "fs/read_text_file");
+        assert_eq!(requests[0]["params"], params);
+        assert_eq!(requests[1]["method"], "session/request_permission");
+        assert_eq!(requests[2]["method"], "fs/write_text_file");
+        let ids: Vec<&Value> = requests.iter().map(|r| &r["id"]).collect();
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+            "{ids:?}"
+        );
+
+        let results = server.backend.call_results.lock().unwrap().clone();
+        assert_eq!(results[0], Ok(json!({"content": "fn main() {}\n"})));
+        let error = results[1].clone().unwrap_err();
+        assert!(
+            error.contains("disk full") && error.contains("-32603"),
+            "{error}"
+        );
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Allowed]
+        );
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
+    }
+
+    #[test]
+    fn a_call_the_editor_never_answers_times_out_and_the_turn_goes_on() {
+        let mut server = ready();
+        let out = call_turn(
+            &mut server,
+            vec![Act::Call(
+                "fs/read_text_file",
+                json!({"path": "/w/a"}),
+                Some(Duration::from_millis(50)),
+            )],
+            |_| None,
+        );
+        let results = server.backend.call_results.lock().unwrap().clone();
+        let error = results[0].clone().unwrap_err();
+        assert!(
+            error.contains("did not answer fs/read_text_file"),
+            "{error}"
+        );
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
+    }
+
+    #[test]
+    fn cancelling_ends_a_call_the_turn_is_waiting_on() {
+        let mut server = ready();
+        server.backend.wait_for_cancel = true;
+        let events = server.sender();
+        server.backend.acts = vec![Act::Call(
+            "fs/read_text_file",
+            json!({"path": "/w/a"}),
+            None,
+        )];
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "fs/read_text_file" {
+                events.send(Event::Line(cancel_line("sess_1"))).unwrap();
+            }
+            out.push(message);
+        });
+        let results = server.backend.call_results.lock().unwrap().clone();
+        assert!(results[0].is_err());
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn a_closed_connection_ends_a_call_the_turn_is_waiting_on() {
+        let mut server = ready();
+        let events = server.sender();
+        server.backend.acts = vec![
+            Act::Call("fs/read_text_file", json!({"path": "/w/a"}), None),
+            Act::Call("fs/read_text_file", json!({"path": "/w/b"}), None),
+        ];
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "fs/read_text_file" {
+                events.send(Event::Eof).unwrap();
+            }
+        });
+        let results = server.backend.call_results.lock().unwrap().clone();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        assert!(server.closed);
     }
 
     #[test]
