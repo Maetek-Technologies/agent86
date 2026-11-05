@@ -749,3 +749,75 @@ fn writes_replace_the_file_whole_and_leave_nothing_behind() {
     );
     assert_eq!(workspace.read("notes.txt"), on_disk("newer\n"));
 }
+
+/// The per-call prompt (beyond Python; the ACP server names the call in its
+/// permission request) is asked in place of the plain one, is given the call, and
+/// changes nothing about when asking happens.
+#[test]
+fn a_per_call_prompt_is_given_the_call_and_the_modes_still_apply() {
+    use agent86::approval::CallApprovalPrompt;
+
+    let workspace = Workspace::new("call-prompt");
+    let ctx = workspace.context();
+    let registry = builtin_registry();
+    let write = registry.get("write_file").unwrap();
+    let read = registry.get("read_file").unwrap();
+    let write_call = call("write_file", json!({"path": "x.txt", "content": "hi"}));
+    let read_call = call("read_file", json!({"path": "x.txt"}));
+    let config = call(
+        "write_file",
+        json!({"path": ".agent86/config.toml", "content": "x"}),
+    );
+    let reason = |gate: &ApprovalGate, tool: &Arc<dyn agent86::tools::Tool>, call: &ToolCall| {
+        let decision = gate.decide(tool.as_ref(), call, &ctx);
+        (decision.approved, decision.reason)
+    };
+
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let record = Arc::clone(&asked);
+    let answer = Arc::new(Mutex::new(true));
+    let reply = Arc::clone(&answer);
+    let per_call: CallApprovalPrompt = Box::new(move |call, _| {
+        record.lock().unwrap().push(call.id.clone());
+        *reply.lock().unwrap()
+    });
+    let plain: ApprovalPrompt = Box::new(|_, _| panic!("the plain prompt must not be asked"));
+    let mut ask = ApprovalGate::new(ApprovalMode::Ask, Some(plain));
+    ask.call_prompt = Some(per_call);
+
+    // Asked about a side-effecting call, with that call; never about a read.
+    assert_eq!(
+        reason(&ask, &write, &write_call),
+        (true, "approved by user")
+    );
+    assert_eq!(reason(&ask, &read, &read_call), (true, "read-only"));
+    assert_eq!(*asked.lock().unwrap(), ["call-1"]);
+    *answer.lock().unwrap() = false;
+    assert_eq!(
+        reason(&ask, &write, &write_call),
+        (false, "declined by user")
+    );
+
+    // `deny` refuses without asking, `auto` approves without asking, and a write
+    // into agent86's own files is asked about even in `auto`.
+    asked.lock().unwrap().clear();
+    let take = |gate: &mut ApprovalGate| {
+        let record = Arc::clone(&asked);
+        gate.call_prompt = Some(Box::new(move |call, _| {
+            record.lock().unwrap().push(call.id.clone());
+            true
+        }));
+    };
+    let mut deny = ApprovalGate::new(ApprovalMode::Deny, None);
+    take(&mut deny);
+    assert_eq!(
+        reason(&deny, &write, &write_call),
+        (false, "blocked by approval policy (deny)")
+    );
+    let mut auto = ApprovalGate::new(ApprovalMode::Auto, None);
+    take(&mut auto);
+    assert_eq!(reason(&auto, &write, &write_call), (true, "auto-approved"));
+    assert!(asked.lock().unwrap().is_empty());
+    assert_eq!(reason(&auto, &write, &config), (true, "approved by user"));
+    assert_eq!(*asked.lock().unwrap(), ["call-1"]);
+}

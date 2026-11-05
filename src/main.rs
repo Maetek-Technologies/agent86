@@ -376,9 +376,10 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            let stdin = std::io::stdin();
+            // The protocol is read on a thread of its own, so the reader is owned.
+            let stdin = std::io::BufReader::new(std::io::stdin());
             let stdout = std::io::stdout();
-            match agent86::acp::serve(stdin.lock(), stdout.lock(), backend) {
+            match agent86::acp::serve(stdin, stdout.lock(), backend) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     stderr.error(&format!("acp: {error}"));

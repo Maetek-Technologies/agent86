@@ -5,24 +5,34 @@
 //! write nothing to stdout that is not a protocol message, so logging goes to
 //! stderr and nothing else in this process may print to stdout in this mode.
 //!
-//! Built so far (slices 1 and 2 of the plan): the transport, the `initialize`
-//! handshake, `session/new`, and `session/prompt` with streamed text and reasoning.
-//! Tool calls, permission requests, cancellation, `session/load`, and editor-supplied
-//! MCP servers come in later slices, so for now every other method answers "method
-//! not found" rather than pretending, and the capabilities advertised are only what
-//! is built.
+//! Built so far (slices 1 to 3 of the plan): the transport, the `initialize`
+//! handshake, `session/new`, `session/prompt` with streamed text and reasoning, tool
+//! calls reported as they happen, and `session/request_permission` for the calls the
+//! approval mode asks about. Cancellation, `session/load`, and editor-supplied MCP
+//! servers come in later slices, so for now every other method answers "method not
+//! found" rather than pretending, and the capabilities advertised are only what is
+//! built.
+//!
+//! Threads, as in the interactive interface: a thread of its own reads stdin and
+//! hands every line over a channel; a prompt's turn runs on a worker thread; and the
+//! connection's thread pumps both, writing what the turn reports and passing the
+//! editor's replies to whoever waits for them. A permission request is the case that
+//! needs it: the turn blocks on the editor's answer while the connection keeps
+//! reading. While a turn runs, a second request is refused (one turn at a time).
 //!
 //! The protocol is separate from the agent: [`Server`] speaks JSON-RPC and drives a
 //! [`Backend`], so the protocol is testable with a scripted backend and no process.
-//! [`harness::HarnessBackend`] is the real one, over agent86's own harness. The
-//! server reads one request at a time, so a prompt blocks the connection until its
-//! turn ends; slice 4 (cancellation) is where reading moves to its own thread.
+//! [`harness::HarnessBackend`] is the real one, over agent86's own harness.
 
 pub mod harness;
 
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 /// The ACP major version this server speaks. Version negotiation: an agent that
 /// supports the requested version answers with it, and otherwise with the latest
@@ -36,14 +46,83 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 
+/// The ids of the two options every permission request offers. Only `allow-once`
+/// approves; the agent keeps no remembered decisions yet, so there is no
+/// `allow_always` to offer.
+pub const ALLOW_ONCE: &str = "allow-once";
+pub const REJECT_ONCE: &str = "reject-once";
+
+/// The category of a tool call, which an editor uses to pick an icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Execute,
+    Fetch,
+    Other,
+}
+
+impl ToolKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Edit => "edit",
+            Self::Execute => "execute",
+            Self::Fetch => "fetch",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Something the agent reports while a prompt runs, sent as a `session/update`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Update {
     /// A chunk of the agent's reply (`agent_message_chunk`). The harness's own
     /// notices (`[cancelled]`, `[guardrail] ...`) travel here too.
     Message(String),
     /// A chunk of the model's reasoning (`agent_thought_chunk`).
     Thought(String),
+    /// The model asked for a tool call (`tool_call`, status `pending`).
+    ToolCall {
+        id: String,
+        title: String,
+        name: String,
+        kind: ToolKind,
+        raw_input: Value,
+    },
+    /// A tool call's outcome (`tool_call_update`, status `completed` or `failed`),
+    /// with the text the model is shown.
+    ToolResult { id: String, ok: bool, text: String },
+}
+
+/// What the agent asks the editor to approve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRequest {
+    /// The call, as already reported by [`Update::ToolCall`].
+    pub tool_call_id: String,
+    pub title: String,
+    pub kind: ToolKind,
+    pub raw_input: Value,
+    /// What the call would do, in full: a diff, a command, or the arguments.
+    pub text: String,
+}
+
+/// The editor's answer. Anything but the user choosing `allow-once` is a refusal:
+/// a rejection, a cancelled turn, an option this agent did not offer, an error
+/// reply, or a connection that is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Allowed,
+    Declined,
+}
+
+/// How a running turn reaches the editor. Called from the turn's worker thread.
+pub trait TurnSink: Send + Sync {
+    /// Report progress; it is sent as the turn runs.
+    fn update(&self, update: Update);
+
+    /// Ask the editor and wait for the answer.
+    fn ask(&self, request: PermissionRequest) -> Permission;
 }
 
 /// Why a prompt turn ended: the protocol's `stopReason`.
@@ -87,34 +166,102 @@ impl BackendError {
     }
 }
 
-/// The agent behind the protocol.
-pub trait Backend {
+/// The agent behind the protocol. `Send`, because a turn runs on a worker thread.
+pub trait Backend: Send {
     /// Open a session jailed to `cwd` (an absolute path) and return its id.
     /// `mcp_servers` is how many servers the client named; none are connected yet.
     fn new_session(&mut self, cwd: &Path, mcp_servers: usize) -> Result<String, BackendError>;
 
-    /// Run one turn on `session_id` with the user's `text`, reporting progress
-    /// through `update` as it streams.
+    /// Run one turn on `session_id` with the user's `text`, reporting through
+    /// `sink` as it goes. Runs on a worker thread, and may block on `sink.ask`.
     fn prompt(
         &mut self,
         session_id: &str,
         text: &str,
-        update: &mut dyn FnMut(Update),
+        sink: Arc<dyn TurnSink>,
     ) -> Result<Stop, BackendError>;
+}
+
+/// What the connection's thread waits on: the reader's lines and the turn's reports.
+#[derive(Debug)]
+pub enum Event {
+    /// One line from the client.
+    Line(String),
+    /// A line that is not UTF-8.
+    Invalid,
+    /// The client closed its end.
+    Eof,
+    /// Reading failed.
+    ReadError(String),
+    /// From the running turn.
+    Turn(TurnMsg),
+}
+
+/// What a running turn tells the connection.
+#[derive(Debug)]
+pub enum TurnMsg {
+    Update(Update),
+    Ask {
+        request: PermissionRequest,
+        reply: Sender<Permission>,
+    },
+    Done(Result<Stop, BackendError>),
+}
+
+/// The [`TurnSink`] that hands everything to the connection's thread.
+struct ChannelSink {
+    events: Sender<Event>,
+}
+
+impl TurnSink for ChannelSink {
+    fn update(&self, update: Update) {
+        let _ = self.events.send(Event::Turn(TurnMsg::Update(update)));
+    }
+
+    fn ask(&self, request: PermissionRequest) -> Permission {
+        let (reply, answer) = channel();
+        if self
+            .events
+            .send(Event::Turn(TurnMsg::Ask { request, reply }))
+            .is_err()
+        {
+            return Permission::Declined;
+        }
+        // A dropped reply (the connection closed) declines.
+        answer.recv().unwrap_or(Permission::Declined)
+    }
 }
 
 /// The protocol state of one connection.
 pub struct Server<B: Backend> {
     backend: B,
     initialized: bool,
+    events: Receiver<Event>,
+    sender: Sender<Event>,
+    /// The permission requests sent and not yet answered, by request id.
+    pending: HashMap<u64, Sender<Permission>>,
+    next_request: u64,
+    /// The client is gone: the connection ends once the current line is handled.
+    closed: bool,
 }
 
 impl<B: Backend> Server<B> {
     pub fn new(backend: B) -> Self {
+        let (sender, events) = channel();
         Self {
             backend,
             initialized: false,
+            events,
+            sender,
+            pending: HashMap::new(),
+            next_request: 0,
+            closed: false,
         }
+    }
+
+    /// A handle for feeding the connection's events, for the reader thread.
+    pub fn sender(&self) -> Sender<Event> {
+        self.sender.clone()
     }
 
     /// Whether the client has completed `initialize`.
@@ -123,8 +270,9 @@ impl<B: Backend> Server<B> {
     }
 
     /// Handle one inbound line, passing each message to send to `emit` as it is
-    /// ready (a prompt streams its updates before its response). A blank line, a
-    /// notification, and a response from the client produce none.
+    /// ready (a prompt streams its updates, and may ask for permission, before its
+    /// response). A blank line, a notification, and a response from the client
+    /// outside a turn produce none. A prompt does not return until its turn ends.
     pub fn handle_line(&mut self, line: &str, emit: &mut dyn FnMut(Value)) {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
@@ -146,26 +294,21 @@ impl<B: Backend> Server<B> {
     }
 
     fn handle_object(&mut self, object: Map<String, Value>, emit: &mut dyn FnMut(Value)) {
-        let id = object.get("id").cloned();
-        let valid_id = matches!(
-            id,
-            None | Some(Value::Null) | Some(Value::String(_)) | Some(Value::Number(_))
-        );
-        let method = object.get("method").and_then(Value::as_str);
-        match (method, id) {
-            (Some(method), Some(id)) if valid_id => {
+        match classify(&object) {
+            Inbound::Request { id, method } => {
                 let params = object.get("params").cloned().unwrap_or(Value::Null);
-                let response = match self.request(method, &params, emit) {
+                let response = match self.request(&method, &params, emit) {
                     Ok(result) => success_response(id, result),
                     Err(error) => error_response(id, error.code, &error.message),
                 };
                 emit(response);
             }
             // A notification has no id and gets no reply, even when unknown.
-            (Some(_), None) => {}
-            // A response to a request this server sent. None are sent yet.
-            (None, Some(_)) if object.contains_key("result") || object.contains_key("error") => {}
-            _ => emit(error_response(
+            Inbound::Notification => {}
+            // A response to a request this server sent; none is outstanding
+            // outside a turn.
+            Inbound::Response { .. } => {}
+            Inbound::Invalid => emit(error_response(
                 Value::Null,
                 INVALID_REQUEST,
                 "Invalid request",
@@ -232,7 +375,8 @@ impl<B: Backend> Server<B> {
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 BackendError::invalid_params("Invalid params: sessionId must be a string")
-            })?;
+            })?
+            .to_owned();
         let blocks = params
             .get("prompt")
             .and_then(Value::as_array)
@@ -241,9 +385,150 @@ impl<B: Backend> Server<B> {
             })?;
         let text = prompt_text(blocks).map_err(BackendError::invalid_params)?;
 
-        let mut update = |update: Update| emit(session_update(session_id, &update));
-        let stop = self.backend.prompt(session_id, &text, &mut update)?;
-        Ok(json!({ "stopReason": stop.as_str() }))
+        let sink: Arc<dyn TurnSink> = Arc::new(ChannelSink {
+            events: self.sender.clone(),
+        });
+        let Self {
+            backend,
+            events,
+            sender,
+            pending,
+            next_request,
+            closed,
+            ..
+        } = self;
+        let stop = std::thread::scope(|scope| {
+            let done = sender.clone();
+            let turn_session = session_id.clone();
+            scope.spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    backend.prompt(&turn_session, &text, sink)
+                }))
+                .unwrap_or_else(|_| Err(BackendError::internal("the turn panicked")));
+                let _ = done.send(Event::Turn(TurnMsg::Done(result)));
+            });
+            // Pump until the turn is done: write what it reports, and route what the
+            // client sends meanwhile.
+            loop {
+                match events.recv() {
+                    Ok(Event::Turn(TurnMsg::Update(update))) => {
+                        emit(session_update(&session_id, &update))
+                    }
+                    Ok(Event::Turn(TurnMsg::Ask { request, reply })) => {
+                        if *closed {
+                            // Nobody to ask: dropping the reply declines.
+                            continue;
+                        }
+                        let id = *next_request;
+                        *next_request += 1;
+                        pending.insert(id, reply);
+                        emit(permission_request(id, &session_id, &request));
+                    }
+                    Ok(Event::Turn(TurnMsg::Done(result))) => break result,
+                    Ok(Event::Line(line)) => during_turn(&line, pending, emit),
+                    Ok(Event::Invalid) => {
+                        emit(error_response(Value::Null, PARSE_ERROR, "Parse error"))
+                    }
+                    Ok(Event::Eof | Event::ReadError(_)) => {
+                        *closed = true;
+                        // Dropping the replies declines whatever waits on them.
+                        pending.clear();
+                    }
+                    Err(_) => break Err(BackendError::internal("the connection was lost")),
+                }
+            }
+        });
+        pending.clear();
+        Ok(json!({ "stopReason": stop?.as_str() }))
+    }
+}
+
+/// How an inbound message reads.
+enum Inbound {
+    Request {
+        id: Value,
+        method: String,
+    },
+    Notification,
+    Response {
+        id: Value,
+        object: Map<String, Value>,
+    },
+    Invalid,
+}
+
+fn classify(object: &Map<String, Value>) -> Inbound {
+    let id = object.get("id").cloned();
+    let valid_id = matches!(
+        id,
+        None | Some(Value::Null) | Some(Value::String(_)) | Some(Value::Number(_))
+    );
+    match (object.get("method").and_then(Value::as_str), id) {
+        (Some(method), Some(id)) if valid_id => Inbound::Request {
+            id,
+            method: method.to_owned(),
+        },
+        (Some(_), None) => Inbound::Notification,
+        (None, Some(id))
+            if valid_id && (object.contains_key("result") || object.contains_key("error")) =>
+        {
+            Inbound::Response {
+                id,
+                object: object.clone(),
+            }
+        }
+        _ => Inbound::Invalid,
+    }
+}
+
+/// Handle a line from the client while a turn runs. A response answers a
+/// permission request; a request has to wait, since one turn runs at a time;
+/// notifications are ignored until cancellation (slice 4) gives one a meaning.
+fn during_turn(
+    line: &str,
+    pending: &mut HashMap<u64, Sender<Permission>>,
+    emit: &mut dyn FnMut(Value),
+) {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.trim().is_empty() {
+        return;
+    }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
+        return emit(error_response(Value::Null, PARSE_ERROR, "Parse error"));
+    };
+    match classify(&object) {
+        Inbound::Response { id, object } => {
+            if let Some(reply) = id.as_u64().and_then(|id| pending.remove(&id)) {
+                let _ = reply.send(permission_from(&object));
+            }
+        }
+        Inbound::Request { id, .. } => emit(error_response(
+            id,
+            INVALID_REQUEST,
+            "A prompt turn is running; wait for its response",
+        )),
+        Inbound::Notification => {}
+        Inbound::Invalid => emit(error_response(
+            Value::Null,
+            INVALID_REQUEST,
+            "Invalid request",
+        )),
+    }
+}
+
+/// The user's answer to a permission request. Only choosing `allow-once` allows.
+fn permission_from(response: &Map<String, Value>) -> Permission {
+    let outcome = response
+        .get("result")
+        .and_then(|result| result.get("outcome"));
+    let selected = outcome.and_then(|outcome| outcome.get("outcome")) == Some(&json!("selected"));
+    let option = outcome
+        .and_then(|outcome| outcome.get("optionId"))
+        .and_then(Value::as_str);
+    if selected && option == Some(ALLOW_ONCE) {
+        Permission::Allowed
+    } else {
+        Permission::Declined
     }
 }
 
@@ -282,21 +567,71 @@ fn prompt_text(blocks: &[Value]) -> Result<String, String> {
     Ok(parts.join("\n"))
 }
 
+fn text_content(text: &str) -> Value {
+    json!({ "type": "text", "text": text })
+}
+
 /// The `session/update` notification for `update`.
 fn session_update(session_id: &str, update: &Update) -> Value {
-    let (kind, text) = match update {
-        Update::Message(text) => ("agent_message_chunk", text),
-        Update::Thought(text) => ("agent_thought_chunk", text),
+    let body = match update {
+        Update::Message(text) => json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": text_content(text)
+        }),
+        Update::Thought(text) => json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": text_content(text)
+        }),
+        Update::ToolCall {
+            id,
+            title,
+            name,
+            kind,
+            raw_input,
+        } => json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": id,
+            "title": title,
+            "name": name,
+            "kind": kind.as_str(),
+            "status": "pending",
+            "rawInput": raw_input
+        }),
+        Update::ToolResult { id, ok, text } => json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": if *ok { "completed" } else { "failed" },
+            "content": [{ "type": "content", "content": text_content(text) }]
+        }),
     };
     json!({
         "jsonrpc": "2.0",
         "method": "session/update",
+        "params": { "sessionId": session_id, "update": body }
+    })
+}
+
+/// The `session/request_permission` request: the call, in full, and the two
+/// choices. The text is what the user is deciding on, so it is the whole detail.
+fn permission_request(id: u64, session_id: &str, request: &PermissionRequest) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/request_permission",
         "params": {
             "sessionId": session_id,
-            "update": {
-                "sessionUpdate": kind,
-                "content": { "type": "text", "text": text }
-            }
+            "toolCall": {
+                "toolCallId": request.tool_call_id,
+                "title": request.title,
+                "kind": request.kind.as_str(),
+                "status": "pending",
+                "rawInput": request.raw_input,
+                "content": [{ "type": "content", "content": text_content(&request.text) }]
+            },
+            "options": [
+                { "optionId": ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
+                { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+            ]
         }
     })
 }
@@ -348,46 +683,97 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// Read newline-delimited messages from `input` until it ends, writing each message
-/// to `output` and flushing it as it is produced, since the client is waiting on
-/// it and a prompt's updates should reach the editor while the turn runs. End of
-/// input is the client closing the connection, so it ends cleanly.
-pub fn serve<B: Backend, R: BufRead, W: Write>(
-    mut input: R,
-    mut output: W,
-    backend: B,
-) -> io::Result<()> {
-    let mut server = Server::new(backend);
-    let mut buffer = Vec::new();
-    // The first write failure (the client went away) stops everything after it.
-    let mut failed: Option<io::Error> = None;
-    let mut emit = |message: Value| {
-        if failed.is_some() {
+/// Writes messages as lines and flushes each, since the client is waiting on it and
+/// a turn's updates should reach the editor while it runs. The first failure (the
+/// client went away) is kept and ends the connection.
+struct Writer<W: Write> {
+    output: W,
+    failed: Option<io::Error>,
+}
+
+impl<W: Write> Writer<W> {
+    fn send(&mut self, message: Value) {
+        if self.failed.is_some() {
             return;
         }
         // `to_string` is compact and escapes newlines inside strings, so a
         // message is always exactly one line.
         let result = serde_json::to_string(&message)
             .map_err(io::Error::from)
-            .and_then(|line| writeln!(output, "{line}"))
-            .and_then(|()| output.flush());
+            .and_then(|line| writeln!(self.output, "{line}"))
+            .and_then(|()| self.output.flush());
         if let Err(error) = result {
-            failed = Some(error);
-        }
-    };
-    loop {
-        buffer.clear();
-        if input.read_until(b'\n', &mut buffer)? == 0 {
-            break;
-        }
-        match std::str::from_utf8(&buffer) {
-            Ok(line) => server.handle_line(line, &mut emit),
-            // Messages must be UTF-8; anything else is not valid JSON.
-            Err(_) => emit(error_response(Value::Null, PARSE_ERROR, "Parse error")),
+            self.failed = Some(error);
         }
     }
-    match failed {
-        Some(error) => Err(error),
+}
+
+/// Read newline-delimited messages from `input` on a thread of its own, so the
+/// connection can keep listening while a turn runs.
+fn read_loop<R: BufRead>(mut input: R, events: Sender<Event>) {
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        let event = match input.read_until(b'\n', &mut buffer) {
+            Ok(0) => {
+                let _ = events.send(Event::Eof);
+                return;
+            }
+            Ok(_) => match String::from_utf8(std::mem::take(&mut buffer)) {
+                Ok(line) => Event::Line(line),
+                // Messages must be UTF-8; anything else is not valid JSON.
+                Err(_) => Event::Invalid,
+            },
+            Err(error) => {
+                let _ = events.send(Event::ReadError(error.to_string()));
+                return;
+            }
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+    }
+}
+
+/// Serve the protocol on `input` and `output` until the client closes the
+/// connection, which ends cleanly. `input` is read on a thread of its own.
+pub fn serve<B, R, W>(input: R, output: W, backend: B) -> io::Result<()>
+where
+    B: Backend,
+    R: BufRead + Send + 'static,
+    W: Write,
+{
+    let mut server = Server::new(backend);
+    let events = server.sender();
+    std::thread::spawn(move || read_loop(input, events));
+    let mut writer = Writer {
+        output,
+        failed: None,
+    };
+    let mut read_error = None;
+    while !server.closed && writer.failed.is_none() {
+        match server.events.recv() {
+            Ok(Event::Line(line)) => {
+                server.handle_line(&line, &mut |message| writer.send(message));
+            }
+            Ok(Event::Invalid) => {
+                writer.send(error_response(Value::Null, PARSE_ERROR, "Parse error"))
+            }
+            Ok(Event::ReadError(error)) => {
+                read_error = Some(error);
+                break;
+            }
+            // The client closing its end is how a session ends.
+            Ok(Event::Eof) | Err(_) => break,
+            // A turn's leftovers: the turn is over.
+            Ok(Event::Turn(_)) => {}
+        }
+    }
+    if let Some(error) = writer.failed {
+        return Err(error);
+    }
+    match read_error {
+        Some(error) => Err(io::Error::other(error)),
         None => Ok(()),
     }
 }
@@ -395,15 +781,25 @@ pub fn serve<B: Backend, R: BufRead, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::sync::Mutex;
 
-    /// A scripted backend: sessions are numbered, and a prompt streams what the
-    /// test queued, then ends the way it says.
+    /// What a scripted turn does, in order.
+    enum Act {
+        Update(Update),
+        Ask(PermissionRequest),
+    }
+
+    /// A scripted backend: sessions are numbered, and a prompt does what the test
+    /// queued, then ends the way it says.
     #[derive(Default)]
     struct Script {
         sessions: Vec<(String, usize)>,
         prompts: Vec<(String, String)>,
-        updates: Vec<Update>,
+        acts: Vec<Act>,
+        answers: Arc<Mutex<Vec<Permission>>>,
         stop: Option<Result<Stop, BackendError>>,
+        panic: bool,
     }
 
     impl Backend for Script {
@@ -417,11 +813,20 @@ mod tests {
             &mut self,
             session_id: &str,
             text: &str,
-            update: &mut dyn FnMut(Update),
+            sink: Arc<dyn TurnSink>,
         ) -> Result<Stop, BackendError> {
             self.prompts.push((session_id.to_owned(), text.to_owned()));
-            for item in self.updates.drain(..) {
-                update(item);
+            if self.panic {
+                panic!("scripted panic");
+            }
+            for act in self.acts.drain(..) {
+                match act {
+                    Act::Update(update) => sink.update(update),
+                    Act::Ask(request) => {
+                        let answer = sink.ask(request);
+                        self.answers.lock().unwrap().push(answer);
+                    }
+                }
             }
             self.stop.take().unwrap_or(Ok(Stop::EndTurn))
         }
@@ -601,13 +1006,15 @@ mod tests {
         )
     }
 
+    const HI: &str = r#"[{"type":"text","text":"hi"}]"#;
+
     #[test]
     fn a_prompt_streams_its_updates_before_the_response() {
         let mut server = ready();
-        server.backend.updates = vec![
-            Update::Thought("hmm".into()),
-            Update::Message("Hel".into()),
-            Update::Message("lo".into()),
+        server.backend.acts = vec![
+            Act::Update(Update::Thought("hmm".into())),
+            Act::Update(Update::Message("Hel".into())),
+            Act::Update(Update::Message("lo".into())),
         ];
         let out = replies(
             &mut server,
@@ -634,6 +1041,259 @@ mod tests {
         );
     }
 
+    fn write_call() -> Update {
+        Update::ToolCall {
+            id: "call_1".into(),
+            title: "write_file(...)".into(),
+            name: "write_file".into(),
+            kind: ToolKind::Edit,
+            raw_input: json!({"path": "a.txt", "content": "x"}),
+        }
+    }
+
+    fn write_request() -> PermissionRequest {
+        PermissionRequest {
+            tool_call_id: "call_1".into(),
+            title: "write_file(...)".into(),
+            kind: ToolKind::Edit,
+            raw_input: json!({"path": "a.txt"}),
+            text: "--- a/a.txt\n+++ b/a.txt".into(),
+        }
+    }
+
+    /// Run a prompt that reports a call, asks about it, and reports its result,
+    /// answering the request with `reply`. Returns everything written, in order.
+    fn ask_and_answer(
+        server: &mut Server<Script>,
+        reply: impl Fn(u64) -> String + 'static,
+    ) -> Vec<Value> {
+        server.backend.acts = vec![
+            Act::Update(write_call()),
+            Act::Ask(write_request()),
+            Act::Update(Update::ToolResult {
+                id: "call_1".into(),
+                ok: true,
+                text: "Wrote 1 byte".into(),
+            }),
+        ];
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "session/request_permission" {
+                let id = message["id"].as_u64().unwrap();
+                events.send(Event::Line(reply(id))).unwrap();
+            }
+            out.push(message);
+        });
+        out
+    }
+
+    /// How a test answers a permission request, given its id.
+    type Reply = Box<dyn Fn(u64) -> String>;
+
+    fn selected(id: u64, option: &str) -> String {
+        json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"selected","optionId":option}}})
+            .to_string()
+    }
+
+    #[test]
+    fn a_tool_call_is_reported_asked_about_and_finished_in_order() {
+        let mut server = ready();
+        let out = ask_and_answer(&mut server, |id| selected(id, ALLOW_ONCE));
+        let shape: Vec<String> = out
+            .iter()
+            .map(|m| {
+                m["method"].as_str().map_or_else(
+                    || "response".to_owned(),
+                    |method| match method {
+                        "session/update" => m["params"]["update"]["sessionUpdate"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                        other => other.to_owned(),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "tool_call",
+                "session/request_permission",
+                "tool_call_update",
+                "response"
+            ]
+        );
+
+        let call = &out[0]["params"]["update"];
+        assert_eq!(call["toolCallId"], "call_1");
+        assert_eq!(call["name"], "write_file");
+        assert_eq!(call["kind"], "edit");
+        assert_eq!(call["status"], "pending");
+        assert_eq!(call["rawInput"]["path"], "a.txt");
+
+        let request = &out[1];
+        assert_eq!(request["id"], 0);
+        assert_eq!(request["params"]["sessionId"], "sess_1");
+        assert_eq!(request["params"]["toolCall"]["toolCallId"], "call_1");
+        assert_eq!(
+            request["params"]["toolCall"]["content"][0]["content"]["text"],
+            "--- a/a.txt\n+++ b/a.txt"
+        );
+        let options = request["params"]["options"].as_array().unwrap();
+        assert_eq!(options[0]["optionId"], ALLOW_ONCE);
+        assert_eq!(options[0]["kind"], "allow_once");
+        assert_eq!(options[1]["optionId"], REJECT_ONCE);
+        assert_eq!(options[1]["kind"], "reject_once");
+
+        let result = &out[2]["params"]["update"];
+        assert_eq!(result["toolCallId"], "call_1");
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["content"][0]["content"]["text"], "Wrote 1 byte");
+
+        assert_eq!(out[3]["result"]["stopReason"], "end_turn");
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Allowed]
+        );
+    }
+
+    #[test]
+    fn only_choosing_allow_once_allows() {
+        let cases: [(&str, Reply); 6] = [
+            ("reject", Box::new(|id| selected(id, REJECT_ONCE))),
+            (
+                "an option never offered",
+                Box::new(|id| selected(id, "allow_always")),
+            ),
+            (
+                "cancelled",
+                Box::new(|id| {
+                    json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"cancelled"}}})
+                        .to_string()
+                }),
+            ),
+            (
+                "an error reply",
+                Box::new(|id| {
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32800,"message":"Cancelled"}})
+                        .to_string()
+                }),
+            ),
+            (
+                "no outcome",
+                Box::new(|id| json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string()),
+            ),
+            (
+                "selected with no option",
+                Box::new(|id| {
+                    json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"selected"}}})
+                        .to_string()
+                }),
+            ),
+        ];
+        for (name, reply) in cases {
+            let mut server = ready();
+            let out = ask_and_answer(&mut server, reply);
+            assert_eq!(
+                *server.backend.answers.lock().unwrap(),
+                [Permission::Declined],
+                "{name}"
+            );
+            // The turn still finished and answered.
+            assert_eq!(
+                out.last().unwrap()["result"]["stopReason"],
+                "end_turn",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_connection_declines_and_the_connection_ends() {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Ask(write_request()), Act::Ask(write_request())];
+        let events = server.sender();
+        let mut requests = 0;
+        let out = {
+            let mut out = Vec::new();
+            server.handle_line(&prompt_line(HI), &mut |message| {
+                if message["method"] == "session/request_permission" {
+                    requests += 1;
+                    events.send(Event::Eof).unwrap();
+                }
+                out.push(message);
+            });
+            out
+        };
+        // The first was asked; the client left; the second was never sent.
+        assert_eq!(requests, 1);
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Declined, Permission::Declined]
+        );
+        assert!(server.closed);
+        assert_eq!(out.last().unwrap()["id"], 5);
+    }
+
+    #[test]
+    fn a_request_during_a_turn_waits_and_a_stray_response_is_ignored() {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Ask(write_request())];
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "session/request_permission" {
+                for line in [
+                    // Another prompt while one runs.
+                    r#"{"jsonrpc":"2.0","id":77,"method":"session/prompt","params":{}}"#.to_owned(),
+                    // A response to nothing we asked.
+                    selected(99, ALLOW_ONCE),
+                    // A notification, and garbage.
+                    r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess_1"}}"#
+                        .to_owned(),
+                    "{nope".to_owned(),
+                    selected(0, ALLOW_ONCE),
+                ] {
+                    events.send(Event::Line(line)).unwrap();
+                }
+            }
+            out.push(message);
+        });
+        let busy = out.iter().find(|m| m["id"] == 77).expect("a busy reply");
+        assert_eq!(busy["error"]["code"], INVALID_REQUEST);
+        assert!(out.iter().any(|m| m["error"]["code"] == PARSE_ERROR));
+        // The stray response did not answer the request, the real one did.
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Allowed]
+        );
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
+        assert_eq!(server.backend.prompts.len(), 1, "no second turn started");
+    }
+
+    #[test]
+    fn a_panicking_turn_is_an_error_and_not_a_hang() {
+        let mut server = ready();
+        server.backend.panic = true;
+        let reply = one(&mut server, &prompt_line(HI));
+        assert_eq!(reply["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(reply["error"]["message"], "the turn panicked");
+    }
+
+    #[test]
+    fn a_failed_tool_call_is_reported_failed() {
+        let update = session_update(
+            "s",
+            &Update::ToolResult {
+                id: "c".into(),
+                ok: false,
+                text: "boom".into(),
+            },
+        );
+        assert_eq!(update["params"]["update"]["status"], "failed");
+    }
+
     #[test]
     fn stop_reasons_and_backend_errors_come_through() {
         let mut server = ready();
@@ -642,11 +1302,11 @@ mod tests {
             (Stop::Cancelled, "cancelled"),
         ] {
             server.backend.stop = Some(Ok(stop));
-            let reply = one(&mut server, &prompt_line(r#"[{"type":"text","text":"x"}]"#));
+            let reply = one(&mut server, &prompt_line(HI));
             assert_eq!(reply["result"]["stopReason"], name);
         }
         server.backend.stop = Some(Err(BackendError::internal("provider down")));
-        let reply = one(&mut server, &prompt_line(r#"[{"type":"text","text":"x"}]"#));
+        let reply = one(&mut server, &prompt_line(HI));
         assert_eq!(reply["error"]["code"], INTERNAL_ERROR);
         assert_eq!(reply["error"]["message"], "provider down");
     }
@@ -691,32 +1351,34 @@ mod tests {
         assert_eq!(reply["error"]["code"], INVALID_PARAMS);
     }
 
+    fn served(input: Vec<u8>) -> (io::Result<()>, Vec<Value>) {
+        let mut output = Vec::new();
+        let result = serve(Cursor::new(input), &mut output, Script::default());
+        let text = String::from_utf8(output).unwrap();
+        let out = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (result, out)
+    }
+
     #[test]
     fn serve_writes_one_flushed_line_per_message_and_ends_at_end_of_input() {
         let input =
             format!("{INITIALIZE}\n\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}}\r\n");
-        let mut output = Vec::new();
-        serve(input.as_bytes(), &mut output, Script::default()).unwrap();
-        let text = String::from_utf8(output).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(text.ends_with('\n'));
-        for line in lines {
-            serde_json::from_str::<Value>(line).unwrap();
-        }
+        let (result, out) = served(input.into_bytes());
+        result.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["id"], 0);
+        assert_eq!(out[1]["error"]["code"], METHOD_NOT_FOUND);
     }
 
     #[test]
     fn serve_survives_a_last_line_without_a_newline_and_invalid_utf8() {
         let mut input = b"\xff\xfe\n".to_vec();
         input.extend_from_slice(INITIALIZE.as_bytes());
-        let mut output = Vec::new();
-        serve(input.as_slice(), &mut output, Script::default()).unwrap();
-        let text = String::from_utf8(output).unwrap();
-        let out: Vec<Value> = text
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let (result, out) = served(input);
+        result.unwrap();
         assert_eq!(out[0]["error"]["code"], PARSE_ERROR);
         assert_eq!(out[1]["result"]["protocolVersion"], 1);
     }
@@ -733,7 +1395,7 @@ mod tests {
             }
         }
         let input = format!("{INITIALIZE}\n");
-        let error = serve(input.as_bytes(), Closed, Script::default()).unwrap_err();
+        let error = serve(Cursor::new(input.into_bytes()), Closed, Script::default()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 

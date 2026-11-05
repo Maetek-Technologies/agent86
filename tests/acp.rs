@@ -17,6 +17,11 @@ struct Workspace {
 impl Workspace {
     /// An isolated home and project; `server` is the mock model behind `mock:test/model`.
     fn new(name: &str, server: Option<&MockServer>) -> Self {
+        Self::with_config(name, server, "")
+    }
+
+    /// [`Workspace::new`] with `extra` appended to the project's config.
+    fn with_config(name: &str, server: Option<&MockServer>, extra: &str) -> Self {
         let root = std::env::temp_dir().join(format!("agent86-acp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home").join(".agent86")).unwrap();
@@ -32,7 +37,7 @@ impl Workspace {
             std::fs::write(
                 root.join("project").join(".agent86").join("config.toml"),
                 format!(
-                    "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n",
+                    "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\napi_key_env = \"AGENT86_TEST_MOCK_KEY\"\nmax_retries = 0\n\n{extra}",
                     server.base_url
                 ),
             )
@@ -94,6 +99,7 @@ impl Workspace {
             stdin: Some(stdin),
             stdout,
             next_id: 0,
+            choose: Some("allow-once"),
         }
     }
 }
@@ -110,16 +116,33 @@ struct Client {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    /// How the user answers a permission request: the option to select, or `None`
+    /// to cancel.
+    choose: Option<&'static str>,
 }
 
 /// What came back for one request: the notifications before its response, and the
 /// response itself.
 struct Exchange {
     updates: Vec<Value>,
+    /// The permission requests the agent made, as received.
+    requests: Vec<Value>,
     response: Value,
 }
 
 impl Exchange {
+    /// The `sessionUpdate` kinds, in order.
+    fn kinds(&self) -> Vec<&str> {
+        self.updates
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect()
+    }
+
     /// The text of the updates of one kind, joined.
     fn text_of(&self, kind: &str) -> String {
         self.updates
@@ -144,6 +167,7 @@ impl Client {
         writeln!(stdin, "{line}").unwrap();
         stdin.flush().unwrap();
         let mut updates = Vec::new();
+        let mut requests = Vec::new();
         loop {
             let mut text = String::new();
             let read = self.stdout.read_line(&mut text).unwrap();
@@ -154,11 +178,25 @@ impl Client {
             // The protocol forbids any stdout line that is not a message.
             let message: Value = serde_json::from_str(&text)
                 .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {text:?}"));
-            if message.get("id") == Some(&json!(id)) {
+            if message.get("id") == Some(&json!(id)) && message.get("method").is_none() {
                 return Exchange {
                     updates,
+                    requests,
                     response: message,
                 };
+            }
+            if message["method"] == "session/request_permission" {
+                let outcome = match self.choose {
+                    Some(option) => json!({"outcome": "selected", "optionId": option}),
+                    None => json!({"outcome": "cancelled"}),
+                };
+                let reply =
+                    json!({"jsonrpc": "2.0", "id": message["id"], "result": {"outcome": outcome}});
+                let stdin = self.stdin.as_mut().unwrap();
+                writeln!(stdin, "{reply}").unwrap();
+                stdin.flush().unwrap();
+                requests.push(message);
+                continue;
             }
             assert_eq!(message["method"], "session/update", "{message}");
             assert!(message.get("id").is_none(), "{message}");
@@ -367,6 +405,21 @@ async fn a_turn_that_calls_a_tool_still_finishes_and_a_session_takes_more_prompt
     .unwrap();
     assert_eq!(first.text_of("agent_message_chunk"), "Listed it.");
     assert_eq!(first.response["result"]["stopReason"], "end_turn");
+    // A read-only call is reported and finished, and nobody is asked.
+    assert_eq!(
+        first.kinds(),
+        ["tool_call", "tool_call_update", "agent_message_chunk"]
+    );
+    assert!(first.requests.is_empty());
+    let call = &first.updates[0]["params"]["update"];
+    assert_eq!(call["toolCallId"], "call_1");
+    assert_eq!(call["name"], "list_dir");
+    assert_eq!(call["kind"], "read");
+    assert_eq!(call["status"], "pending");
+    assert_eq!(call["rawInput"], json!({"path": "."}));
+    let done = &first.updates[1]["params"]["update"];
+    assert_eq!(done["toolCallId"], "call_1");
+    assert_eq!(done["status"], "completed");
     assert_eq!(second.text_of("agent_message_chunk"), "Second answer.");
     // The second turn carries the first's history to the model.
     let sent = &server.requests()[2];
@@ -455,4 +508,125 @@ async fn bad_session_requests_are_refused_without_running_anything() {
         .unwrap()
         .contains("no-such-session"));
     assert!(server.requests().is_empty());
+}
+
+const WRITE: (&str, &str, &str) = (
+    "call_w",
+    "write_file",
+    r#"{"path":"out.txt","content":"hi\n"}"#,
+);
+
+/// One turn in which the model asks to write `out.txt`, and then says it is done;
+/// `choose` is how the user answers the permission request (`None` cancels).
+async fn write_turn(
+    name: &str,
+    config: &str,
+    choose: Option<&'static str>,
+) -> (Exchange, Workspace, MockServer) {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[WRITE]),
+        sse_text("All done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config(name, Some(&server), config);
+    let exchange = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        client.choose = choose;
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let exchange = client.prompt(&session, "Write the file");
+            client.finish();
+            exchange
+        }
+    })
+    .await
+    .unwrap();
+    (exchange, workspace, server)
+}
+
+#[tokio::test]
+async fn an_approved_write_is_asked_about_then_done() {
+    let (exchange, workspace, _server) = write_turn("approve", "", Some("allow-once")).await;
+
+    // The call is reported, then asked about by id, then finished.
+    assert_eq!(
+        exchange.kinds(),
+        ["tool_call", "tool_call_update", "agent_message_chunk"]
+    );
+    assert_eq!(exchange.requests.len(), 1);
+    let request = &exchange.requests[0]["params"];
+    assert_eq!(request["toolCall"]["toolCallId"], "call_w");
+    assert_eq!(request["toolCall"]["kind"], "edit");
+    // The user sees what would be written: the tool's own preview.
+    let shown = request["toolCall"]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(shown.contains("new file: out.txt"), "{shown}");
+    assert!(shown.contains("hi"), "{shown}");
+    let ids: Vec<&str> = request["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| option["optionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["allow-once", "reject-once"]);
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.project().join("out.txt")).unwrap(),
+        "hi\n"
+    );
+    let done = &exchange.updates[1]["params"]["update"];
+    assert_eq!(done["toolCallId"], "call_w");
+    assert_eq!(done["status"], "completed");
+    assert_eq!(exchange.text_of("agent_message_chunk"), "All done.");
+    assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test]
+async fn a_rejected_or_cancelled_write_does_not_happen_and_the_model_is_told() {
+    for (name, choose) in [("reject", Some("reject-once")), ("cancel", None)] {
+        let (exchange, workspace, server) = write_turn(name, "", choose).await;
+        assert_eq!(exchange.requests.len(), 1, "{name}");
+        assert!(
+            !workspace.project().join("out.txt").exists(),
+            "{name}: the file was written anyway"
+        );
+        let done = &exchange.updates[1]["params"]["update"];
+        assert_eq!(done["status"], "failed", "{name}");
+        // The turn went on: the model saw the refusal and answered.
+        assert_eq!(
+            exchange.text_of("agent_message_chunk"),
+            "All done.",
+            "{name}"
+        );
+        assert_eq!(
+            exchange.response["result"]["stopReason"], "end_turn",
+            "{name}"
+        );
+        let second = server.requests()[1].body["messages"].to_string();
+        assert!(second.contains("declined by user"), "{name}: {second}");
+    }
+}
+
+#[tokio::test]
+async fn auto_mode_asks_nobody_and_deny_mode_refuses() {
+    let (auto, workspace, _server) =
+        write_turn("auto", "[guardrails]\napproval = \"auto\"\n", None).await;
+    assert!(auto.requests.is_empty());
+    assert!(workspace.project().join("out.txt").exists());
+    assert_eq!(auto.updates[1]["params"]["update"]["status"], "completed");
+
+    let (deny, workspace, server) = write_turn(
+        "deny",
+        "[guardrails]\napproval = \"deny\"\n",
+        Some("allow-once"),
+    )
+    .await;
+    assert!(deny.requests.is_empty());
+    assert!(!workspace.project().join("out.txt").exists());
+    assert_eq!(deny.updates[1]["params"]["update"]["status"], "failed");
+    let second = server.requests()[1].body["messages"].to_string();
+    assert!(second.contains("blocked by approval policy"), "{second}");
 }
