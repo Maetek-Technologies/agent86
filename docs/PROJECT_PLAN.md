@@ -216,7 +216,7 @@ The agent works end to end, but it does not yet have:
 
 - Config sections other than `[model]`, `[limits]`, `[sandbox]`, `[guardrails]`, `[tools]`, `[memory]`, `[observability]`, `[mcp]`/`[mcp_servers]`, `[ui]`, `[pricing]`, and `[providers.*]` (others are accepted and ignored, not validated)
 - Python's programmatic `SupervisorOrchestrator` (`fan_out` over a `MessageBus`); nothing in the CLI or the interfaces reaches it
-- The Agent Client Protocol's optional parts (terminals, modes and config options, plans, `session/resume`, remembered permissions, images and audio), and a run against a real editor: `agent86 acp` has the handshake, sessions, prompts, tool calls, permissions, cancel, load, the editor's MCP servers, and its files (section 9)
+- The Agent Client Protocol's optional parts (terminals, plans, `session/resume`, remembered permissions, images and audio), and runs against Zed and the other editors: `agent86 acp` has the handshake, sessions, prompts, tool calls, permissions, cancel, load, the editor's MCP servers, and its files (section 9)
 
 ### Known `run` differences from Python
 
@@ -548,7 +548,7 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] `run` prints only the answer on stdout, with its progress on stderr; `--output`, `AGENT86_RUN_OUTPUT`, and `[run] output` choose `final`, `full`, or `quiet`, and `run --json` gains `final` (beyond Python; done 2026-11-01, see below)
 - [x] Fix what the 1.0.11 security review found, in four PRs (beyond Python; done 2026-11-01, see below). PR 1 (project trust and agent86's own files) and PR 2 (approval and jail integrity) shipped in 1.0.12; PRs 3, 4a, and 4b shipped in 1.0.13
 - [ ] Scheduled jobs: the model creates durable recurring or one-shot jobs for itself, and `agent86 schedule daemon` fires them and runs a real agent turn with no session open (beyond Python; planned after the show/hide feature above, see below)
-- [x] ACP server: `agent86 acp` speaks the Agent Client Protocol over stdio so editors such as Zed can drive agent86 (beyond Python; planned 2026-11-05 and built the same day in six slices, see below and [docs/ACP.md](ACP.md); checked against the protocol's schema, not yet against a real editor)
+- [x] ACP server: `agent86 acp` speaks the Agent Client Protocol over stdio so editors such as Zed can drive agent86 (beyond Python; planned 2026-11-05 and built the same day in six slices, see below and [docs/ACP.md](ACP.md); checked against the protocol's schema and used in Intelligent Terminal, not yet tried in Zed or the other editors)
 
 Decided (2026-10-30): this implementation is the standard agent86, and the Python implementation is the legacy one. Python was the behavioral oracle while the port was under way; every stage of the roadmap has landed, and the work since (the reasoning guard, routing, secrets, limits) goes beyond it. The formats the two share stay compatible (the session database and `state_json`, the config files, the trace, and the keyring layout), so a Python user can switch without losing sessions, keys, or config. The steps, in order:
 
