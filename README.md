@@ -168,6 +168,10 @@ OpenRouter may serve a model from a host that handles it badly, for example one 
 ignore = ["Phala"]
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT, matching the reference implementation. See [LICENSE](LICENSE).
