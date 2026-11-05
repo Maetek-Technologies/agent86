@@ -86,7 +86,7 @@ agent86 is compatible with the [Agent Client Protocol](https://agentclientprotoc
 - **The client's servers and files.** MCP servers configured in the client are started for the thread. If the client offers it, the file tools go through it, so the model sees your unsaved changes.
 - **Secrets.** A secret you enter at a terminal in the project and choose to remember is loaded into that project's threads, and the model sees only its name. There is no secret prompt in a client, because the protocol forbids asking for one.
 
-It has been used by hand in Intelligent Terminal on Windows, and every message exchanged in the test suite was checked against the protocol's published schema. It has not yet been tried in Zed, the JetBrains IDEs, or the others, so please [open an issue](https://github.com/Maetek-Technologies/agent86/issues) if one behaves differently. The client's own terminals, remembered "always allow" choices, and images or audio in a prompt are not built. Setup and what differs from the terminal are in [docs/ACP.md](docs/ACP.md).
+It has been used by hand in Zed and in Intelligent Terminal on Windows, and every message exchanged in the test suite was checked against the protocol's published schema. It has not yet been tried in the JetBrains IDEs or the others, so please [open an issue](https://github.com/Maetek-Technologies/agent86/issues) if one behaves differently. The client's own terminals, remembered "always allow" choices, and images or audio in a prompt are not built. Setup and what differs from the terminal are in [docs/ACP.md](docs/ACP.md).
 
 ## Why Rust?
 
@@ -124,7 +124,7 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] Arguments a model sends as JSON strings where the tool wants an array or an object are repaired (beyond Python)
 - [x] Show or hide thinking and tool use in the interface: `full`, `summary`, or `hidden` for each, Ctrl+T and commands, `[ui] thinking` and `[ui] tool_use` (beyond Python)
 - [ ] Scheduled jobs: the agent schedules work for itself, and `agent86 schedule daemon` runs it, with no session open (beyond Python; planned, see the project plan)
-- [x] ACP server: `agent86 acp` for editors such as Zed that speak the Agent Client Protocol (beyond Python; checked against the protocol's schema and used in Microsoft's Intelligent Terminal, not yet tried in Zed or the other editors; see [docs/ACP.md](docs/ACP.md))
+- [x] ACP server: `agent86 acp` for editors such as Zed that speak the Agent Client Protocol (beyond Python; checked against the protocol's schema and used by hand in Zed and Microsoft's Intelligent Terminal, not yet tried in the JetBrains IDEs or the other editors; see [docs/ACP.md](docs/ACP.md))
 - [x] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
 - [x] A notice when a newer release is out, and `/update` to install it (beyond Python)
 - [x] Install and update through npm (`npm install -g agent86`)
