@@ -30,8 +30,8 @@
 //! A server that fails to start is reported on stderr and the session goes on.
 
 use super::{
-    Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, McpSpec, Permission,
-    PermissionRequest, Stop, ToolKind, TurnSink, Update,
+    Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, McpSpec,
+    Permission, PermissionRequest, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
@@ -63,6 +63,11 @@ type SinkSlot = Arc<Mutex<Option<Arc<dyn TurnSink>>>>;
 
 struct Session {
     harness: Harness,
+    /// The `provider:model` the session runs on: the config's default until `/model`
+    /// or the editor's picker switches it. Kept as the ref the user wrote, not read
+    /// back from the provider, whose own name is the adapter's (`openai` for every
+    /// OpenAI-compatible provider).
+    model_ref: String,
     store: Option<SessionStore>,
     state: AgentState,
     sink: SinkSlot,
@@ -158,6 +163,7 @@ impl HarnessBackend {
             }));
         }
         let session = Session {
+            model_ref: assembly.model_ref.to_string(),
             harness: assembly.harness,
             store: assembly.store,
             state,
@@ -265,11 +271,9 @@ impl HarnessBackend {
     /// chosen model is pinned, which stops triage routing.
     fn switch_model(&self, session: &mut Session, arg: &str) -> String {
         if arg.is_empty() {
-            let provider = session.harness.active_provider();
             return format!(
-                "current model: {}:{}\nusage: /model <provider:model>",
-                provider.name(),
-                provider.model()
+                "current model: {}\nusage: /model <provider:model>",
+                session.model_ref
             );
         }
         match crate::setup::build_provider(&self.config, arg) {
@@ -281,11 +285,8 @@ impl HarnessBackend {
                     crate::setup::model_context_window(&self.config, &reference.to_string());
                 harness.provider = provider.into();
                 harness.router.pin();
-                format!(
-                    "model: {}:{}",
-                    harness.provider.name(),
-                    harness.provider.model()
-                )
+                session.model_ref = reference.to_string();
+                format!("model: {}", session.model_ref)
             }
         }
     }
@@ -320,7 +321,110 @@ impl HarnessBackend {
     }
 }
 
+impl HarnessBackend {
+    /// The selectors an editor shows: the approval mode, and the models the config
+    /// names (the default and the two routes, which is all the config lists) with
+    /// the one in use, which `/model` may have set to something else.
+    fn options_for(&self, session: &Session) -> Vec<ConfigOption> {
+        let mut models: Vec<String> = Vec::new();
+        for name in [
+            self.config.model.default.as_str(),
+            self.config.model.route.cheap.as_str(),
+            self.config.model.route.frontier.as_str(),
+            session.model_ref.as_str(),
+        ] {
+            if !name.is_empty() && !models.iter().any(|known| known == name) {
+                models.push(name.to_owned());
+            }
+        }
+        let mode = session.harness.gate.mode();
+        vec![
+            ConfigOption {
+                id: "mode".into(),
+                name: "Approval mode".into(),
+                description: Some(
+                    "ask: confirm each change; auto: run without asking; deny: refuse changes"
+                        .into(),
+                ),
+                category: "mode",
+                current: mode.as_str().to_owned(),
+                choices: ["ask", "auto", "deny"]
+                    .iter()
+                    .map(|value| ((*value).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+            ConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                description: Some(
+                    "provider:model; /model switches to any other, for example one not listed"
+                        .into(),
+                ),
+                category: "model",
+                current: session.model_ref.clone(),
+                choices: models
+                    .into_iter()
+                    .map(|model| (model.clone(), model))
+                    .collect(),
+            },
+        ]
+    }
+}
+
 impl Backend for HarnessBackend {
+    fn config_options(&self, session_id: &str) -> Vec<ConfigOption> {
+        self.sessions
+            .get(session_id)
+            .map(|session| self.options_for(session))
+            .unwrap_or_default()
+    }
+
+    fn set_config_option(
+        &mut self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>, BackendError> {
+        let mut session = self.sessions.remove(session_id).ok_or_else(|| {
+            BackendError::invalid_params(format!("Unknown session: {session_id}"))
+        })?;
+        let outcome = match config_id {
+            "mode" => match ApprovalMode::parse(value) {
+                Some(mode) => {
+                    session.harness.gate.set_mode(mode);
+                    Ok(())
+                }
+                None => Err(format!("'{value}' is not one of ask, auto, deny")),
+            },
+            "model" => {
+                // Only the listed choices: the picker offers them, and a free-form
+                // ref is what `/model` is for.
+                let listed = self.options_for(&session).iter().any(|option| {
+                    option.id == "model" && option.choices.iter().any(|(v, _)| v == value)
+                });
+                if !listed {
+                    Err(format!("'{value}' is not one of the listed models"))
+                } else if value == session.model_ref {
+                    Ok(())
+                } else {
+                    let said = self.switch_model(&mut session, value);
+                    // A refusal leaves the model as it was, and says why.
+                    if session.model_ref == value {
+                        Ok(())
+                    } else {
+                        Err(said)
+                    }
+                }
+            }
+            other => Err(format!("Unknown config option: {other}")),
+        };
+        let options = self.options_for(&session);
+        self.sessions.insert(session_id.to_owned(), session);
+        outcome
+            .map(|()| options)
+            .map_err(BackendError::invalid_params)
+    }
+
     fn commands(&self) -> Vec<CommandInfo> {
         COMMANDS
             .iter()
@@ -424,6 +528,7 @@ impl Backend for HarnessBackend {
             store,
             state,
             sink: slot,
+            ..
         } = session;
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&sink));
         let secrets = harness.context.secrets.clone();

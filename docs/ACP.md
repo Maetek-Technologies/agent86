@@ -51,6 +51,7 @@ Any ACP client works the same way: run `agent86` with the argument `acp`, in the
 - **Tool calls.** Each call shows in the thread when the model asks for it, with its arguments and what came back.
 - **Permission requests.** The editor asks you before anything that changes something, with the change in front of you: the diff of a file edit, the command to be run, the arguments of anything else. Choose *Allow once* to let it run; anything else (reject, cancelling, closing the dialog) declines, and the model is told it was declined. A call that only reads is not asked about. There is no "always allow" yet.
 - **Stop.** Cancelling in the editor stops the turn at the next safe point, as Escape does in the terminal interface: a running tool finishes, no new model call starts, and the thread ends as cancelled, not as an error.
+- **Mode and model pickers.** agent86 offers two session config options, which editors show as selectors: the approval mode (`ask`, `auto`, `deny`) and the model. The model list is the models your config names, meaning `[model] default` and the two `[model.route]` entries, plus whichever one is in use. A model in that list that you have no key for is refused with the reason when picked. `/model provider:model` switches to any model, listed or not, and moves the picker. Changing either takes effect from the next turn and applies to that thread only.
 - **The editor's MCP servers.** The MCP servers configured in the editor are started for each thread and their tools offered to the model beside agent86's own and any in `[mcp.servers.*]`. They run as you, like the configured ones.
 - **The editor's files.** When the editor offers them, `read_file`, `write_file`, and `edit_file` go through the editor: the model sees unsaved changes, the approval shows the change from what is on your screen, and the write lands in the editor, which owns the file. Everything else the agent runs, such as a command or a Python snippet, still sees the files on disk.
 
@@ -68,7 +69,7 @@ Approvals follow the usual setting, `[guardrails] approval` (`ask` by default). 
 ## What is not built
 
 - Terminals (`terminal/*`): commands run in agent86's own sandbox and their output comes back as text, not in the editor's terminal.
-- ACP session modes and config options (the editor's own mode or model pickers; `/mode` and `/model` are the substitute), and a plan view in the editor's panel.
+- ACP's older `modes` field (the config options below replace it), a boolean option kind, and a plan view in the editor's panel.
 - Images, audio, and embedded resources in a prompt (it accepts text and file links).
 - Remembered permission choices.
 - Reconnection: if the editor goes away, the agent ends.

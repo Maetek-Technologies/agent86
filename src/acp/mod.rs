@@ -93,6 +93,8 @@ pub enum Update {
     Thought(String),
     /// The slash commands the session offers (`available_commands_update`).
     Commands(Vec<CommandInfo>),
+    /// The session's settings changed (`config_option_update`).
+    Config(Vec<ConfigOption>),
     /// The model asked for a tool call (`tool_call`, status `pending`).
     ToolCall {
         id: String,
@@ -114,6 +116,24 @@ pub struct CommandInfo {
     /// What to show while the user has typed no argument; `None` for a command that
     /// takes none.
     pub hint: Option<String>,
+}
+
+/// A session setting the editor shows as a selector (`configOptions`): the model
+/// and the approval mode. Every one is a `select`; the boolean kind needs a client
+/// capability this server does not ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOption {
+    /// What `session/set_config_option` names it by.
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// `model` or `mode`: the spec's reserved categories, which help the editor
+    /// place the selector.
+    pub category: &'static str,
+    /// The value in force. Always one of `choices`.
+    pub current: String,
+    /// `(value, label)` pairs.
+    pub choices: Vec<(String, String)>,
 }
 
 /// What the agent asks the editor to approve.
@@ -282,6 +302,24 @@ pub trait Backend: Send {
     /// thread, between turns.
     fn run_command(&mut self, _session_id: &str, _line: &str) -> Option<String> {
         None
+    }
+
+    /// The settings the editor may show for a session, current values included.
+    fn config_options(&self, _session_id: &str) -> Vec<ConfigOption> {
+        Vec::new()
+    }
+
+    /// Change one setting and return all of them as they now stand. A value that is
+    /// not one of the option's choices, or an unknown id, is `invalid_params`.
+    fn set_config_option(
+        &mut self,
+        _session_id: &str,
+        config_id: &str,
+        _value: &str,
+    ) -> Result<Vec<ConfigOption>, BackendError> {
+        Err(BackendError::invalid_params(format!(
+            "Unknown config option: {config_id}"
+        )))
     }
 
     /// Open an existing session and return its history as updates to replay, in
@@ -496,7 +534,9 @@ impl<B: Backend> Server<B> {
                     .client_capabilities(ClientCapabilities::from_params(params));
                 Ok(result)
             }
-            "session/new" | "session/load" | "session/prompt" if !self.initialized => {
+            "session/new" | "session/load" | "session/prompt" | "session/set_config_option"
+                if !self.initialized =>
+            {
                 Err(BackendError {
                     code: INVALID_REQUEST,
                     message: "Not initialized: call initialize first".into(),
@@ -505,6 +545,7 @@ impl<B: Backend> Server<B> {
             "session/new" => self.session_new(params),
             "session/load" => self.session_load(params, emit),
             "session/prompt" => self.session_prompt(params, emit),
+            "session/set_config_option" => self.set_config_option(params),
             other => Err(BackendError {
                 code: METHOD_NOT_FOUND,
                 message: format!("Method not found: {other}"),
@@ -516,7 +557,32 @@ impl<B: Backend> Server<B> {
         let (cwd, servers) = session_location(params)?;
         let session_id = self.backend.new_session(Path::new(&cwd), servers)?;
         self.advertise_commands(&session_id);
-        Ok(json!({ "sessionId": session_id }))
+        let mut result = json!({ "sessionId": session_id });
+        self.add_config_options(&mut result, &session_id);
+        Ok(result)
+    }
+
+    /// Put the session's settings in `result` when it has any.
+    fn add_config_options(&self, result: &mut Value, session_id: &str) {
+        let options = self.backend.config_options(session_id);
+        if !options.is_empty() {
+            result["configOptions"] = config_options_json(&options);
+        }
+    }
+
+    /// `session/set_config_option`: change a select option, answer with all of them.
+    fn set_config_option(&mut self, params: &Value) -> Result<Value, BackendError> {
+        let text = |key: &str| {
+            params.get(key).and_then(Value::as_str).ok_or_else(|| {
+                BackendError::invalid_params(format!("Invalid params: {key} must be a string"))
+            })
+        };
+        let (session_id, config_id) = (text("sessionId")?, text("configId")?);
+        let value = text("value")?;
+        let options = self
+            .backend
+            .set_config_option(session_id, config_id, value)?;
+        Ok(json!({ "configOptions": config_options_json(&options) }))
     }
 
     /// Queue the command list for after the response, when there is one to offer.
@@ -549,7 +615,9 @@ impl<B: Backend> Server<B> {
             emit(session_update(session_id, update));
         }
         self.advertise_commands(session_id);
-        Ok(json!({}))
+        let mut result = json!({});
+        self.add_config_options(&mut result, session_id);
+        Ok(result)
     }
 
     fn session_prompt(
@@ -575,6 +643,11 @@ impl<B: Backend> Server<B> {
         if text.trim_start().starts_with('/') {
             if let Some(output) = self.backend.run_command(&session_id, text.trim()) {
                 emit(session_update(&session_id, &Update::Message(output)));
+                // A command may have changed a setting the editor is showing.
+                let options = self.backend.config_options(&session_id);
+                if !options.is_empty() {
+                    emit(session_update(&session_id, &Update::Config(options)));
+                }
                 return Ok(json!({ "stopReason": Stop::EndTurn.as_str() }));
             }
         }
@@ -944,6 +1017,31 @@ fn text_content(text: &str) -> Value {
     json!({ "type": "text", "text": text })
 }
 
+/// `options` as the protocol writes them.
+fn config_options_json(options: &[ConfigOption]) -> Value {
+    Value::Array(
+        options
+            .iter()
+            .map(|option| {
+                let mut entry = json!({
+                    "id": option.id,
+                    "name": option.name,
+                    "category": option.category,
+                    "type": "select",
+                    "currentValue": option.current,
+                    "options": option.choices.iter().map(|(value, name)| {
+                        json!({ "value": value, "name": name })
+                    }).collect::<Vec<_>>()
+                });
+                if let Some(description) = &option.description {
+                    entry["description"] = json!(description);
+                }
+                entry
+            })
+            .collect(),
+    )
+}
+
 /// The `session/update` notification for `update`.
 fn session_update(session_id: &str, update: &Update) -> Value {
     let body = match update {
@@ -958,6 +1056,10 @@ fn session_update(session_id: &str, update: &Update) -> Value {
         Update::Thought(text) => json!({
             "sessionUpdate": "agent_thought_chunk",
             "content": text_content(text)
+        }),
+        Update::Config(options) => json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": config_options_json(options)
         }),
         Update::Commands(commands) => json!({
             "sessionUpdate": "available_commands_update",
@@ -1206,11 +1308,36 @@ mod tests {
         /// The commands offered, and the one this backend answers (`/ping`).
         offered: Vec<CommandInfo>,
         commands_run: Vec<String>,
+        /// The settings offered; `set_config_option` changes `current` of the one
+        /// named, if the value is one of its choices.
+        options: Vec<ConfigOption>,
     }
 
     impl Backend for Script {
         fn commands(&self) -> Vec<CommandInfo> {
             self.offered.clone()
+        }
+
+        fn config_options(&self, _session_id: &str) -> Vec<ConfigOption> {
+            self.options.clone()
+        }
+
+        fn set_config_option(
+            &mut self,
+            _session_id: &str,
+            config_id: &str,
+            value: &str,
+        ) -> Result<Vec<ConfigOption>, BackendError> {
+            let option = self
+                .options
+                .iter_mut()
+                .find(|option| option.id == config_id)
+                .ok_or_else(|| BackendError::invalid_params("unknown option"))?;
+            if !option.choices.iter().any(|(choice, _)| choice == value) {
+                return Err(BackendError::invalid_params("not a choice"));
+            }
+            option.current = value.to_owned();
+            Ok(self.options.clone())
         }
 
         fn run_command(&mut self, _session_id: &str, line: &str) -> Option<String> {
@@ -2203,6 +2330,130 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(Result::is_err), "{results:?}");
         assert!(server.closed);
+    }
+
+    fn mode_and_model() -> Vec<ConfigOption> {
+        let choices = |values: &[&str]| {
+            values
+                .iter()
+                .map(|v| ((*v).to_owned(), v.to_uppercase()))
+                .collect()
+        };
+        vec![
+            ConfigOption {
+                id: "mode".into(),
+                name: "Approval mode".into(),
+                description: Some("How changes are approved".into()),
+                category: "mode",
+                current: "ask".into(),
+                choices: choices(&["ask", "auto", "deny"]),
+            },
+            ConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: "model",
+                current: "p:a".into(),
+                choices: choices(&["p:a", "p:b"]),
+            },
+        ]
+    }
+
+    fn new_session_line() -> String {
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+            "params":{"cwd": std::env::temp_dir(), "mcpServers": []}})
+        .to_string()
+    }
+
+    fn set_option_line(config_id: &str, value: Value) -> String {
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_config_option",
+            "params":{"sessionId":"sess_1","configId":config_id,"value":value}})
+        .to_string()
+    }
+
+    #[test]
+    fn config_options_ride_on_the_session_response_in_the_protocols_shape() {
+        let mut server = ready();
+        server.backend.options = mode_and_model();
+        let reply = one(&mut server, &new_session_line());
+        assert_eq!(
+            reply["result"]["configOptions"],
+            json!([
+                {"id": "mode", "name": "Approval mode", "description": "How changes are approved",
+                 "category": "mode", "type": "select", "currentValue": "ask",
+                 "options": [{"value":"ask","name":"ASK"},{"value":"auto","name":"AUTO"},
+                             {"value":"deny","name":"DENY"}]},
+                {"id": "model", "name": "Model", "category": "model", "type": "select",
+                 "currentValue": "p:a",
+                 "options": [{"value":"p:a","name":"P:A"},{"value":"p:b","name":"P:B"}]}
+            ])
+        );
+        // A load carries them too, and a backend with none leaves the field out.
+        let cwd = std::env::temp_dir();
+        let loaded = replies(&mut server, &load_line("sess_9", cwd.to_str().unwrap()));
+        assert!(loaded[0]["result"]["configOptions"].is_array());
+        let mut bare = ready();
+        let reply = one(&mut bare, &new_session_line());
+        assert!(reply["result"].get("configOptions").is_none());
+    }
+
+    #[test]
+    fn setting_an_option_answers_with_every_option_and_refuses_what_is_not_offered() {
+        let mut server = ready();
+        server.backend.options = mode_and_model();
+        let reply = one(&mut server, &set_option_line("model", json!("p:b")));
+        assert_eq!(reply["id"], 4);
+        let options = reply["result"]["configOptions"].as_array().unwrap();
+        assert_eq!(options.len(), 2, "the complete list, not just the change");
+        assert_eq!(options[1]["currentValue"], "p:b");
+        assert_eq!(options[0]["currentValue"], "ask");
+
+        for (id, value) in [
+            ("model", json!("p:zzz")),
+            ("nonsense", json!("x")),
+            ("mode", json!(true)),
+            ("mode", json!(7)),
+        ] {
+            let reply = one(&mut server, &set_option_line(id, value.clone()));
+            assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{id} {value}");
+        }
+        let reply = one(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"sess_1","value":"x"}}"#,
+        );
+        assert_eq!(reply["error"]["code"], INVALID_PARAMS);
+        // Still as set before the refusals.
+        assert_eq!(server.backend.options[1].current, "p:b");
+    }
+
+    #[test]
+    fn setting_an_option_needs_the_handshake() {
+        let mut server = Server::new(Script::default());
+        let reply = one(&mut server, &set_option_line("mode", json!("auto")));
+        assert_eq!(reply["error"]["code"], INVALID_REQUEST);
+    }
+
+    #[test]
+    fn a_command_that_may_change_a_setting_tells_the_editor_after_its_answer() {
+        let mut server = ready();
+        server.backend.options = mode_and_model();
+        let out = replies(
+            &mut server,
+            &prompt_line(r#"[{"type":"text","text":"/ping"}]"#),
+        );
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|m| {
+                m["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap_or("response")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["agent_message_chunk", "config_option_update", "response"]
+        );
+        assert_eq!(out[1]["params"]["update"]["configOptions"][0]["id"], "mode");
     }
 
     fn offer(server: &mut Server<Script>) {

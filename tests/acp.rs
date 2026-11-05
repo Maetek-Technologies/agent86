@@ -896,7 +896,15 @@ async fn a_saved_session_loads_with_its_history_replayed_and_goes_on() {
             "agent_message_chunk"
         ]
     );
-    assert_eq!(loaded.response["result"], json!({}));
+    // Nothing but the settings the editor's pickers show.
+    assert_eq!(
+        loaded.response["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["configOptions"]
+    );
     assert_eq!(loaded.text_of("user_message_chunk"), "What is here?");
     assert_eq!(loaded.text_of("agent_message_chunk"), "One directory.");
     let call = &loaded.updates[1]["params"]["update"];
@@ -1393,7 +1401,11 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
     );
     for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
         assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
-        assert_eq!(exchange.kinds(), ["agent_message_chunk"]);
+        // The answer, then the settings as they now stand (a command may change one).
+        assert_eq!(
+            exchange.kinds(),
+            ["agent_message_chunk", "config_option_update"]
+        );
     }
     assert_eq!(mode.text_of("agent_message_chunk"), "approval mode: ask");
     assert!(bad
@@ -1445,4 +1457,123 @@ async fn setting_the_mode_changes_what_is_asked_and_unknown_slashes_reach_the_mo
     assert_eq!(other.text_of("agent_message_chunk"), "The model saw it.");
     let sent = server.requests().last().unwrap().body["messages"].to_string();
     assert!(sent.contains("/frobnicate now"), "{sent}");
+}
+
+/// The option with this id from a `configOptions` array.
+fn option<'a>(options: &'a Value, id: &str) -> &'a Value {
+    options
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["id"] == id)
+        .unwrap_or_else(|| panic!("no option {id} in {options}"))
+}
+
+fn choice_values(option: &Value) -> Vec<&str> {
+    option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|choice| choice["value"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_editors_pickers_get_the_mode_and_the_models_and_can_change_them() {
+    let server = MockServer::start(vec![sse_text("From the cheap model.", "stop")]).await;
+    let workspace = Workspace::with_config(
+        "config-options",
+        Some(&server),
+        "[model.route]\ncheap = \"mock:cheap/model\"\nfrontier = \"mock:big/model\"\n",
+    );
+    let (created, set_model, set_mode, bad_model, bad_mode, answer, after_command) =
+        tokio::task::spawn_blocking({
+            let project = workspace.project();
+            let mut client = workspace.connect();
+            move || {
+                client.initialize();
+                let created = client.request(
+                    "session/new",
+                    json!({"cwd": project.to_str().unwrap(), "mcpServers": []}),
+                );
+                let session = created.response["result"]["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let set = |client: &mut Client, id: &str, value: Value| {
+                    client.request(
+                        "session/set_config_option",
+                        json!({"sessionId": session, "configId": id, "value": value}),
+                    )
+                };
+                let set_model = set(&mut client, "model", json!("mock:cheap/model"));
+                let set_mode = set(&mut client, "mode", json!("deny"));
+                let bad_model = set(&mut client, "model", json!("mock:unlisted/model"));
+                let bad_mode = set(&mut client, "mode", json!("sideways"));
+                let answer = client.prompt(&session, "Which model?");
+                // `/mode` from the prompt box moves the picker too.
+                let after_command = client.prompt(&session, "/mode auto");
+                client.finish();
+                (
+                    created,
+                    set_model,
+                    set_mode,
+                    bad_model,
+                    bad_mode,
+                    answer,
+                    after_command,
+                )
+            }
+        })
+        .await
+        .unwrap();
+
+    let options = &created.response["result"]["configOptions"];
+    let mode = option(options, "mode");
+    assert_eq!(mode["category"], "mode");
+    assert_eq!(mode["type"], "select");
+    assert_eq!(mode["currentValue"], "ask");
+    assert_eq!(choice_values(mode), ["ask", "auto", "deny"]);
+    let model = option(options, "model");
+    assert_eq!(model["category"], "model");
+    let models = choice_values(model);
+    // The config's own models, each once, and the one in use among them.
+    assert_eq!(models[0], "mock:test/model");
+    assert!(models.contains(&"mock:cheap/model") && models.contains(&"mock:big/model"));
+    assert!(models.contains(&model["currentValue"].as_str().unwrap()));
+    assert_eq!(model["currentValue"], "mock:test/model");
+
+    // Picking a listed model switches the session to it, and answers with all options.
+    let options = &set_model.response["result"]["configOptions"];
+    assert_eq!(option(options, "model")["currentValue"], "mock:cheap/model");
+    assert_eq!(option(options, "mode")["currentValue"], "ask");
+    assert_eq!(
+        option(&set_mode.response["result"]["configOptions"], "mode")["currentValue"],
+        "deny"
+    );
+    // Refusals are parameter errors and change nothing.
+    assert_eq!(bad_model.response["error"]["code"], -32602);
+    assert_eq!(bad_mode.response["error"]["code"], -32602);
+    // The next turn really ran on the chosen model.
+    assert_eq!(
+        answer.text_of("agent_message_chunk"),
+        "From the cheap model."
+    );
+    assert_eq!(server.requests()[0].body["model"], "cheap/model");
+
+    // And the slash command told the editor the picker's new position.
+    let update = after_command
+        .updates
+        .iter()
+        .map(|m| &m["params"]["update"])
+        .find(|u| u["sessionUpdate"] == "config_option_update")
+        .expect("a config_option_update after /mode");
+    assert_eq!(
+        option(&update["configOptions"], "mode")["currentValue"],
+        "auto"
+    );
+    assert_eq!(
+        option(&update["configOptions"], "model")["currentValue"],
+        "mock:cheap/model"
+    );
 }
