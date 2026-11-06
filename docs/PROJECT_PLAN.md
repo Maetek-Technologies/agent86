@@ -721,6 +721,8 @@ Secrets over ACP, decided and built 2026-11-05: the spec forbids form-mode elici
 
 Released as 1.0.14 (2026-11-05; notes in `docs/releases/v1.0.14.md`), with only Intelligent Terminal on Windows tried by hand, which the notes say.
 
+Released as 1.0.15 (2026-11-06; notes in `docs/releases/v1.0.15.md`): `agent86 auth` and the ACP `terminal` authentication method, for the ACP registry.
+
 Live check in Zed (2026-11-05): `agent86 acp` was run as a custom external agent in Zed and worked. This is the check the six slices and the schema conformance run left open, so the Zed settings in the guide are no longer written only from Zed's documentation; the remaining clients (JetBrains, Neovim, Emacs, the VS Code extensions) are still unverified. The README, the guide's status section, and the plan's "not implemented" list now say Zed has been used by hand.
 
 All six slices are done; what remains is a run against more editors, and the optional parts of the protocol that were left out on purpose (terminals, modes and config options, plans, `session/resume`, remembered permissions, images and audio).
