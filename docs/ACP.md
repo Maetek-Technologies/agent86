@@ -12,6 +12,8 @@ Every message exchanged in agent86's ACP tests was checked against the protocol'
 
 You need agent86 on your `PATH` (see [Install](../README.md#install)) and a model it can reach, exactly as for `run`: a `[model] default` in your config or `--model`, and its key in the environment or the OS keyring (`agent86 keys set <provider>`). An editor started from a launcher may not see your shell's environment, so the keyring is the dependable place for a key.
 
+If a client offers the **Set up a provider and API key** sign-in (the ACP registry requires an authentication method), it runs `agent86 auth` in a terminal: pick a provider, paste its key (hidden), and it is stored in the OS keyring, the same place as `agent86 keys set`. A key in the environment works just as well, so no session is refused for lack of this step.
+
 Test it by hand first. This should print one line of JSON, the handshake answer, and exit:
 
 ```bash

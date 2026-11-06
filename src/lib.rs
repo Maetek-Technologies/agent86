@@ -7,6 +7,7 @@
 pub mod acp;
 pub mod agent;
 pub mod approval;
+pub mod auth;
 pub mod config;
 pub mod config_writer;
 pub mod difflib;
