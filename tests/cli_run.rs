@@ -645,6 +645,19 @@ fn run_with_stdin(workspace: &Workspace, args: &[&str], input: &str) -> Output {
 // keyring is touched; a successful `keys set` would write the real keyring.
 
 #[test]
+fn auth_needs_a_terminal() {
+    // Piped stdin: refused before anything is prompted or stored.
+    let workspace = Workspace::new("auth-no-tty");
+    let output = workspace.command(&["auth"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("needs a terminal"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn keys_set_refuses_unknown_and_keyless_providers() {
     let workspace = Workspace::new("keys-providers");
 

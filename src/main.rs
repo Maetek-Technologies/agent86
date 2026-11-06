@@ -124,6 +124,10 @@ enum Command {
     #[command(subcommand)]
     Keys(KeysCommand),
 
+    /// Interactive setup: choose a provider and store its API key in the OS
+    /// keyring. This is what an editor runs for ACP terminal authentication.
+    Auth,
+
     /// Manage MCP servers.
     #[command(subcommand)]
     Mcp(McpCommand),
@@ -364,6 +368,7 @@ fn main() -> ExitCode {
         }
         Some(Command::Skills(command)) => skills_command(&config, command, &stderr),
         Some(Command::Keys(command)) => keys_command(&config, command, &stderr),
+        Some(Command::Auth) => auth_command(&config, &stderr),
         Some(Command::Trace(command)) => trace_command(&config, command, &stderr),
         Some(Command::Mcp(command)) => mcp_command(&config, command, &stderr),
         Some(Command::Memory(command)) => memory_command(&config, command, &stderr),
@@ -1366,6 +1371,26 @@ fn persist(store: Option<&SessionStore>, state: &AgentState, as_json: bool, stde
     if let Some(Err(error)) = store.map(|store| store.persist(state)) {
         if !as_json {
             stderr.dim(&format!("memory: could not save the session: {error}"));
+        }
+    }
+}
+
+fn auth_command(config: &Config, stderr: &Stderr) -> ExitCode {
+    if !std::io::stdin().is_terminal() {
+        stderr.error("`agent86 auth` is interactive and needs a terminal.");
+        return ExitCode::from(1);
+    }
+    let mut input = std::io::stdin().lock();
+    let mut out = std::io::stdout();
+    let mut read_key = |provider: &str| keys::read_key(provider, false);
+    match agent86::auth::run(config, &OsKeyring, &mut input, &mut out, &mut read_key) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            stderr.error(&message);
+            ExitCode::from(1)
         }
     }
 }

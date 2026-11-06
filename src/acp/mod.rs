@@ -580,6 +580,7 @@ impl<B: Backend> Server<B> {
                     message: "Not initialized: call initialize first".into(),
                 })
             }
+            "authenticate" => authenticate(params).map_err(BackendError::invalid_params),
             "session/new" => self.session_new(params),
             "session/load" => self.session_load(params, emit),
             "session/prompt" => self.session_prompt(params, emit),
@@ -1257,6 +1258,23 @@ fn permission_params(session_id: &str, request: &PermissionRequest) -> Value {
     })
 }
 
+/// The id of the one authentication method: terminal setup, `agent86 auth`.
+/// Keys may equally come from the environment, so no session is refused for
+/// lack of authentication; the method exists so a client can offer the setup.
+pub const AUTH_METHOD_ID: &str = "terminal-setup";
+
+/// `authenticate`: the terminal flow runs outside this connection (the client
+/// launches `agent86 auth` itself), so there is nothing to do but accept the id.
+fn authenticate(params: &Value) -> Result<Value, String> {
+    match params.get("methodId").and_then(Value::as_str) {
+        Some(AUTH_METHOD_ID) => Ok(json!({})),
+        Some(other) => Err(format!(
+            "Invalid params: unknown authentication method '{other}'"
+        )),
+        None => Err("Invalid params: methodId must be a string".into()),
+    }
+}
+
 /// The `initialize` result. The capabilities are exactly what is implemented, and
 /// a client treats an omitted capability as unsupported.
 fn initialize(params: &Value) -> Result<Value, String> {
@@ -1293,7 +1311,13 @@ fn initialize(params: &Value) -> Result<Value, String> {
             "title": "agent86",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "authMethods": []
+        "authMethods": [{
+            "id": AUTH_METHOD_ID,
+            "name": "Set up a provider and API key",
+            "description": "Choose a model provider and store its API key in the OS keyring.",
+            "type": "terminal",
+            "args": ["auth"]
+        }]
     }))
 }
 
@@ -1614,7 +1638,11 @@ mod tests {
         assert_eq!(reply["id"], 0);
         let result = &reply["result"];
         assert_eq!(result["protocolVersion"], 1);
-        assert_eq!(result["authMethods"], json!([]));
+        let method = &result["authMethods"][0];
+        assert_eq!(result["authMethods"].as_array().unwrap().len(), 1);
+        assert_eq!(method["id"], AUTH_METHOD_ID);
+        assert_eq!(method["type"], "terminal");
+        assert_eq!(method["args"], json!(["auth"]));
         assert_eq!(result["agentInfo"]["name"], "agent86");
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
         let capabilities = &result["agentCapabilities"];
@@ -1625,6 +1653,23 @@ mod tests {
         assert_eq!(capabilities["mcpCapabilities"]["http"], true);
         assert_eq!(capabilities["mcpCapabilities"]["sse"], true);
         assert!(server.initialized());
+    }
+
+    #[test]
+    fn authenticate_accepts_the_terminal_method_only() {
+        let mut server = Server::new(Script::default());
+        one(&mut server, INITIALIZE);
+        let ok = one(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"terminal-setup"}}"#,
+        );
+        assert_eq!(ok["result"], json!({}));
+        for params in [r#"{"methodId":"other"}"#, r#"{}"#] {
+            let line =
+                format!(r#"{{"jsonrpc":"2.0","id":2,"method":"authenticate","params":{params}}}"#);
+            let bad = one(&mut server, &line);
+            assert_eq!(bad["error"]["code"], INVALID_PARAMS, "{params}");
+        }
     }
 
     #[test]

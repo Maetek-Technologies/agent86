@@ -158,6 +158,7 @@ Try it against OpenRouter. Either set `OPENROUTER_API_KEY` in your environment, 
 
 ```bash
 cargo run -- keys set openrouter      # prompts with input hidden, including in Git Bash
+cargo run -- auth                     # interactive: choose a provider, then store its key
 ```
 
 Then run:
