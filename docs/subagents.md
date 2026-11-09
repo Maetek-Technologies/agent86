@@ -1,7 +1,7 @@
 # Specialist sub-agents: defined, named, and callable
 
-**Status:** brainstorm (not yet implemented; decisions marked *open* are undecided)
-**Last updated:** 2026-10-31
+**Status:** design (not yet implemented; anything marked *proposed* or *open* is unconfirmed)
+**Last updated:** 2026-11-08
 
 This document is the working plan for letting users (and projects) define
 sub-agents with a specialty, such as `reviewer`, `test-writer`, or `researcher`,
@@ -65,7 +65,26 @@ A *specialty* is a named, reusable sub-agent definition:
 - **Context passing:** the parent can attach files and a conversation summary
   to a delegation.
 
-## Proposed design (first draft, to be refined by the open questions below)
+## Decisions (2026-11-08)
+
+- **Fan-out uses one thread per specialty**, not futures on the turn's runtime
+  (section 6).
+- **The built-in `reviewer` keeps `run_command`, and its commands are always
+  asked about**, even in `auto` mode (section 4). Only `researcher` and
+  `planner` are read-only.
+- **A specialty's system prompt is a filtered copy of the parent's**: it lists
+  only the tools and skills that specialty may use (section 2).
+- **Sub-agents follow routing.** With no `model:`, a sub-agent runs on the model
+  the turn was routed to. This also applies to plain `delegate`, and fixes
+  today's mismatch (section 2).
+- **`#name` is a hint to the main agent**, not a direct run (section 3).
+- **Project specialties are approved per file**, separately from project-file
+  trust, and `--trust-project` also covers them (section 4).
+- **`--with-context` reuses the compaction summarizer** (section 9).
+- **Editors get `delegate`, `/agent`, and `/agents` in the first version**;
+  `#name` stays terminal-only (section 10).
+
+## Proposed design
 
 ### 1. Definition format: one Markdown file per specialty
 
@@ -102,25 +121,49 @@ existing transcript stay valid. The available specialties (name and
 description only) are listed in the system prompt, the way skills are, so the
 model can choose without loading anything.
 
-Resolution: a defined specialty's body replaces the generic persona; its
-`tools` filter the registry the sub-agent sees (the same mechanism as a
-skill's `allowed-tools`, enforced in `ToolRegistry::dispatch`, so a refused
-call is refused even if the model invents it); `model` builds its own provider
-through `provider_for_ref`; `max_steps` is clamped under the turn's `steps`
-as `agent_steps` already is.
+Resolution: a defined specialty's body replaces the generic persona; `model`
+builds its own provider through `provider_for_ref`; `max_steps` is clamped
+under the turn's `steps` as `agent_steps` already is.
+
+**System prompt.** Today a sub-agent gets its persona ahead of the parent's
+whole system content (`run_subagent` in `src/subagent.rs`), which would advertise
+skills and MCP tools a specialty may not use. A specialty gets its instructions,
+then the base identity and environment, then only the tools and skills its
+allowlist permits. Plain `delegate` with `role` alone keeps Python's full copy.
+
+**Tool allowlist.** `tools` filters the specs the sub-agent sees and is enforced
+in `ToolRegistry::dispatch`, so a refused call is refused even if the model
+invents it. It cannot simply reuse the active skill's `allowed-tools`: that slot
+holds one skill, the model can replace it by calling `use_skill`, and
+`ToolContext::fork` copies the parent's. The specialty's list needs its own
+field on the forked context, set once at spawn, and a call must pass both it and
+the active skill's list. *Proposed:* a missing `tools` line inherits the parent's
+tools except `delegate`, so a specialty can only delegate further if it lists
+`delegate`; `max_depth` still applies.
+
+**Model.** With no `model:`, the sub-agent uses the turn's model
+(`active_provider()`). Today `run_subagent` reads that provider but sends the
+request to `self.provider`, the session default, while its records name the
+routed model; providers ignore `CompletionRequest.model`, so the routed name is
+discarded. Sending the request to the routed provider fixes both, and differs
+from Python, so it is recorded in the plan when it lands.
 
 ### 3. How the user calls one
 
-*Decided:* `/agent <name> <task>` and a `#name` mention in the prompt (both
-run the specialty as a sub-agent and put its answer in the conversation), and
-`agent86 run --agent <name> <goal>`, which makes the specialty the *main* agent
+*Decided:* `/agent <name> <task>` runs the specialty directly as a sub-agent, with
+no main-agent call, and puts its answer in the conversation. It is the guaranteed
+route. `agent86 run --agent <name> <goal>` makes the specialty the *main* agent
 of the run (its body replaces the persona, its tools and model apply to the
 turn itself). A `/agents` command lists and inspects them.
 
-`#name` is a new sigil handled next to `@path` in `mentions.rs`: `#reviewer
-check the auth changes` expands to a delegation to `reviewer`. An unknown
-`#name` is left as typed (a `#` in prose, an issue number) rather than
-refused. Several `#` mentions in one prompt fan out (see section 6).
+`#name` is a new sigil handled next to `@path` in `mentions.rs`, and it is a hint
+to the main agent: `#reviewer check the auth changes` sends the prompt as typed
+plus a note asking the model to delegate to `reviewer`. The main agent writes the
+task, so mixed requests and surrounding context work, at the cost of one more
+model turn. The model can still decline, which is why `/agent` exists. Several
+`#` mentions name several specialties, which the model may fan out (section 6).
+An unknown `#name` is left as typed (a `#` in prose, an issue number) rather than
+refused. Specialty names must start with a letter, so `#12` is never one.
 
 *Open:* what `run --agent` does with `--model` (the explicit flag wins over the
 specialty's `model`, proposed).
@@ -130,12 +173,20 @@ specialty's `model`, proposed).
 - A specialty can **narrow** authority, never widen it: its `approval` may be
   stricter than the session's, never looser; its tools are a subset of what the
   parent has.
+- A specialty can name tools that are **always asked about**, whatever the
+  session's mode: *proposed* frontmatter `confirm: run_command`, implemented
+  beside the existing rule in `ApprovalGate::decide` that asks about guarded
+  files in every mode but `deny`. `deny` still declines, and with no terminal the
+  call is declined. The built-in `reviewer` uses this, because a shell can write
+  files.
 - Project-level definitions are untrusted input (a cloned repo can ship one),
   and an instruction body is prompt text from the repo. The first use of a
   project specialty asks for approval, showing the file; the approval is
-  remembered by the file's content hash, so an edited file asks again. Without
-  a terminal (piped, CI) an unapproved project specialty is refused, as `ask`
-  mode declines there.
+  remembered by the file's content hash, so an edited file asks again. This is
+  separate from project-file trust (`src/trust.rs`), which covers only the config
+  file. `--trust-project` or `AGENT86_TRUST_PROJECT` also approves project
+  specialties, for CI; otherwise, without a terminal, an unapproved project
+  specialty is refused, as `ask` mode declines there.
 - Everything it sees and returns goes through the vault's redaction, the
   guardrails, and the recorder, as sub-agents do now (the trace events keep
   Python's names; add `agent` fields rather than new kinds).
@@ -155,22 +206,33 @@ would set `role` to its name so existing trace readers keep working.
 would race for one terminal's approval prompt. Fan-out keeps that rule's
 purpose and drops its blunt form:
 
-- A turn's `delegate` calls (and `#` mentions) that name specialties run
-  concurrently as futures on the turn's runtime, bounded by
-  `[agents] max_parallel` (proposed default 3; the rest queue).
-- **Approvals are serialized.** Every sub-agent's approval request goes through
-  one queue owned by the loop's thread, and the panel shows which specialty is
-  asking. A declined or pending call blocks only its own sub-agent.
+- A turn's `delegate` calls that name specialties run concurrently, bounded by
+  `[agents] max_parallel` (3; the rest queue). **Each gets a scoped thread with
+  its own current-thread runtime.** Futures on the turn's runtime would not be
+  enough: runtimes here are single-threaded and tools run synchronously, so one
+  long `run_command` would freeze every sibling. `execute_batch` already shares
+  `&self` across scoped threads for parallel reads, and the prompt hooks are
+  `Send + Sync`, so this follows an existing pattern.
+- `delegate` currently falls in the batch's sequential part. Fan-out adds a third
+  group: specialty delegations run together, after reads and before writes
+  (*proposed*). Plain `role`-only delegations stay sequential, as in Python.
+- **Prompts are serialized.** Approval requests from sub-agents pass through one
+  queue, and the panel shows which specialty is asking. A declined or pending
+  call blocks only its own sub-agent. Today's rule that approvals are settled on
+  the loop's thread before a batch runs cannot hold for a call that starts
+  mid-sub-agent, so this replaces it for sub-agents. The queue must also carry
+  the other prompts a sub-agent can raise: `raise_limit`'s offer and
+  `request_secret`.
 - Tool results are still pushed back to the parent in call order, whatever
   order the sub-agents finish.
 - Usage is summed into the step as now; the cost cap is checked as each
   finishes, and a trip cancels the siblings at their next safe point
   (`CancelToken`, the same safe points as a turn).
 - Concurrent writers are the hazard: two specialties editing one file. Two
-  mitigations, both used: read-only specialties (the built-ins) are the common
-  fan-out case, and a specialty that writes while others run should use
-  isolation (section 7). The harness refuses nothing automatically; the
-  system prompt says to isolate parallel writers.
+  mitigations, both used: read-only specialties (`researcher`, `planner`) and the
+  always-asking `reviewer` are the common fan-out case, and a specialty that
+  writes while others run should use isolation (section 7). The harness refuses
+  nothing automatically; the system prompt says to isolate parallel writers.
 
 ### 7. Isolation: worktree copy
 
@@ -189,6 +251,9 @@ directory, jailed there through `SandboxPolicy` instead of the real workspace.
   naming prefix.
 - Exec tools run with the worktree as their working directory; secrets and the
   scrubbed environment apply unchanged.
+- In an editor session the fork's `ToolContext::editor` must be cleared, or file
+  tools would read and write the editor's buffers for the real workspace instead
+  of the worktree.
 
 ### 8. Skills both ways
 
@@ -210,12 +275,23 @@ directory, jailed there through `SandboxPolicy` instead of the real workspace.
 
 - `files`: workspace paths whose contents are read, jailed through
   `resolve_within`, size-capped, and put in the sub-agent's first message.
-- `summary`: text the parent wrote (or, for `/agent`, a one-line "include the
-  conversation so far" flag that has the parent summarize it).
+- `summary`: text the parent wrote. For `/agent`, `--with-context` produces it by
+  running the existing compaction summarizer (`src/memory/working.rs`) over the
+  conversation, so its prompt, cost, and routing to the cheap model behave as
+  compaction's do.
 
 Everything attached passes the same redaction and guardrails as any other
 message. The sub-agent still returns only its final text; its own history is
 not given back to the parent.
+
+### 10. Editors (ACP)
+
+In the first version, `agent86 acp` sessions get model delegation to specialties
+and `/agent` and `/agents`, added to `COMMANDS` in `src/acp/harness.rs`. Approval
+of a project specialty goes through `session/request_permission`. `#name` is
+terminal-only for now: editors have no `#` completion, and a mistyped name would
+silently stay as plain text. The serialized prompt queue (section 6) must work
+for ACP's per-call prompts as well as the terminal panel.
 
 ## Open questions
 
@@ -236,27 +312,35 @@ Settled (2026-10-31):
 - **Frontmatter names** (`name`, `description`, `tools`, `model`) stay close to
   Claude Code's, so a `.claude/agents` reader is cheap to add later.
 
-Still open:
+Still open (each has a proposed answer in the section named):
 
-1. **Summary generation** for `/agent ... --with-context`: proposed to reuse the
-   existing compaction summarizer (`src/memory/working.rs`) instead of a new
-   model call by the parent, so the summary's prompt and cost behave like
-   compaction's. Not yet confirmed.
+1. **`run --agent` with `--model`:** the explicit flag wins over the specialty's
+   `model` (section 3).
+2. **A specialty with no `tools` line** inherits everything except `delegate`
+   (section 2).
+3. **The `confirm:` frontmatter key** for always-asked tools (section 4).
+4. **Where specialty delegations run in a batch:** after reads, before writes
+   (section 6).
 
 ## Rough slices (provisional)
 
+0. Fix sub-agent routing: send the request to the routed provider, on its own
+   and first, since plain `delegate` changes too.
 1. Parse and discover definitions (`src/agents_def.rs`, pure, tested with
    fixtures; no behavior change).
-2. `delegate`'s `agent` argument, persona replacement, system-prompt listing.
-3. Tool allowlist and per-specialty step budget.
+2. `delegate`'s `agent` argument, persona replacement, filtered system prompt,
+   system-prompt listing.
+3. Tool allowlist (its own context field), always-asked tools, and per-specialty
+   step budget.
 4. Per-specialty model.
-5. Project-specialty trust (approval by content hash).
-6. Context passing (`files`, `summary`).
-7. User entry points (`/agents`, `/agent`, `#name`, `run --agent`) and
-   interface display.
-8. Parallel fan-out with the serialized approval queue (the riskiest slice;
-   needs tests for ordering, cancellation, and approval interleaving).
-9. Worktree isolation.
+5. Project-specialty trust (approval by content hash, `--trust-project`).
+6. Context passing (`files`, `summary` through the compaction summarizer).
+7. User entry points (`/agents`, `/agent`, `#name` as a hint, `run --agent`),
+   interface display, and the ACP commands and approval.
+8. Parallel fan-out on scoped threads with the serialized prompt queue (the
+   riskiest slice; needs tests for ordering, cancellation, and approval, limit,
+   and secret prompts interleaving, in the terminal and over ACP).
+9. Worktree isolation, including clearing the editor hook.
 10. Skills both ways.
 11. Built-in specialties, embedded and tested for the prompt text and tool lists.
 12. Docs, plan entry, README status.
