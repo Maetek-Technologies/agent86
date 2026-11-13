@@ -304,6 +304,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     );
     app.set_size(usize::from(width), usize::from(height));
     app.workspace = Some(repl.harness.context.policy.workspace().to_path_buf());
+    app.skill_commands = menu::skill_items(&repl.harness.context.skills);
     app.markdown = repl.config.ui.markdown;
     app.set_thinking_level(repl.config.ui.thinking);
     app.set_tool_level(repl.config.ui.tool_use);
@@ -513,8 +514,11 @@ fn dispatch(
                 app.commit_text(render);
             }
         }
-        Action::Turn => {
-            let outcome = run_turn(app, screen, repl, inbox, events, runtime, line)?;
+        Action::Turn | Action::Directed => {
+            // A skill run as a command: its task is what follows the instructions.
+            let (skill, typed) = repl.turn_input(&result, line);
+            let turn = TurnInput { line, typed, skill };
+            let outcome = run_turn(app, screen, repl, inbox, events, runtime, turn)?;
             return Ok(outcome != Request::Exit);
         }
     }
@@ -606,6 +610,14 @@ fn resume_picked(
 }
 
 /// Run one turn on a worker thread while the interface keeps drawing and taking keys.
+/// What a turn runs: the line as typed (for the trace), the text to expand for the
+/// model, and the skill the user ran as a command, if any.
+struct TurnInput<'a> {
+    line: &'a str,
+    typed: &'a str,
+    skill: Option<std::sync::Arc<crate::skills::Skill>>,
+}
+
 fn run_turn(
     app: &mut App,
     screen: &mut Screen<io::Stdout>,
@@ -613,16 +625,23 @@ fn run_turn(
     inbox: &mpsc::Receiver<UiEvent>,
     events: &mpsc::Sender<UiEvent>,
     runtime: &tokio::runtime::Runtime,
-    line: &str,
+    turn: TurnInput<'_>,
 ) -> io::Result<Request> {
+    let TurnInput { line, typed, skill } = turn;
     // `@path` mentions are inlined for the model; refusals are shown and sent along.
     let mentions = expand_mentions(
-        line,
+        typed,
         &repl.harness.context.policy,
         repl.config.tools.mention_max_bytes,
     );
     for problem in &mentions.errors {
         app.note(Style::DimYellow, problem);
+    }
+    if let Some(skill) = &skill {
+        app.note(
+            Style::Dim,
+            &format!("using skill {}", crate::ui::text::sanitize(&skill.name)),
+        );
     }
     app.start_turn();
     let outcome = std::thread::scope(|scope| {
@@ -636,9 +655,15 @@ fn run_turn(
         let worker_events = events.clone();
         let prompt = mentions.prompt;
         scope.spawn(move || {
-            let result = runtime.block_on(harness.run_turn_events(state, &prompt, line, |event| {
+            let on_event = |event: crate::agent::TurnEvent<'_>| {
                 let _ = worker_events.send(event.into());
-            }));
+            };
+            let result = match &skill {
+                Some(skill) => {
+                    runtime.block_on(harness.run_skill_turn(state, skill, &prompt, line, on_event))
+                }
+                None => runtime.block_on(harness.run_turn_events(state, &prompt, line, on_event)),
+            };
             let error = result
                 .err()
                 .map(|error| (error.python_type().to_owned(), error.to_string()));

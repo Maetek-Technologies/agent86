@@ -15,7 +15,7 @@ use super::limits::LimitPanel;
 use super::markdown;
 use super::mcp_config::McpDraft;
 use super::mcp_panels::{McpAction, McpForm, McpList, McpTest, McpTestOutcome};
-use super::menu::{mention_text, Menu, MenuKind};
+use super::menu::{mention_text, Menu, MenuItem, MenuKind};
 use super::panels::{
     ConnectionTest, KeyEntry, KeyPurpose, SaveDiff, SavePurpose, TestOutcome, TestResult,
 };
@@ -302,6 +302,8 @@ pub struct App {
     view: Option<View>,
     /// Where `@` paths are completed from: the workspace.
     pub workspace: Option<PathBuf>,
+    /// The skills the `/` menu offers after the built-in commands (beyond Python).
+    pub skill_commands: Vec<MenuItem>,
     /// The terminal title last written, so it is only written when it changes.
     title_written: String,
     exit_armed: Option<Instant>,
@@ -342,6 +344,7 @@ impl App {
             menu: None,
             view: None,
             workspace: None,
+            skill_commands: Vec::new(),
             title_written: String::new(),
             exit_armed: None,
             request: None,
@@ -1228,6 +1231,7 @@ impl App {
             &self.editor.text(),
             self.editor.cursor(),
             self.workspace.as_deref(),
+            &self.skill_commands,
         );
     }
 

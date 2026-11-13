@@ -275,6 +275,10 @@ pub enum Action {
     Handled,
     /// Not a command: run it as a turn.
     Turn,
+    /// A command that asks for a turn of a particular kind, on
+    /// [`CommandResult::directed`]: run it where turns run, since a command handler
+    /// runs where an approval could never be answered. Beyond Python.
+    Directed,
     Exit,
     /// An empty line: nothing to run and nothing to say.
     Noop,
@@ -288,6 +292,17 @@ pub struct CommandResult {
     /// reprints the banner. Signalled here rather than by matching the command's
     /// name; the plain loop has no transcript and prints `render` regardless.
     pub clears_transcript: bool,
+    /// The turn an [`Action::Directed`] asks for.
+    pub directed: Option<DirectedTurn>,
+}
+
+/// A turn a command asks for, beyond Python. A skill run as a command
+/// (`/<name> [task]`, `/skill <name> [task]`) is one; specialist sub-agents'
+/// `/agent` (docs/subagents.md) is meant to join it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectedTurn {
+    /// Run `task` with the skill `name` chosen ([`Harness::run_skill_turn`]).
+    Skill { name: String, task: String },
 }
 
 impl CommandResult {
@@ -296,6 +311,14 @@ impl CommandResult {
             action,
             render: None,
             clears_transcript: false,
+            directed: None,
+        }
+    }
+
+    fn directed(turn: DirectedTurn) -> Self {
+        Self {
+            directed: Some(turn),
+            ..Self::of(Action::Directed)
         }
     }
 
@@ -332,13 +355,13 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 20] = [
+pub const COMMANDS: [CommandEntry; 21] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
         description: "Show this help",
         needs_choice: None,
-        handler: |_, _| CommandResult::handled(help_table()),
+        handler: |repl, _| CommandResult::handled(help_table(&repl.harness.context.skills)),
     },
     CommandEntry {
         name: "/config",
@@ -404,6 +427,13 @@ pub const COMMANDS: [CommandEntry; 20] = [
             }
             CommandResult::handled(skills_list(skills))
         },
+    },
+    CommandEntry {
+        name: "/skill",
+        usage: "/skill <name> [task]",
+        description: "Run a skill now, with an optional task",
+        needs_choice: None,
+        handler: |repl, arg| repl.skill_command(arg),
     },
     CommandEntry {
         name: "/memory",
@@ -544,10 +574,22 @@ pub fn secret_to_enter(arg: &str) -> Option<&str> {
 
 const LIMITS_USAGE: &str = "/limits <steps|agent_steps|output> <n> sets one for this session · /limits reset · /limits save";
 
-fn help_table() -> Text {
+/// `/help`: every command, then (beyond Python) the skills that can be run as
+/// commands, aligned in one column.
+fn help_table(skills: &crate::skills::Skills) -> Text {
+    let shortcuts: Vec<(String, String)> = skill_shortcuts(skills)
+        .into_iter()
+        .map(|skill| {
+            (
+                format!("/{} [task]", skill.name),
+                crate::skills::one_line(&skill.description),
+            )
+        })
+        .collect();
     let width = COMMANDS
         .iter()
         .map(|entry| entry.usage.chars().count())
+        .chain(shortcuts.iter().map(|(usage, _)| usage.chars().count()))
         .max()
         .unwrap_or(0);
     let mut text = Text::default();
@@ -565,13 +607,85 @@ fn help_table() -> Text {
             ),
         );
     }
+    if !shortcuts.is_empty() {
+        text.push(Style::Plain, "\n\nSkills");
+        for (usage, description) in &shortcuts {
+            text.push(Style::Plain, "\n");
+            text.push(Style::Cyan, usage.as_str());
+            if !description.is_empty() {
+                text.push(
+                    Style::Plain,
+                    format!(
+                        "{}{description}",
+                        " ".repeat(width - usage.chars().count() + 2)
+                    ),
+                );
+            }
+        }
+    }
     text
+}
+
+/// Whether `name` (without the slash) is a built-in command, `/exit` and `/quit`
+/// included. A built-in always wins over a skill of the same name.
+pub fn is_builtin_command(name: &str) -> bool {
+    matches!(name, "exit" | "quit")
+        || COMMANDS
+            .iter()
+            .any(|entry| entry.name.strip_prefix('/') == Some(name))
+}
+
+/// The skill a line runs and its task, beyond Python: `/skill <name> [task]` for
+/// any discovered skill, or `/<name> [task]` for one in [`skill_shortcuts`]. `None`
+/// for anything else, including an unknown name. Shared by both terminal surfaces
+/// and editors, so a line means the same everywhere.
+pub fn skill_invocation<'a>(
+    skills: &crate::skills::Skills,
+    line: &'a str,
+) -> Option<(std::sync::Arc<crate::skills::Skill>, &'a str)> {
+    let rest = line.trim().strip_prefix('/')?;
+    let (word, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if word == "skill" {
+        let after = after.trim_start();
+        let (name, task) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
+        return skills.get(name).map(|skill| (skill.clone(), task.trim()));
+    }
+    let skill = skills.get(word)?;
+    let shortcut = skill
+        .command_name()
+        .is_some_and(|name| !is_builtin_command(name));
+    shortcut.then(|| (skill.clone(), after.trim()))
+}
+
+/// What `/skill` says instead of running anything: the usage with no name, or an
+/// unknown name. `None` when the line names a skill. `arg` is what follows `/skill`.
+pub fn skill_refusal(skills: &crate::skills::Skills, arg: &str) -> Option<String> {
+    let name = arg.split_whitespace().next().unwrap_or("");
+    if name.is_empty() {
+        return Some("usage: /skill <name> [task] · /skills lists them".to_owned());
+    }
+    (!skills.contains_key(name)).then(|| format!("no skill named '{name}' · /skills lists them"))
+}
+
+/// The skills the user can run as `/<name>`, in discovery order: those whose name
+/// can be a command ([`crate::skills::Skill::command_name`]) and is not a built-in's.
+pub fn skill_shortcuts(
+    skills: &crate::skills::Skills,
+) -> Vec<&std::sync::Arc<crate::skills::Skill>> {
+    skills
+        .values()
+        .filter(|skill| {
+            skill
+                .command_name()
+                .is_some_and(|name| !is_builtin_command(name))
+        })
+        .collect()
 }
 
 /// `/skills`: each name on its own line, with its description (and any tool
 /// restriction) indented under it. Python prints `name - description` on one
 /// line, which is hard to scan once descriptions run past the terminal's width.
-fn skills_list(skills: &crate::skills::Skills) -> Text {
+pub(crate) fn skills_list(skills: &crate::skills::Skills) -> Text {
     let mut text = Text::default();
     for (index, skill) in skills.values().enumerate() {
         if index > 0 {
@@ -588,7 +702,27 @@ fn skills_list(skills: &crate::skills::Skills) -> Text {
                 format!("\n  tools while active: {}", skill.allowed_tools.join(", ")),
             );
         }
+        // Beyond Python: how to run it, when that is not simply `/<name>`.
+        let how = match skill.command_name() {
+            Some(name) if is_builtin_command(name) => Some(format!(
+                "\n  run with /skill {name} (/{name} is a built-in command)"
+            )),
+            Some(_) => None,
+            None if !skill.name.contains(char::is_whitespace) => {
+                Some(format!("\n  run with /skill {}", skill.name))
+            }
+            None => {
+                Some("\n  only the model can choose this one: its name is not a command".to_owned())
+            }
+        };
+        if let Some(how) = how {
+            text.push(Style::Dim, how);
+        }
     }
+    text.push(
+        Style::Dim,
+        "\n\nrun one with /<name> [task] or /skill <name> [task]",
+    );
     text
 }
 
@@ -1012,7 +1146,45 @@ impl Repl {
         }
         match find_command_for_line(line) {
             Some((entry, arg)) => (entry.handler)(self, &arg),
-            None => CommandResult::message(format!("unknown command {line}")),
+            // Beyond Python: `/<name> [task]` runs a skill, when no built-in has
+            // that name.
+            None => match skill_invocation(&self.harness.context.skills, line) {
+                Some((skill, task)) => CommandResult::directed(DirectedTurn::Skill {
+                    name: skill.name.clone(),
+                    task: task.to_owned(),
+                }),
+                None => CommandResult::message(format!("unknown command {line}")),
+            },
+        }
+    }
+
+    /// `/skill <name> [task]`: any discovered skill, including one whose `/<name>`
+    /// a built-in takes. An unknown name is answered here, with no model call.
+    fn skill_command(&self, arg: &str) -> CommandResult {
+        let skills = &self.harness.context.skills;
+        if let Some(refusal) = skill_refusal(skills, arg) {
+            return CommandResult::message(refusal);
+        }
+        let (name, task) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+        CommandResult::directed(DirectedTurn::Skill {
+            name: name.to_owned(),
+            task: task.trim().to_owned(),
+        })
+    }
+
+    /// The skill and the text to expand for the model, for a line that
+    /// [`Repl::handle_command`] answered with `result`: a skill's task, or the line.
+    pub fn turn_input<'a>(
+        &self,
+        result: &'a CommandResult,
+        line: &'a str,
+    ) -> (Option<std::sync::Arc<crate::skills::Skill>>, &'a str) {
+        match &result.directed {
+            Some(DirectedTurn::Skill { name, task }) => (
+                self.harness.context.skills.get(name).cloned(),
+                task.as_str(),
+            ),
+            None => (None, line),
         }
     }
 
@@ -1610,14 +1782,16 @@ pub fn plain_loop(mut repl: Repl) {
                 }
                 continue;
             }
-            Action::Turn => {}
+            Action::Turn | Action::Directed => {}
         }
+        // A skill run as a command: its task is what follows the instructions.
+        let (skill, typed) = repl.turn_input(&result, line);
 
         // `@path` mentions become inline file blocks before the model sees the line.
         // Refusals are shown here and carried in the prompt, so neither side assumes
         // a file arrived when it didn't.
         let mentions = expand_mentions(
-            line,
+            typed,
             &repl.harness.context.policy,
             repl.config.tools.mention_max_bytes,
         );
@@ -1625,6 +1799,9 @@ pub fn plain_loop(mut repl: Repl) {
             console.line(Style::Yellow, problem);
         }
 
+        if let Some(skill) = &skill {
+            console.line(Style::Dim, &format!("using skill {}", skill.name));
+        }
         console.write(&Text::plain("\n"));
         let mut label = Text::styled(Style::BoldCyan, "agent86");
         label.push(Style::Plain, " ");
@@ -1634,7 +1811,7 @@ pub fn plain_loop(mut repl: Repl) {
         let mut at_line_start = false;
         let result = {
             let Repl { harness, state, .. } = &mut repl;
-            runtime.block_on(harness.run_turn_as(state, &mentions.prompt, line, |text| {
+            let mut on_text = |text: &str| {
                 if text.is_empty() {
                     return;
                 }
@@ -1650,7 +1827,22 @@ pub fn plain_loop(mut repl: Repl) {
                 console.write(&Text::plain(text));
                 at_line_start = text.ends_with('\n');
                 printed = true;
-            }))
+            };
+            match &skill {
+                Some(skill) => runtime.block_on(harness.run_skill_turn(
+                    state,
+                    skill,
+                    &mentions.prompt,
+                    line,
+                    |event| on_text(event.text()),
+                )),
+                None => runtime.block_on(harness.run_turn_as(
+                    state,
+                    &mentions.prompt,
+                    line,
+                    &mut on_text,
+                )),
+            }
         };
         input.drain_interrupts();
         match result {
@@ -1794,13 +1986,13 @@ mod tests {
 
     #[test]
     fn the_help_table_lists_every_command_aligned() {
-        let help = help_table().plain_text();
+        let help = help_table(&crate::skills::Skills::new()).plain_text();
         let lines: Vec<&str> = help.lines().collect();
         assert_eq!(lines.len(), COMMANDS.len());
         // Rendered by Rich from Python's `_help_table` (trailing padding trimmed).
         assert_eq!(lines[0], "/help                    Show this help");
         assert_eq!(
-            lines[9],
+            lines[10],
             "/mode [ask|auto|deny]    Show/set approval mode (Shift+Tab cycles)"
         );
     }
@@ -2023,6 +2215,82 @@ mod tests {
         assert_eq!(
             lines[5],
             "╰─────────────────────────────────────────────────╯"
+        );
+    }
+
+    fn skill_set(names: &[&str]) -> crate::skills::Skills {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    std::sync::Arc::new(crate::skills::Skill::new(
+                        name,
+                        "",
+                        std::path::PathBuf::from("SKILL.md"),
+                        Vec::new(),
+                    )),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skill_lines_name_a_skill_and_built_ins_win() {
+        let skills = skill_set(&["pdf", "cost", "exit", "a b"]);
+        let run = |line: &str| {
+            skill_invocation(&skills, line)
+                .map(|(skill, task)| (skill.name.clone(), task.to_owned()))
+        };
+        assert_eq!(run("/pdf"), Some(("pdf".into(), String::new())));
+        assert_eq!(
+            run("/pdf  summarize it "),
+            Some(("pdf".into(), "summarize it".into()))
+        );
+        assert_eq!(run("/skill pdf go"), Some(("pdf".into(), "go".into())));
+        // A built-in's name is no shortcut, but `/skill` still reaches the skill.
+        assert_eq!(run("/cost"), None);
+        assert_eq!(run("/exit"), None);
+        assert_eq!(run("/skill cost now"), Some(("cost".into(), "now".into())));
+        assert_eq!(run("/nope"), None);
+        assert_eq!(run("/skill nope"), None);
+        assert_eq!(run("pdf"), None);
+        assert_eq!(run("/a b"), None);
+
+        assert!(is_builtin_command("cost") && is_builtin_command("quit"));
+        assert!(!is_builtin_command("pdf"));
+        let shortcuts: Vec<&str> = skill_shortcuts(&skills)
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect();
+        assert_eq!(shortcuts, ["pdf"]);
+
+        assert_eq!(
+            skill_refusal(&skills, "").as_deref(),
+            Some("usage: /skill <name> [task] · /skills lists them")
+        );
+        assert_eq!(
+            skill_refusal(&skills, "nope go").as_deref(),
+            Some("no skill named 'nope' · /skills lists them")
+        );
+        assert_eq!(skill_refusal(&skills, "pdf go"), None);
+    }
+
+    #[test]
+    fn help_and_the_skill_list_say_how_to_run_each_skill() {
+        let skills = skill_set(&["pdf", "cost", "a b", "a/b"]);
+        let help = help_table(&skills).plain_text();
+        assert!(
+            help.ends_with("\n/exit                    Quit\n\nSkills\n/pdf [task]"),
+            "{help:?}"
+        );
+        let list = skills_list(&skills).plain_text();
+        assert_eq!(
+            list,
+            "pdf\ncost\n  run with /skill cost (/cost is a built-in command)\n\
+             a b\n  only the model can choose this one: its name is not a command\n\
+             a/b\n  run with /skill a/b\n\n\
+             run one with /<name> [task] or /skill <name> [task]"
         );
     }
 }

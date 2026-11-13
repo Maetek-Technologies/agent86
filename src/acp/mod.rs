@@ -310,8 +310,9 @@ pub trait Backend: Send {
         mcp_servers: Vec<McpSpec>,
     ) -> Result<String, BackendError>;
 
-    /// The slash commands offered to the editor for a session. None by default.
-    fn commands(&self) -> Vec<CommandInfo> {
+    /// The slash commands offered to the editor for `session_id`, which may differ
+    /// between sessions (a session's skills depend on its folder). None by default.
+    fn commands(&self, _session_id: &str) -> Vec<CommandInfo> {
         Vec::new()
     }
 
@@ -662,7 +663,7 @@ impl<B: Backend> Server<B> {
 
     /// Queue the command list for after the response, when there is one to offer.
     fn advertise_commands(&mut self, session_id: &str) {
-        let commands = self.backend.commands();
+        let commands = self.backend.commands(session_id);
         if !commands.is_empty() {
             self.after
                 .push(session_update(session_id, &Update::Commands(commands)));
@@ -1486,7 +1487,7 @@ mod tests {
     }
 
     impl Backend for Script {
-        fn commands(&self) -> Vec<CommandInfo> {
+        fn commands(&self, _session_id: &str) -> Vec<CommandInfo> {
             self.offered.clone()
         }
 

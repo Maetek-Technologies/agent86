@@ -57,25 +57,10 @@ impl Tool for UseSkillTool {
                 format!("No skill named '{name}'. Available: {available}."),
             ));
         };
-        let mut body = skill.instructions().to_owned();
-        let resources = skill.resources();
-        if !resources.is_empty() {
-            body.push_str(&format!(
-                "\n\nBundled resources in the skill directory ({}), readable with read_file: {}",
-                skill.directory().display(),
-                resources.join(", ")
-            ));
-        }
+        let body = skill.load_text();
         // Activating a skill replaces any previously active one, so its list is the
         // restriction in force from here to the end of the turn.
         ctx.activate_skill(skill);
-        if !skill.allowed_tools.is_empty() {
-            body.push_str(&format!(
-                "\n\nWhile this skill is active you may only call these tools: {} (plus \
-                 use_skill). Other tools will be refused.",
-                skill.allowed_tools.join(", ")
-            ));
-        }
         let mut result = success(self.name(), body);
         result.metadata.insert("skill".into(), json!(skill.name));
         result

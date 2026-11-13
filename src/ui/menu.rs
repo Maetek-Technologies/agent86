@@ -37,7 +37,12 @@ pub struct Menu {
 
 impl Menu {
     /// The menu for this draft and cursor, or `None` when nothing applies.
-    pub fn for_draft(text: &str, cursor: usize, workspace: Option<&Path>) -> Option<Self> {
+    pub fn for_draft(
+        text: &str,
+        cursor: usize,
+        workspace: Option<&Path>,
+        skills: &[MenuItem],
+    ) -> Option<Self> {
         if let Some((prefix, start, end)) = mention_token(text, cursor) {
             let workspace = workspace?;
             let items: Vec<MenuItem> = complete_mentions(&prefix, workspace)
@@ -56,13 +61,15 @@ impl Menu {
         if !text.starts_with('/') || text.contains(' ') {
             return None;
         }
+        // Beyond Python: the skills that run as commands follow the built-ins.
         let items: Vec<MenuItem> = COMMANDS
             .iter()
-            .filter(|entry| entry.name.starts_with(text))
             .map(|entry| MenuItem {
                 value: entry.name.to_owned(),
                 description: entry.description.to_owned(),
             })
+            .chain(skills.iter().cloned())
+            .filter(|item| item.value.starts_with(text))
             .collect();
         // A command typed in full is the one highlighted, so `/mode` and Enter runs
         // `/mode`, not `/models`, which comes first. Python highlights the first row.
@@ -128,6 +135,19 @@ impl Menu {
     }
 }
 
+/// The `/` menu's rows for the skills that run as commands
+/// ([`crate::repl::skill_shortcuts`]). Names are plain ASCII by then; descriptions
+/// come from files, so they are flattened and sanitized before they are drawn.
+pub fn skill_items(skills: &crate::skills::Skills) -> Vec<MenuItem> {
+    crate::repl::skill_shortcuts(skills)
+        .into_iter()
+        .map(|skill| MenuItem {
+            value: format!("/{}", skill.name),
+            description: sanitize(&crate::skills::one_line(&skill.description)),
+        })
+        .collect()
+}
+
 /// The `@…` token the cursor sits in: the text after the `@`, and the token's
 /// start and end as character indices. It runs from the whitespace before it to
 /// the cursor, so completing mid-line never eats the text that follows.
@@ -163,26 +183,26 @@ mod tests {
 
     #[test]
     fn the_command_menu_follows_pythons_rule() {
-        let menu = Menu::for_draft("/mo", 3, None).unwrap();
+        let menu = Menu::for_draft("/mo", 3, None, &[]).unwrap();
         assert_eq!(menu.kind, MenuKind::Commands);
         assert_eq!(values(&menu), ["/models", "/model", "/mode"]);
         assert_eq!(menu.chosen(), "/models");
-        let typed_in_full = Menu::for_draft("/mode", 5, None).unwrap();
+        let typed_in_full = Menu::for_draft("/mode", 5, None, &[]).unwrap();
         assert_eq!(values(&typed_in_full), ["/models", "/model", "/mode"]);
         assert_eq!(typed_in_full.chosen(), "/mode");
-        let config = Menu::for_draft("/config", 7, None).unwrap();
+        let config = Menu::for_draft("/config", 7, None, &[]).unwrap();
         assert_eq!(values(&config), ["/config", "/config model", "/config mcp"]);
         assert!(
-            Menu::for_draft("/model x", 8, None).is_none(),
+            Menu::for_draft("/model x", 8, None, &[]).is_none(),
             "a space closes it"
         );
-        assert!(Menu::for_draft("hello", 5, None).is_none());
-        assert!(Menu::for_draft("/zzz", 4, None).is_none());
+        assert!(Menu::for_draft("hello", 5, None, &[]).is_none());
+        assert!(Menu::for_draft("/zzz", 4, None, &[]).is_none());
     }
 
     #[test]
     fn the_menu_wraps_and_scrolls() {
-        let mut menu = Menu::for_draft("/", 1, None).unwrap();
+        let mut menu = Menu::for_draft("/", 1, None, &[]).unwrap();
         menu.up();
         assert_eq!(menu.chosen(), "/exit");
         menu.down();
@@ -212,5 +232,39 @@ mod tests {
         assert_eq!(mention_token("x @a b", 6), None);
         assert_eq!(mention_text("my file.txt"), "@\"my file.txt\"");
         assert_eq!(mention_text("src/"), "@src/");
+    }
+
+    #[test]
+    fn skills_follow_the_built_ins_with_clean_descriptions() {
+        let mut skills = crate::skills::Skills::new();
+        for (name, description) in [
+            (
+                "models-guide",
+                "Explain \u{1b}[31mmodels\u{1b}[0m\nin depth.",
+            ),
+            ("cost", "Shadowed by the built-in."),
+            ("two words", "Not a command."),
+        ] {
+            skills.insert(
+                name.to_owned(),
+                std::sync::Arc::new(crate::skills::Skill::new(
+                    name,
+                    description,
+                    std::path::PathBuf::from("SKILL.md"),
+                    Vec::new(),
+                )),
+            );
+        }
+        let items = skill_items(&skills);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].value, "/models-guide");
+        assert!(!items[0].description.contains('\u{1b}'), "{:?}", items[0]);
+        assert!(items[0].description.contains("in depth."));
+
+        let menu = Menu::for_draft("/model", 6, None, &items).unwrap();
+        let values: Vec<&str> = menu.items.iter().map(|item| item.value.as_str()).collect();
+        assert_eq!(values, ["/models", "/model", "/models-guide"]);
+        // Typed in full, the built-in stays highlighted.
+        assert_eq!(menu.chosen(), "/model");
     }
 }
