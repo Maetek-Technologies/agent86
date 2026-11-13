@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "agent86"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "apple-native-keyring-store",
  "candle-core",

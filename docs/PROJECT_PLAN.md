@@ -733,6 +733,8 @@ Released as 1.0.15 (2026-11-06; notes in `docs/releases/v1.0.15.md`): `agent86 a
 
 Released as 1.0.16 (2026-11-13; notes in `docs/releases/v1.0.16.md`): skill commands (`/<skill-name>`, `/skill`, `/skills` in editors, `run --skill`; see the skill differences above), the ACP `/cost` fix for OpenAI-compatible providers, and `rusqlite` 0.41 for RUSTSEC-2026-0459. The skill commands were tried by hand by the maintainer (2026-11-12) and worked.
 
+Released as 1.0.17 (2026-11-13; notes in `docs/releases/v1.0.17.md`): every session records its directory, terminal sessions included, so editors' and agent86-web's lists filtered by directory are right (sessions saved earlier with no recorded directory drop out of those lists until resumed), and `/rename` in the terminal and over ACP (`rename` is advertised, answered without a model turn, and followed by a `session_info_update` carrying the title, which `schema/v1/schema.json` defines; checked against the schema fetched 2026-11-13). See the session differences above.
+
 Live check in Zed (2026-11-05): `agent86 acp` was run as a custom external agent in Zed and worked. This is the check the six slices and the schema conformance run left open, so the Zed settings in the guide are no longer written only from Zed's documentation; the remaining clients (JetBrains, Neovim, Emacs, the VS Code extensions) are still unverified. The README, the guide's status section, and the plan's "not implemented" list now say Zed has been used by hand.
 
 All six slices are done; what remains is a run against more editors, and the optional parts of the protocol that were left out on purpose (terminals, the separate modes API, plans, `session/resume`, remembered permissions, images and audio).
