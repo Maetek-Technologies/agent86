@@ -519,9 +519,10 @@ impl EditorFiles for AcpFiles {
 
 /// The slash commands an editor session offers: the ones that make sense with the
 /// editor owning the screen, and that act on this session alone. The rest of the
-/// terminal's commands (`/resume`, `/clear`, `/thinking`, `/secret`, ...) are the
-/// editor's to provide, or need a terminal.
-const COMMANDS: [(&str, &str, Option<&str>); 8] = [
+/// terminal's commands (`/clear`, `/limits`, `/update`, ...) are the editor's to
+/// provide, or need a terminal. `/skill` and the skills' own commands are advertised
+/// beside these but run as turns, through `prompt` (see `commands`).
+const COMMANDS: [(&str, &str, Option<&str>); 9] = [
     (
         "mode",
         "Show or set the approval mode for this session",
@@ -554,7 +555,17 @@ const COMMANDS: [(&str, &str, Option<&str>); 8] = [
     ),
     ("cost", "Show token usage and cost this session", None),
     ("tools", "List the tools the agent can use", None),
+    ("skills", "List the skills, and how to run each", None),
 ];
+
+/// `/skill`, advertised with [`COMMANDS`] but run as a turn by `prompt`, since a
+/// command answered by `run_command` has no sink: an approval could not reach the
+/// editor and `session/cancel` would not be read. Only a refusal is answered there.
+const SKILL_COMMAND: (&str, &str, Option<&str>) = (
+    "skill",
+    "Run a skill now, with an optional task",
+    Some("skill name, then the task (optional)"),
+);
 
 impl HarnessBackend {
     /// `/model <ref>`, as the terminal's: the current model stays on a refusal, and a
@@ -946,15 +957,35 @@ impl Backend for HarnessBackend {
             .map_err(BackendError::invalid_params)
     }
 
-    fn commands(&self) -> Vec<CommandInfo> {
-        COMMANDS
+    fn commands(&self, session_id: &str) -> Vec<CommandInfo> {
+        let mut commands: Vec<CommandInfo> = COMMANDS
             .iter()
+            .chain(std::iter::once(&SKILL_COMMAND))
             .map(|(name, description, hint)| CommandInfo {
                 name: (*name).to_owned(),
                 description: (*description).to_owned(),
                 hint: hint.map(str::to_owned),
             })
-            .collect()
+            .collect();
+        // Beyond Python: each skill that can be a command, as the terminal offers
+        // them. Names are plain ASCII by then; descriptions come from files, so
+        // they are flattened and stripped of control characters.
+        if let Some(session) = self.sessions.get(session_id) {
+            let skills = &session.harness.context.skills;
+            commands.extend(
+                crate::repl::skill_shortcuts(skills)
+                    .into_iter()
+                    .map(|skill| CommandInfo {
+                        name: skill.name.clone(),
+                        description: crate::skills::one_line(&skill.description)
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .collect(),
+                        hint: Some("task (optional)".to_owned()),
+                    }),
+            );
+        }
+        commands
     }
 
     fn run_command(&mut self, session_id: &str, line: &str) -> Option<String> {
@@ -963,6 +994,11 @@ impl Backend for HarnessBackend {
             None => (line, ""),
         };
         let name = name.strip_prefix('/')?;
+        if name == SKILL_COMMAND.0 {
+            // A skill to run goes on to `prompt`; only a refusal is answered here.
+            let session = self.sessions.get(session_id)?;
+            return crate::repl::skill_refusal(&session.harness.context.skills, arg);
+        }
         if !COMMANDS.iter().any(|(known, _, _)| *known == name) {
             return None;
         }
@@ -989,6 +1025,14 @@ impl Backend for HarnessBackend {
             "resume" => self.resume(&mut session, arg),
             "secret" => secret_command(&session, arg),
             "cost" => self.cost(&session),
+            "skills" => {
+                let skills = &session.harness.context.skills;
+                if skills.is_empty() {
+                    "no skills discovered".to_owned()
+                } else {
+                    crate::repl::skills_list(skills).plain_text()
+                }
+            }
             _ => {
                 let mut lines = vec![format!(
                     "tools: {}",
@@ -1059,11 +1103,19 @@ impl Backend for HarnessBackend {
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&sink));
         let secrets = harness.context.secrets.clone();
 
-        let result = self
-            .runtime
-            .block_on(harness.run_turn_events(state, text, text, |event| {
-                presenter.event(event, sink.as_ref(), &secrets)
-            }));
+        let on_event = |event: crate::agent::TurnEvent<'_>| {
+            presenter.event(event, sink.as_ref(), &secrets);
+        };
+        // Beyond Python: `/skill <name> [task]` and a skill's own `/<name> [task]` run
+        // a turn with that skill chosen, as at a terminal.
+        let result = match crate::repl::skill_invocation(&harness.context.skills, text) {
+            Some((skill, task)) => self
+                .runtime
+                .block_on(harness.run_skill_turn(state, &skill, task, text, on_event)),
+            None => self
+                .runtime
+                .block_on(harness.run_turn_events(state, text, text, on_event)),
+        };
         presenter.end_thought(sink.as_ref());
         // The turn is over: nothing may be asked of the editor until the next one.
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = None;

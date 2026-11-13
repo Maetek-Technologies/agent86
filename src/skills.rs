@@ -105,6 +105,60 @@ impl Skill {
         names.sort();
         names
     }
+
+    /// What loading the skill gives the model: the instructions, the bundled
+    /// resources, and the tool restriction, as `use_skill` returns them. Shared with
+    /// a skill the user runs as a command, so the model reads the same text either way.
+    pub fn load_text(&self) -> String {
+        let mut body = self.instructions().to_owned();
+        let resources = self.resources();
+        if !resources.is_empty() {
+            body.push_str(&format!(
+                "\n\nBundled resources in the skill directory ({}), readable with read_file: {}",
+                self.directory().display(),
+                resources.join(", ")
+            ));
+        }
+        if !self.allowed_tools.is_empty() {
+            body.push_str(&format!(
+                "\n\nWhile this skill is active you may only call these tools: {} (plus \
+                 use_skill). Other tools will be refused.",
+                self.allowed_tools.join(", ")
+            ));
+        }
+        body
+    }
+
+    /// The name as a slash command, beyond Python: only a name of 1 to 64 ASCII
+    /// letters, digits, `-`, and `_`, starting with a letter or digit, gets one.
+    /// Names come from files and are otherwise unchecked, so anything else (spaces,
+    /// slashes, control characters) can be chosen by the model, or with `/skill`
+    /// when it has no space, but is never offered as a command of its own.
+    pub fn command_name(&self) -> Option<&str> {
+        let name = self.name.as_str();
+        let mut chars = name.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+        let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        (first_ok && rest_ok && name.len() <= 64).then_some(name)
+    }
+}
+
+/// The text a skill run as a command (`/<name> [task]`, `/skill <name> [task]`,
+/// `run --skill`) sends the model, beyond Python: the user chose the skill, so its
+/// instructions arrive in the user's message rather than through a `use_skill` call
+/// the model never made.
+pub fn skill_request(skill: &Skill, task: &str) -> String {
+    let task = task.trim();
+    let request = if task.is_empty() {
+        "(none given; follow the skill's instructions, and ask the user if it needs more)"
+    } else {
+        task
+    };
+    format!(
+        "The user ran the skill \"{}\". Follow its instructions below for this request.\n\n{}\n\nRequest: {request}",
+        skill.name,
+        skill.load_text()
+    )
 }
 
 /// Discovered skills, keyed by name in discovery order.
@@ -600,5 +654,27 @@ mod tests {
             "['a']"
         );
         assert_eq!(as_text(None), "");
+    }
+
+    #[test]
+    fn only_plain_names_become_commands() {
+        let named = |name: &str| Skill::new(name, "", PathBuf::from("SKILL.md"), Vec::new());
+        let long = "a".repeat(64);
+        for name in ["pdf", "release-notes", "lint_2", "9lives", long.as_str()] {
+            assert_eq!(named(name).command_name(), Some(name), "{name}");
+        }
+        let too_long = "a".repeat(65);
+        for name in [
+            "",
+            "-x",
+            "_x",
+            "two words",
+            "a/b",
+            "caf\u{e9}",
+            "x\u{1b}",
+            too_long.as_str(),
+        ] {
+            assert_eq!(named(name).command_name(), None, "{name:?}");
+        }
     }
 }

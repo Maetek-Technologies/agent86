@@ -1,7 +1,7 @@
 # Skill commands: run a skill by name, everywhere
 
-**Status:** design (not yet implemented; the next feature update; anything marked
-*proposed* is unconfirmed)
+**Status:** implemented (2026-11-12). The plan's "Known skill differences from
+Python" records what was built; where it differs from this design, the plan wins.
 **Last updated:** 2026-11-12
 
 This document plans letting the user run a skill directly, as `/<skill-name> [task]`
@@ -228,16 +228,17 @@ updates the plan.
 5. **Docs.** README, [ACP.md](ACP.md) (the command list), the plan's skill, REPL,
    and interface differences, and the plan's next-actions entry checked off.
 
-## Open questions
+## Settled questions (2026-11-12, as built)
 
-- Should a skill turn's user message be stored expanded (as proposed, so the model
-  keeps the instructions on later turns and resumes) or stored as the typed line
-  with the instructions re-sent only for that turn (smaller sessions, but later
-  turns lose them)? Proposed: expanded, matching how a `use_skill` result stays.
-- Should project skills (`<workspace>/.agent86/skills`, `.claude/skills`) need
-  project trust before they get shortcuts? Today they are read regardless of trust
-  and the model can already load them; a shortcut only lets the user choose one
-  explicitly. Proposed: no new gate.
-- Is `using skill <name>` the right notice, and should it also print in the plain
-  loop and over ACP (as an `agent_message_chunk`)? Proposed: interface and plain
-  loop only; editors show the typed command already.
+- **The skill turn's user message is saved expanded**, so the model keeps the
+  instructions on later turns and resumes, as a `use_skill` result stays.
+- **No new trust gate**: project skills get commands without project trust. They
+  are read regardless of trust today and the model can already load them; a
+  command only lets the user choose one explicitly.
+- **`using skill <name>`** prints in the interface and the plain loop, not over
+  ACP, where the editor shows the typed command already.
+- **Built-in names**: a skill named like any terminal command gets no command of
+  its own on any surface (the editor's commands are a subset of the terminal's),
+  so a name means the same everywhere; `/skill` reaches it.
+- **`run --skill`** was built, as an option of `run` (after the subcommand, like
+  `--json`).

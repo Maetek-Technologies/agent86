@@ -316,6 +316,49 @@ Environment: agent86 v{}. Default model: mock:test/model. Sandbox: subprocess.",
 }
 
 #[tokio::test]
+async fn run_skill_sends_the_skill_and_an_unknown_one_fails_before_the_model() {
+    // Beyond Python: `run --skill NAME` runs the goal with that skill chosen.
+    let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
+    let workspace = Workspace::with_mock_provider("skill", &server);
+    let dir = workspace
+        .project()
+        .join(".agent86")
+        .join("skills")
+        .join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: notes\ndescription: Draft release notes.\n---\nWrite notes in the past tense.\n",
+    )
+    .unwrap();
+
+    let output = workspace
+        .run(&["run", "--skill", "notes", "for 1.0.16"])
+        .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Hello, world\n");
+    let messages = server.requests()[0].body["messages"].clone();
+    let sent = messages[1]["content"].as_str().unwrap();
+    assert!(
+        sent.starts_with("The user ran the skill \"notes\"."),
+        "{sent}"
+    );
+    assert!(sent.contains("Write notes in the past tense."), "{sent}");
+    assert!(sent.ends_with("\n\nRequest: for 1.0.16"), "{sent}");
+
+    let unknown = workspace.run(&["run", "--skill", "nope", "hi"]).await;
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(stdout(&unknown), "");
+    assert!(
+        stderr(&unknown).contains("no skill named 'nope'"),
+        "{}",
+        stderr(&unknown)
+    );
+    // Only the first run reached the model.
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn run_json_emits_exactly_one_object_with_the_contract_fields() {
     let server = MockServer::start(vec![Reply::Sse(fixture("openai/text.sse"))]).await;
     let workspace = Workspace::with_mock_provider("json", &server);

@@ -1408,16 +1408,23 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
         .unwrap();
     assert_eq!(
         names,
-        ["mode", "model", "thinking", "toolview", "resume", "secret", "cost", "tools"]
+        [
+            "mode", "model", "thinking", "toolview", "resume", "secret", "cost", "tools", "skills",
+            "skill"
+        ]
     );
-    assert_eq!(hints.len(), 8);
+    assert_eq!(hints.len(), 10);
     assert_eq!(hints[0].as_deref(), Some("ask, auto, or deny"));
     assert_eq!(hints[1].as_deref(), Some("provider:model"));
     assert_eq!(hints[2].as_deref(), Some("full, summary, or hidden"));
     assert_eq!(hints[3], hints[2]);
     assert!(hints[4].is_some());
     assert_eq!(hints[5].as_deref(), Some("forget NAME"));
-    assert_eq!((&hints[6], &hints[7]), (&None, &None));
+    assert_eq!((&hints[6], &hints[7], &hints[8]), (&None, &None, &None));
+    assert_eq!(
+        hints[9].as_deref(),
+        Some("skill name, then the task (optional)")
+    );
     for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
         assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
         // The answer, then the settings as they now stand (a command may change one).
@@ -1442,6 +1449,105 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
     // A refused switch leaves things as they were, and none of it reached the model.
     assert!(!bad_model.text_of("agent_message_chunk").is_empty());
     assert!(server.requests().is_empty());
+}
+
+/// Beyond Python: an editor session lists the project's skills as commands, and
+/// `/<name> [task]` runs a turn with the skill chosen, through the prompt path, so
+/// its approvals still reach the editor. `/skills` and a refused `/skill` are
+/// answered without the model.
+#[tokio::test]
+async fn skills_are_offered_as_commands_and_run_as_turns() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[WRITE]),
+        sse_text("Notes drafted.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("skill-commands", Some(&server));
+    for (folder, text) in [
+        (
+            "notes",
+            "---\nname: notes\ndescription: Draft release notes.\n---\nWrite notes in the past tense.\n",
+        ),
+        (
+            "cost",
+            "---\nname: cost\ndescription: Tally costs.\n---\nAdd it all up.\n",
+        ),
+    ] {
+        let dir = workspace
+            .project()
+            .join(".agent86")
+            .join("skills")
+            .join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), text).unwrap();
+    }
+    let (commands, listed, refused, turn) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        client.choose = Some("allow-once");
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            // The list arrives after the response, so the next read picks it up.
+            let listed = client.prompt(&session, "/skills");
+            let commands = client.commands.clone();
+            let refused = client.prompt(&session, "/skill nope");
+            let turn = client.prompt(&session, "/notes for 1.0.16");
+            client.finish();
+            (commands, listed, refused, turn)
+        }
+    })
+    .await
+    .unwrap();
+
+    let notes = commands
+        .iter()
+        .find(|command| command["name"] == "notes")
+        .expect("the skill is offered");
+    assert_eq!(notes["description"], "Draft release notes.");
+    assert_eq!(notes["input"]["hint"], "task (optional)");
+    // A skill named like a built-in gets no command of its own.
+    let named_cost = commands
+        .iter()
+        .filter(|command| command["name"] == "cost")
+        .count();
+    assert_eq!(named_cost, 1);
+
+    let listed = listed.text_of("agent_message_chunk");
+    assert!(listed.contains("notes\n  Draft release notes."), "{listed}");
+    assert!(
+        listed.contains("run with /skill cost (/cost is a built-in command)"),
+        "{listed}"
+    );
+    assert_eq!(
+        refused.text_of("agent_message_chunk"),
+        "no skill named 'nope' · /skills lists them"
+    );
+
+    assert_eq!(turn.response["result"]["stopReason"], "end_turn");
+    // The write the skill turn asked for was put to the editor, then done.
+    assert_eq!(turn.requests.len(), 1);
+    assert!(workspace.project().join("out.txt").exists());
+    assert!(turn
+        .text_of("agent_message_chunk")
+        .contains("Notes drafted."));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let sent = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .unwrap()
+        .to_owned();
+    assert!(
+        sent.starts_with("The user ran the skill \"notes\"."),
+        "{sent}"
+    );
+    assert!(sent.contains("Write notes in the past tense."), "{sent}");
+    assert!(sent.ends_with("\n\nRequest: for 1.0.16"), "{sent}");
 }
 
 /// `/cost` prices the session's usage under the ref the user wrote. The mock is an

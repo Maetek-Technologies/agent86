@@ -434,6 +434,86 @@ async fn skills_lists_the_discovered_skills() {
     );
 }
 
+/// The last user message the model was sent in `request`.
+fn last_user_message(request: &support::Recorded) -> String {
+    request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn skills_run_as_commands_and_built_ins_keep_their_names() {
+    // Beyond Python: `/<name> [task]` and `/skill <name> [task]` run a skill.
+    let server = MockServer::start(vec![
+        sse_text("Notes drafted.", "stop"),
+        sse_text("Tallied.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("skill-commands", &server);
+    for (folder, text) in [
+        (
+            "notes",
+            "---\nname: notes\ndescription: Draft release notes.\n---\nWrite notes in the past tense.\n",
+        ),
+        (
+            "cost",
+            "---\nname: cost\ndescription: Tally costs.\n---\nAdd it all up.\n",
+        ),
+    ] {
+        let dir = workspace
+            .project()
+            .join(".agent86")
+            .join("skills")
+            .join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), text).unwrap();
+    }
+
+    let output = workspace
+        .repl(
+            &[],
+            "/notes for 1.0.16\n/skill cost tally it\n/cost\n/skill nope\n/zzz\n/help\n",
+        )
+        .await;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("using skill notes\n"), "{text}");
+    assert!(text.contains("Notes drafted."), "{text}");
+    assert!(text.contains("using skill cost\n"), "{text}");
+    // `/cost` is still the built-in, not the skill.
+    assert!(text.contains("agent86> steps 2  in "), "{text}");
+    assert!(
+        text.contains("agent86> no skill named 'nope' · /skills lists them\n"),
+        "{text}"
+    );
+    assert!(text.contains("agent86> unknown command /zzz\n"), "{text}");
+    // `/help` lists the skill that has a shortcut, and not the shadowed one.
+    assert!(
+        text.contains("\n\nSkills\n/notes [task]            Draft release notes.\n"),
+        "{text}"
+    );
+    assert!(!text.contains("/cost [task]"), "{text}");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let notes = last_user_message(&requests[0]);
+    assert!(
+        notes.starts_with("The user ran the skill \"notes\"."),
+        "{notes}"
+    );
+    assert!(notes.contains("Write notes in the past tense."), "{notes}");
+    assert!(notes.ends_with("\n\nRequest: for 1.0.16"), "{notes}");
+    let cost = last_user_message(&requests[1]);
+    assert!(cost.contains("Add it all up."), "{cost}");
+    assert!(cost.ends_with("\n\nRequest: tally it"), "{cost}");
+}
+
 #[tokio::test]
 async fn limits_are_shown_set_for_the_session_and_reset() {
     // Beyond Python, which reads these limits only from config.

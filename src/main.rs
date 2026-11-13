@@ -100,6 +100,11 @@ enum Command {
         /// Step budget for each sub-agent, in place of [agents] max_steps.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         max_agent_steps: Option<u32>,
+
+        /// Run the goal with this skill chosen: its instructions go to the model
+        /// ahead of the goal, and its allowed-tools apply from the first step.
+        #[arg(long, value_name = "NAME")]
+        skill: Option<String>,
     },
 
     /// Inspect configuration. With no subcommand: show providers, key source, and
@@ -342,6 +347,7 @@ fn main() -> ExitCode {
             max_steps,
             max_output_tokens,
             max_agent_steps,
+            skill,
         }) => {
             let mut config = config;
             if yes {
@@ -359,7 +365,11 @@ fn main() -> ExitCode {
                 agent_steps: max_agent_steps,
                 output: max_output_tokens,
             };
-            run(&config, &goal, json, session.as_deref(), limits, &stderr)
+            let goal = Goal {
+                text: &goal,
+                skill: skill.as_deref(),
+            };
+            run(&config, goal, json, session.as_deref(), limits, &stderr)
         }
         Some(Command::Config { command }) => config_command(&config, command, &stderr),
         Some(Command::Models) => {
@@ -408,9 +418,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// What `run` was asked to do: the goal, and the skill `--skill` chose (beyond
+/// Python).
+struct Goal<'a> {
+    text: &'a str,
+    skill: Option<&'a str>,
+}
+
 fn run(
     config: &Config,
-    goal: &str,
+    goal: Goal<'_>,
     as_json: bool,
     session: Option<&str>,
     limits: LimitOverrides,
@@ -431,6 +448,19 @@ fn run(
         }
     };
     let harness = assembly.harness;
+    // An unknown skill fails before a session is made or a model is called.
+    let skill = match goal.skill {
+        Some(name) => match harness.context.skills.get(name) {
+            Some(skill) => Some(skill.clone()),
+            None => {
+                stderr.error(&format!("no skill named '{name}'"));
+                stderr.dim("agent86 skills lists them");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+    let goal = goal.text;
     for kind in LimitKind::ALL {
         if let Some(value) = limits.get(kind) {
             harness.session_limits.set(kind, Some(value));
@@ -480,9 +510,18 @@ fn run(
     };
 
     let mut printer = RunPrinter::new((!as_json).then_some(config.run.output), stderr);
-    let result = runtime.block_on(harness.run_turn_events(&mut state, goal, goal, |event| {
-        printer.event(event);
-    }));
+    let on_event = |event: TurnEvent<'_>| printer.event(event);
+    let result = match &skill {
+        // The trace records the run as the command a terminal would take.
+        Some(skill) => runtime.block_on(harness.run_skill_turn(
+            &mut state,
+            skill,
+            goal,
+            &format!("/skill {} {goal}", skill.name),
+            on_event,
+        )),
+        None => runtime.block_on(harness.run_turn_events(&mut state, goal, goal, on_event)),
+    };
     // Saved whether the turn finished or failed, so the session stays resumable.
     persist(store.as_ref(), &state, as_json, stderr);
 

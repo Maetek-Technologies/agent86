@@ -515,12 +515,47 @@ impl Harness {
         display_text: &str,
         on_event: impl FnMut(TurnEvent<'_>),
     ) -> Result<String, HarnessError> {
+        self.run_turn_with(state, user_text, display_text, None, on_event)
+            .await
+    }
+
+    /// A turn with `skill` chosen by the user (`/<name> [task]`, `/skill <name>`,
+    /// `run --skill`), beyond Python: the model gets the skill's instructions ahead
+    /// of `task` in the user's message ([`crate::skills::skill_request`]), and the
+    /// skill is active from the first step, so its `allowed-tools` apply at once.
+    /// Everything else is [`Harness::run_turn_events`]; `display_text` is what the
+    /// user typed, for the trace.
+    pub async fn run_skill_turn(
+        &self,
+        state: &mut AgentState,
+        skill: &Arc<crate::skills::Skill>,
+        task: &str,
+        display_text: &str,
+        on_event: impl FnMut(TurnEvent<'_>),
+    ) -> Result<String, HarnessError> {
+        let user_text = crate::skills::skill_request(skill, task);
+        self.run_turn_with(state, &user_text, display_text, Some(skill), on_event)
+            .await
+    }
+
+    async fn run_turn_with(
+        &self,
+        state: &mut AgentState,
+        user_text: &str,
+        display_text: &str,
+        skill: Option<&Arc<crate::skills::Skill>>,
+        on_event: impl FnMut(TurnEvent<'_>),
+    ) -> Result<String, HarnessError> {
         // A cancel requested while no turn was running must not kill this one.
         self.cancel.clear();
         // A skill activated with `use_skill` restricts tools for its turn only: the
         // restriction is lifted on entry and on every exit, so it can never keep
-        // refusing tools for the rest of the session.
+        // refusing tools for the rest of the session. A skill the user ran is then
+        // made active for this turn alone.
         self.context.clear_skill();
+        if let Some(skill) = skill {
+            self.context.activate_skill(skill);
+        }
         let started = Instant::now();
         // One `turn` span per user turn, parent of its model and tool spans.
         let mut span = self.tracer.start(
