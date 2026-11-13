@@ -690,7 +690,7 @@ impl HarnessBackend {
         let harness = &session.harness;
         let reference = harness
             .routed_ref()
-            .unwrap_or_else(|| format!("{}:{}", harness.provider.name(), harness.provider.model()));
+            .unwrap_or_else(|| session.model_ref.clone());
         let priced = crate::pricing::PriceTable::from_config(&self.config).is_priced(&reference);
         let cost = crate::pricing::format_cost(usage.cost_usd, priced);
         let cost_text = if cost == crate::pricing::UNPRICED_LABEL {

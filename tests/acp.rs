@@ -1444,6 +1444,37 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
     assert!(server.requests().is_empty());
 }
 
+/// `/cost` prices the session's usage under the ref the user wrote. The mock is an
+/// OpenAI-compatible section, whose adapter calls itself `openai`, so a ref read back
+/// from the provider (`openai:test/model`) would find no price.
+#[tokio::test]
+async fn cost_prices_an_openai_compatible_model_under_its_configured_ref() {
+    let server = MockServer::start(vec![sse_text("Hello.", "stop")]).await;
+    let workspace = Workspace::with_config(
+        "cost-priced",
+        Some(&server),
+        "[pricing.models.\"mock:test/model\"]\ninput_per_mtok = 1000.0\noutput_per_mtok = 2000.0\n",
+    );
+    let cost = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.prompt(&session, "hello");
+            let cost = client.prompt(&session, "/cost");
+            client.finish();
+            cost
+        }
+    })
+    .await
+    .unwrap();
+    let shown = cost.text_of("agent_message_chunk");
+    assert!(shown.contains("in 10  out 5 tok"), "{shown}");
+    assert!(shown.contains("cost $"), "{shown}");
+    assert!(!shown.contains("unpriced"), "{shown}");
+}
+
 #[tokio::test]
 async fn setting_the_mode_changes_what_is_asked_and_unknown_slashes_reach_the_model() {
     let server = MockServer::start(vec![
