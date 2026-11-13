@@ -524,6 +524,13 @@ fn run(
     };
     // Saved whether the turn finished or failed, so the session stays resumable.
     persist(store.as_ref(), &state, as_json, stderr);
+    // And where it ran, for editors' and browsers' session lists (beyond Python).
+    if let (Some(store), Some(dirs)) = (&store, agent86::session_dirs::SessionDirs::for_user()) {
+        if store.path() != std::path::Path::new(":memory:") {
+            let workspace = agent86::tools::plain_path(harness.context.policy.workspace());
+            dirs.record_if_titled(store, &state.session_id, &workspace);
+        }
+    }
 
     let streamed = match result {
         Ok(streamed) => streamed,

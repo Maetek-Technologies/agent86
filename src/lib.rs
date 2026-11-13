@@ -29,6 +29,7 @@ pub mod repl;
 pub mod router;
 pub mod secrets;
 pub mod session;
+pub mod session_dirs;
 pub mod setup;
 pub mod skills;
 pub mod subagent;

@@ -66,10 +66,15 @@ impl Workspace {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_in(&self.root.join("project"), args)
+    }
+
+    /// [`Workspace::command`] started in `dir` instead of the project.
+    fn command_in(&self, dir: &std::path::Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent86"));
         command
             .args(args)
-            .current_dir(self.root.join("project"))
+            .current_dir(dir)
             .env("HOME", self.root.join("home"))
             .env("USERPROFILE", self.root.join("home"))
             .env("AGENT86_TEST_MOCK_KEY", "sk-test-0123456789abcdefghij")
@@ -108,7 +113,13 @@ impl Workspace {
     /// Start `agent86 acp` for a conversation: a session id comes back before the
     /// prompt that needs it, so the test has to answer line by line.
     fn connect(&self) -> Client {
-        let mut child = self.command(&["acp"]).spawn().unwrap();
+        self.connect_in(&self.root.join("project"))
+    }
+
+    /// [`Workspace::connect`] with the agent started in `dir`, as a client that
+    /// starts one listing process per workspace does.
+    fn connect_in(&self, dir: &std::path::Path) -> Client {
+        let mut child = self.command_in(dir, &["acp"]).spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Client {
@@ -1409,20 +1420,21 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
     assert_eq!(
         names,
         [
-            "mode", "model", "thinking", "toolview", "resume", "secret", "cost", "tools", "skills",
-            "skill"
+            "mode", "model", "thinking", "toolview", "resume", "secret", "rename", "cost", "tools",
+            "skills", "skill"
         ]
     );
-    assert_eq!(hints.len(), 10);
+    assert_eq!(hints.len(), 11);
     assert_eq!(hints[0].as_deref(), Some("ask, auto, or deny"));
     assert_eq!(hints[1].as_deref(), Some("provider:model"));
     assert_eq!(hints[2].as_deref(), Some("full, summary, or hidden"));
     assert_eq!(hints[3], hints[2]);
     assert!(hints[4].is_some());
     assert_eq!(hints[5].as_deref(), Some("forget NAME"));
-    assert_eq!((&hints[6], &hints[7], &hints[8]), (&None, &None, &None));
+    assert_eq!(hints[6].as_deref(), Some("new title"));
+    assert_eq!((&hints[7], &hints[8], &hints[9]), (&None, &None, &None));
     assert_eq!(
-        hints[9].as_deref(),
+        hints[10].as_deref(),
         Some("skill name, then the task (optional)")
     );
     for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
@@ -1894,6 +1906,171 @@ async fn saved_sessions_are_listed_with_their_directory_and_a_title_across_proce
         .unwrap()
         .is_empty());
     assert_eq!(relative.response["error"]["code"], -32602);
+}
+
+/// 1.0.17: a session made at a terminal records its directory, so a list filtered
+/// by directory shows it under that directory only, whichever directory the
+/// listing process started in. A session whose directory was never recorded (saved
+/// by an earlier build) is left out of filtered lists and marked in unfiltered ones.
+/// Multi-threaded, so the blocking runs below leave the mock server a thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_sessions_are_listed_under_their_own_directory_only() {
+    let server = MockServer::start(vec![
+        sse_text("Noted.", "stop"),
+        sse_text("Noted again.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("list-terminal", Some(&server));
+    let elsewhere = workspace.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let run_json = |goal: &str| -> String {
+        let output = workspace.run(&["run", "--json", goal], "");
+        assert!(output.status.success(), "{output:?}");
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        document["session_id"].as_str().unwrap().to_owned()
+    };
+    let recorded = run_json("Terminal question about the build");
+    let older = run_json("Question from an older build");
+    // Make `older` look saved before 1.0.17: no directory recorded for it.
+    let dirs_file = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("acp-sessions.json");
+    let mut known: serde_json::Map<String, Value> =
+        serde_json::from_str(&std::fs::read_to_string(&dirs_file).unwrap()).unwrap();
+    assert!(known.contains_key(&recorded), "{known:?}");
+    assert!(known.remove(&older).is_some(), "{known:?}");
+    std::fs::write(&dirs_file, Value::Object(known).to_string()).unwrap();
+
+    let list = |start_in: PathBuf, cwd: Option<PathBuf>| {
+        let mut client = workspace.connect_in(&start_in);
+        client.initialize();
+        let params = match &cwd {
+            Some(cwd) => json!({"cwd": cwd.to_str().unwrap()}),
+            None => json!({}),
+        };
+        let reply = client.request("session/list", params);
+        client.finish();
+        reply.response["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let ids = |sessions: &[Value]| -> Vec<String> {
+        sessions
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let project = workspace.project();
+    // Listed from another directory, filtered by the project: the recorded one only.
+    let here = list(elsewhere.clone(), Some(project.clone()));
+    assert_eq!(ids(&here), [recorded.as_str()]);
+    assert!(here[0].get("_meta").is_none());
+    // Listed from the project, filtered by another directory: nothing, although
+    // the listing process started where both sessions ran.
+    assert!(list(project.clone(), Some(elsewhere.clone())).is_empty());
+    // Listed from the project, filtered by it: still not the unknown one.
+    assert_eq!(
+        ids(&list(project.clone(), Some(project.clone()))),
+        [recorded.as_str()]
+    );
+    // Unfiltered: both, the unknown one with the stand-in directory marked.
+    let all = list(elsewhere.clone(), None);
+    assert_eq!(ids(&all), [older.as_str(), recorded.as_str()]);
+    assert_eq!(all[0]["_meta"], json!({"agent86": {"cwdKnown": false}}));
+    assert!(all[0]["cwd"].is_string());
+    assert!(all[1].get("_meta").is_none());
+    assert_eq!(
+        all[1]["cwd"].as_str().unwrap().to_lowercase(),
+        project.display().to_string().to_lowercase()
+    );
+}
+
+/// 1.0.17: `/rename` over ACP is answered locally, announced with a
+/// `session_info_update`, kept out of the conversation, and seen by `session/list`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_is_local_announced_and_listed() {
+    let server = MockServer::start(vec![sse_text("Noted.", "stop")]).await;
+    let workspace = Workspace::new("rename", Some(&server));
+    let project = workspace.project();
+    let mut client = workspace.connect();
+    client.initialize();
+    let session = client.new_session(&project);
+    client.prompt(&session, "Alpha question about the build");
+    let requests_before = server.requests().len();
+
+    let shown = client.prompt(&session, "/rename");
+    assert_eq!(
+        shown.kinds(),
+        ["agent_message_chunk", "config_option_update"]
+    );
+    let text = shown.text_of("agent_message_chunk");
+    assert!(
+        text.contains("session name: Alpha question about the build"),
+        "{text}"
+    );
+    assert!(text.contains("usage: /rename <title>"), "{text}");
+
+    let refused = client.prompt(&session, "/rename \u{202e}  ");
+    assert_eq!(
+        refused.kinds(),
+        ["agent_message_chunk", "config_option_update"]
+    );
+    assert!(refused
+        .text_of("agent_message_chunk")
+        .contains("cannot be empty"));
+
+    let renamed = client.prompt(&session, "/rename   Release prep\nsecond line");
+    assert_eq!(renamed.response["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        renamed.kinds(),
+        [
+            "agent_message_chunk",
+            "session_info_update",
+            "config_option_update"
+        ]
+    );
+    assert_eq!(
+        renamed.text_of("agent_message_chunk"),
+        "session renamed: Release prep"
+    );
+    let info = renamed
+        .updates
+        .iter()
+        .find(|u| u["params"]["update"]["sessionUpdate"] == "session_info_update")
+        .unwrap();
+    assert_eq!(info["params"]["update"]["title"], "Release prep");
+    assert_eq!(info["params"]["sessionId"], session.as_str());
+    let listed = client.request("session/list", json!({"cwd": project.to_str().unwrap()}));
+    client.finish();
+
+    // No model call, and nothing of it in the conversation.
+    assert_eq!(server.requests().len(), requests_before);
+    let sessions = listed.response["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["title"], "Release prep");
+    let mut client = workspace.connect();
+    client.initialize();
+    let replay = client.load_session(&session, &project);
+    client.finish();
+    let users: Vec<String> = replay
+        .updates
+        .iter()
+        .filter(|u| u["params"]["update"]["sessionUpdate"] == "user_message_chunk")
+        .map(|u| {
+            u["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(users, ["Alpha question about the build"]);
+    assert!(!replay
+        .updates
+        .iter()
+        .any(|u| u.to_string().contains("rename")));
 }
 
 #[tokio::test]

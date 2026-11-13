@@ -95,6 +95,8 @@ pub enum Update {
     Commands(Vec<CommandInfo>),
     /// The session's settings changed (`config_option_update`).
     Config(Vec<ConfigOption>),
+    /// The session was renamed (`session_info_update` with its `title`).
+    Title(String),
     /// The model asked for a tool call (`tool_call`, status `pending`).
     ToolCall {
         id: String,
@@ -146,6 +148,11 @@ pub struct SessionSummary {
     pub session_id: String,
     /// Absolute: where the session works.
     pub cwd: String,
+    /// Whether `cwd` is the session's recorded directory. When it is not (the
+    /// session was saved before directories were recorded), `cwd` is a stand-in the
+    /// schema requires, and the entry says so with
+    /// `_meta: {"agent86": {"cwdKnown": false}}`. Filtered lists never hold one.
+    pub cwd_known: bool,
     pub title: Option<String>,
     /// Seconds since the Unix epoch.
     pub updated_at: f64,
@@ -321,6 +328,12 @@ pub trait Backend: Send {
     /// which case it goes to the model like any other prompt. Runs on the connection's
     /// thread, between turns.
     fn run_command(&mut self, _session_id: &str, _line: &str) -> Option<String> {
+        None
+    }
+
+    /// The session's new title, when the command just run renamed it (`/rename`),
+    /// taken so it is announced once. None by default.
+    fn take_title_change(&mut self, _session_id: &str) -> Option<String> {
         None
     }
 
@@ -632,6 +645,9 @@ impl<B: Backend> Server<B> {
                 if let Some(title) = &session.title {
                     entry["title"] = json!(title);
                 }
+                if !session.cwd_known {
+                    entry["_meta"] = json!({ "agent86": { "cwdKnown": false } });
+                }
                 entry
             })
             .collect();
@@ -719,6 +735,10 @@ impl<B: Backend> Server<B> {
         if text.trim_start().starts_with('/') {
             if let Some(output) = self.backend.run_command(&session_id, text.trim()) {
                 emit(session_update(&session_id, &Update::Message(output)));
+                // A rename is announced, so the editor's list shows the new title.
+                if let Some(title) = self.backend.take_title_change(&session_id) {
+                    emit(session_update(&session_id, &Update::Title(title)));
+                }
                 // A command may have changed a setting the editor is showing.
                 let options = self.backend.config_options(&session_id);
                 if !options.is_empty() {
@@ -1197,6 +1217,10 @@ fn session_update(session_id: &str, update: &Update) -> Value {
             "sessionUpdate": "config_option_update",
             "configOptions": config_options_json(options)
         }),
+        Update::Title(title) => json!({
+            "sessionUpdate": "session_info_update",
+            "title": title
+        }),
         Update::Commands(commands) => json!({
             "sessionUpdate": "available_commands_update",
             "availableCommands": commands.iter().map(|command| {
@@ -1451,6 +1475,8 @@ mod tests {
     /// queued, then ends the way it says.
     #[derive(Default)]
     struct Script {
+        /// What `take_title_change` hands over once, after a command.
+        title_change: Option<String>,
         sessions: Vec<(String, Vec<McpSpec>)>,
         prompts: Vec<(String, String)>,
         acts: Vec<Act>,
@@ -1521,6 +1547,10 @@ mod tests {
             }
             option.current = value.to_owned();
             Ok(self.options.clone())
+        }
+
+        fn take_title_change(&mut self, _session_id: &str) -> Option<String> {
+            self.title_change.take()
         }
 
         fn run_command(&mut self, _session_id: &str, line: &str) -> Option<String> {
@@ -2778,6 +2808,7 @@ mod tests {
         SessionSummary {
             session_id: id.into(),
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            cwd_known: true,
             title: title.map(str::to_owned),
             updated_at: 1_700_000_000.0,
         }
@@ -2808,6 +2839,23 @@ mod tests {
         );
         assert!(reply["result"].get("nextCursor").is_none());
         assert_eq!(server.backend.listed_for, [None]);
+    }
+
+    #[test]
+    fn a_session_whose_directory_is_a_stand_in_says_so() {
+        let mut server = ready();
+        let mut unknown = saved("c3", Some("From before"));
+        unknown.cwd_known = false;
+        server.backend.saved = vec![saved("a1", Some("t")), unknown];
+        let reply = one(&mut server, &list_line(json!({})));
+        let sessions = reply["result"]["sessions"].as_array().unwrap();
+        assert!(sessions[0].get("_meta").is_none(), "{reply}");
+        assert_eq!(
+            sessions[1]["_meta"],
+            json!({"agent86": {"cwdKnown": false}})
+        );
+        // The schema requires a directory either way.
+        assert!(sessions[1]["cwd"].is_string());
     }
 
     #[test]
@@ -2865,6 +2913,36 @@ mod tests {
             ["agent_message_chunk", "config_option_update", "response"]
         );
         assert_eq!(out[1]["params"]["update"]["configOptions"][0]["id"], "mode");
+    }
+
+    #[test]
+    fn a_rename_is_announced_as_session_info_after_the_answer() {
+        let mut server = ready();
+        server.backend.title_change = Some("Release prep".into());
+        let out = replies(
+            &mut server,
+            &prompt_line(r#"[{"type":"text","text":"/ping"}]"#),
+        );
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|m| {
+                m["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap_or("response")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["agent_message_chunk", "session_info_update", "response"]
+        );
+        assert_eq!(out[1]["params"]["update"]["title"], "Release prep");
+        assert_eq!(out[2]["result"]["stopReason"], "end_turn");
+        // Taken once: the next command announces nothing.
+        let out = replies(
+            &mut server,
+            &prompt_line(r#"[{"type":"text","text":"/ping"}]"#),
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
     }
 
     fn offer(server: &mut Server<Script>) {

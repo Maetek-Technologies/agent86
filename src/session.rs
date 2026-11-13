@@ -107,6 +107,44 @@ pub fn session_title(state: &AgentState) -> Option<String> {
     None
 }
 
+/// Longest title `/rename` sets, in characters.
+pub const RENAME_TITLE_MAX: usize = 200;
+
+/// Why a title given to `/rename` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleError {
+    /// Nothing is left once it is trimmed and cleaned.
+    Empty,
+}
+
+/// A title the user typed, made fit to store and to show in every list: trimmed,
+/// its first line only, without control or bidirectional-formatting characters
+/// (which could reorder or hide what other text in a list shows), and at most
+/// [`RENAME_TITLE_MAX`] characters.
+pub fn clean_title(raw: &str) -> Result<String, TitleError> {
+    let first = raw.trim().lines().next().unwrap_or_default();
+    let kept: String = first
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_format(*c))
+        .collect();
+    let capped: String = kept.trim().chars().take(RENAME_TITLE_MAX).collect();
+    let title = capped.trim_end().to_owned();
+    if title.is_empty() {
+        Err(TitleError::Empty)
+    } else {
+        Ok(title)
+    }
+}
+
+/// Unicode's bidirectional formatting characters (marks, embeddings, overrides,
+/// and isolates).
+fn is_bidi_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// The memory database could not be opened. The message says what to do about it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -237,6 +275,21 @@ impl SessionStore {
             )
             .optional()
             .map(Option::flatten)
+            .map_err(|error| StoreError(error.to_string()))
+    }
+
+    /// Set a session's title (beyond Python, which names a session only once, from
+    /// its first message): what `/rename` does. Returns whether there was such a
+    /// session. The last-activity time is left alone, so a rename does not move the
+    /// session up a list. [`SessionStore::persist`] never replaces a title that is
+    /// set, so the new one stays. Callers clean the title first ([`clean_title`]).
+    pub fn set_title(&self, session_id: &str, title: &str) -> Result<bool, StoreError> {
+        self.connection()
+            .execute(
+                "UPDATE sessions SET title = ?2 WHERE session_id = ?1",
+                params![session_id, title],
+            )
+            .map(|changed| changed > 0)
             .map_err(|error| StoreError(error.to_string()))
     }
 
