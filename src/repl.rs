@@ -20,6 +20,7 @@ use crate::mentions::expand_mentions;
 use crate::pricing::{format_cost, PriceTable, UNPRICED_LABEL};
 use crate::secrets::{SecretStore, SERVICE_NAME};
 use crate::session::{AgentState, SessionInfo, SessionStore};
+use crate::session_dirs::SessionDirs;
 use crate::setup::{assemble, build_provider, SetupError, REPL_MODEL_HELP};
 use crate::turn::format_turn_summary;
 use crate::types::{ApprovalMode, ModelRef};
@@ -355,7 +356,7 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 21] = [
+pub const COMMANDS: [CommandEntry; 22] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
@@ -501,6 +502,16 @@ pub const COMMANDS: [CommandEntry; 21] = [
         description: "Resume a saved session",
         needs_choice: Some(Choice::Resume),
         handler: |repl, arg| repl.resume(arg),
+    },
+    // Beyond Python, which names a session once, from its first message.
+    CommandEntry {
+        name: "/rename",
+        usage: "/rename <title>",
+        description: "Rename this session",
+        needs_choice: None,
+        handler: |repl, arg| {
+            CommandResult::message(rename_session(repl.store.as_ref(), &repl.state, arg).0)
+        },
     },
     CommandEntry {
         name: "/clear",
@@ -665,6 +676,53 @@ pub fn skill_refusal(skills: &crate::skills::Skills, arg: &str) -> Option<String
         return Some("usage: /skill <name> [task] · /skills lists them".to_owned());
     }
     (!skills.contains_key(name)).then(|| format!("no skill named '{name}' · /skills lists them"))
+}
+
+/// What `/rename` shows with no title, and after a refusal.
+pub const RENAME_USAGE: &str = "usage: /rename <title>";
+
+/// `/rename [title]` on `state`'s session, beyond Python: with a title, set it
+/// (cleaned by [`crate::session::clean_title`]) and return the confirmation and the
+/// title; with none, show the current name and the usage. Shared by both terminal
+/// surfaces and editors. Nothing is added to the conversation, and a session not
+/// yet in the store is saved first, so the title has a row to go on.
+pub fn rename_session(
+    store: Option<&SessionStore>,
+    state: &AgentState,
+    arg: &str,
+) -> (String, Option<String>) {
+    let Some(store) = store else {
+        return (
+            "memory is disabled - sessions are not saved, so there is nothing to rename".to_owned(),
+            None,
+        );
+    };
+    if arg.trim().is_empty() {
+        let current = match store.title(&state.session_id).ok().flatten() {
+            Some(title) => format!("session name: {title}"),
+            None => "this session has no name yet".to_owned(),
+        };
+        return (format!("{current}\n{RENAME_USAGE}"), None);
+    }
+    let Ok(title) = crate::session::clean_title(arg) else {
+        return (
+            format!("a session name cannot be empty\n{RENAME_USAGE}"),
+            None,
+        );
+    };
+    let renamed = store
+        .set_title(&state.session_id, &title)
+        .and_then(|found| {
+            if found {
+                return Ok(());
+            }
+            store.persist(state)?;
+            store.set_title(&state.session_id, &title).map(drop)
+        });
+    match renamed {
+        Ok(()) => (format!("session renamed: {title}"), Some(title)),
+        Err(error) => (format!("could not rename the session: {error}"), None),
+    }
 }
 
 /// The skills the user can run as `/<name>`, in discovery order: those whose name
@@ -952,6 +1010,13 @@ pub struct Repl {
     /// Counts successful `/model` switches. Python tells a switch from a refusal by
     /// the provider object changing; this is the same signal.
     pub(crate) model_switches: u64,
+    /// Where each session's directory is recorded, for editors' and browsers'
+    /// session lists (beyond Python; see [`crate::session_dirs`]). `None` when
+    /// sessions are not saved to a file.
+    pub session_dirs: Option<SessionDirs>,
+    /// The session whose directory has been recorded, so a session is recorded
+    /// once, not on every save.
+    dir_recorded: std::sync::Mutex<Option<String>>,
 }
 
 impl Repl {
@@ -1031,9 +1096,23 @@ impl Repl {
             startup_notes: Vec::new(),
             config_paths: None,
             model_switches: 0,
+            session_dirs: None,
+            dir_recorded: std::sync::Mutex::new(None),
         };
+        // Recorded only for a database on disk: a `:memory:` one (tests) keeps no
+        // sessions to list.
+        let on_disk = repl
+            .store
+            .as_ref()
+            .is_some_and(|store| store.path() != std::path::Path::new(":memory:"));
+        if on_disk {
+            repl.session_dirs = SessionDirs::for_user();
+        }
         repl.state = match resumed {
-            Some(state) => state,
+            Some(state) => {
+                repl.record_directory(&state, true);
+                state
+            }
             None => repl.new_session(),
         };
         // Marked before the startup notes are collected, so a note racing startup
@@ -1079,9 +1158,37 @@ impl Repl {
     }
 
     /// Save the session; a failure is not fatal (the conversation goes on unsaved).
+    /// Once the session has a title, its directory is recorded too.
     pub(crate) fn persist(&self, state: &AgentState) {
         if let Some(store) = &self.store {
             let _ = store.persist(state);
+            self.record_directory(state, false);
+        }
+    }
+
+    /// Record the directory `state`'s session works in (the workspace), once per
+    /// session: on resume (`resumed`), or else once it has a title, which is when
+    /// session lists start showing it.
+    fn record_directory(&self, state: &AgentState, resumed: bool) {
+        let (Some(dirs), Some(store)) = (&self.session_dirs, &self.store) else {
+            return;
+        };
+        let mut recorded = self
+            .dir_recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recorded.as_deref() == Some(state.session_id.as_str()) {
+            return;
+        }
+        let workspace = crate::tools::plain_path(self.harness.context.policy.workspace());
+        let done = if resumed {
+            dirs.record(&state.session_id, &workspace);
+            true
+        } else {
+            dirs.record_if_titled(store, &state.session_id, &workspace)
+        };
+        if done {
+            *recorded = Some(state.session_id.clone());
         }
     }
 
@@ -1499,6 +1606,7 @@ impl Repl {
             return CommandResult::message(format!("no session '{arg}' found"));
         };
         let message = self.resumed_note(&state);
+        self.record_directory(&state, true);
         self.state = state;
         CommandResult::message(message)
     }
@@ -1514,6 +1622,7 @@ impl Repl {
             return Err(format!("no session '{session_id}' found"));
         };
         let note = self.resumed_note(&state);
+        self.record_directory(&state, true);
         self.state = state;
         Ok(note)
     }

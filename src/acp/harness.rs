@@ -41,6 +41,7 @@ use crate::mcp::{var_ref_names, McpManager};
 use crate::pyjson::python_json_dumps;
 use crate::secrets::{NoSecretStore, OsKeyring, SharedStore};
 use crate::session::{AgentState, SessionStore};
+use crate::session_dirs::{same_path_key, SessionDirs};
 use crate::setup::{assemble_in, SetupError};
 use crate::tools::EditorFiles;
 use crate::types::{ApprovalMode, Role, ToolCall, ToolResult};
@@ -53,32 +54,6 @@ use std::time::Duration;
 /// How long the editor has to answer a file request before the tool goes on without
 /// it (a read falls back to the disk; a write fails).
 const FILE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The saved working directories, by session id; empty when there is no file.
-fn read_cwds(file: &Path) -> serde_json::Map<String, Value> {
-    std::fs::read_to_string(file)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| match value {
-            Value::Object(map) => Some(map),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-/// A directory as it is compared: slashes alike and no trailing one, and on Windows
-/// without regard to case.
-fn same_path_key(path: &str) -> String {
-    let mut key = if cfg!(windows) {
-        path.replace('\\', "/").to_lowercase()
-    } else {
-        path.to_owned()
-    };
-    while key.len() > 1 && key.ends_with('/') {
-        key.pop();
-    }
-    key
-}
 
 /// `/secret`: the names the session holds, or `forget NAME`. A secret is never
 /// entered here: what is typed into an editor's box is shown in its thread and kept
@@ -269,6 +244,8 @@ struct Session {
     store: Option<SessionStore>,
     state: AgentState,
     sink: SinkSlot,
+    /// The title `/rename` just set, until it is announced to the editor.
+    title_change: Option<String>,
 }
 
 /// Sessions on agent86's harness, driven on one single-threaded runtime.
@@ -282,9 +259,9 @@ pub struct HarnessBackend {
     notifier: Option<Notifier>,
     /// Whether the lists have been asked for yet: once, on the first session.
     lists_started: bool,
-    /// Where agent86 was started: the directory shown for a saved session that no
-    /// editor session recorded one for (it was made at a terminal, or before this
-    /// was kept).
+    /// Where agent86 was started: the directory an unfiltered `session/list` shows
+    /// for a saved session whose own was never recorded (saved before 1.0.17, or by
+    /// Python's agent86), marked as unknown. A filtered list leaves those out.
     startup_cwd: String,
     /// The database, opened on its own for `session/list` when no session has yet.
     list_store: Option<SessionStore>,
@@ -317,11 +294,9 @@ impl HarnessBackend {
         self
     }
 
-    /// The file recording each editor session's directory.
-    fn cwd_file(&self) -> Option<PathBuf> {
-        self.home
-            .as_ref()
-            .map(|home| home.join(".agent86").join("acp-sessions.json"))
+    /// The record of each session's directory (see [`crate::session_dirs`]).
+    fn session_dirs(&self) -> Option<SessionDirs> {
+        self.home.as_deref().map(SessionDirs::under_home)
     }
 
     /// A backend that reads no remembered secrets.
@@ -438,6 +413,7 @@ impl HarnessBackend {
             store: assembly.store,
             state,
             sink,
+            title_change: None,
         };
         persist(&session.store, &session.state);
         self.sessions.insert(session_id.clone(), session);
@@ -522,7 +498,7 @@ impl EditorFiles for AcpFiles {
 /// terminal's commands (`/clear`, `/limits`, `/update`, ...) are the editor's to
 /// provide, or need a terminal. `/skill` and the skills' own commands are advertised
 /// beside these but run as turns, through `prompt` (see `commands`).
-const COMMANDS: [(&str, &str, Option<&str>); 9] = [
+const COMMANDS: [(&str, &str, Option<&str>); 10] = [
     (
         "mode",
         "Show or set the approval mode for this session",
@@ -552,6 +528,11 @@ const COMMANDS: [(&str, &str, Option<&str>); 9] = [
         "secret",
         "List the secrets available to the agent (never their values), or forget one",
         Some("forget NAME"),
+    ),
+    (
+        "rename",
+        "Show or set this session's name",
+        Some("new title"),
     ),
     ("cost", "Show token usage and cost this session", None),
     ("tools", "List the tools the agent can use", None),
@@ -655,23 +636,11 @@ impl HarnessBackend {
     }
 
     /// Note that `session_id` works in `cwd`, for `session/list`: the database has
-    /// no such column, and it is shared with Python's. Best effort, in a small file
-    /// beside it; a lost update only means the session shows the startup directory.
+    /// no such column, and it is shared with Python's. The terminal records its
+    /// sessions in the same file, through the same code.
     fn remember_cwd(&self, session_id: &str, cwd: &Path) {
-        let Some(file) = self.cwd_file() else {
-            return;
-        };
-        let mut known = read_cwds(&file);
-        known.insert(
-            session_id.to_owned(),
-            Value::String(crate::tools::display_path(cwd)),
-        );
-        let Ok(text) = serde_json::to_string(&Value::Object(known)) else {
-            return;
-        };
-        let staged = file.with_extension("json.tmp");
-        if std::fs::write(&staged, text).is_ok() && std::fs::rename(&staged, &file).is_err() {
-            let _ = std::fs::remove_file(&staged);
+        if let Some(dirs) = self.session_dirs() {
+            dirs.record(session_id, cwd);
         }
     }
 
@@ -871,8 +840,8 @@ impl Backend for HarnessBackend {
             return Vec::new();
         };
         let known = self
-            .cwd_file()
-            .map(|file| read_cwds(&file))
+            .session_dirs()
+            .map(|dirs| dirs.read())
             .unwrap_or_default();
         let wanted = cwd.map(|cwd| same_path_key(&crate::tools::display_path(cwd)));
         store
@@ -881,20 +850,24 @@ impl Backend for HarnessBackend {
             .into_iter()
             // A session with no title has no user message yet: nothing to come back to.
             .filter(|info| info.title.is_some())
-            .map(|info| SessionSummary {
-                cwd: known
-                    .get(&info.session_id)
-                    .and_then(Value::as_str)
-                    .unwrap_or(&self.startup_cwd)
-                    .to_owned(),
-                session_id: info.session_id,
-                title: info.title,
-                updated_at: info.updated_at,
-            })
-            .filter(|summary| {
-                wanted
-                    .as_ref()
-                    .is_none_or(|wanted| *wanted == same_path_key(&summary.cwd))
+            .filter_map(|info| {
+                let recorded = known.get(&info.session_id).and_then(Value::as_str);
+                match (&wanted, recorded) {
+                    // Filtered: only sessions known to work there. One whose
+                    // directory was never recorded is left out, not guessed at.
+                    (Some(wanted), Some(dir)) if *wanted != same_path_key(dir) => return None,
+                    (Some(_), None) => return None,
+                    _ => {}
+                }
+                Some(SessionSummary {
+                    // The schema requires a directory, so an unfiltered list shows
+                    // the one agent86 was started in, marked as a stand-in.
+                    cwd: recorded.unwrap_or(&self.startup_cwd).to_owned(),
+                    cwd_known: recorded.is_some(),
+                    session_id: info.session_id,
+                    title: info.title,
+                    updated_at: info.updated_at,
+                })
             })
             .take(100)
             .collect()
@@ -988,6 +961,10 @@ impl Backend for HarnessBackend {
         commands
     }
 
+    fn take_title_change(&mut self, session_id: &str) -> Option<String> {
+        self.sessions.get_mut(session_id)?.title_change.take()
+    }
+
     fn run_command(&mut self, session_id: &str, line: &str) -> Option<String> {
         let (name, arg) = match line.split_once(char::is_whitespace) {
             Some((name, arg)) => (name, arg.trim()),
@@ -1024,6 +1001,13 @@ impl Backend for HarnessBackend {
             "toolview" => show_level("toolview", &mut session.tool_view, arg),
             "resume" => self.resume(&mut session, arg),
             "secret" => secret_command(&session, arg),
+            "rename" => {
+                // Answered here, so nothing reaches the model or the conversation.
+                let (message, title) =
+                    crate::repl::rename_session(session.store.as_ref(), &session.state, arg);
+                session.title_change = title;
+                message
+            }
             "cost" => self.cost(&session),
             "skills" => {
                 let skills = &session.harness.context.skills;
@@ -1487,15 +1471,6 @@ mod tests {
             "unknown level 'loud' (full|summary|hidden)"
         );
         assert_eq!(level, DisplayLevel::Hidden);
-    }
-
-    #[test]
-    fn directories_compare_the_way_the_platform_does() {
-        assert_eq!(same_path_key("/a/b/"), same_path_key("/a/b"));
-        assert_ne!(same_path_key("/a/b"), same_path_key("/a/c"));
-        if cfg!(windows) {
-            assert_eq!(same_path_key(r"C:\Proj\X\"), same_path_key("c:/proj/x"));
-        }
     }
 
     #[test]

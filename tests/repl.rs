@@ -623,3 +623,143 @@ async fn a_chosen_model_pins_the_session_and_stops_triage_routing() {
     assert_eq!(requests[0].body["model"], "small/model");
     assert_eq!(requests[1].body["model"], "pinned/model");
 }
+
+/// The directory recorded for `id` in the isolated home, if any.
+fn recorded_dir(workspace: &Workspace, id: &str) -> Option<String> {
+    let file = workspace.home().join(".agent86").join("acp-sessions.json");
+    let text = std::fs::read_to_string(file).ok()?;
+    let known: serde_json::Value = serde_json::from_str(&text).unwrap();
+    known[id].as_str().map(str::to_owned)
+}
+
+/// Drop `id` from the record, as for a session saved before 1.0.17.
+fn forget_dir(workspace: &Workspace, id: &str) {
+    let file = workspace.home().join(".agent86").join("acp-sessions.json");
+    let mut known: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    known.remove(id);
+    std::fs::write(&file, serde_json::Value::Object(known).to_string()).unwrap();
+}
+
+/// The project as recorded: canonical, without Windows' `\?\` prefix.
+fn project_dir(workspace: &Workspace) -> String {
+    let text = workspace
+        .project()
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+}
+
+/// 1.0.17: a terminal session records its directory once it has a title, and
+/// resuming one (`--resume` or `/resume`) records it again, so a session saved
+/// before then is found in its directory's list after one resume there.
+#[tokio::test]
+async fn terminal_sessions_record_their_directory_when_named_or_resumed() {
+    let server = MockServer::start(vec![sse_text("Hello.", "stop")]).await;
+    let workspace = Workspace::new("dirs", &server);
+
+    let text = stdout(&workspace.repl(&[], "Say hello\n/clear\n").await);
+    let id = session_id(&text);
+    assert_eq!(recorded_dir(&workspace, &id), Some(project_dir(&workspace)));
+    // The session `/clear` started never got a title, so it is not recorded.
+    let file = workspace.home().join(".agent86").join("acp-sessions.json");
+    let known: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(known.as_object().unwrap().len(), 1, "{known}");
+
+    forget_dir(&workspace, &id);
+    workspace.repl(&["--resume", &id], "").await;
+    assert_eq!(recorded_dir(&workspace, &id), Some(project_dir(&workspace)));
+
+    forget_dir(&workspace, &id);
+    workspace
+        .repl(&[], &format!("/resume {}\n", &id[..8]))
+        .await;
+    assert_eq!(recorded_dir(&workspace, &id), Some(project_dir(&workspace)));
+}
+
+/// 1.0.17: `/rename` names the session, cleaned and capped, and the name is what
+/// `/sessions` shows and what later turns keep.
+#[tokio::test]
+async fn rename_shows_sets_and_keeps_the_session_name() {
+    let server =
+        MockServer::start(vec![sse_text("Hello.", "stop"), sse_text("Again.", "stop")]).await;
+    let workspace = Workspace::new("rename", &server);
+    let long = "x".repeat(250);
+
+    let text = stdout(
+        &workspace
+            .repl(
+                &[],
+                &format!(
+                    "/rename\nSay hello\n/rename\n/rename    \n/rename \u{202e}\u{7}\n\
+                     /rename {long}\n/rename  Re\u{7}lease\u{202e} prep  \n/rename\n\
+                     Another question\n/sessions\n/help\n"
+                ),
+            )
+            .await,
+    );
+    let id = session_id(&text);
+    for line in [
+        "agent86> this session has no name yet\nusage: /rename <title>\n",
+        "agent86> session name: Say hello\nusage: /rename <title>\n",
+        "agent86> a session name cannot be empty\nusage: /rename <title>\n",
+        &format!("agent86> session renamed: {}\n", "x".repeat(200)),
+        "agent86> session renamed: Release prep\n",
+        "agent86> session name: Release prep\nusage: /rename <title>\n",
+    ] {
+        assert!(text.contains(line), "{line:?} not in {text}");
+    }
+    // Spaces alone are no title at all (the name is shown); a title of nothing but
+    // control and formatting characters is refused.
+    assert_eq!(
+        text.matches("session name: Say hello\n").count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("a session name cannot be empty").count(),
+        1,
+        "{text}"
+    );
+    // The turn after the rename saved the session again; the name stayed.
+    let rows = Regex::new(&format!(r"(?m)^{}  Release prep +just now$", &id[..8])).unwrap();
+    assert!(rows.is_match(&text), "{text}");
+    assert!(
+        text.contains("/rename <title>          Rename this session\n"),
+        "{text}"
+    );
+    // Nothing of it reached the model.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let sent = requests[1].body["messages"].as_array().unwrap();
+    assert!(
+        !sent.iter().any(|m| m.to_string().contains("rename")),
+        "{sent:?}"
+    );
+    let resumed = stdout(&workspace.repl(&["--resume", &id], "").await);
+    assert!(
+        resumed.starts_with(&format!(
+            "resumed session {id} (4 messages) - Release prep\n"
+        )),
+        "{resumed}"
+    );
+}
+
+#[tokio::test]
+async fn rename_needs_memory() {
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::new("rename-no-memory", &server);
+    let config =
+        std::fs::read_to_string(workspace.project().join(".agent86").join("config.toml")).unwrap();
+    workspace.write_config(&format!("{config}\n[memory]\nenabled = false\n"));
+    let text = stdout(&workspace.repl(&[], "/rename Release prep\n").await);
+    assert!(
+        text.contains(
+            "agent86> memory is disabled - sessions are not saved, so there is nothing to rename\n"
+        ),
+        "{text}"
+    );
+}

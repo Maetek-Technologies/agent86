@@ -165,3 +165,74 @@ fn the_store_creates_its_directory_and_python_schema() {
     drop(connection);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_renamed_session_keeps_its_title_through_later_saves() {
+    let store = SessionStore::open(Path::new(":memory:")).unwrap();
+    let mut state = state_with(vec![user("first question")]);
+    assert!(
+        !store.set_title(&state.session_id, "early").unwrap(),
+        "no row yet"
+    );
+    store.persist(&state).unwrap();
+    assert_eq!(
+        store.title(&state.session_id).unwrap().as_deref(),
+        Some("first question")
+    );
+    let before = store.recent_sessions(10).unwrap()[0].updated_at;
+
+    assert!(store.set_title(&state.session_id, "Release prep").unwrap());
+    assert_eq!(
+        store.title(&state.session_id).unwrap().as_deref(),
+        Some("Release prep")
+    );
+    // A rename is not activity: the session keeps its place in the list.
+    assert_eq!(store.recent_sessions(10).unwrap()[0].updated_at, before);
+
+    // Later turns save the state again; the title they would derive is not used.
+    state.messages.push(user("second question"));
+    store.persist(&state).unwrap();
+    let listed = store.recent_sessions(10).unwrap();
+    assert_eq!(listed[0].title.as_deref(), Some("Release prep"));
+    assert_eq!(store.load(&state.session_id).unwrap().unwrap(), state);
+}
+
+#[test]
+fn a_session_renamed_before_its_first_message_is_not_renamed_by_it() {
+    let store = SessionStore::open(Path::new(":memory:")).unwrap();
+    let mut state = AgentState::new();
+    store.persist(&state).unwrap();
+    assert_eq!(store.title(&state.session_id).unwrap(), None);
+    assert!(store.set_title(&state.session_id, "Named first").unwrap());
+    state.messages.push(user("hello"));
+    store.persist(&state).unwrap();
+    assert_eq!(
+        store.title(&state.session_id).unwrap().as_deref(),
+        Some("Named first")
+    );
+}
+
+#[test]
+fn rename_titles_are_cleaned_and_capped() {
+    use agent86::session::{clean_title, TitleError, RENAME_TITLE_MAX};
+    assert_eq!(clean_title("  Release prep  ").unwrap(), "Release prep");
+    assert_eq!(clean_title("\n first line \nsecond").unwrap(), "first line");
+    assert_eq!(
+        clean_title("a\u{7}b\u{1b}[31mc\u{202e}d\u{2066}e\u{200f}").unwrap(),
+        "ab[31mcde"
+    );
+    assert_eq!(clean_title(""), Err(TitleError::Empty));
+    assert_eq!(clean_title("   \n  "), Err(TitleError::Empty));
+    assert_eq!(clean_title("\u{202e}\u{200e}"), Err(TitleError::Empty));
+    let long = "é".repeat(RENAME_TITLE_MAX + 50);
+    assert_eq!(
+        clean_title(&long).unwrap().chars().count(),
+        RENAME_TITLE_MAX
+    );
+    // Cut at the cap, then trimmed: no trailing space is kept.
+    let spaced = format!("{} tail", "x".repeat(RENAME_TITLE_MAX - 1));
+    assert_eq!(
+        clean_title(&spaced).unwrap(),
+        "x".repeat(RENAME_TITLE_MAX - 1)
+    );
+}
