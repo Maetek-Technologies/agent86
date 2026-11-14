@@ -123,6 +123,7 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] Secure secret entry, part 3: remembering secrets per project in the OS keyring (beyond Python)
 - [x] Arguments a model sends as JSON strings where the tool wants an array or an object are repaired (beyond Python)
 - [x] Show or hide thinking and tool use in the interface: `full`, `summary`, or `hidden` for each, Ctrl+T and commands, `[ui] thinking` and `[ui] tool_use` (beyond Python)
+- [ ] Google (Gemini) and vLLM providers: a native `google` adapter, and a built-in `vllm` provider for local or remote servers (beyond Python; planned, see the project plan)
 - [ ] Scheduled jobs: the agent schedules work for itself, and `agent86 schedule daemon` runs it, with no session open (beyond Python; planned, see the project plan)
 - [x] ACP server: `agent86 acp` for editors such as Zed that speak the Agent Client Protocol (beyond Python; checked against the protocol's schema and used by hand in Zed and Microsoft's Intelligent Terminal, not yet tried in the JetBrains IDEs or the other editors; see [docs/ACP.md](docs/ACP.md))
 - [x] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
