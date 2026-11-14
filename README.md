@@ -22,7 +22,7 @@ This is the standard agent86. It replaced the original [Python implementation](h
 - An Anthropic provider (`--model anthropic:<model>`) on the Messages API, with tool use, prompt caching, and the SDK's retries and error messages
 - A llama.cpp and LM Studio provider (`--model llamacpp:<model>`), keyless and free, through the OpenAI-compatible adapter
 - Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
-- Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks. A project's file is not trusted until you say so (beyond Python): settings that could start programs, send your keys elsewhere, or loosen approvals (MCP servers, providers, guardrails, the sandbox, and so on) are listed at a terminal for a `[y/N]`, remembered by the file's hash, and ignored otherwise unless you pass `--trust-project` or set `AGENT86_TRUST_PROJECT=1`. The model's writes into `.agent86/` or a skills directory are always asked about, even with `--yes`
+- Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks. A project's file is not trusted until you say so (beyond Python): settings that could start programs, send your keys elsewhere, or loosen approvals (MCP servers, providers, guardrails, the sandbox, and so on) are listed at a terminal for a `[y/N]`, remembered by the file's hash, and ignored otherwise unless you pass `--trust-project` or set `AGENT86_TRUST_PROJECT=1`. The project's own specialist sub-agents (`.agent86/agents/`) are approved separately, per file: each is shown to you in full before it first runs, and `--trust-project` approves them too (except in an editor, which always asks). The model's writes into `.agent86/` or a skills directory are always asked about, even with `--yes`
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
 - Python's system prompt (identity plus environment line), checked against text extracted from the Python source
 - API keys from the provider's environment variable or, failing that, the OS keyring (service `agent86`, account = provider name), compatible with keys stored by the Python implementation
@@ -30,6 +30,7 @@ This is the standard agent86. It replaced the original [Python implementation](h
 - An interactive interface (`agent86` with no subcommand), inline in Claude Code's style:
   - the conversation in your terminal's scrollback, a bordered input box, a spinner, a live status line, and approval panels
   - Python's slash commands with a `/` menu, `@file` mentions with path completion, and shared prompt history
+  - specialist sub-agents: `/agents` lists them, `/agent <name> <task>` runs one now, and `#name` (with completion) asks the agent to delegate to one (beyond Python)
   - pickers for the approval mode, the model (with the provider's live model list), and the session to resume
   - `/config model`: pick a provider, enter its key (kept in the OS keyring only after a live connection test passes), pick a model, and save it to your user or project config with your comments kept
   - `/config mcp`: add an MCP server from a pasted JSON block or by hand, test it live, save it, and use its tools at once; edit, disable, or remove servers the same way
@@ -82,7 +83,8 @@ agent86 is compatible with the [Agent Client Protocol](https://agentclientprotoc
 - **Stop.** Cancelling stops the turn at the next safe point.
 - **Saved threads.** Your agent86 sessions, terminal ones included, appear in the client's session list under the folder they ran in, and can be reopened and renamed.
 - **Pickers.** The approval mode and the model can be changed from the client's selectors, including each provider's own model list.
-- **Slash commands.** `/mode`, `/model`, `/thinking`, `/toolview`, `/resume`, `/secret`, `/rename`, `/cost`, and `/tools`, answered without using the model.
+- **Slash commands.** `/mode`, `/model`, `/thinking`, `/toolview`, `/resume`, `/secret`, `/rename`, `/cost`, `/tools`, `/skills`, and `/agents`, answered without using the model, plus `/skill`, each skill's own command, and `/agent <name> <task>`, which run as turns.
+- **Sub-agents as cards.** Each delegation is one tool call card, named for the specialist and its task, listing its calls while it runs.
 - **The client's servers and files.** MCP servers configured in the client are started for the thread. If the client offers it, the file tools go through it, so the model sees your unsaved changes.
 - **Secrets.** A secret you enter at a terminal in the project and choose to remember is loaded into that project's threads, and the model sees only its name. There is no secret prompt in a client, because the protocol forbids asking for one.
 
