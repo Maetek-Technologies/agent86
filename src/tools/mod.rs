@@ -209,6 +209,44 @@ impl<'a> Arguments<'a> {
         }
     }
 
+    /// An `Optional[str]` field (default `None`); `null` reads as absent.
+    pub fn optional_string(&mut self, field: &str) -> Option<String> {
+        match self.args.get(field) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                self.errors
+                    .push(format!("{field}: Input should be a valid string"));
+                None
+            }
+        }
+    }
+
+    /// A `list[str]` field (default `[]`), each bad item reported under its index,
+    /// as pydantic does.
+    pub fn string_list(&mut self, field: &str) -> Vec<String> {
+        match self.args.get(field) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut values = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    match item {
+                        Value::String(text) => values.push(text.clone()),
+                        _ => self
+                            .errors
+                            .push(format!("{field}.{index}: Input should be a valid string")),
+                    }
+                }
+                values
+            }
+            Some(_) => {
+                self.errors
+                    .push(format!("{field}: Input should be a valid list"));
+                Vec::new()
+            }
+        }
+    }
+
     /// A string field accepted under any of `names` (pydantic's `AliasChoices`);
     /// the first name present wins, and errors name the first choice.
     pub fn string_alias(&mut self, names: &[&str]) -> String {
@@ -416,6 +454,18 @@ impl SandboxPolicy {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    /// This policy jailed to `root` instead (a git worktree, beyond Python), with its
+    /// guards, timeout, output cap, passthrough, and network kept, the roots it
+    /// already allowed, and `keep` (roots inside the old workspace that must stay
+    /// reachable at their real path, such as a project's skill directories).
+    pub fn rerooted(&self, root: &Path, keep: Vec<PathBuf>) -> std::io::Result<Self> {
+        let mut policy = self.clone();
+        policy.workspace = std::fs::canonicalize(root)?;
+        let allowed = std::mem::take(&mut policy.allow_paths);
+        policy.allow(allowed.into_iter().chain(keep));
+        Ok(policy)
     }
 
     /// Let tools also reach `roots` (already resolved), leaving out any inside the
@@ -640,6 +690,112 @@ pub struct ToolContext {
     /// The editor's files, when an editor drives the agent. Shared by clones and
     /// sub-agent forks.
     pub editor: Option<Arc<dyn EditorFiles>>,
+    /// The specialist sub-agents (beyond Python), for `delegate` and `use_skill`.
+    pub specialties: Arc<crate::agents_def::Specialties>,
+    /// What narrows this context (beyond Python): the specialty it runs, or one it
+    /// was delegated from. Set once when a sub-agent is spawned (or for `run
+    /// --agent`), never by the model, and checked with the active skill's list.
+    pub scope: Option<Arc<ToolScope>>,
+    /// Whether a `use_skill` hand-off to a specialty could be made from here: the
+    /// harness delegates, `delegate` is offered at this depth, and this context may
+    /// call it. Set by the harness.
+    pub can_delegate: bool,
+    /// The fan-out this context's sub-agent belongs to (beyond Python): siblings
+    /// running at once share its spend and its stop. Inherited by forks, so a
+    /// sibling's own delegations stop with it.
+    pub fanout: Option<Arc<crate::subagent::FanOut>>,
+    /// On a fan-out thread: every sub-agent here calls a provider copy with an
+    /// HTTP client of its own ([`crate::provider::Provider::fresh`]).
+    pub fresh_clients: bool,
+    /// The git worktree this context is jailed to, when a specialty runs isolated;
+    /// a delegation from inside asking for isolation is served by the same one.
+    pub worktree: Option<Arc<crate::worktree::Worktree>>,
+    /// The card a sub-agent's progress is reported on (beyond Python): the
+    /// top-level delegation's, which nested runs share.
+    pub card: Option<Arc<crate::subagent::Card>>,
+}
+
+/// What a specialist sub-agent may do (beyond Python): its tools, approval mode,
+/// and always-asked tools, already narrowed by whoever delegated to it. Authority
+/// only narrows: a nested delegation intersects the lists, keeps the stricter
+/// mode, and unites the always-asked tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolScope {
+    /// Who runs under it, for refusals and approval prompts: the specialty's name.
+    pub label: String,
+    /// Only these tools, when set.
+    pub only: Option<Vec<String>>,
+    /// Never these (a specialty with no `tools` line inherits all but `delegate`).
+    pub except: Vec<String>,
+    /// Applies only when stricter than the session's mode.
+    pub approval: Option<crate::types::ApprovalMode>,
+    /// Asked about in every mode but `deny`.
+    pub confirm: Vec<String>,
+    /// The skills preloaded into it, so `use_skill` does not hand one back to it.
+    pub preloaded: Vec<String>,
+    /// Runs in a git worktree: MCP tools, which act outside the jail, are allowed
+    /// only when `only` names them.
+    pub isolated: bool,
+}
+
+impl ToolScope {
+    pub fn allows(&self, name: &str) -> bool {
+        let named = self
+            .only
+            .as_ref()
+            .is_some_and(|only| only.iter().any(|tool| tool == name));
+        if self.isolated && name.starts_with("mcp__") && !named {
+            return false;
+        }
+        (self.only.is_none() || named) && !self.except.iter().any(|tool| tool == name)
+    }
+
+    /// This scope narrowed by `outer`, the caller's.
+    pub fn within(mut self, outer: Option<&ToolScope>) -> Self {
+        let Some(outer) = outer else {
+            return self;
+        };
+        self.only = match (self.only.take(), &outer.only) {
+            (Some(mine), Some(theirs)) => Some(
+                mine.into_iter()
+                    .filter(|tool| theirs.contains(tool))
+                    .collect(),
+            ),
+            (Some(mine), None) => Some(mine),
+            (None, theirs) => theirs.clone(),
+        };
+        for tool in &outer.except {
+            if !self.except.contains(tool) {
+                self.except.push(tool.clone());
+            }
+        }
+        self.approval = stricter(self.approval, outer.approval);
+        self.isolated |= outer.isolated;
+        for tool in &outer.confirm {
+            if !self.confirm.contains(tool) {
+                self.confirm.push(tool.clone());
+            }
+        }
+        self
+    }
+}
+
+/// The stricter of two modes (`deny`, then `ask`, then `auto`); `None` imposes nothing.
+pub fn stricter(
+    a: Option<crate::types::ApprovalMode>,
+    b: Option<crate::types::ApprovalMode>,
+) -> Option<crate::types::ApprovalMode> {
+    use crate::types::ApprovalMode::{Ask, Auto, Deny};
+    let rank = |mode| match mode {
+        Deny => 2,
+        Ask => 1,
+        Auto => 0,
+    };
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if rank(a) >= rank(b) { a } else { b }),
+        (a, None) => a,
+        (None, b) => b,
+    }
 }
 
 impl ToolContext {
@@ -654,6 +810,13 @@ impl ToolContext {
             active_skill: Arc::default(),
             secrets: crate::vault::SecretVault::default(),
             editor: None,
+            specialties: Arc::default(),
+            scope: None,
+            can_delegate: false,
+            fanout: None,
+            fresh_clients: false,
+            worktree: None,
+            card: None,
         })
     }
 
@@ -685,10 +848,20 @@ impl ToolContext {
         self.active().clone()
     }
 
+    /// Whether the specialty this context runs under (if any) permits `name`.
+    pub fn scope_allows(&self, name: &str) -> bool {
+        self.scope.as_deref().is_none_or(|scope| scope.allows(name))
+    }
+
     /// Whether `name` may be called now, given the active skill's `allowed-tools`.
     /// `use_skill` always may: it is how the model switches skills, and a skill
     /// that forgot to list it would otherwise be a one-way door.
     pub fn allowed_tool(&self, name: &str) -> bool {
+        // A specialty's own list is not lifted for `use_skill`: it is set at spawn
+        // and the model cannot change it.
+        if !self.scope_allows(name) {
+            return false;
+        }
         match self.active().as_deref() {
             Some(skill) if !skill.allowed_tools.is_empty() => {
                 name == "use_skill" || skill.allowed_tools.iter().any(|tool| tool == name)
@@ -832,6 +1005,7 @@ impl ToolRegistry {
 
     fn dispatch_unredacted(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
         match self.get(&call.name) {
+            Some(_) if !ctx.scope_allows(&call.name) => scope_refusal(call, ctx),
             Some(_) if !ctx.allowed_tool(&call.name) => skill_refusal(call, ctx),
             Some(tool) => match with_secrets(tool.as_ref(), call, ctx) {
                 Ok(call) => {
@@ -965,6 +1139,26 @@ fn accepted_types(property: &Value) -> Vec<&str> {
         }
     }
     types
+}
+
+/// The answer to a call outside the running specialty's tools, naming what it
+/// may use so the model can re-plan.
+pub fn scope_refusal(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+    let label = ctx
+        .scope
+        .as_deref()
+        .map_or("", |scope| scope.label.as_str());
+    ToolResult {
+        call_id: call.id.clone(),
+        ..failure(
+            &call.name,
+            format!(
+                "Tool '{}' is not permitted for the '{label}' sub-agent. Use only the tools you \
+                 were given.",
+                call.name
+            ),
+        )
+    }
 }
 
 /// The answer to a call the active skill's `allowed-tools` forbid, naming the

@@ -156,6 +156,11 @@ pub fn assemble_in(
         .policy
         .allow(skill_roots(config, &workspace, home.as_deref()));
     context.skills = Arc::clone(&skills);
+    // Beyond Python: the specialist sub-agents, from the built-ins, the user's
+    // directory, and this workspace (the editor's project, for an ACP session).
+    if config.agents.enabled {
+        context.specialties = Arc::new(crate::agents_def::discover(&workspace, home.as_deref()));
+    }
     // Beyond Python: the user's own agent86 directory (config, trusted projects,
     // memory, traces) and skills are agent86's own files wherever the workspace is,
     // including when it is that directory.
@@ -214,8 +219,24 @@ pub fn assemble_in(
         memory: store.clone(),
         mcp,
         cancel: Default::default(),
+        subagents: Default::default(),
     };
     harness.configure_output(config, &model_ref.provider);
+    harness.context.can_delegate = harness.delegation_offered(&harness.context, 0);
+    // One question at a time, approvals, limits, and secrets alike, and none once
+    // the turn is cancelled (beyond Python: parallel sub-agents can each ask).
+    harness.gate.queue.watch(harness.cancel.clone());
+    harness
+        .context
+        .secrets
+        .set_queue(harness.gate.queue.clone());
+    // Worktrees that isolated specialties of exited processes left behind.
+    if config.agents.enabled {
+        crate::worktree::sweep();
+    }
+    if let Some(home) = &home {
+        harness.subagents.approvals = crate::subagent::ApprovalStore::under_home(home);
+    }
     Ok(Assembly {
         harness,
         model_ref,

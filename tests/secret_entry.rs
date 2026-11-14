@@ -97,6 +97,7 @@ fn harness(server: &MockServer, workspace: &Workspace, registry: ToolRegistry) -
             enabled: false,
             max_depth: 2,
             max_steps: 8,
+            max_parallel: 3,
         },
         system: Message {
             role: Role::System,
@@ -118,6 +119,7 @@ fn harness(server: &MockServer, workspace: &Workspace, registry: ToolRegistry) -
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     }
 }
 

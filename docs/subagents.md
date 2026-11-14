@@ -1,7 +1,86 @@
 # Specialist sub-agents: defined, named, and callable
 
-**Status:** design (not yet implemented; anything marked *proposed* is unconfirmed)
-**Last updated:** 2026-11-09
+**Status:** built (2026-11-14): slices 0 to 12, including the editor's
+per-delegation card of section 10. ACP child sessions stay a later, unnumbered
+slice. Text still marked *proposed* below was the plan; where the build differs,
+*Built differently* below says how.
+**Last updated:** 2026-11-14
+
+## What is built (2026-11-14)
+
+- Slice 0: a sub-agent's requests go to the turn's routed model, which its trace
+  already named. Slice 0b: sub-agents stop at the main loop's safe points on a
+  cancel; over ACP, a cancel or a closed connection stops the turn, and no
+  permission request is sent after a cancel.
+- Slices 1 to 6: `src/agents_def.rs` (parsing and discovery, failing closed), the
+  `agent`, `skill`, `files`, and `summary` arguments, the filtered system prompt
+  and the listing, `tools::ToolScope` (allowlist, approval mode, `confirm`,
+  narrowing through nesting from the caller's context), the specialty's own model
+  with its fallback notice and `route` event, its step budget and run-only raises,
+  and project-file approval by content hash (`~/.agent86/approved-agents.json`).
+- Slice 7, except the observer: `/agents`, `/agent [--with-context]` on every
+  surface (`Harness::run_agent_turn`), `#name` hints in the terminal, and `run
+  --agent`.
+- Slice 8: adjacent specialty delegations among a batch's calls left after the
+  reads run at once (`Harness::fan_out`), each on a scoped thread with its own
+  current-thread runtime and provider copies with HTTP clients of their own
+  (`Provider::fresh`), at most `[agents] max_parallel` (default 3, clamped to
+  1..=8) at a time; a write or a plain delegation between them separates them, a
+  batch with any specialty delegation takes the reads-first path, and
+  `parallel_tools = false` groups nothing. Approval, limit, and secret prompts
+  pass through one `approval::PromptQueue` (one question at a time; none after a
+  cancel). The siblings share one spend counter (`subagent::FanOut`) and one stop;
+  sub-agent events carry a per-spawn `run`.
+- Slice 9: `isolation: worktree` and `delegate`'s `isolate` run a specialty in a
+  `git worktree` of `HEAD` in the temporary directory (`src/worktree.rs`), jailed
+  there by `SandboxPolicy::rerooted`, with the editor's buffers dropped and MCP
+  tools left out unless named. Its answer carries the redacted, size-capped diff
+  (untracked files through `git add --intent-to-add`); a worktree with changes is
+  kept and reported with its branch, one without is removed, and a startup sweep
+  removes those of exited processes (never one kept on purpose). Host `git` runs
+  with an empty `core.hooksPath`, `core.fsmonitor=false`, explicit `--git-dir` and
+  `--work-tree` after creation, and `--no-ext-diff --no-textconv`. A delegation
+  from inside a worktree stays in it.
+- Section 10 and the rest of slice 7: a sub-agent observer
+  (`subagent::SubagentEvent`, `SubagentState::set_observer`) reports each run's
+  start, tool calls, results, notices, and end on a `subagent::Card`: the
+  top-level `delegate` call's, which nested runs share, or a synthetic one for
+  `/agent`. A sub-agent's calls get ids namespaced under the card (`<card>/<n>`),
+  which the gate and nested delegations see too. Over ACP the `delegate` call is
+  the card, titled `<name>: <first line of the task>`, sent `in_progress` with a
+  log of its calls (the last 20 lines, a running count at `summary`, failures only
+  at `hidden`) and ended by its result; `/agent` announces and ends a card of its
+  own; a call the gate asks about is announced as a card of its own first, and the
+  request's title names the specialty (`[reviewer] write_file(...)`); a model
+  fallback notice is a line on the card. Tool call ids are unique within a session,
+  replay included. A project specialty's approval goes through its own hook
+  (`ApprovalGate::specialty_prompt`), which an editor answers with one
+  `allow_always` option ("Allow this version of <name>"). The terminal interface
+  prints when a specialist starts and finishes, and its menu completes `#` names.
+- Slice 10: `skills:` preloading, `delegate`'s `skill`, and `use_skill`'s hand-off
+  note for a skill with `agent:`.
+- Slice 11: the built-in `researcher`, `reviewer`, and `planner`
+  (`src/agents/*.md`).
+
+Built differently from the design:
+
+- Slice 8: the stop is one token per fan-out (a cost trip stops every sibling, which
+  is what the design needs; cancelling one child alone is for the child sessions
+  later). A queued question checks the turn's token, not the fan-out's, so after a
+  cost trip a sibling's queued question is still put. The keep-alive regression test
+  is replaced by the design itself: every sub-agent on a fan-out thread builds its
+  own client, so no pooled connection crosses runtimes.
+- Slice 9: a filter driver configured in the repository (`filter.<name>.smudge`)
+  still runs when git checks the worktree out; the hardening covers hooks,
+  fsmonitor, external diffs, textconv, and a rewritten `.git` file. An editor's
+  unsaved buffers are not counted for the dirty-workspace notice.
+- Section 10: the layer keeps a provider's tool call id while it is unused in the
+  session and adds a `#<n>` suffix to a repeat, instead of numbering every call;
+  ids stay unique and the common case is unchanged. A cancelled delegation's card
+  ends `completed` with the `[sub-agent ... cancelled]` text, since that is the
+  call's result, rather than `failed`.
+- The raise offered to a plain (role-only) delegation stays the session's
+  override, as before, so it also ranks above a specialty's own `max_steps`.
 
 This document is the working plan for letting users (and projects) define
 sub-agents with a specialty, such as `reviewer`, `test-writer`, or `researcher`,

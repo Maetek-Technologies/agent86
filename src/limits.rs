@@ -97,6 +97,10 @@ pub struct LimitHit {
     pub current: u32,
     /// The values offered, ascending.
     pub offers: Vec<u32>,
+    /// Beyond Python's settings: the raise lasts for this run of a specialist
+    /// sub-agent only, not the session, since it is that specialty's own budget or
+    /// model.
+    pub run_only: bool,
 }
 
 impl LimitHit {
@@ -121,9 +125,13 @@ impl LimitHit {
 
     /// What accepting does.
     pub fn question(&self) -> &'static str {
-        match self.kind {
-            LimitKind::Steps | LimitKind::AgentSteps => "Raise it for this session and go on?",
-            LimitKind::Output => "Raise it for this session and ask again?",
+        match (self.kind, self.run_only) {
+            (LimitKind::Steps | LimitKind::AgentSteps, false) => {
+                "Raise it for this session and go on?"
+            }
+            (LimitKind::Output, false) => "Raise it for this session and ask again?",
+            (LimitKind::Steps | LimitKind::AgentSteps, true) => "Raise it for this run and go on?",
+            (LimitKind::Output, true) => "Raise it for this run and ask again?",
         }
     }
 }
@@ -315,13 +323,16 @@ impl Harness {
     }
 
     /// Offer to raise `kind`, reached at `current`, and keep the new value for the
-    /// session. `None` when there is no hook, nothing to offer, or the user stops.
+    /// session, or with `run_only` hand it back for the caller's run alone (a
+    /// specialist sub-agent's own budget or model). `None` when there is no hook,
+    /// nothing to offer, or the user stops.
     pub(crate) fn raise_limit(
         &self,
         kind: LimitKind,
         agent: Option<&str>,
         sid: &str,
         current: u32,
+        run_only: bool,
     ) -> Option<u32> {
         let prompt = self.session_limits.prompt.as_ref()?;
         // A sub-agent's budget stays under the turn's.
@@ -331,12 +342,21 @@ impl Harness {
             agent: agent.map(str::to_owned),
             current,
             offers: offers(current, ceiling),
+            run_only,
         };
         if hit.offers.is_empty() {
             return None;
         }
-        let raised = prompt(&hit).filter(|value| hit.offers.contains(value))?;
-        self.session_limits.set(kind, Some(raised));
+        // One question at a time, and none once the turn was cancelled.
+        let raised = self
+            .gate
+            .queue
+            .ask(|| prompt(&hit))
+            .flatten()
+            .filter(|value| hit.offers.contains(value))?;
+        if !run_only {
+            self.session_limits.set(kind, Some(raised));
+        }
         let mut fields = vec![("limit", json!(kind.name()))];
         if let Some(agent) = agent {
             fields.push(("agent", json!(agent)));
@@ -442,6 +462,7 @@ mod tests {
             agent: agent.map(str::to_owned),
             current,
             offers: Vec::new(),
+            run_only: false,
         };
         assert_eq!(
             hit(LimitKind::Steps, None, 40).headline(),

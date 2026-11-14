@@ -93,6 +93,15 @@ pub struct CancelToken {
     inner: Arc<CancelInner>,
 }
 
+impl std::fmt::Debug for CancelToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
 #[derive(Default)]
 struct CancelInner {
     flag: AtomicBool,
@@ -265,6 +274,11 @@ impl CircuitBreaker {
     }
 
     /// Count spending that is not a step, such as a compaction summary.
+    /// What the turn has spent so far.
+    pub fn cost(&self) -> f64 {
+        self.cost_usd
+    }
+
     pub fn record_cost(&mut self, cost_usd: f64) {
         self.cost_usd += cost_usd;
     }
@@ -327,6 +341,9 @@ pub struct Harness {
     pub memory: Option<crate::session::SessionStore>,
     /// Stops the running turn at its next safe point.
     pub cancel: CancelToken,
+    /// Specialist sub-agents' state (beyond Python): notices for the user and the
+    /// approvals of project specialties (`crate::subagent`).
+    pub subagents: crate::subagent::SubagentState,
 }
 
 impl Harness {
@@ -335,6 +352,23 @@ impl Harness {
     /// `_system_content`. Beyond Python, the names of the secrets the user entered
     /// come before the recall note, when there are any.
     pub(crate) fn system_message(&self, extra: Option<&str>) -> Message {
+        let offered = self.delegation_offered(&self.context, 0);
+        // Beyond Python: under `run --agent`, the specialty's filtered prompt.
+        if let Some((persona, preloaded)) = self.subagents.main() {
+            return self.filtered_system(&persona, &self.context, &preloaded, offered, extra);
+        }
+        self.system_for(&self.context, offered, extra)
+    }
+
+    /// [`Harness::system_message`] for `ctx`, an unrestricted context (the main
+    /// loop's, or a plain sub-agent's fork of it). Beyond Python, when `delegate`
+    /// is offered, the specialist sub-agents are listed after the MCP section.
+    pub(crate) fn system_for(
+        &self,
+        ctx: &ToolContext,
+        delegation_offered: bool,
+        extra: Option<&str>,
+    ) -> Message {
         let mut system = self.system.clone();
         if let Some(section) = self
             .mcp
@@ -344,7 +378,12 @@ impl Harness {
         {
             system.content = format!("{}\n\n{section}", system.content);
         }
-        if let Some(section) = self.context.secrets.prompt_section() {
+        if delegation_offered {
+            if let Some(section) = self.specialty_listing(ctx) {
+                system.content = format!("{}\n\n{section}", system.content);
+            }
+        }
+        if let Some(section) = ctx.secrets.prompt_section() {
             system.content = format!("{}\n\n{section}", system.content);
         }
         if let Some(extra) = extra.filter(|extra| !extra.is_empty()) {
@@ -358,12 +397,29 @@ impl Harness {
     /// history (the system message and the tool catalogue, both of which change at
     /// runtime), minus the room the response needs.
     pub(crate) fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
+        self.context_budget_with(
+            system,
+            specs,
+            self.active_context_window(),
+            self.output_cap(),
+        )
+    }
+
+    /// [`Harness::context_budget`] for a model with this window and output cap (a
+    /// specialist sub-agent on a model of its own).
+    pub(crate) fn context_budget_with(
+        &self,
+        system: &Message,
+        specs: &[ToolSpec],
+        window: u64,
+        output_cap: u32,
+    ) -> u64 {
         let overhead = count_tokens(std::slice::from_ref(system)) + count_spec_tokens(specs);
         conversation_budget(
-            self.active_context_window(),
+            window,
             overhead,
             self.limits.context_reserve_tokens,
-            u64::from(self.output_cap()),
+            u64::from(output_cap),
             self.limits.max_context_tokens,
         )
     }
@@ -699,7 +755,7 @@ impl Harness {
             }
             // Beyond Python: the interface may offer to raise a spent budget.
             if breaker.out_of_steps() {
-                match self.raise_limit(LimitKind::Steps, None, &sid, breaker.max_steps()) {
+                match self.raise_limit(LimitKind::Steps, None, &sid, breaker.max_steps(), false) {
                     Some(raised) => breaker.set_max_steps(raised),
                     // Ctrl+C at the offer stops it and cancels the turn.
                     None if self.cancel.is_cancelled() => {
@@ -736,7 +792,9 @@ impl Harness {
 
             let mut completion = {
                 let system = self.system_message(recall_note.as_deref());
-                let tools = self.registry.specs();
+                let mut tools = self.registry.specs();
+                // Under `run --agent`, only what the specialty may call is offered.
+                tools.retain(|spec| self.context.scope_allows(&spec.name));
                 let budget = self.context_budget(&system, &tools);
                 let conversation = fit(&state.messages, budget);
                 let mut request_messages = Vec::with_capacity(conversation.len() + 1);
@@ -957,7 +1015,7 @@ impl Harness {
             {
                 let cap = self.output_cap();
                 if self
-                    .raise_limit(LimitKind::Output, None, &sid, cap)
+                    .raise_limit(LimitKind::Output, None, &sid, cap, false)
                     .is_some()
                 {
                     record_step(
@@ -1072,7 +1130,13 @@ impl Harness {
                 );
                 emit(TurnEvent::ToolCall { call, text: &text });
             }
-            let results = self.execute_batch(&tool_calls, &sid).await;
+            let results = self.execute_batch(&tool_calls, &sid, breaker.cost()).await;
+            // Beyond Python: what a sub-agent had to tell the user (a specialty's
+            // model that could not be built), as notices, so `run`'s stdout keeps
+            // only the answer.
+            for notice in self.take_notices() {
+                emit(TurnEvent::Notice(&format!("{notice}\n")));
+            }
             for (call, (result, delegated)) in tool_calls.iter().zip(results) {
                 summary.tool_calls += 1;
                 // What a sub-agent spent is what this turn spent: in the summary, the
@@ -1143,12 +1207,29 @@ impl Harness {
     /// run sequentially, in the order the model asked for them, after the reads.
     /// Every approval is settled first, on this thread, because the gate may
     /// prompt a human.
-    async fn execute_batch(&self, calls: &[ToolCall], sid: &str) -> Vec<(ToolResult, Usage)> {
+    ///
+    /// Beyond Python, adjacent delegations to specialist sub-agents among the
+    /// calls left after the reads run at once (`Harness::fan_out`, `[agents]
+    /// max_parallel`), so a write listed before a delegation still happens first.
+    /// A batch with any specialty delegation takes this reads-first path whatever
+    /// the number of reads; `spent` is what the turn has spent so far, for the
+    /// fan-out's cost cap.
+    async fn execute_batch(
+        &self,
+        calls: &[ToolCall],
+        sid: &str,
+        spent: f64,
+    ) -> Vec<(ToolResult, Usage)> {
         let eligible = calls
             .iter()
             .filter(|call| self.parallel_eligible(call))
             .count();
-        if !self.limits.parallel_tools || eligible < 2 {
+        let specialty: Vec<bool> = calls
+            .iter()
+            .map(|call| self.is_specialty_delegation(call))
+            .collect();
+        let any_specialty = specialty.contains(&true);
+        if !self.limits.parallel_tools || (eligible < 2 && !any_specialty) {
             // Strictly sequential: each call is resolved and run before the next.
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
@@ -1202,8 +1283,35 @@ impl Harness {
             }
         }
         // Between calls, never mid-execution: a tool that started is allowed to finish.
-        for index in writes {
-            settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid).await);
+        // A run of adjacent specialty delegations goes together; anything else
+        // (a write, a plain delegation) runs alone and separates them.
+        let mut next = 0;
+        while next < writes.len() {
+            let index = writes[next];
+            let run_end = writes[next..]
+                .iter()
+                .position(|&index| !specialty[index])
+                .map_or(writes.len(), |offset| next + offset);
+            if specialty[index] && run_end - next > 1 {
+                let group: Vec<usize> = writes[next..run_end].to_vec();
+                let results = if self.cancel.is_cancelled() {
+                    group
+                        .iter()
+                        .map(|&index| (not_executed(&calls[index], "cancelled"), Usage::default()))
+                        .collect()
+                } else {
+                    let members: Vec<&ToolCall> =
+                        group.iter().map(|&index| &calls[index]).collect();
+                    self.fan_out(&members, sid, spent)
+                };
+                for (index, result) in group.into_iter().zip(results) {
+                    settled[index] = Some(result);
+                }
+                next = run_end;
+            } else {
+                settled[index] = Some(self.dispatch_unless_cancelled(&calls[index], sid).await);
+                next += 1;
+            }
         }
 
         settled
@@ -1237,6 +1345,11 @@ impl Harness {
             // The registry's own "Unknown tool" answer.
             return (Some(self.registry.dispatch(call, &self.context)), false);
         };
+        // Under `run --agent`, a call outside the specialty's tools gets the
+        // registry's refusal, which says so, before the gate is consulted.
+        if !self.context.scope_allows(&call.name) {
+            return (Some(self.registry.dispatch(call, &self.context)), false);
+        }
         let decision = self.gate.decide(tool.as_ref(), call, &self.context);
         if !decision.approved {
             return (Some(not_executed(call, decision.reason)), false);
@@ -1261,7 +1374,7 @@ impl Harness {
         };
         let mut span = self.tool_span(call);
         let (result, usage) = match request {
-            Ok((role, task)) => self.delegate(call, &role, &task, 1).await,
+            Ok(request) => self.delegate(call, request, 1, &self.context).await,
             Err(invalid) => (invalid, Usage::default()),
         };
         span.set(vec![("tool.ok", json!(result.ok))]);
@@ -1281,7 +1394,7 @@ impl Harness {
     }
 
     /// A `tool_call` span for `call`, as Python's `_dispatch_call` opens.
-    fn tool_span(&self, call: &ToolCall) -> crate::otel::Span {
+    pub(crate) fn tool_span(&self, call: &ToolCall) -> crate::otel::Span {
         self.tracer.start(
             "tool_call",
             vec![
@@ -1291,7 +1404,7 @@ impl Harness {
         )
     }
 
-    fn record_tool_call(&self, call: &ToolCall, result: &ToolResult, sid: &str) {
+    pub(crate) fn record_tool_call(&self, call: &ToolCall, result: &ToolResult, sid: &str) {
         self.recorder.event(
             sid,
             "tool_call",
@@ -1350,7 +1463,7 @@ impl Harness {
 }
 
 /// The observation for a call that was not run.
-fn not_executed(call: &ToolCall, reason: &str) -> ToolResult {
+pub(crate) fn not_executed(call: &ToolCall, reason: &str) -> ToolResult {
     ToolResult {
         call_id: call.id.clone(),
         name: call.name.clone(),

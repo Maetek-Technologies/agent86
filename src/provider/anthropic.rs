@@ -354,6 +354,24 @@ impl AnthropicProvider {
 }
 
 impl Provider for AnthropicProvider {
+    fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError> {
+        Ok(std::sync::Arc::new(Self {
+            model: self.model.clone(),
+            url: self.url.clone(),
+            api_key: self.api_key.clone(),
+            config: self.config.clone(),
+            client: reqwest::Client::builder()
+                .connect_timeout(self.config.connect_timeout)
+                .read_timeout(self.config.read_timeout)
+                .build()
+                .map_err(|error| ProviderError::Client {
+                    detail: error_chain(&error),
+                })?,
+            pricing: self.pricing.clone(),
+            price_ref: self.price_ref.clone(),
+        }))
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }

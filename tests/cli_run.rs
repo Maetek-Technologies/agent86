@@ -110,7 +110,21 @@ fn without_time(system: &str) -> &str {
         .rsplit_once("\n\nCurrent date and time: ")
         .unwrap_or_else(|| panic!("no time line: {system}"));
     assert!(note.contains(" UTC. Tool results can be cached"), "{note}");
-    head
+    without_specialties(head)
+}
+
+/// `system` without the list of specialist sub-agents that ends it when
+/// `delegate` is offered (beyond Python), which has to name the built-ins.
+fn without_specialties(system: &str) -> &str {
+    match system.rsplit_once("\n\nSpecialist sub-agents (call delegate with `agent`") {
+        Some((head, listing)) => {
+            for name in ["researcher", "reviewer", "planner"] {
+                assert!(listing.contains(&format!("\n- {name}: ")), "{listing}");
+            }
+            head
+        }
+        None => system,
+    }
 }
 
 /// An `/api/show` answer reporting `length` as the model's trained context.
@@ -2432,4 +2446,84 @@ async fn otel_spans_reach_the_collector_or_the_console_when_enabled() {
         "{}",
         stderr(&invalid)
     );
+}
+
+#[tokio::test]
+async fn run_agent_makes_a_specialty_the_main_agent() {
+    // Beyond Python: the built-in planner's instructions lead the system message,
+    // and only its tools are offered.
+    let server = MockServer::start(vec![sse_text("1. Do it.", "stop")]).await;
+    let workspace = Workspace::with_mock_provider("run-agent", &server);
+    let output = workspace
+        .run(&["run", "--agent", "planner", "plan the refactor"])
+        .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "1. Do it.\n");
+    let request = &server.requests()[0].body;
+    let system = request["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.starts_with("You are the 'planner' specialist sub-agent"),
+        "{system}"
+    );
+    assert!(system.contains("You are a planner working for a supervising agent."));
+    let tools: Vec<&str> = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["read_file", "list_dir"]);
+}
+
+#[tokio::test]
+async fn run_agent_refuses_an_unknown_name_or_an_unapproved_project_file() {
+    let server = MockServer::start(Vec::new()).await;
+    let workspace = Workspace::with_mock_provider("run-agent-refused", &server);
+    let unknown = workspace
+        .run(&["run", "--json", "--agent", "nobody", "go"])
+        .await;
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(stdout(&unknown), "");
+    assert!(
+        stderr(&unknown).starts_with("error: no specialist sub-agent named 'nobody'"),
+        "{}",
+        stderr(&unknown)
+    );
+
+    // A project specialty needs approval, and with no terminal nobody can give it,
+    // unless `--trust-project` (or its variable) does. The provider moves to the
+    // user's config, which needs no trust.
+    let user = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("config.toml");
+    let project = workspace.project().join(".agent86").join("config.toml");
+    let provider = std::fs::read_to_string(&project).unwrap();
+    std::fs::write(
+        &user,
+        format!("[memory]\nembeddings = \"hash:256\"\n\n{provider}"),
+    )
+    .unwrap();
+    std::fs::remove_file(&project).unwrap();
+    let agents = workspace.project().join(".agent86").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("repo.md"),
+        "---\nname: repo\ndescription: Repo text.\ntools: list_dir\n---\nDo repo things.",
+    )
+    .unwrap();
+    let mut command = workspace.command(&["run", "--json", "--agent", "repo", "go"]);
+    command.env_remove("AGENT86_TRUST_PROJECT");
+    let refused = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(stdout(&refused), "");
+    assert!(
+        stderr(&refused).contains("needs the user's approval, and nobody can be asked"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(server.requests().is_empty());
 }

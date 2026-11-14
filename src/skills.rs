@@ -63,6 +63,9 @@ pub struct Skill {
     /// The `SKILL.md` file.
     pub path: PathBuf,
     pub allowed_tools: Vec<String>,
+    /// Beyond Python: the specialist sub-agent this skill hands off to (`agent:`
+    /// in its frontmatter), so its work happens in a context of its own.
+    pub agent: Option<String>,
     instructions: OnceLock<String>,
 }
 
@@ -73,6 +76,7 @@ impl Skill {
             description: description.to_owned(),
             path,
             allowed_tools,
+            agent: None,
             instructions: OnceLock::new(),
         }
     }
@@ -462,12 +466,14 @@ pub fn load_skill(skill_md: &Path) -> Option<Skill> {
         .find_map(|key| meta.get(*key))
         .map(parse_allowed_tools)
         .unwrap_or_default();
-    Some(Skill::new(
+    let mut skill = Skill::new(
         &name,
         &as_text(meta.get("description")),
         skill_md.to_path_buf(),
         allowed,
-    ))
+    );
+    skill.agent = Some(as_text(meta.get("agent"))).filter(|agent| !agent.is_empty());
+    Some(skill)
 }
 
 /// Every directory searched for skills, highest precedence first. `home` is the

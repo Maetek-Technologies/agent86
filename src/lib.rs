@@ -6,6 +6,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod agents_def;
 pub mod approval;
 pub mod auth;
 pub mod config;
@@ -32,6 +33,7 @@ pub mod session;
 pub mod session_dirs;
 pub mod setup;
 pub mod skills;
+pub mod specialty_turn;
 pub mod subagent;
 pub mod tools;
 pub mod trust;
@@ -40,3 +42,4 @@ pub mod types;
 pub mod ui;
 pub mod update;
 pub mod vault;
+pub mod worktree;

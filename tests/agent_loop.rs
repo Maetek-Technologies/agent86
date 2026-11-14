@@ -69,6 +69,7 @@ fn agents() -> AgentsConfig {
         enabled: true,
         max_depth: 2,
         max_steps: 8,
+        max_parallel: 3,
     }
 }
 
@@ -163,6 +164,7 @@ async fn run_with(
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness.run_turn(&mut state, goal, |_| {}).await?;
@@ -307,6 +309,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     };
     let mut state = AgentState::new();
     let mut seen = Vec::new();
@@ -619,6 +622,7 @@ async fn reasoning_is_reported_apart_from_the_output_and_kept_out_of_the_history
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     };
     let mut state = AgentState::new();
     let mut thinking = Vec::new();
@@ -933,6 +937,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness
@@ -1033,6 +1038,7 @@ async fn recorded_turn(
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     };
     let mut state = AgentState::new();
     let _ = harness.run_turn(&mut state, goal, |_| {}).await;
@@ -1152,6 +1158,7 @@ fn cancellable(
         mcp: None,
         memory: None,
         cancel: cancel.clone(),
+        subagents: Default::default(),
     }
 }
 
@@ -1330,6 +1337,7 @@ async fn a_spent_step_budget_can_be_raised_and_the_turn_goes_on() {
             agent: None,
             current: 1,
             offers: vec![2, 4],
+            run_only: false,
         }]
     );
     // The raise lasts for the session.
@@ -1398,6 +1406,7 @@ async fn a_reply_that_spent_the_whole_cap_before_any_text_is_asked_again_with_mo
             agent: None,
             current: 1024,
             offers: vec![2048, 4096],
+            run_only: false,
         }]
     );
     let requests = server.requests();

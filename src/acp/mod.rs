@@ -52,10 +52,12 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// ACP's "resource not found": a session that does not exist.
 pub const RESOURCE_NOT_FOUND: i64 = -32002;
 
-/// The ids of the two options every permission request offers. Only `allow-once`
-/// approves; the agent keeps no remembered decisions yet, so there is no
-/// `allow_always` to offer.
+/// The ids of the two options a permission request offers. Only the allowing one
+/// approves: `allow-once` for a tool call, or, for a project specialty's file,
+/// `allow-always` (beyond Python), since agent86 remembers that answer by the
+/// file's hash. The agent keeps no other remembered decisions.
 pub const ALLOW_ONCE: &str = "allow-once";
+pub const ALLOW_ALWAYS: &str = "allow-always";
 pub const REJECT_ONCE: &str = "reject-once";
 
 /// The category of a tool call, which an editor uses to pick an icon.
@@ -108,6 +110,10 @@ pub enum Update {
     /// A tool call's outcome (`tool_call_update`, status `completed` or `failed`),
     /// with the text the model is shown.
     ToolResult { id: String, ok: bool, text: String },
+    /// A running tool call's progress (`tool_call_update`, status `in_progress`),
+    /// whose text replaces the call's content: a sub-agent's log on its
+    /// delegation's card (beyond Python).
+    ToolProgress { id: String, text: String },
 }
 
 /// A slash command the agent offers the editor to list, without the slash.
@@ -168,6 +174,10 @@ pub struct PermissionRequest {
     pub raw_input: Value,
     /// What the call would do, in full: a diff, a command, or the arguments.
     pub text: String,
+    /// For a question whose answer the agent remembers (a project specialty's file),
+    /// the name of the one allowing option, offered as `allow_always` in place of
+    /// `allow_once`.
+    pub remember: Option<String>,
 }
 
 /// The editor's answer. Anything but the user choosing `allow-once` is a refusal:
@@ -432,13 +442,18 @@ impl TurnSink for ChannelSink {
     }
 
     fn ask(&self, request: PermissionRequest) -> Permission {
+        let allow = if request.remember.is_some() {
+            ALLOW_ALWAYS
+        } else {
+            ALLOW_ONCE
+        };
         // No answer (the connection closed, the turn cancelled) declines.
         match self.call(
             "session/request_permission",
             permission_params(&self.session_id, &request),
             None,
         ) {
-            Ok(result) => permission_from(&result),
+            Ok(result) => permission_from(&result, allow),
             Err(_) => Permission::Declined,
         }
     }
@@ -805,6 +820,13 @@ impl<B: Backend> Server<B> {
                             // Nobody to ask: dropping the reply is "no answer".
                             continue;
                         }
+                        // No new question once the turn was cancelled (a sub-agent
+                        // can still reach the gate before its next safe point):
+                        // dropping the reply declines. `fs/*` calls still go
+                        // through, since a running tool is allowed to finish.
+                        if cancel.requested && method == "session/request_permission" {
+                            continue;
+                        }
                         let id = *next_request;
                         *next_request += 1;
                         pending.insert(id, reply);
@@ -829,6 +851,11 @@ impl<B: Backend> Server<B> {
                         *closed = true;
                         // Dropping the replies declines whatever waits on them.
                         pending.clear();
+                        // Nobody is left to read the answer: the turn (and any
+                        // sub-agent in it) stops at its next safe point rather than
+                        // spending its budget.
+                        cancel.requested = true;
+                        cancel.repeat();
                     }
                     Err(_) => break Err(BackendError::internal("the connection was lost")),
                 }
@@ -1074,14 +1101,15 @@ fn error_text(error: &Value) -> String {
     }
 }
 
-/// The user's answer to a permission request. Only choosing `allow-once` allows.
-fn permission_from(result: &Value) -> Permission {
+/// The user's answer to a permission request. Only choosing the allowing option
+/// the request offered (`allow`) allows.
+fn permission_from(result: &Value, allow: &str) -> Permission {
     let outcome = result.get("outcome");
     let selected = outcome.and_then(|outcome| outcome.get("outcome")) == Some(&json!("selected"));
     let option = outcome
         .and_then(|outcome| outcome.get("optionId"))
         .and_then(Value::as_str);
-    if selected && option == Some(ALLOW_ONCE) {
+    if selected && option == Some(allow) {
         Permission::Allowed
     } else {
         Permission::Declined
@@ -1249,6 +1277,12 @@ fn session_update(session_id: &str, update: &Update) -> Value {
             "status": "pending",
             "rawInput": raw_input
         }),
+        Update::ToolProgress { id, text } => json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": "in_progress",
+            "content": [{ "type": "content", "content": text_content(text) }]
+        }),
         Update::ToolResult { id, ok, text } => json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": id,
@@ -1276,10 +1310,16 @@ fn permission_params(session_id: &str, request: &PermissionRequest) -> Value {
             "rawInput": request.raw_input,
             "content": [{ "type": "content", "content": text_content(&request.text) }]
         },
-        "options": [
-            { "optionId": ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
-            { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
-        ]
+        "options": match &request.remember {
+            Some(name) => json!([
+                { "optionId": ALLOW_ALWAYS, "name": name, "kind": "allow_always" },
+                { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+            ]),
+            None => json!([
+                { "optionId": ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
+                { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+            ]),
+        }
     })
 }
 
@@ -1958,6 +1998,7 @@ mod tests {
             kind: ToolKind::Edit,
             raw_input: json!({"path": "a.txt"}),
             text: "--- a/a.txt\n+++ b/a.txt".into(),
+            remember: None,
         }
     }
 
@@ -1994,6 +2035,50 @@ mod tests {
     fn selected(id: u64, option: &str) -> String {
         json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"selected","optionId":option}}})
             .to_string()
+    }
+
+    #[test]
+    fn a_remembered_question_offers_one_allow_always_option_and_only_it_allows() {
+        let mut request = write_request();
+        request.remember = Some("Allow this version of repo".into());
+        let params = permission_params("sess_1", &request);
+        assert_eq!(
+            params["options"],
+            json!([
+                { "optionId": ALLOW_ALWAYS, "name": "Allow this version of repo", "kind": "allow_always" },
+                { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+            ])
+        );
+        let answer = |option: &str| json!({"outcome": {"outcome": "selected", "optionId": option}});
+        assert_eq!(
+            permission_from(&answer(ALLOW_ALWAYS), ALLOW_ALWAYS),
+            Permission::Allowed
+        );
+        // An option the request did not offer declines.
+        assert_eq!(
+            permission_from(&answer(ALLOW_ONCE), ALLOW_ALWAYS),
+            Permission::Declined
+        );
+        assert_eq!(
+            permission_from(&answer(ALLOW_ALWAYS), ALLOW_ONCE),
+            Permission::Declined
+        );
+        let progress = session_update(
+            "sess_1",
+            &Update::ToolProgress {
+                id: "d".into(),
+                text: "reviewer started".into(),
+            },
+        );
+        assert_eq!(
+            progress["params"]["update"],
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "d",
+                "status": "in_progress",
+                "content": [{"type": "content", "content": {"type": "text", "text": "reviewer started"}}]
+            })
+        );
     }
 
     #[test]
@@ -2254,6 +2339,64 @@ mod tests {
             [Permission::Declined]
         );
         assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn no_permission_request_is_sent_after_a_cancel() {
+        // A sub-agent can reach the gate after the cancel, before its next safe
+        // point; the question is declined without reaching the editor.
+        let mut server = ready();
+        server.backend.acts = vec![
+            Act::Ask(write_request()),
+            Act::Call("fs/read_text_file", json!({"path": "/w/a"}), None),
+        ];
+        server
+            .sender()
+            .send(Event::Line(cancel_line("sess_1")))
+            .unwrap();
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "fs/read_text_file" {
+                let id = message["id"].clone();
+                events
+                    .send(Event::Line(
+                        json!({"jsonrpc":"2.0","id":id,"result":{"content":"a"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            out.push(message);
+        });
+        assert!(
+            !out.iter()
+                .any(|message| message["method"] == "session/request_permission"),
+            "{out:?}"
+        );
+        assert_eq!(
+            *server.backend.answers.lock().unwrap(),
+            [Permission::Declined]
+        );
+        // A file call still goes through: a running tool is allowed to finish.
+        assert!(out
+            .iter()
+            .any(|message| message["method"] == "fs/read_text_file"));
+        assert!(server.backend.call_results.lock().unwrap()[0].is_ok());
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn a_closed_connection_cancels_the_turn() {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Update(Update::Message("partial".into()))];
+        server.backend.wait_for_cancel = true;
+        let events = server.sender();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == "session/update" {
+                events.send(Event::Eof).unwrap();
+            }
+        });
+        assert!(server.backend.cancelled.load(Ordering::SeqCst));
+        assert!(server.closed);
     }
 
     #[test]

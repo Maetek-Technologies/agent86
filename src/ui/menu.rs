@@ -20,6 +20,9 @@ pub enum MenuKind {
     /// Workspace paths for the `@` mention between these character indices of the
     /// draft; choosing one replaces that span.
     Paths { start: usize, end: usize },
+    /// Specialist sub-agents for the `#` hint between these character indices
+    /// (beyond Python); choosing one replaces that span.
+    Agents { start: usize, end: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +45,20 @@ impl Menu {
         cursor: usize,
         workspace: Option<&Path>,
         skills: &[MenuItem],
+        agents: &[MenuItem],
     ) -> Option<Self> {
+        if let Some((prefix, start, end)) = agent_token(text, cursor) {
+            let items: Vec<MenuItem> = agents
+                .iter()
+                .filter(|item| item.value.starts_with(&prefix))
+                .cloned()
+                .collect();
+            return (!items.is_empty()).then_some(Self {
+                kind: MenuKind::Agents { start, end },
+                items,
+                selected: 0,
+            });
+        }
         if let Some((prefix, start, end)) = mention_token(text, cursor) {
             let workspace = workspace?;
             let items: Vec<MenuItem> = complete_mentions(&prefix, workspace)
@@ -104,6 +120,7 @@ impl Menu {
             MenuKind::Commands => item.value.clone(),
             // File names come off the user's disk: drawn plain, never interpreted.
             MenuKind::Paths { .. } => format!("@{}", sanitize(&item.value)),
+            MenuKind::Agents { .. } => format!("#{}", item.value),
         };
         let column = shown
             .iter()
@@ -148,6 +165,44 @@ pub fn skill_items(skills: &crate::skills::Skills) -> Vec<MenuItem> {
         .collect()
 }
 
+/// The `#` menu's rows: every specialty by name, with its description once it may
+/// be trusted (an unapproved project file is shown by name only, as the model sees
+/// it). Names are plain ASCII words; descriptions are sanitized.
+pub fn agent_items(harness: &crate::agent::Harness) -> Vec<MenuItem> {
+    harness
+        .context
+        .specialties
+        .found
+        .values()
+        .map(|specialty| MenuItem {
+            value: specialty.name.clone(),
+            description: if harness.subagents.approvals.approved(specialty) {
+                sanitize(&specialty.description)
+            } else {
+                "(project file, not approved yet)".to_owned()
+            },
+        })
+        .collect()
+}
+
+/// The `#…` token the cursor sits in, when it can still become a specialty's
+/// name: `#` at the start of the line or after whitespace, then ASCII letters,
+/// digits, or hyphens up to the cursor. The text after `#`, and the token's span.
+pub fn agent_token(text: &str, cursor: usize) -> Option<(String, usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut start = cursor;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let token: String = chars[start..cursor].iter().collect();
+    let prefix = token.strip_prefix('#')?;
+    prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        .then(|| (prefix.to_owned(), start, cursor))
+}
+
 /// The `@…` token the cursor sits in: the text after the `@`, and the token's
 /// start and end as character indices. It runs from the whitespace before it to
 /// the cursor, so completing mid-line never eats the text that follows.
@@ -183,26 +238,26 @@ mod tests {
 
     #[test]
     fn the_command_menu_follows_pythons_rule() {
-        let menu = Menu::for_draft("/mo", 3, None, &[]).unwrap();
+        let menu = Menu::for_draft("/mo", 3, None, &[], &[]).unwrap();
         assert_eq!(menu.kind, MenuKind::Commands);
         assert_eq!(values(&menu), ["/models", "/model", "/mode"]);
         assert_eq!(menu.chosen(), "/models");
-        let typed_in_full = Menu::for_draft("/mode", 5, None, &[]).unwrap();
+        let typed_in_full = Menu::for_draft("/mode", 5, None, &[], &[]).unwrap();
         assert_eq!(values(&typed_in_full), ["/models", "/model", "/mode"]);
         assert_eq!(typed_in_full.chosen(), "/mode");
-        let config = Menu::for_draft("/config", 7, None, &[]).unwrap();
+        let config = Menu::for_draft("/config", 7, None, &[], &[]).unwrap();
         assert_eq!(values(&config), ["/config", "/config model", "/config mcp"]);
         assert!(
-            Menu::for_draft("/model x", 8, None, &[]).is_none(),
+            Menu::for_draft("/model x", 8, None, &[], &[]).is_none(),
             "a space closes it"
         );
-        assert!(Menu::for_draft("hello", 5, None, &[]).is_none());
-        assert!(Menu::for_draft("/zzz", 4, None, &[]).is_none());
+        assert!(Menu::for_draft("hello", 5, None, &[], &[]).is_none());
+        assert!(Menu::for_draft("/zzz", 4, None, &[], &[]).is_none());
     }
 
     #[test]
     fn the_menu_wraps_and_scrolls() {
-        let mut menu = Menu::for_draft("/", 1, None, &[]).unwrap();
+        let mut menu = Menu::for_draft("/", 1, None, &[], &[]).unwrap();
         menu.up();
         assert_eq!(menu.chosen(), "/exit");
         menu.down();
@@ -261,10 +316,37 @@ mod tests {
         assert!(!items[0].description.contains('\u{1b}'), "{:?}", items[0]);
         assert!(items[0].description.contains("in depth."));
 
-        let menu = Menu::for_draft("/model", 6, None, &items).unwrap();
+        let menu = Menu::for_draft("/model", 6, None, &items, &[]).unwrap();
         let values: Vec<&str> = menu.items.iter().map(|item| item.value.as_str()).collect();
         assert_eq!(values, ["/models", "/model", "/models-guide"]);
         // Typed in full, the built-in stays highlighted.
         assert_eq!(menu.chosen(), "/model");
+    }
+
+    #[test]
+    fn hash_completes_specialty_names_where_a_hint_can_start() {
+        let agents = vec![
+            MenuItem {
+                value: "planner".into(),
+                description: "Plans.".into(),
+            },
+            MenuItem {
+                value: "reviewer".into(),
+                description: "Reviews.".into(),
+            },
+        ];
+        let menu = Menu::for_draft("ask #re", 7, None, &[], &agents).unwrap();
+        assert_eq!(menu.kind, MenuKind::Agents { start: 4, end: 7 });
+        assert_eq!(values(&menu), ["reviewer"]);
+        assert!(menu.render(60)[0].plain_text().contains("#reviewer"));
+        assert_eq!(
+            values(&Menu::for_draft("#", 1, None, &[], &agents).unwrap()),
+            ["planner", "reviewer"]
+        );
+        // Not after other text, not past punctuation, not without specialties.
+        assert!(Menu::for_draft("foo#re", 6, None, &[], &agents).is_none());
+        assert!(Menu::for_draft("#re.", 4, None, &[], &agents).is_none());
+        assert!(Menu::for_draft("#zz", 3, None, &[], &agents).is_none());
+        assert!(Menu::for_draft("#re", 3, None, &[], &[]).is_none());
     }
 }

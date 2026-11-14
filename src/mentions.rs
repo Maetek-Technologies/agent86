@@ -322,9 +322,85 @@ pub fn complete_mentions(prefix: &str, workspace: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The specialties a typed line names with `#name` (beyond Python), in order and
+/// without repeats. A mention is `#` at the start of the line or after whitespace,
+/// ended by whitespace or punctuation, naming a known specialty; anything else (a
+/// `#` in prose, an issue number like `#12`, `foo#x`) is left alone.
+pub fn find_agent_hints(text: &str, specialties: &crate::agents_def::Specialties) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    for (index, c) in text.char_indices() {
+        let starts = c == '#' && previous.is_none_or(char::is_whitespace);
+        previous = Some(c);
+        if !starts {
+            continue;
+        }
+        let rest = &text[index + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .unwrap_or(rest.len());
+        // A trailing hyphen is punctuation (`#reviewer-`), not part of the name.
+        let name = rest[..end].trim_end_matches('-');
+        if crate::agents_def::valid_name(name)
+            && specialties.get(name).is_some()
+            && !found.iter().any(|known| known == name)
+        {
+            found.push(name.to_owned());
+        }
+    }
+    found
+}
+
+/// `text` with a note asking the model to delegate to the specialties it names
+/// with `#name`, or unchanged when it names none. Only the typed line is scanned
+/// (before `@` mentions are expanded), so a `#name` inside an attached file cannot
+/// add a hint. The model writes the task and may still decline; `/agent` is the
+/// guaranteed route.
+pub fn with_agent_hints(specialties: &crate::agents_def::Specialties, text: &str) -> String {
+    let names = find_agent_hints(text, specialties);
+    if names.is_empty() {
+        return text.to_owned();
+    }
+    let (noun, them) = if names.len() == 1 {
+        ("sub-agent", "it")
+    } else {
+        ("sub-agents", "them")
+    };
+    format!(
+        "{text}\n\n(The user named the specialist {noun} {} with `#`: delegate to {them} with the \
+         delegate tool's `agent` argument for the matching part of this request.)",
+        names.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_names_known_specialties_only_where_a_mention_can_start() {
+        let specialties = crate::agents_def::Specialties::built_in();
+        let hints = |text: &str| find_agent_hints(text, &specialties);
+        assert_eq!(hints("#reviewer check the auth changes"), ["reviewer"]);
+        assert_eq!(
+            hints("ask #planner, then #reviewer. And #planner again"),
+            ["planner", "reviewer"]
+        );
+        assert_eq!(hints("(#reviewer)"), Vec::<String>::new());
+        assert_eq!(
+            hints("see issue #12 and foo#reviewer"),
+            Vec::<String>::new()
+        );
+        assert_eq!(hints("#nobody here"), Vec::<String>::new());
+        assert_eq!(hints("#reviewer-"), ["reviewer"]);
+        assert_eq!(with_agent_hints(&specialties, "plain"), "plain");
+        assert_eq!(
+            with_agent_hints(&specialties, "#reviewer look"),
+            "#reviewer look\n\n(The user named the specialist sub-agent reviewer with `#`: \
+             delegate to it with the delegate tool's `agent` argument for the matching part of \
+             this request.)"
+        );
+    }
 
     #[test]
     fn completions_list_directories_first_and_stay_in_the_workspace() {

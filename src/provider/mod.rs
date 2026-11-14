@@ -195,6 +195,13 @@ pub trait Provider: Send + Sync {
     /// never retried, because a retry would duplicate text the caller already saw.
     fn stream(&self, request: CompletionRequest) -> DeltaStream<'_>;
 
+    /// A copy with the same settings and key and an HTTP client of its own, for a
+    /// specialist sub-agent on a fan-out thread (beyond Python): a pooled
+    /// connection only makes progress while the runtime that opened it is polled,
+    /// so a thread must never reuse one another runtime opened. Never reads the
+    /// keyring. Building the client can fail, which fails that delegation.
+    fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError>;
+
     /// Consume [`Provider::stream`] and return the assembled completion.
     fn complete(
         &self,
