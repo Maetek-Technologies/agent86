@@ -95,23 +95,23 @@ plain `role`. `run --agent` makes a specialty the main agent of a run, so that i
 not a sub-agent. The `delegate` argument, `/agent`, and `--agent` are called
 `agent` because the caller is naming which agent to run.
 
-## Where we are today
+## Where it started
 
-`delegate(role, task)` (see `src/tools/delegate.rs` and `src/subagent.rs`) runs
-a sub-agent that:
+Before this work (agent86 1.0.17 and earlier), `delegate(role, task)` ran a
+sub-agent that:
 
-- gets Python's persona (`You are a '<role>' sub-agent ...`) ahead of the
+- got Python's persona (`You are a '<role>' sub-agent ...`) ahead of the
   parent's full system content, and the task as its only message;
-- gets the **same tools**, approval gate, guardrails, and recorder as the parent
+- got the **same tools**, approval gate, guardrails, and recorder as the parent
   (a fresh `ToolContext::fork`, so its own active skill), and the session's model,
-  even when the turn was routed to another (section 2, *Model*);
-- runs under `[agents] max_steps` (8) and `[agents] max_depth` (2);
-- returns only its final text, with its token usage folded into the parent's.
+  even when the turn was routed to another (fixed by slice 0);
+- ran under `[agents] max_steps` (8) and `[agents] max_depth` (2);
+- returned only its final text, with its token usage folded into the parent's.
 
-The `role` is just a string the model invents. Nothing makes a `reviewer`
-different from a `coder` except the persona sentence, so there is no way to
+The `role` was just a string the model invents. Nothing made a `reviewer`
+different from a `coder` except the persona sentence, so there was no way to
 give a specialty its own instructions, restrict its tools, or pick a cheaper or
-stronger model for it.
+stronger model for it. A `delegate` call with `role` alone still works that way.
 
 ## Goal
 
