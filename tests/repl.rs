@@ -763,3 +763,40 @@ async fn rename_needs_memory() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn agents_lists_specialties_and_agent_runs_one_without_the_main_agent() {
+    // Beyond Python: `/agents` lists the built-ins; `/agent` runs one directly, and
+    // an unknown name or a missing task is answered with no model call.
+    let server = MockServer::start(vec![sse_text("Plan: one step.", "stop")]).await;
+    let workspace = Workspace::new("agents", &server);
+    let text = stdout(
+        &workspace
+            .repl(
+                &[],
+                "/agents\n/agents reviewer\n/agent nobody go\n/agent planner\n/agent planner plan it\n",
+            )
+            .await,
+    );
+    assert!(
+        text.contains("agent86> specialist sub-agents (/agent <name> <task> runs one):\n  researcher [built-in] "),
+        "{text}"
+    );
+    assert!(
+        text.contains("tools: read_file, list_dir, run_command\nalways asked: run_command\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("agent86> no specialist sub-agent named 'nobody' (known: researcher, reviewer, planner)\n"),
+        "{text}"
+    );
+    assert!(text.contains("/agent planner needs a task"), "{text}");
+    assert!(text.contains("Plan: one step."), "{text}");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "only the planner's own call");
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.starts_with("You are the 'planner' specialist sub-agent"),
+        "{system}"
+    );
+}

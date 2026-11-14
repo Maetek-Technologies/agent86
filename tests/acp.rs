@@ -1421,10 +1421,10 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
         names,
         [
             "mode", "model", "thinking", "toolview", "resume", "secret", "rename", "cost", "tools",
-            "skills", "skill"
+            "skills", "agents", "skill", "agent"
         ]
     );
-    assert_eq!(hints.len(), 11);
+    assert_eq!(hints.len(), 13);
     assert_eq!(hints[0].as_deref(), Some("ask, auto, or deny"));
     assert_eq!(hints[1].as_deref(), Some("provider:model"));
     assert_eq!(hints[2].as_deref(), Some("full, summary, or hidden"));
@@ -1433,9 +1433,14 @@ async fn the_commands_are_advertised_and_run_without_the_model() {
     assert_eq!(hints[5].as_deref(), Some("forget NAME"));
     assert_eq!(hints[6].as_deref(), Some("new title"));
     assert_eq!((&hints[7], &hints[8], &hints[9]), (&None, &None, &None));
+    assert_eq!(hints[10].as_deref(), Some("name (optional)"));
     assert_eq!(
-        hints[10].as_deref(),
+        hints[11].as_deref(),
         Some("skill name, then the task (optional)")
+    );
+    assert_eq!(
+        hints[12].as_deref(),
+        Some("[--with-context] name, then the task")
     );
     for exchange in [&mode, &bad, &cost, &tools, &model_help, &bad_model] {
         assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
@@ -2317,4 +2322,79 @@ async fn the_secret_command_never_takes_or_repeats_a_value() {
     );
     // None of it reached the model.
     assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_delegation_is_one_card_with_its_sub_agents_log_and_ids_stay_unique() {
+    // Beyond Python: the `delegate` call is the sub-agent's card, named for the
+    // specialty and its task, `in_progress` with a line per call while it runs,
+    // and ended by its result. A provider id seen before is reported anew.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "call_1",
+            "delegate",
+            r#"{"agent": "planner", "task": "Plan the change\nin detail"}"#,
+        )]),
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("1. Do it.", "stop"),
+        sse_text("Planned.", "stop"),
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("Listed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("delegation-card", Some(&server));
+    let (first, second) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let first = client.prompt(&session, "Plan it");
+            let second = client.prompt(&session, "List it");
+            client.finish();
+            (first, second)
+        }
+    })
+    .await
+    .unwrap();
+    let updates: Vec<&Value> = first
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .collect();
+    assert_eq!(updates[0]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[0]["toolCallId"], "call_1");
+    assert_eq!(updates[0]["title"], "planner: Plan the change");
+    let progress: Vec<&&Value> = updates
+        .iter()
+        .filter(|update| update["status"] == "in_progress")
+        .collect();
+    assert!(!progress.is_empty());
+    assert!(progress
+        .iter()
+        .all(|update| update["toolCallId"] == "call_1"));
+    let log = progress.last().unwrap()["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(log.starts_with("planner started\nlist_dir("), "{log}");
+    let done = updates
+        .iter()
+        .find(|update| update["status"] == "completed")
+        .unwrap();
+    assert_eq!(done["toolCallId"], "call_1");
+    assert_eq!(first.text_of("agent_message_chunk"), "Planned.");
+    // The sub-agent's own call never became a card of its own.
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|update| update["sessionUpdate"] == "tool_call")
+            .count(),
+        1
+    );
+    // The next turn's `call_1` is another call, reported under another id.
+    let call = &second.updates[0]["params"]["update"];
+    assert_eq!(call["sessionUpdate"], "tool_call");
+    assert_eq!(call["toolCallId"], "call_1#1");
+    let done = &second.updates[1]["params"]["update"];
+    assert_eq!(done["toolCallId"], "call_1#1");
 }

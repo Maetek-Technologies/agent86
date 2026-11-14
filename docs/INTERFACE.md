@@ -155,7 +155,7 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 | `src/ui/markdown.rs` | `commit_point` (how much of a streaming reply is complete blocks), `split_inside` (the tail-limit cut, closing and reopening a code fence), and `render` (Markdown to styled lines with `pulldown-cmark`) |
 | `src/ui/diff.rs` | Colouring for an approval's detail by the tool's `preview_lexer` |
 | `src/ui/input.rs` | The multi-line editor: cursor, editing keys, word movement, paste, and history navigation over `PromptHistory` |
-| `src/ui/menu.rs` | The `/` command menu and `@` path completion (`complete_mentions` itself lives in `src/mentions.rs`) |
+| `src/ui/menu.rs` | The `/` command menu, `@` path completion (`complete_mentions` itself lives in `src/mentions.rs`), and `#` specialty completion (beyond Python) |
 | `src/ui/picker.rs` | The mode, model, and session pickers (part 3): a list panel with optional type-to-filter |
 | `src/ui/status.rs` | A port of `ui/status.py` and `fit_status_line`. Shared, so `/cost` and the plain loop could use the same numbers |
 | `src/ui/panels.rs` (part 5) | The key entry, connection test, and save-diff panels (Python's `KeyEntryModal`, `ConnectionTestModal`, `SaveDiffModal`) and the frame every panel is drawn in. The provider list and the catalog picker are pickers (`picker.rs`); the approval panel is in `app.rs`. Part 6 adds the MCP manager, the server form, and the MCP test |
@@ -220,6 +220,7 @@ Each slice is one PR to `main`. Each passes `cargo test --all-targets`, `cargo f
 - **Menus:**
   - The `/` command menu (Python's rule: the line starts with `/` and has no space).
   - `@` path completion (`complete_mentions`: 20 results, directories first with `/`, quoted when a path has a space).
+  - `#` completion of specialist sub-agents' names (beyond Python): at the start of the line or after whitespace, with each one's description (an unapproved project file by name only); choosing one writes `#name `. Approvals from a sub-agent carry `Asked by the '<name>' sub-agent.` as their warning, and a dim line says when a specialist starts and finishes (hidden with tool use).
 - **Pickers that bare `needs_choice` commands open:**
   - The mode picker.
   - The model picker, with the configured role slots (`model.default`, `model.route.cheap`, `model.route.frontier`).

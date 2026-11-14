@@ -668,6 +668,14 @@ impl McpManager {
     /// connected server (by name) with the tools the registry would dispatch to
     /// it, and its instructions.
     pub fn prompt_section(&self) -> String {
+        self.prompt_section_for(None)
+    }
+
+    /// [`McpManager::prompt_section`] for a context that may call only the tools
+    /// `permitted` allows (a specialist sub-agent, beyond Python): only those tools
+    /// are listed, and a server none of whose tools are permitted is left out,
+    /// instructions and all.
+    pub fn prompt_section_for(&self, permitted: Option<&dyn Fn(&str) -> bool>) -> String {
         let registry = lock(&self.inner.registry).clone();
         let mut entries: Vec<(String, Vec<String>, Option<String>)> = lock(&self.inner.slots)
             .iter()
@@ -677,9 +685,10 @@ impl McpManager {
                     .tools()
                     .iter()
                     .filter(|tool| registry.as_ref().is_some_and(|r| r.contains_tool(tool)))
+                    .filter(|tool| permitted.is_none_or(|permitted| permitted(tool.name())))
                     .map(|tool| tool.name().to_owned())
                     .collect();
-                (!names.is_empty() || session.instructions.is_some())
+                (!names.is_empty() || (permitted.is_none() && session.instructions.is_some()))
                     .then(|| (name.clone(), names, session.instructions.clone()))
             })
             .collect();

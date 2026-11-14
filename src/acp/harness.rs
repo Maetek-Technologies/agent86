@@ -43,10 +43,11 @@ use crate::secrets::{NoSecretStore, OsKeyring, SharedStore};
 use crate::session::{AgentState, SessionStore};
 use crate::session_dirs::{same_path_key, SessionDirs};
 use crate::setup::{assemble_in, SetupError};
+use crate::subagent::SubagentEvent;
 use crate::tools::EditorFiles;
 use crate::types::{ApprovalMode, Role, ToolCall, ToolResult};
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -130,15 +131,107 @@ struct Presenter {
     tools: DisplayLevel,
     /// When the current reasoning began, and how many characters it has run to.
     thought: Option<(std::time::Instant, usize)>,
+    /// The session's tool call ids and cards, shared with the sub-agent observer.
+    cards: Cards,
+}
+
+/// How many lines of a sub-agent's log its card shows; earlier ones are counted.
+const CARD_LINES: usize = 20;
+
+/// The tool call ids this layer reports, and each delegation's card (beyond
+/// Python). Provider ids are not unique within a session (Ollama's restart with
+/// every response, and the OpenAI adapter falls back to `call_<n>`), so a call is
+/// reported under its provider id the first time that id appears and with a
+/// `#<n>` suffix after that. The model's history keeps the provider's id. Replay
+/// draws from the same set, so a loaded session's new calls never reuse a
+/// replayed id.
+#[derive(Default)]
+struct CardState {
+    used: HashSet<String>,
+    /// The id each provider id was last reported under.
+    latest: HashMap<String, String>,
+    /// The ids already announced with a `tool_call`.
+    announced: HashSet<String>,
+    /// The running turn's `/toolview`, which a card follows.
+    tools: Option<DisplayLevel>,
+    /// Each card's log, by reported id.
+    logs: HashMap<String, CardLog>,
+    counter: u64,
+}
+
+#[derive(Default)]
+struct CardLog {
+    lines: Vec<String>,
+    calls: usize,
+}
+
+type Cards = Arc<Mutex<CardState>>;
+
+impl CardState {
+    /// A new id for a call the provider named `provider`.
+    fn assign(&mut self, provider: &str) -> String {
+        let mut id = provider.to_owned();
+        while id.is_empty() || self.used.contains(&id) {
+            self.counter += 1;
+            id = format!("{provider}#{}", self.counter);
+        }
+        self.used.insert(id.clone());
+        self.latest.insert(provider.to_owned(), id.clone());
+        id
+    }
+
+    /// The id `provider` was last reported under, or a new one.
+    fn lookup(&mut self, provider: &str) -> String {
+        match self.latest.get(provider) {
+            Some(id) => id.clone(),
+            None => self.assign(provider),
+        }
+    }
+
+    fn level(&self) -> DisplayLevel {
+        self.tools.unwrap_or(DisplayLevel::Full)
+    }
+
+    /// The card's content for the editor: its last [`CARD_LINES`] lines, with a
+    /// count of those dropped, or a running count of calls at `summary`.
+    fn card_text(&self, id: &str) -> String {
+        let Some(log) = self.logs.get(id) else {
+            return String::new();
+        };
+        if self.level() == DisplayLevel::Summary {
+            let mut text = format!(
+                "{} tool call{}",
+                log.calls,
+                if log.calls == 1 { "" } else { "s" }
+            );
+            for line in log.lines.iter().filter(|line| line.starts_with('\u{2717}')) {
+                text.push('\n');
+                text.push_str(line);
+            }
+            return text;
+        }
+        let dropped = log.lines.len().saturating_sub(CARD_LINES);
+        let mut text = String::new();
+        if dropped > 0 {
+            text.push_str(&format!("({dropped} earlier lines not shown)\n"));
+        }
+        text.push_str(&log.lines[dropped..].join("\n"));
+        text
+    }
 }
 
 impl Presenter {
-    fn new(thinking: DisplayLevel, tools: DisplayLevel) -> Self {
+    fn new(thinking: DisplayLevel, tools: DisplayLevel, cards: Cards) -> Self {
         Self {
             thinking,
             tools,
             thought: None,
+            cards,
         }
+    }
+
+    fn cards(&self) -> std::sync::MutexGuard<'_, CardState> {
+        self.cards.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Say that held reasoning ended, as its summary line.
@@ -151,9 +244,16 @@ impl Presenter {
         }
     }
 
-    fn announce(&self, call: &ToolCall, sink: &dyn TurnSink, secrets: &crate::vault::SecretVault) {
+    fn announce(
+        &self,
+        id: &str,
+        call: &ToolCall,
+        sink: &dyn TurnSink,
+        secrets: &crate::vault::SecretVault,
+    ) {
+        self.cards().announced.insert(id.to_owned());
         sink.update(Update::ToolCall {
-            id: call.id.clone(),
+            id: id.to_owned(),
             title: title(call, secrets),
             name: call.name.clone(),
             kind: tool_kind(&call.name),
@@ -188,8 +288,12 @@ impl Presenter {
                 }
                 DisplayLevel::Hidden => {}
             },
-            TurnEvent::ToolCall { call, .. } if self.tools != DisplayLevel::Hidden => {
-                self.announce(call, sink, secrets)
+            // An id is assigned whatever the level, so a later update can find it.
+            TurnEvent::ToolCall { call, .. } => {
+                let id = self.cards().assign(&call.id);
+                if self.tools != DisplayLevel::Hidden {
+                    self.announce(&id, call, sink, secrets);
+                }
             }
             TurnEvent::ToolResult {
                 call,
@@ -197,24 +301,153 @@ impl Presenter {
                 observation,
                 ..
             } => {
-                if self.tools == DisplayLevel::Hidden {
+                let id = self.cards().lookup(&call.id);
+                let announced = self.cards().announced.contains(&id);
+                if self.tools == DisplayLevel::Hidden && result.ok && !announced {
                     // Only a failure is shown, and it needs the call announced first.
-                    if result.ok {
-                        return;
-                    }
-                    self.announce(call, sink, secrets);
+                    return;
+                }
+                if !announced {
+                    self.announce(&id, call, sink, secrets);
                 }
                 let text = match (self.tools, result.ok) {
                     (DisplayLevel::Full, _) | (_, false) => result_text(result, observation),
                     _ => crate::agent::summarize(result),
                 };
                 sink.update(Update::ToolResult {
-                    id: call.id.clone(),
+                    id,
                     ok: result.ok,
                     text,
                 });
             }
             _ => {}
+        }
+    }
+}
+
+/// Report a sub-agent on its delegation's card (beyond Python;
+/// `docs/subagents.md` section 10): `in_progress` when it starts, one line per
+/// tool call at `full` (a running count at `summary`, nothing at `hidden` but
+/// failures), notices as lines, and for `/agent`, which has no tool call of its
+/// own, a card announced when it starts and ended when it finishes. A call the
+/// gate asks about is a card of its own (announced by the approval hook), which is
+/// ended here. Everything shown is redacted and has its controls made visible.
+fn on_subagent(
+    cards: &Cards,
+    sink: &dyn TurnSink,
+    secrets: &crate::vault::SecretVault,
+    event: &SubagentEvent<'_>,
+) {
+    let mut state = cards.lock().unwrap_or_else(PoisonError::into_inner);
+    let level = state.level();
+    let clean = |text: &str| show_controls(&secrets.redact(text));
+    let progress = |state: &mut CardState, card: &str| {
+        if state.announced.contains(card) && level != DisplayLevel::Hidden {
+            let text = state.card_text(card);
+            sink.update(Update::ToolProgress {
+                id: card.to_owned(),
+                text,
+            });
+        }
+    };
+    match event {
+        SubagentEvent::Started {
+            card,
+            name,
+            depth,
+            task,
+            ..
+        } => {
+            let id = state.lookup(&card.id);
+            if level == DisplayLevel::Hidden {
+                return;
+            }
+            let first = task.lines().next().unwrap_or_default();
+            if *depth <= 1 && !state.announced.contains(&id) {
+                state.announced.insert(id.clone());
+                sink.update(Update::ToolCall {
+                    id: id.clone(),
+                    title: clean(&format!("{name}: {first}")),
+                    name: "agent".into(),
+                    kind: ToolKind::Other,
+                    raw_input: json!({ "agent": name, "task": secrets.redact(task) }),
+                });
+            }
+            let line = if *depth <= 1 {
+                format!("{name} started")
+            } else {
+                format!("\u{2192} {name} started: {}", clean(first))
+            };
+            state
+                .logs
+                .entry(id.clone())
+                .or_default()
+                .lines
+                .push(clean(&line));
+            progress(&mut state, &id);
+        }
+        SubagentEvent::ToolCall { card, call } => {
+            let id = state.lookup(&card.id);
+            let log = state.logs.entry(id.clone()).or_default();
+            log.calls += 1;
+            log.lines.push(title(call, secrets));
+            progress(&mut state, &id);
+        }
+        SubagentEvent::ToolResult { card, call, result } => {
+            // A call that was asked about is a card of its own: end it.
+            if let Some(own) = state.latest.get(&call.id).cloned() {
+                if state.announced.contains(&own) {
+                    sink.update(Update::ToolResult {
+                        id: own,
+                        ok: result.ok,
+                        text: clean(&result_text(result, &result.content)),
+                    });
+                }
+            }
+            let id = state.lookup(&card.id);
+            let summary = clean(&crate::agent::summarize(result));
+            let line = if result.ok {
+                format!("  \u{21b3} {summary}")
+            } else {
+                format!("\u{2717} {}: {summary}", show_controls(&call.name))
+            };
+            state.logs.entry(id.clone()).or_default().lines.push(line);
+            if result.ok || level != DisplayLevel::Hidden {
+                progress(&mut state, &id);
+            }
+        }
+        SubagentEvent::Notice { card, text } => {
+            let id = state.lookup(&card.id);
+            state
+                .logs
+                .entry(id.clone())
+                .or_default()
+                .lines
+                .push(clean(text));
+            progress(&mut state, &id);
+        }
+        SubagentEvent::Finished {
+            card,
+            name,
+            depth,
+            ok,
+            ..
+        } => {
+            let id = state.lookup(&card.id);
+            if *depth > 1 {
+                state
+                    .logs
+                    .entry(id.clone())
+                    .or_default()
+                    .lines
+                    .push(format!("\u{2190} {} finished", show_controls(name)));
+                progress(&mut state, &id);
+            } else if !card.announced && state.announced.contains(&id) {
+                // `/agent`'s card: its answer arrives as the reply, so the card
+                // ends with its log.
+                let text = state.card_text(&id);
+                sink.update(Update::ToolResult { id, ok: *ok, text });
+            }
         }
     }
 }
@@ -246,6 +479,8 @@ struct Session {
     sink: SinkSlot,
     /// The title `/rename` just set, until it is announced to the editor.
     title_change: Option<String>,
+    /// The tool call ids reported in this session, and each delegation's card.
+    cards: Cards,
 }
 
 /// Sessions on agent86's harness, driven on one single-threaded runtime.
@@ -359,27 +594,76 @@ impl HarnessBackend {
 
         // Approvals go to the editor, through whichever sink the running turn has.
         let sink: SinkSlot = Arc::default();
+        let cards: Cards = Arc::default();
         let secrets = assembly.harness.context.secrets.clone();
-        let hook_sink = Arc::clone(&sink);
+        let running = |slot: &SinkSlot| slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let (hook_sink, hook_cards, hook_secrets) =
+            (Arc::clone(&sink), Arc::clone(&cards), secrets.clone());
         assembly.harness.gate.call_prompt = Some(Box::new(
             move |call: &ToolCall, preview: &ApprovalPreview| {
-                let running = hook_sink
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                let Some(running) = running else {
+                let Some(running) = running(&hook_sink) else {
                     return false;
                 };
+                // A sub-agent's call was never shown: it is announced first, so the
+                // question names a call the editor has.
+                let title = labeled(preview, title(call, &hook_secrets));
+                let id = announce_for_question(
+                    &hook_cards,
+                    running.as_ref(),
+                    call,
+                    &title,
+                    &hook_secrets,
+                );
                 let request = PermissionRequest {
-                    tool_call_id: call.id.clone(),
-                    title: title(call, &secrets),
+                    tool_call_id: id,
+                    title,
                     kind: tool_kind(&call.name),
-                    raw_input: redacted_input(call, &secrets),
+                    raw_input: redacted_input(call, &hook_secrets),
                     text: approval_text(preview),
+                    remember: None,
                 };
                 running.ask(request) == Permission::Allowed
             },
         ));
+        // A project specialty's file is approved once per version: one remembering
+        // option, named for its scope.
+        let (hook_sink, hook_cards, hook_secrets) =
+            (Arc::clone(&sink), Arc::clone(&cards), secrets.clone());
+        assembly.harness.gate.specialty_prompt = Some(Box::new(
+            move |call: &ToolCall, preview: &ApprovalPreview| {
+                let Some(running) = running(&hook_sink) else {
+                    return false;
+                };
+                let name = show_controls(preview.agent.as_deref().unwrap_or("specialty"));
+                let title = format!("[{name}] run the project specialty");
+                let id = announce_for_question(
+                    &hook_cards,
+                    running.as_ref(),
+                    call,
+                    &title,
+                    &hook_secrets,
+                );
+                let request = PermissionRequest {
+                    tool_call_id: id,
+                    title,
+                    kind: ToolKind::Other,
+                    raw_input: redacted_input(call, &hook_secrets),
+                    text: approval_text(preview),
+                    remember: Some(format!("Allow this version of {name}")),
+                };
+                running.ask(request) == Permission::Allowed
+            },
+        ));
+        // Sub-agents report on their delegation's card.
+        let (hook_sink, hook_cards, hook_secrets) =
+            (Arc::clone(&sink), Arc::clone(&cards), secrets.clone());
+        assembly.harness.subagents.set_observer(Some(Arc::new(
+            move |event: &SubagentEvent<'_>| {
+                if let Some(running) = running(&hook_sink) {
+                    on_subagent(&hook_cards, running.as_ref(), &hook_secrets, event);
+                }
+            },
+        )));
 
         let state = match resume {
             None => AgentState::new(),
@@ -414,6 +698,7 @@ impl HarnessBackend {
             state,
             sink,
             title_change: None,
+            cards,
         };
         persist(&session.store, &session.state);
         self.sessions.insert(session_id.clone(), session);
@@ -498,7 +783,7 @@ impl EditorFiles for AcpFiles {
 /// terminal's commands (`/clear`, `/limits`, `/update`, ...) are the editor's to
 /// provide, or need a terminal. `/skill` and the skills' own commands are advertised
 /// beside these but run as turns, through `prompt` (see `commands`).
-const COMMANDS: [(&str, &str, Option<&str>); 10] = [
+const COMMANDS: [(&str, &str, Option<&str>); 11] = [
     (
         "mode",
         "Show or set the approval mode for this session",
@@ -537,6 +822,11 @@ const COMMANDS: [(&str, &str, Option<&str>); 10] = [
     ("cost", "Show token usage and cost this session", None),
     ("tools", "List the tools the agent can use", None),
     ("skills", "List the skills, and how to run each", None),
+    (
+        "agents",
+        "List the specialist sub-agents, or show one",
+        Some("name (optional)"),
+    ),
 ];
 
 /// `/skill`, advertised with [`COMMANDS`] but run as a turn by `prompt`, since a
@@ -546,6 +836,15 @@ const SKILL_COMMAND: (&str, &str, Option<&str>) = (
     "skill",
     "Run a skill now, with an optional task",
     Some("skill name, then the task (optional)"),
+);
+
+/// `/agent`, advertised with [`COMMANDS`] but run as a turn by `prompt`, like
+/// [`SKILL_COMMAND`]: a specialty's approvals must reach the editor and
+/// `session/cancel` must be read while it runs. Only a refusal is answered there.
+const AGENT_COMMAND: (&str, &str, Option<&str>) = (
+    "agent",
+    "Run a specialist sub-agent on a task now",
+    Some("[--with-context] name, then the task"),
 );
 
 impl HarnessBackend {
@@ -933,7 +1232,7 @@ impl Backend for HarnessBackend {
     fn commands(&self, session_id: &str) -> Vec<CommandInfo> {
         let mut commands: Vec<CommandInfo> = COMMANDS
             .iter()
-            .chain(std::iter::once(&SKILL_COMMAND))
+            .chain([&SKILL_COMMAND, &AGENT_COMMAND])
             .map(|(name, description, hint)| CommandInfo {
                 name: (*name).to_owned(),
                 description: (*description).to_owned(),
@@ -976,6 +1275,12 @@ impl Backend for HarnessBackend {
             let session = self.sessions.get(session_id)?;
             return crate::repl::skill_refusal(&session.harness.context.skills, arg);
         }
+        if name == AGENT_COMMAND.0 {
+            // So does a specialty to run.
+            let session = self.sessions.get(session_id)?;
+            return crate::repl::parse_agent_command(&session.harness.context.specialties, arg)
+                .err();
+        }
         if !COMMANDS.iter().any(|(known, _, _)| *known == name) {
             return None;
         }
@@ -1017,6 +1322,7 @@ impl Backend for HarnessBackend {
                     crate::repl::skills_list(skills).plain_text()
                 }
             }
+            "agents" => crate::repl::agents_render(&session.harness, arg),
             _ => {
                 let mut lines = vec![format!(
                     "tools: {}",
@@ -1059,7 +1365,11 @@ impl Backend for HarnessBackend {
             self.open(cwd, mcp_servers, Some(session_id))?;
         }
         let session = &self.sessions[session_id];
-        Ok(replay(&session.state, &session.harness.context.secrets))
+        Ok(replay(
+            &session.state,
+            &session.harness.context.secrets,
+            &session.cards,
+        ))
     }
 
     fn cancel_handle(&self, session_id: &str) -> Option<CancelHandle> {
@@ -1076,7 +1386,16 @@ impl Backend for HarnessBackend {
         let session = self.sessions.get_mut(session_id).ok_or_else(|| {
             BackendError::invalid_params(format!("Unknown session: {session_id}"))
         })?;
-        let mut presenter = Presenter::new(session.thinking, session.tool_view);
+        {
+            let mut cards = session.cards.lock().unwrap_or_else(PoisonError::into_inner);
+            cards.tools = Some(session.tool_view);
+            cards.logs.clear();
+        }
+        let mut presenter = Presenter::new(
+            session.thinking,
+            session.tool_view,
+            Arc::clone(&session.cards),
+        );
         let Session {
             harness,
             store,
@@ -1092,14 +1411,28 @@ impl Backend for HarnessBackend {
         };
         // Beyond Python: `/skill <name> [task]` and a skill's own `/<name> [task]` run
         // a turn with that skill chosen, as at a terminal.
-        let result = match crate::repl::skill_invocation(&harness.context.skills, text) {
-            Some((skill, task)) => self
-                .runtime
-                .block_on(harness.run_skill_turn(state, &skill, task, text, on_event)),
-            None => self
-                .runtime
-                .block_on(harness.run_turn_events(state, text, text, on_event)),
-        };
+        // Beyond Python: `/agent [--with-context] <name> <task>` runs a specialty.
+        let agent = text
+            .strip_prefix("/agent")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .and_then(|rest| {
+                crate::repl::parse_agent_command(&harness.context.specialties, rest).ok()
+            });
+        let result =
+            match (
+                agent,
+                crate::repl::skill_invocation(&harness.context.skills, text),
+            ) {
+                (Some((name, task, with_context)), _) => self.runtime.block_on(
+                    harness.run_agent_turn(state, &name, &task, text, with_context, on_event),
+                ),
+                (None, Some((skill, task))) => self
+                    .runtime
+                    .block_on(harness.run_skill_turn(state, &skill, task, text, on_event)),
+                (None, None) => self
+                    .runtime
+                    .block_on(harness.run_turn_events(state, text, text, on_event)),
+            };
         presenter.end_thought(sink.as_ref());
         // The turn is over: nothing may be asked of the editor until the next one.
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -1214,7 +1547,8 @@ fn pairs_object(pairs: &[(String, String)]) -> Value {
 /// A session's saved messages as the updates that tell them again: the user's
 /// words, the agent's replies, each call it made, and what came back. The system
 /// message is rebuilt per request and not part of the history.
-fn replay(state: &AgentState, secrets: &crate::vault::SecretVault) -> Vec<Update> {
+fn replay(state: &AgentState, secrets: &crate::vault::SecretVault, cards: &Cards) -> Vec<Update> {
+    let mut cards = cards.lock().unwrap_or_else(PoisonError::into_inner);
     let mut updates = Vec::new();
     for message in &state.messages {
         match message.role {
@@ -1226,8 +1560,10 @@ fn replay(state: &AgentState, secrets: &crate::vault::SecretVault) -> Vec<Update
                     updates.push(Update::Message(message.content.clone()));
                 }
                 for call in &message.tool_calls {
+                    let id = cards.assign(&call.id);
+                    cards.announced.insert(id.clone());
                     updates.push(Update::ToolCall {
-                        id: call.id.clone(),
+                        id,
                         title: title(call, secrets),
                         name: call.name.clone(),
                         kind: tool_kind(&call.name),
@@ -1238,7 +1574,7 @@ fn replay(state: &AgentState, secrets: &crate::vault::SecretVault) -> Vec<Update
             Role::Tool => {
                 if let Some(id) = &message.tool_call_id {
                     updates.push(Update::ToolResult {
-                        id: id.clone(),
+                        id: cards.lookup(id),
                         ok: true,
                         text: message.content.clone(),
                     });
@@ -1271,6 +1607,25 @@ pub fn tool_kind(name: &str) -> ToolKind {
 /// secrets and control characters dealt with: the name of a tool comes from the
 /// model (an MCP server names its own), and the editor shows the title as text.
 fn title(call: &ToolCall, secrets: &crate::vault::SecretVault) -> String {
+    // Beyond Python: a delegation's card is named for the agent and its task.
+    if call.name == crate::tools::delegate::NAME {
+        let text = |key: &str| {
+            call.arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        };
+        let who = text("agent").or(text("role")).unwrap_or("assistant");
+        let task = text("task").unwrap_or_default();
+        let first = task.lines().next().unwrap_or_default();
+        let first = if first.chars().count() > TITLE_ARGS {
+            format!("{} ...", first.chars().take(TITLE_ARGS).collect::<String>())
+        } else {
+            first.to_owned()
+        };
+        return show_controls(&secrets.redact(&format!("{who}: {first}")));
+    }
     let arguments = python_json_dumps(&Value::Object(call.arguments.clone()), false);
     let arguments = secrets.redact(&arguments);
     let arguments = if arguments.chars().count() > TITLE_ARGS {
@@ -1282,6 +1637,38 @@ fn title(call: &ToolCall, secrets: &crate::vault::SecretVault) -> String {
         arguments
     };
     show_controls(&format!("{}({arguments})", call.name))
+}
+
+/// `title` with the asking sub-agent's name ahead of it, when one asks.
+fn labeled(preview: &ApprovalPreview, title: String) -> String {
+    match &preview.agent {
+        Some(agent) => format!("[{}] {title}", show_controls(agent)),
+        None => title,
+    }
+}
+
+/// The id a question about `call` names: the call's reported id, announced first
+/// when the editor has not been shown it (a sub-agent's call, or `/agent`'s
+/// approval of a project specialty).
+fn announce_for_question(
+    cards: &Cards,
+    sink: &dyn TurnSink,
+    call: &ToolCall,
+    title: &str,
+    secrets: &crate::vault::SecretVault,
+) -> String {
+    let mut state = cards.lock().unwrap_or_else(PoisonError::into_inner);
+    let id = state.lookup(&call.id);
+    if state.announced.insert(id.clone()) {
+        sink.update(Update::ToolCall {
+            id: id.clone(),
+            title: title.to_owned(),
+            name: call.name.clone(),
+            kind: tool_kind(&call.name),
+            raw_input: redacted_input(call, secrets),
+        });
+    }
+    id
 }
 
 /// The call's arguments for the editor, with every vault value replaced by its
@@ -1356,11 +1743,139 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeated_provider_ids_are_reported_under_ids_of_their_own() {
+        let mut cards = CardState::default();
+        assert_eq!(cards.assign("ollama-0"), "ollama-0");
+        assert_eq!(cards.assign("ollama-0"), "ollama-0#1");
+        assert_eq!(cards.lookup("ollama-0"), "ollama-0#1");
+        assert_eq!(cards.assign("ollama-0#1x"), "ollama-0#1x");
+        assert_eq!(cards.assign(""), "#2");
+        // Replay draws from the same set, so a loaded session's next call is new.
+        let mut state = AgentState::new();
+        let call = call("list_dir", json!({}));
+        state.messages.push(crate::types::Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![call.clone(), call.clone()],
+            tool_call_id: None,
+            name: None,
+        });
+        let cards: Cards = Arc::default();
+        let updates = replay(&state, &crate::vault::SecretVault::default(), &cards);
+        let ids: Vec<&str> = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["c1", "c1#1"]);
+        assert_eq!(cards.lock().unwrap().assign("c1"), "c1#2");
+    }
+
+    #[test]
+    fn a_delegation_is_titled_for_its_agent_and_task() {
+        let secrets = crate::vault::SecretVault::default();
+        let delegate = |arguments: Value| title(&call("delegate", arguments), &secrets);
+        assert_eq!(
+            delegate(json!({"agent": "reviewer", "task": "Check auth\nthen tests"})),
+            "reviewer: Check auth"
+        );
+        assert_eq!(delegate(json!({"role": "coder", "task": "x"})), "coder: x");
+        assert_eq!(
+            delegate(json!({"task": "x\u{1b}[2J"})),
+            "assistant: x\u{241b}[2J"
+        );
+    }
+
+    #[test]
+    fn a_sub_agent_fills_its_card_at_the_sessions_level() {
+        use crate::subagent::{Card, SubagentEvent};
+        let secrets = crate::vault::SecretVault::default();
+        let run = |level: DisplayLevel, card: &Card| {
+            let cards: Cards = Arc::default();
+            {
+                let mut state = cards.lock().unwrap();
+                state.tools = Some(level);
+                if card.announced {
+                    let id = state.assign(&card.id);
+                    state.announced.insert(id);
+                }
+            }
+            let sink = Recorder::default();
+            let inner = call("list_dir", json!({"path": "."}));
+            let ok = outcome(true, "a.txt");
+            let failed = outcome(false, "");
+            for event in [
+                SubagentEvent::Started {
+                    card,
+                    run: 1,
+                    name: "planner",
+                    depth: 1,
+                    task: "Plan it\nfully",
+                },
+                SubagentEvent::ToolCall { card, call: &inner },
+                SubagentEvent::ToolResult {
+                    card,
+                    call: &inner,
+                    result: &ok,
+                },
+                SubagentEvent::ToolResult {
+                    card,
+                    call: &inner,
+                    result: &failed,
+                },
+                SubagentEvent::Finished {
+                    card,
+                    run: 1,
+                    name: "planner",
+                    depth: 1,
+                    ok: true,
+                },
+            ] {
+                on_subagent(&cards, &sink, &secrets, &event);
+            }
+            sink.0.into_inner().unwrap()
+        };
+        let delegation = Card::new("d", true);
+        let full = run(DisplayLevel::Full, &delegation);
+        let Update::ToolProgress { id, text } = full.last().unwrap() else {
+            panic!("{full:?}");
+        };
+        assert_eq!(id, "d");
+        assert_eq!(
+            text,
+            "planner started\nlist_dir({\"path\": \".\"})\n  \u{21b3} a.txt\n\u{2717} list_dir: error: it broke"
+        );
+        // The delegation's card is ended by its own result, not here.
+        assert!(!full
+            .iter()
+            .any(|update| matches!(update, Update::ToolResult { .. })));
+        let summary = run(DisplayLevel::Summary, &delegation);
+        let Update::ToolProgress { text, .. } = summary.last().unwrap() else {
+            panic!("{summary:?}");
+        };
+        assert_eq!(text, "1 tool call\n\u{2717} list_dir: error: it broke");
+        assert!(run(DisplayLevel::Hidden, &delegation).is_empty());
+
+        // `/agent` has no call of its own: its card is announced and ended here.
+        let synthetic = run(DisplayLevel::Full, &Card::new("agent-planner-1", false));
+        assert!(matches!(
+            &synthetic[0],
+            Update::ToolCall { id, title, .. } if id == "agent-planner-1" && title == "planner: Plan it"
+        ));
+        assert!(matches!(
+            synthetic.last().unwrap(),
+            Update::ToolResult { id, ok: true, .. } if id == "agent-planner-1"
+        ));
+    }
+
     /// Run a turn of events through a presenter at these levels.
     fn presented(thinking: DisplayLevel, tools: DisplayLevel, ok: bool) -> Vec<Update> {
         let sink = Recorder::default();
         let secrets = crate::vault::SecretVault::default();
-        let mut presenter = Presenter::new(thinking, tools);
+        let mut presenter = Presenter::new(thinking, tools, Cards::default());
         let call = call("list_dir", json!({"path": "."}));
         let result = outcome(ok, "a.txt\nb.txt");
         for event in [
@@ -1510,6 +2025,8 @@ mod tests {
             detail: Some("--- a/a\n+++ b/a\r\n@@".into()),
             lexer: Some("diff"),
             warning: None,
+            full: false,
+            agent: None,
         };
         let text = approval_text(&preview);
         assert!(text.starts_with("--- a/a"));
@@ -1520,6 +2037,8 @@ mod tests {
 
         let warned = ApprovalPreview {
             warning: Some("changes what agent86 runs".into()),
+            full: false,
+            agent: None,
             detail: None,
             ..preview
         };

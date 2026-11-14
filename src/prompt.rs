@@ -65,26 +65,7 @@ pub fn build_system_prompt(config: &Config, skills: &crate::skills::Skills) -> M
         config.model.default,
         config.sandbox.mode.as_str(),
     );
-    if !skills.is_empty() {
-        // Progressive disclosure: names and descriptions only; `use_skill` loads the rest.
-        content.push_str(
-            "\n\nAvailable skills (call use_skill with the name to load full instructions):",
-        );
-        for skill in skills.values() {
-            content.push_str(&format!(
-                "\n- {}: {}",
-                skill.name,
-                crate::skills::one_line(&skill.description)
-            ));
-            // Said up front: finding the restriction through a refused call wastes a step.
-            if !skill.allowed_tools.is_empty() {
-                content.push_str(&format!(
-                    " [tools while active: {}]",
-                    skill.allowed_tools.join(", ")
-                ));
-            }
-        }
-    }
+    content.push_str(&skills_section(skills.values().map(AsRef::as_ref)));
     Message {
         role: Role::System,
         content,
@@ -92,6 +73,33 @@ pub fn build_system_prompt(config: &Config, skills: &crate::skills::Skills) -> M
         tool_call_id: None,
         name: None,
     }
+}
+
+/// The skills section of the system prompt (empty with no skills): names and
+/// descriptions only, since `use_skill` loads the rest. A specialist sub-agent's
+/// prompt lists only the skills it may load, with this same text.
+pub fn skills_section<'a>(skills: impl Iterator<Item = &'a crate::skills::Skill>) -> String {
+    let mut content = String::new();
+    for skill in skills {
+        if content.is_empty() {
+            content.push_str(
+                "\n\nAvailable skills (call use_skill with the name to load full instructions):",
+            );
+        }
+        content.push_str(&format!(
+            "\n- {}: {}",
+            skill.name,
+            crate::skills::one_line(&skill.description)
+        ));
+        // Said up front: finding the restriction through a refused call wastes a step.
+        if !skill.allowed_tools.is_empty() {
+            content.push_str(&format!(
+                " [tools while active: {}]",
+                skill.allowed_tools.join(", ")
+            ));
+        }
+    }
+    content
 }
 
 #[cfg(test)]

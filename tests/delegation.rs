@@ -113,6 +113,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
         mcp: None,
         memory: None,
         cancel: Default::default(),
+        subagents: Default::default(),
     }
 }
 
@@ -121,6 +122,7 @@ fn agents(max_depth: u32, max_steps: u32) -> AgentsConfig {
         enabled: true,
         max_depth,
         max_steps,
+        max_parallel: 3,
     }
 }
 
@@ -471,7 +473,23 @@ fn delegate_is_registered_only_when_agents_are_on_and_never_runs_in_parallel() {
         .contains(&"delegate".to_owned()));
     let schemas: Value = serde_json::from_str(&support::fixture("skills/schemas.json")).unwrap();
     let tool = agent86::tools::delegate::DelegateTool;
-    assert_eq!(tool.parameters(), schemas["delegate"]);
+    // Python's `role` and `task` exactly; beyond Python, optional arguments after
+    // them, none required.
+    assert_eq!(
+        agent86::tools::delegate::python_parameters(),
+        schemas["delegate"]
+    );
+    let parameters = tool.parameters();
+    assert_eq!(parameters["required"], schemas["delegate"]["required"]);
+    let properties = parameters["properties"].as_object().unwrap();
+    let names: Vec<&str> = properties.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        ["role", "task", "agent", "skill", "isolate", "files", "summary"]
+    );
+    for name in ["role", "task"] {
+        assert_eq!(properties[name], schemas["delegate"]["properties"][name]);
+    }
     assert!(!tool.side_effecting());
     assert!(!tool.parallel_safe());
     let python: Value =
@@ -549,12 +567,14 @@ async fn a_sub_agents_spent_budget_or_empty_cap_can_be_raised() {
                 agent: reviewer.clone(),
                 current: 1,
                 offers: vec![2, 4],
+                run_only: false,
             },
             LimitHit {
                 kind: LimitKind::Output,
                 agent: reviewer,
                 current: 1024,
                 offers: vec![2048, 4096],
+                run_only: false,
             },
         ]
     );
@@ -579,6 +599,7 @@ fn a_sub_agents_offer_stays_under_the_turns_budget() {
         enabled: true,
         max_depth: 2,
         max_steps: 30,
+        max_parallel: 3,
     };
     let workspace = Workspace::new("ceiling");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -596,4 +617,89 @@ fn a_sub_agents_offer_stays_under_the_turns_budget() {
     );
     harness.session_limits.set(LimitKind::Steps, Some(120));
     assert_eq!(harness.agent_max_steps(), 100);
+}
+
+/// A router whose routes are `cheap/model` and `frontier/model` on `server`.
+fn triage_router(server: &MockServer) -> agent86::router::Router {
+    let base_url = server.base_url.clone();
+    agent86::router::Router::new(
+        true,
+        "mock:cheap/model",
+        "mock:frontier/model",
+        Box::new(move |reference| {
+            let model = reference.strip_prefix("mock:").ok_or("unknown route")?;
+            let config = OpenAiConfig {
+                base_url: Some(base_url.clone()),
+                require_key: false,
+                max_retries: 0,
+                ..OpenAiConfig::default()
+            };
+            let provider = OpenAiProvider::new(model, config, None).map_err(|e| e.to_string())?;
+            Ok(agent86::router::RoutedModel {
+                reference: reference.to_owned(),
+                provider: Arc::new(provider),
+                max_tokens: 900,
+                context_window: 64_000,
+                output_setting: "[providers.mock] max_tokens".into(),
+            })
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_sub_agent_runs_on_the_model_the_turn_was_routed_to() {
+    // Slice 0 of the specialist work: the request went to the session's model
+    // while the trace named the routed one. Python's sub-agent uses the routed model.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "look"}"#)]),
+        sse_text("Fine.", "stop"),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("routed");
+    let mut harness = harness(&server, &workspace, agents(2, 8));
+    harness.router = triage_router(&server);
+    let mut state = AgentState::new();
+    harness
+        .run_turn(&mut state, "review the parser", |_| {})
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert_eq!(requests[0].body["model"], "frontier/model");
+    assert_eq!(requests[1].body["model"], "frontier/model", "the sub-agent");
+    assert_eq!(requests[1].body["max_completion_tokens"], 900);
+    let events = workspace.events("sub:reviewer");
+    assert_eq!(events[0]["model"], "frontier/model");
+}
+
+#[tokio::test]
+async fn a_cancel_stops_a_running_sub_agent() {
+    // Beyond Python, whose sub-agent has no cancel checks: a stalled sub-agent
+    // call stops at once, and the turn closes out with every call answered.
+    let partial = "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Hel\"}, \"finish_reason\": null}]}\n\n";
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"role": "reviewer", "task": "look"}"#)]),
+        Reply::StallAfter(partial.to_owned()),
+    ])
+    .await;
+    let workspace = Workspace::new("cancel");
+    let harness = harness(&server, &workspace, agents(2, 8));
+    let canceller = harness.cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        canceller.cancel();
+    });
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "go", |_| {}).await.unwrap();
+    assert!(
+        output.contains("[tool] delegate -> [sub-agent 'reviewer' cancelled]"),
+        "{output}"
+    );
+    assert!(output.ends_with("[cancelled]\n"), "{output}");
+    assert_eq!(server.requests().len(), 2, "no model call after the cancel");
+    let roles: Vec<Role> = state.messages.iter().map(|m| m.role).collect();
+    assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool]);
+    let done = workspace.events("sub:reviewer");
+    assert_eq!(done.last().unwrap()["kind"], "subagent_done");
+    assert_eq!(done.last().unwrap()["status"], "cancelled");
 }

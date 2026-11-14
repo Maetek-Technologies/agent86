@@ -30,6 +30,12 @@ pub struct ApprovalPreview {
     /// Beyond Python: a caution shown above the detail, for a write into agent86's
     /// own configuration or skills ([`guarded_warning`]).
     pub warning: Option<String>,
+    /// Beyond Python: show the whole detail, never capped, because what is approved
+    /// is all of it (a project specialty's file, whose every line becomes prompt text).
+    pub full: bool,
+    /// Beyond Python: the specialist sub-agent asking (or, for a project specialty's
+    /// own approval, its name), so a surface can say who asks.
+    pub agent: Option<String>,
 }
 
 /// The caution for a write into agent86's own configuration or skills.
@@ -55,6 +61,57 @@ pub struct ApprovalDecision {
     pub reason: &'static str,
 }
 
+/// One question at a time (beyond Python): approval, limit, and secret prompts all
+/// pass through one queue, because sub-agents running in parallel can each reach a
+/// prompt, and a terminal or an editor answers one at a time. A waiter that gets
+/// its turn after the turn was cancelled declines without asking, so a cancel is
+/// not followed by each queued question in turn. Clones share the queue.
+#[derive(Clone, Default)]
+pub struct PromptQueue {
+    inner: std::sync::Arc<QueueInner>,
+}
+
+#[derive(Default)]
+struct QueueInner {
+    turn: Mutex<()>,
+    cancel: Mutex<Option<crate::agent::CancelToken>>,
+}
+
+impl std::fmt::Debug for PromptQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PromptQueue")
+    }
+}
+
+impl PromptQueue {
+    /// Decline queued questions once `token` (the turn's) is cancelled.
+    pub fn watch(&self, token: crate::agent::CancelToken) {
+        *self
+            .inner
+            .cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(token);
+    }
+
+    /// Ask with `ask` once nobody else is asking, or `None` when the turn was
+    /// cancelled while this question waited.
+    pub fn ask<T>(&self, ask: impl FnOnce() -> T) -> Option<T> {
+        let _turn = self
+            .inner
+            .turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let cancelled = self
+            .inner
+            .cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(crate::agent::CancelToken::is_cancelled);
+        (!cancelled).then(ask)
+    }
+}
+
 /// Decides whether a call may run, asking a human when the mode says so.
 pub struct ApprovalGate {
     /// Behind a lock, so the interactive interface can switch it (Shift+Tab) while a
@@ -63,6 +120,12 @@ pub struct ApprovalGate {
     pub prompt: Option<ApprovalPrompt>,
     /// Asked in place of `prompt` when set.
     pub call_prompt: Option<CallApprovalPrompt>,
+    /// Every question goes through it, one at a time (beyond Python).
+    pub queue: PromptQueue,
+    /// Asked in place of the others about a project specialty's file (beyond
+    /// Python): an editor offers one remembering option for it, which a call's
+    /// prompt cannot.
+    pub specialty_prompt: Option<CallApprovalPrompt>,
 }
 
 impl ApprovalGate {
@@ -71,18 +134,15 @@ impl ApprovalGate {
             mode: Mutex::new(mode),
             prompt,
             call_prompt: None,
+            queue: PromptQueue::default(),
+            specialty_prompt: None,
         }
     }
 
     /// Ask `preview` of whichever prompt is installed, or `None` when nobody can be
     /// asked.
     fn ask(&self, tool: &dyn Tool, call: &ToolCall, preview: &ApprovalPreview) -> Option<bool> {
-        if let Some(prompt) = &self.call_prompt {
-            return Some(prompt(call, preview));
-        }
-        self.prompt
-            .as_ref()
-            .map(|prompt| prompt(tool.name(), preview))
+        self.ask_about(tool.name(), call, preview)
     }
 
     pub fn mode(&self) -> ApprovalMode {
@@ -95,16 +155,51 @@ impl ApprovalGate {
 
     pub fn decide(&self, tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> ApprovalDecision {
         let decision = |approved, reason| ApprovalDecision { approved, reason };
+        let scope = ctx.scope.as_deref();
+        // Beyond Python: a specialist sub-agent's list comes before anything else,
+        // so nobody is asked about a call that would then be refused.
+        if !ctx.scope_allows(tool.name()) {
+            return decision(false, "not permitted for this sub-agent");
+        }
+        // Its approval mode applies only when stricter than the session's, read
+        // for each call so a switch mid-turn still counts.
+        let mode = crate::tools::stricter(Some(self.mode()), scope.and_then(|s| s.approval))
+            .unwrap_or(ApprovalMode::Ask);
+        // Beyond Python: a specialty's `confirm` tools are asked about in every mode
+        // but `deny`, read-only ones included.
+        if let Some(scope) = scope.filter(|s| s.confirm.iter().any(|t| t == tool.name())) {
+            if mode == ApprovalMode::Deny {
+                return decision(false, "blocked by approval policy (deny)");
+            }
+            if !self.can_ask() {
+                return decision(
+                    false,
+                    "this sub-agent's calls to this tool need approval, and no prompt is available",
+                );
+            }
+            let mut preview = build_preview(tool, call, ctx);
+            preview.warning = Some(format!(
+                "The '{}' sub-agent always asks before running {}.",
+                scope.label,
+                tool.name()
+            ));
+            preview.agent = Some(scope.label.clone());
+            return if self.ask(tool, call, &preview) == Some(true) {
+                decision(true, "approved by user")
+            } else {
+                decision(false, "declined by user")
+            };
+        }
         if !tool.side_effecting() {
             return decision(true, "read-only");
         }
         // Beyond Python: agent86's own files are asked about whatever the mode,
         // except that `deny` still denies.
         if let Some(path) = tool.guarded_target(&call.arguments, ctx) {
-            if self.mode() == ApprovalMode::Deny {
+            if mode == ApprovalMode::Deny {
                 return decision(false, "blocked by approval policy (deny)");
             }
-            if self.prompt.is_none() && self.call_prompt.is_none() {
+            if !self.can_ask() {
                 return decision(
                     false,
                     "writing agent86's own configuration or skills needs approval, and no \
@@ -113,26 +208,74 @@ impl ApprovalGate {
             }
             let mut preview = build_preview(tool, call, ctx);
             preview.warning = Some(guarded_warning(&path));
+            preview.agent = scope.map(|scope| scope.label.clone());
             return if self.ask(tool, call, &preview) == Some(true) {
                 decision(true, "approved by user")
             } else {
                 decision(false, "declined by user")
             };
         }
-        match self.mode() {
+        match mode {
             ApprovalMode::Auto => decision(true, "auto-approved"),
             ApprovalMode::Deny => decision(false, "blocked by approval policy (deny)"),
             ApprovalMode::Ask => {
-                if self.prompt.is_none() && self.call_prompt.is_none() {
+                if !self.can_ask() {
                     return decision(false, "approval required but no prompt available");
                 }
-                if self.ask(tool, call, &build_preview(tool, call, ctx)) == Some(true) {
+                let mut preview = build_preview(tool, call, ctx);
+                // Beyond Python: the user is told which sub-agent asks.
+                if let Some(scope) = scope {
+                    preview.warning = Some(format!("Asked by the '{}' sub-agent.", scope.label));
+                    preview.agent = Some(scope.label.clone());
+                }
+                if self.ask(tool, call, &preview) == Some(true) {
                     decision(true, "approved by user")
                 } else {
                     decision(false, "declined by user")
                 }
             }
         }
+    }
+
+    /// Ask about a project specialty's file: the specialty hook when one is
+    /// installed, else the call prompts. `None` when nobody can be asked.
+    pub fn ask_specialty(&self, call: &ToolCall, preview: &ApprovalPreview) -> Option<bool> {
+        match &self.specialty_prompt {
+            Some(prompt) => Some(self.queue.ask(|| prompt(call, preview)).unwrap_or(false)),
+            None => self.ask_about("delegate", call, preview),
+        }
+    }
+
+    /// Whether anybody can be asked.
+    pub fn can_ask(&self) -> bool {
+        self.prompt.is_some() || self.call_prompt.is_some()
+    }
+
+    /// Put a question that is not a tool's own to whichever prompt is installed (a
+    /// project specialty's approval). `call` is the call it belongs to, for a surface
+    /// that has to say which; `name` is what the plain prompt shows. `None` when
+    /// nobody can be asked.
+    pub fn ask_about(
+        &self,
+        name: &str,
+        call: &ToolCall,
+        preview: &ApprovalPreview,
+    ) -> Option<bool> {
+        if !self.can_ask() {
+            return None;
+        }
+        // A question that waited past a cancel is declined without being put.
+        Some(
+            self.queue
+                .ask(|| match &self.call_prompt {
+                    Some(prompt) => prompt(call, preview),
+                    None => self
+                        .prompt
+                        .as_ref()
+                        .is_some_and(|prompt| prompt(name, preview)),
+                })
+                .unwrap_or(false),
+        )
     }
 }
 
@@ -163,6 +306,8 @@ pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> App
             .filter(|detail| !detail.is_empty()),
         lexer: tool.preview_lexer(),
         warning: None,
+        full: false,
+        agent: None,
     }
 }
 
@@ -214,7 +359,11 @@ pub fn prompt_text(color: bool, tool_name: &str, preview: &ApprovalPreview) -> S
             format!("warning: {warning}\n")
         });
     }
-    text.push_str(&show_controls(&cap_lines(detail, APPROVAL_DETAIL_LINES)));
+    text.push_str(&show_controls(&if preview.full {
+        detail.to_owned()
+    } else {
+        cap_lines(detail, APPROVAL_DETAIL_LINES)
+    }));
     text.push('\n');
     text.push_str(&if color {
         format!("\x1b[1;33mapprove \x1b[0m\x1b[1m{tool_name}?\x1b[0m\n")
@@ -274,6 +423,8 @@ mod tests {
             detail: detail.map(str::to_owned),
             lexer: None,
             warning: None,
+            full: false,
+            agent: None,
         }
     }
 

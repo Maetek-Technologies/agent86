@@ -129,6 +129,9 @@ pub enum UiEvent {
     /// A line to print from background work (the new-version check, `/update`).
     /// Held until no turn runs and no panel is open, as a catalog is.
     Note(Style, String),
+    /// A specialist sub-agent started or finished (beyond Python): printed at
+    /// once, dimmed, unless tool use is hidden.
+    Agent(String),
 }
 
 /// What a catalog was fetched for, as Python's `CatalogReady.purpose`.
@@ -304,6 +307,8 @@ pub struct App {
     pub workspace: Option<PathBuf>,
     /// The skills the `/` menu offers after the built-in commands (beyond Python).
     pub skill_commands: Vec<MenuItem>,
+    /// The `#` menu's specialties (beyond Python).
+    pub agent_names: Vec<MenuItem>,
     /// The terminal title last written, so it is only written when it changes.
     title_written: String,
     exit_armed: Option<Instant>,
@@ -345,6 +350,7 @@ impl App {
             view: None,
             workspace: None,
             skill_commands: Vec::new(),
+            agent_names: Vec::new(),
             title_written: String::new(),
             exit_armed: None,
             request: None,
@@ -683,6 +689,22 @@ impl App {
             } => {
                 // The question has to be seen: the transcript view gives way to it.
                 self.view = None;
+                // Beyond Python: a preview that must be read whole (a project
+                // specialty's file) goes into scrollback, where every line can be
+                // read, since the panel has room for only part of it.
+                let mut preview = preview;
+                if preview.full {
+                    if let Some(detail) = preview.detail.take() {
+                        self.commit(
+                            sanitize(&detail)
+                                .split('\n')
+                                .map(Line::plain)
+                                .collect::<Vec<_>>(),
+                        );
+                        preview.summary =
+                            format!("{} (the whole file is printed above)", preview.summary);
+                    }
+                }
                 self.approval = Some(ApprovalPanel {
                     tool,
                     preview,
@@ -745,6 +767,12 @@ impl App {
                 purpose,
             }),
             UiEvent::Note(style, text) => self.deferred.push_back(Request::Note(style, text)),
+            UiEvent::Agent(text) => {
+                // A notice (a specialty's model fell back) shows at every level.
+                if self.tool_level != DisplayLevel::Hidden || text.starts_with("[agent]") {
+                    self.note(Style::Dim, &text);
+                }
+            }
             UiEvent::McpTested { id, result } => {
                 if let Some(Panel::McpTest(test)) = &mut self.panel {
                     if test.id == id {
@@ -1055,13 +1083,15 @@ impl App {
             if let Some(answer) = panel.on_key(key) {
                 if let Some(panel) = self.limit.take() {
                     if let Some(value) = answer {
-                        self.note(
-                            Style::Dim,
-                            &format!(
+                        let note = if panel.hit.run_only {
+                            format!("{} raised to {value} for this run", panel.hit.kind.name())
+                        } else {
+                            format!(
                                 "{} raised to {value} for this session · /limits save keeps it",
                                 panel.hit.kind.name()
-                            ),
-                        );
+                            )
+                        };
+                        self.note(Style::Dim, &note);
                     }
                     panel.answer(answer);
                 }
@@ -1232,6 +1262,7 @@ impl App {
             self.editor.cursor(),
             self.workspace.as_deref(),
             &self.skill_commands,
+            &self.agent_names,
         );
     }
 
@@ -1249,6 +1280,9 @@ impl App {
                 self.request = Some(Request::Submit(chosen));
             }
             MenuKind::Commands => self.editor.set_text(&format!("{chosen} ")),
+            MenuKind::Agents { start, end } => {
+                self.editor.replace(start, end, &format!("#{chosen} "));
+            }
             MenuKind::Paths { start, end } => {
                 self.editor.replace(start, end, &mention_text(&chosen));
                 if chosen.ends_with('/') && !chosen.contains(' ') {
@@ -1879,6 +1913,8 @@ mod tests {
                 detail: None,
                 lexer: None,
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2020,6 +2056,8 @@ mod tests {
                 detail: None,
                 lexer: None,
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2047,6 +2085,8 @@ mod tests {
                 detail: None,
                 lexer: None,
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2069,6 +2109,8 @@ mod tests {
                 detail: Some("--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-old\n+new".into()),
                 lexer: Some("diff"),
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2321,6 +2363,7 @@ mod tests {
             agent: Some("reviewer".into()),
             current: 8,
             offers: vec![16, 32],
+            run_only: false,
         };
         let mut app = app_running();
         app.set_size(81, 30);
@@ -2373,6 +2416,8 @@ mod tests {
                 detail: Some("--- a.txt\n+++ a.txt\n+hello".into()),
                 lexer: Some("diff"),
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2395,6 +2440,8 @@ mod tests {
                 detail: None,
                 lexer: None,
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2409,6 +2456,8 @@ mod tests {
                 detail: None,
                 lexer: None,
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });
@@ -2428,6 +2477,8 @@ mod tests {
                 detail: Some(detail.join("\n")),
                 lexer: Some("diff"),
                 warning: None,
+                full: false,
+                agent: None,
             },
             reply,
         });

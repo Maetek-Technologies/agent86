@@ -196,6 +196,21 @@ impl OllamaProvider {
 }
 
 impl Provider for OllamaProvider {
+    fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError> {
+        Ok(std::sync::Arc::new(Self {
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            config: self.config.clone(),
+            client: reqwest::Client::builder()
+                .connect_timeout(self.config.connect_timeout)
+                .read_timeout(self.config.read_timeout)
+                .build()
+                .map_err(|error| ProviderError::Client {
+                    detail: error_chain(&error),
+                })?,
+        }))
+    }
+
     fn name(&self) -> &str {
         "ollama"
     }

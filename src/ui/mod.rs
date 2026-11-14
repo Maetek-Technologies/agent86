@@ -69,12 +69,15 @@ pub fn run_interactive(
     resume: Option<&str>,
     plain: bool,
     secrets: Box<dyn SecretStore>,
+    trust_specialties: bool,
 ) {
     let wanted = wants_interface(&config, plain);
     let Some(mut repl) = start_repl(config, resume, secrets) else {
         return;
     };
     repl.config_paths = Some(paths);
+    // `--trust-project` (or its variable) approves project specialties too.
+    repl.harness.subagents.approvals.forced = trust_specialties;
     if !wanted {
         return plain_loop(repl);
     }
@@ -263,6 +266,34 @@ fn run(repl: &mut Repl) -> io::Result<()> {
         };
         approvals.send(request).is_ok() && answer.recv().unwrap_or(false)
     }));
+    // Beyond Python: say which specialist is running, and when it is done.
+    let progress = events.clone();
+    repl.harness
+        .subagents
+        .set_observer(Some(std::sync::Arc::new(
+            move |event: &crate::subagent::SubagentEvent<'_>| {
+                use crate::subagent::SubagentEvent;
+                let line = match event {
+                    SubagentEvent::Started {
+                        name, depth, task, ..
+                    } => format!(
+                        "{}\u{2192} {name}: {}",
+                        "  ".repeat(depth.saturating_sub(1) as usize),
+                        task.lines().next().unwrap_or_default()
+                    ),
+                    SubagentEvent::Finished {
+                        name, depth, ok, ..
+                    } => format!(
+                        "{}\u{2190} {name} {}",
+                        "  ".repeat(depth.saturating_sub(1) as usize),
+                        if *ok { "finished" } else { "failed" }
+                    ),
+                    SubagentEvent::Notice { text, .. } => (*text).to_owned(),
+                    _ => return,
+                };
+                let _ = progress.send(UiEvent::Agent(line));
+            },
+        )));
     // So does an offer to raise a limit the turn reached; a dropped sender stops.
     let offers = events.clone();
     repl.harness.session_limits.prompt = Some(Box::new(move |hit| {
@@ -305,6 +336,7 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     app.set_size(usize::from(width), usize::from(height));
     app.workspace = Some(repl.harness.context.policy.workspace().to_path_buf());
     app.skill_commands = menu::skill_items(&repl.harness.context.skills);
+    app.agent_names = menu::agent_items(&repl.harness);
     app.markdown = repl.config.ui.markdown;
     app.set_thinking_level(repl.config.ui.thinking);
     app.set_tool_level(repl.config.ui.tool_use);
@@ -515,9 +547,16 @@ fn dispatch(
             }
         }
         Action::Turn | Action::Directed => {
-            // A skill run as a command: its task is what follows the instructions.
-            let (skill, typed) = repl.turn_input(&result, line);
-            let turn = TurnInput { line, typed, skill };
+            // A skill or a specialty run as a command: its task is what is expanded.
+            let (kind, typed) = repl.turn_input(&result, line);
+            // Beyond Python: `#name` names a specialty to delegate to, as a hint.
+            let hinted =
+                crate::mentions::with_agent_hints(&repl.harness.context.specialties, typed);
+            let turn = TurnInput {
+                line,
+                typed: &hinted,
+                kind,
+            };
             let outcome = run_turn(app, screen, repl, inbox, events, runtime, turn)?;
             return Ok(outcome != Request::Exit);
         }
@@ -615,7 +654,7 @@ fn resume_picked(
 struct TurnInput<'a> {
     line: &'a str,
     typed: &'a str,
-    skill: Option<std::sync::Arc<crate::skills::Skill>>,
+    kind: crate::specialty_turn::TurnKind,
 }
 
 fn run_turn(
@@ -627,7 +666,7 @@ fn run_turn(
     runtime: &tokio::runtime::Runtime,
     turn: TurnInput<'_>,
 ) -> io::Result<Request> {
-    let TurnInput { line, typed, skill } = turn;
+    let TurnInput { line, typed, kind } = turn;
     // `@path` mentions are inlined for the model; refusals are shown and sent along.
     let mentions = expand_mentions(
         typed,
@@ -637,7 +676,7 @@ fn run_turn(
     for problem in &mentions.errors {
         app.note(Style::DimYellow, problem);
     }
-    if let Some(skill) = &skill {
+    if let crate::specialty_turn::TurnKind::Skill(skill) = &kind {
         app.note(
             Style::Dim,
             &format!("using skill {}", crate::ui::text::sanitize(&skill.name)),
@@ -658,12 +697,7 @@ fn run_turn(
             let on_event = |event: crate::agent::TurnEvent<'_>| {
                 let _ = worker_events.send(event.into());
             };
-            let result = match &skill {
-                Some(skill) => {
-                    runtime.block_on(harness.run_skill_turn(state, skill, &prompt, line, on_event))
-                }
-                None => runtime.block_on(harness.run_turn_events(state, &prompt, line, on_event)),
-            };
+            let result = runtime.block_on(harness.run_kind(state, &kind, &prompt, line, on_event));
             let error = result
                 .err()
                 .map(|error| (error.python_type().to_owned(), error.to_string()));

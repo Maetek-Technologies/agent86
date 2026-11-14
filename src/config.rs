@@ -64,6 +64,7 @@ paths = []
 enabled = true
 max_depth = 2
 max_steps = 8
+max_parallel = 3
 
 [observability]
 trace = true
@@ -351,6 +352,26 @@ pub struct AgentsConfig {
     pub max_depth: u32,
     /// Each sub-agent's step cap, kept below `limits.max_steps`.
     pub max_steps: u32,
+    /// Beyond Python: how many adjacent specialist delegations run at once (the
+    /// rest queue). Trust-free, so it is clamped: below 1 counts as 1, and the
+    /// ceiling is [`MAX_PARALLEL_CEILING`].
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: u32,
+}
+
+/// The most specialist sub-agents that run at once, whatever `[agents]
+/// max_parallel` says (a cloned repo's config may set it).
+pub const MAX_PARALLEL_CEILING: u32 = 8;
+
+fn default_max_parallel() -> u32 {
+    3
+}
+
+impl AgentsConfig {
+    /// `max_parallel`, clamped to 1 ..= [`MAX_PARALLEL_CEILING`].
+    pub fn parallel_limit(&self) -> usize {
+        self.max_parallel.clamp(1, MAX_PARALLEL_CEILING) as usize
+    }
 }
 
 /// `[mcp]`.

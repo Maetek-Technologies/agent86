@@ -166,6 +166,9 @@ pub struct SecretVault {
 
 #[derive(Default)]
 struct Inner {
+    /// The harness's prompt queue, so a secret is asked one question at a time
+    /// with approvals and limits (beyond Python).
+    queue: Mutex<Option<crate::approval::PromptQueue>>,
     /// In the order they were entered.
     values: RwLock<Vec<(String, String)>>,
     prompt: Mutex<Option<Arc<SecretPrompt>>>,
@@ -252,6 +255,15 @@ impl SecretVault {
     }
 
     /// Install (or, with `None`, remove) the prompt that asks the user for a secret.
+    /// Ask through `queue`, one question at a time with the harness's others.
+    pub fn set_queue(&self, queue: crate::approval::PromptQueue) {
+        *self
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(queue);
+    }
+
     pub fn set_prompt(&self, prompt: Option<SecretPrompt>) {
         *self
             .inner
@@ -289,9 +301,19 @@ impl SecretVault {
     /// types, so redaction elsewhere never waits on them.
     pub fn ask(&self, name: &str, reason: &str) -> Result<Stored, NotSet> {
         let prompt = self.prompt().ok_or(NotSet::Declined)?;
-        let answer = prompt(&self.request(name, reason))
-            .filter(|answer| !answer.value.is_empty())
-            .ok_or(NotSet::Declined)?;
+        let request = self.request(name, reason);
+        let queue = self
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let answer = match queue {
+            Some(queue) => queue.ask(|| prompt(&request)).flatten(),
+            None => prompt(&request),
+        }
+        .filter(|answer| !answer.value.is_empty())
+        .ok_or(NotSet::Declined)?;
         self.accept(name, answer)
     }
 

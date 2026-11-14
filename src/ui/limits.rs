@@ -177,6 +177,7 @@ mod tests {
             agent: None,
             current: 40,
             offers: vec![80, 160],
+            run_only: false,
         };
         (LimitPanel::new(hit, reply), answer)
     }

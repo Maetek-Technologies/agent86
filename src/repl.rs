@@ -304,6 +304,13 @@ pub struct CommandResult {
 pub enum DirectedTurn {
     /// Run `task` with the skill `name` chosen ([`Harness::run_skill_turn`]).
     Skill { name: String, task: String },
+    /// Run the specialist sub-agent `name` on `task` (`/agent`,
+    /// [`Harness::run_agent_turn`]).
+    Agent {
+        name: String,
+        task: String,
+        with_context: bool,
+    },
 }
 
 impl CommandResult {
@@ -356,7 +363,7 @@ pub struct CommandEntry {
 }
 
 /// Python's registry, in its order.
-pub const COMMANDS: [CommandEntry; 22] = [
+pub const COMMANDS: [CommandEntry; 24] = [
     CommandEntry {
         name: "/help",
         usage: "/help",
@@ -435,6 +442,20 @@ pub const COMMANDS: [CommandEntry; 22] = [
         description: "Run a skill now, with an optional task",
         needs_choice: None,
         handler: |repl, arg| repl.skill_command(arg),
+    },
+    CommandEntry {
+        name: "/agent",
+        usage: "/agent <name> <task>",
+        description: "Run a specialist sub-agent now (--with-context first passes a summary)",
+        needs_choice: None,
+        handler: |repl, arg| repl.agent_command(arg),
+    },
+    CommandEntry {
+        name: "/agents",
+        usage: "/agents [name]",
+        description: "List specialist sub-agents, or show one",
+        needs_choice: None,
+        handler: |repl, arg| CommandResult::message(agents_render(&repl.harness, arg)),
     },
     CommandEntry {
         name: "/memory",
@@ -635,6 +656,141 @@ fn help_table(skills: &crate::skills::Skills) -> Text {
         }
     }
     text
+}
+
+/// `/agent`'s argument as `(name, task, with_context)`, or what to say instead:
+/// usage, an unknown name (with the ones there are), or a missing task. Shared by
+/// both terminal surfaces and editors.
+pub fn parse_agent_command(
+    specialties: &crate::agents_def::Specialties,
+    arg: &str,
+) -> Result<(String, String, bool), String> {
+    const USAGE: &str = "usage: /agent [--with-context] <name> <task> · /agents lists them";
+    let mut rest = arg.trim();
+    let mut with_context = false;
+    if let Some(after) = rest.strip_prefix("--with-context") {
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            with_context = true;
+            rest = after.trim_start();
+        }
+    }
+    let (name, task) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if name.is_empty() {
+        return Err(USAGE.to_owned());
+    }
+    if specialties.get(name).is_none() {
+        let known = specialties.names();
+        return Err(format!(
+            "no specialist sub-agent named '{}' (known: {})",
+            crate::escape::show_controls(name),
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(", ")
+            }
+        ));
+    }
+    let task = task.trim();
+    if task.is_empty() {
+        return Err(format!("/agent {name} needs a task · {USAGE}"));
+    }
+    Ok((name.to_owned(), task.to_owned(), with_context))
+}
+
+/// `/agents [name]`: every specialty with where it comes from and what it may use,
+/// or one specialty in full. A project file the user has not approved shows its
+/// name and path only, since its text is untrusted until then.
+pub fn agents_render(harness: &Harness, arg: &str) -> String {
+    use crate::escape::show_controls;
+    let specialties = &harness.context.specialties;
+    if !harness.agents.enabled {
+        return "specialist sub-agents are off ([agents] enabled = false)".to_owned();
+    }
+    let path_of = |specialty: &crate::agents_def::Specialty| {
+        specialty
+            .source
+            .path()
+            .map(|path| show_controls(&crate::tools::display_path(path)))
+    };
+    let approved =
+        |specialty: &crate::agents_def::Specialty| harness.subagents.approvals.approved(specialty);
+    let name = arg.trim();
+    if !name.is_empty() {
+        let Some(specialty) = specialties.get(name) else {
+            return format!(
+                "no specialist sub-agent named '{}' (known: {})",
+                show_controls(name),
+                specialties.names().join(", ")
+            );
+        };
+        let mut lines = vec![format!(
+            "{} ({}{})",
+            specialty.name,
+            specialty.source.label(),
+            path_of(specialty).map_or(String::new(), |path| format!(", {path}"))
+        )];
+        if !approved(specialty) {
+            lines.push(
+                "not approved yet: you are shown the whole file and asked before it first runs"
+                    .to_owned(),
+            );
+            return lines.join("\n");
+        }
+        lines.push(show_controls(&specialty.description));
+        let tools = match &specialty.tools {
+            None => "all but delegate (inherited)".to_owned(),
+            Some(tools) if tools.is_empty() => "none".to_owned(),
+            Some(tools) => tools.join(", "),
+        };
+        lines.push(format!("tools: {}", show_controls(&tools)));
+        if !specialty.confirm.is_empty() {
+            lines.push(format!(
+                "always asked: {}",
+                show_controls(&specialty.confirm.join(", "))
+            ));
+        }
+        if let Some(model) = &specialty.model {
+            lines.push(format!("model: {}", show_controls(model)));
+        }
+        if let Some(steps) = specialty.max_steps {
+            lines.push(format!("max_steps: {steps}"));
+        }
+        if let Some(mode) = specialty.approval {
+            lines.push(format!("approval: {}", mode.as_str()));
+        }
+        if !specialty.skills.is_empty() {
+            lines.push(format!(
+                "skills: {}",
+                show_controls(&specialty.skills.join(", "))
+            ));
+        }
+        if specialty.worktree {
+            lines.push("isolation: worktree (not supported yet)".to_owned());
+        }
+        lines.push(String::new());
+        lines.push(show_controls(&specialty.instructions));
+        return lines.join("\n");
+    }
+    if specialties.is_empty() {
+        return "no specialist sub-agents".to_owned();
+    }
+    let mut lines = vec!["specialist sub-agents (/agent <name> <task> runs one):".to_owned()];
+    for specialty in specialties.found.values() {
+        let summary = if approved(specialty) {
+            show_controls(&specialty.description)
+        } else {
+            "(project file, not approved yet)".to_owned()
+        };
+        lines.push(format!(
+            "  {} [{}] {summary}",
+            specialty.name,
+            specialty.source.label()
+        ));
+    }
+    for notice in &specialties.notices {
+        lines.push(format!("  ! {notice}"));
+    }
+    lines.join("\n")
 }
 
 /// Whether `name` (without the slash) is a built-in command, `/exit` and `/quit`
@@ -1279,19 +1435,50 @@ impl Repl {
         })
     }
 
-    /// The skill and the text to expand for the model, for a line that
-    /// [`Repl::handle_command`] answered with `result`: a skill's task, or the line.
+    /// `/agent [--with-context] <name> <task>`: a known specialty runs as a turn
+    /// (where turns run, so its approvals can be answered); anything else is
+    /// answered here, with no model call.
+    fn agent_command(&self, arg: &str) -> CommandResult {
+        match parse_agent_command(&self.harness.context.specialties, arg) {
+            Ok((name, task, with_context)) => CommandResult::directed(DirectedTurn::Agent {
+                name,
+                task,
+                with_context,
+            }),
+            Err(message) => CommandResult::message(message),
+        }
+    }
+
+    /// How to run a line that [`Repl::handle_command`] answered with `result`, and
+    /// the text to expand for the model: a skill's or a specialty's task, or the line.
     pub fn turn_input<'a>(
         &self,
         result: &'a CommandResult,
         line: &'a str,
-    ) -> (Option<std::sync::Arc<crate::skills::Skill>>, &'a str) {
+    ) -> (crate::specialty_turn::TurnKind, &'a str) {
+        use crate::specialty_turn::TurnKind;
         match &result.directed {
             Some(DirectedTurn::Skill { name, task }) => (
-                self.harness.context.skills.get(name).cloned(),
+                self.harness
+                    .context
+                    .skills
+                    .get(name)
+                    .cloned()
+                    .map_or(TurnKind::Plain, TurnKind::Skill),
                 task.as_str(),
             ),
-            None => (None, line),
+            Some(DirectedTurn::Agent {
+                name,
+                task,
+                with_context,
+            }) => (
+                TurnKind::Agent {
+                    name: name.clone(),
+                    with_context: *with_context,
+                },
+                task.as_str(),
+            ),
+            None => (TurnKind::Plain, line),
         }
     }
 
@@ -1893,8 +2080,10 @@ pub fn plain_loop(mut repl: Repl) {
             }
             Action::Turn | Action::Directed => {}
         }
-        // A skill run as a command: its task is what follows the instructions.
-        let (skill, typed) = repl.turn_input(&result, line);
+        // A skill or a specialty run as a command: its task is what is expanded.
+        let (kind, typed) = repl.turn_input(&result, line);
+        // Beyond Python: `#name` names a specialty to delegate to, as a hint.
+        let typed = &crate::mentions::with_agent_hints(&repl.harness.context.specialties, typed);
 
         // `@path` mentions become inline file blocks before the model sees the line.
         // Refusals are shown here and carried in the prompt, so neither side assumes
@@ -1908,7 +2097,7 @@ pub fn plain_loop(mut repl: Repl) {
             console.line(Style::Yellow, problem);
         }
 
-        if let Some(skill) = &skill {
+        if let crate::specialty_turn::TurnKind::Skill(skill) = &kind {
             console.line(Style::Dim, &format!("using skill {}", skill.name));
         }
         console.write(&Text::plain("\n"));
@@ -1937,21 +2126,11 @@ pub fn plain_loop(mut repl: Repl) {
                 at_line_start = text.ends_with('\n');
                 printed = true;
             };
-            match &skill {
-                Some(skill) => runtime.block_on(harness.run_skill_turn(
-                    state,
-                    skill,
-                    &mentions.prompt,
-                    line,
-                    |event| on_text(event.text()),
-                )),
-                None => runtime.block_on(harness.run_turn_as(
-                    state,
-                    &mentions.prompt,
-                    line,
-                    &mut on_text,
-                )),
-            }
+            runtime.block_on(
+                harness.run_kind(state, &kind, &mentions.prompt, line, |event| {
+                    on_text(event.text())
+                }),
+            )
         };
         input.drain_interrupts();
         match result {
@@ -2101,7 +2280,7 @@ mod tests {
         // Rendered by Rich from Python's `_help_table` (trailing padding trimmed).
         assert_eq!(lines[0], "/help                    Show this help");
         assert_eq!(
-            lines[10],
+            lines[12],
             "/mode [ask|auto|deny]    Show/set approval mode (Shift+Tab cycles)"
         );
     }

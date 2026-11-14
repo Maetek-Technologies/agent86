@@ -54,8 +54,9 @@ struct Cli {
     #[arg(long)]
     plain: bool,
 
-    /// Honor every setting in ./.agent86/config.toml for this run, without asking
-    /// (for CI; also AGENT86_TRUST_PROJECT=1).
+    /// Honor every setting in ./.agent86/config.toml for this run, without asking,
+    /// and run the project's own specialist sub-agents (./.agent86/agents) without
+    /// asking either (for CI; also AGENT86_TRUST_PROJECT=1).
     #[arg(long)]
     trust_project: bool,
 
@@ -105,6 +106,11 @@ enum Command {
         /// ahead of the goal, and its allowed-tools apply from the first step.
         #[arg(long, value_name = "NAME")]
         skill: Option<String>,
+
+        /// Run the goal with this specialist sub-agent as the main agent: its
+        /// instructions, tools, approval mode, and model apply to the run.
+        #[arg(long, value_name = "NAME", conflicts_with = "skill")]
+        agent: Option<String>,
     },
 
     /// Inspect configuration. With no subcommand: show providers, key source, and
@@ -319,6 +325,10 @@ fn main() -> ExitCode {
         (acts && terminal).then_some(ask),
     );
 
+    // Recorded before `cli.model` moves: an explicit `--model` wins over a
+    // specialty's `model` under `run --agent`.
+    let model_flag = cli.model.is_some();
+    let trust_specialties = cli.trust_project || trust::forced_by_env();
     let config = match load_config(
         &paths,
         &Overrides::from_env(cli.model, cli.sandbox, cli.approval),
@@ -348,6 +358,7 @@ fn main() -> ExitCode {
             max_output_tokens,
             max_agent_steps,
             skill,
+            agent,
         }) => {
             let mut config = config;
             if yes {
@@ -365,9 +376,44 @@ fn main() -> ExitCode {
                 agent_steps: max_agent_steps,
                 output: max_output_tokens,
             };
+            // Beyond Python: `--agent` is resolved before the harness is built, since
+            // its model may be the one that has to be built.
+            let specialty = match agent.as_deref() {
+                None => None,
+                Some(name) => {
+                    let workspace = std::env::current_dir().unwrap_or_default();
+                    let home = agent86::config::home_dir();
+                    let found = agent86::agents_def::discover(&workspace, home.as_deref());
+                    match found.get(name) {
+                        Some(specialty) if config.agents.enabled => Some(specialty.clone()),
+                        Some(_) => {
+                            stderr
+                                .error("specialist sub-agents are off ([agents] enabled = false)");
+                            return ExitCode::from(1);
+                        }
+                        None => {
+                            stderr.error(&format!(
+                                "no specialist sub-agent named '{}'",
+                                agent86::escape::show_controls(name)
+                            ));
+                            stderr.dim(&format!("known: {}", found.names().join(", ")));
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+            };
+            if let Some(specialty) = &specialty {
+                // `--model`, then the specialty's `model`, then the config.
+                if let (false, Some(model)) = (model_flag, &specialty.model) {
+                    config.model.default = model.clone();
+                }
+            }
             let goal = Goal {
                 text: &goal,
                 skill: skill.as_deref(),
+                agent: specialty,
+                pin_model: model_flag,
+                trust_specialties,
             };
             run(&config, goal, json, session.as_deref(), limits, &stderr)
         }
@@ -412,6 +458,7 @@ fn main() -> ExitCode {
                 cli.resume.as_deref(),
                 cli.plain,
                 Box::new(OsKeyring),
+                trust_specialties,
             );
             ExitCode::SUCCESS
         }
@@ -423,6 +470,12 @@ fn main() -> ExitCode {
 struct Goal<'a> {
     text: &'a str,
     skill: Option<&'a str>,
+    /// `--agent`: the specialty that is the run's main agent.
+    agent: Option<std::sync::Arc<agent86::agents_def::Specialty>>,
+    /// `--model` was given, so routing is off under `--agent`.
+    pin_model: bool,
+    /// `--trust-project` or its variable: project specialties need no approval.
+    trust_specialties: bool,
 }
 
 fn run(
@@ -447,7 +500,28 @@ fn run(
             return ExitCode::from(1);
         }
     };
-    let harness = assembly.harness;
+    let mut harness = assembly.harness;
+    harness.subagents.approvals.forced = goal.trust_specialties;
+    // Beyond Python: `--agent` makes a specialty the main agent. A refused project
+    // file fails the run before a session is made, with nothing on stdout.
+    if let Some(specialty) = &goal.agent {
+        if let Err(error) = harness.approve_main_specialty(specialty, goal.text) {
+            stderr.error(&agent86::escape::show_controls(&error));
+            return ExitCode::from(1);
+        }
+        harness.become_specialty(specialty);
+        // Whichever model applies (`--model` or the specialty's) bypasses routing.
+        if goal.pin_model || specialty.model.is_some() {
+            harness.router.pin();
+        }
+        // Its `max_steps` can lower the turn's budget but not raise it, and
+        // `--max-steps` wins over it.
+        if let (None, Some(steps)) = (limits.steps, specialty.max_steps) {
+            harness
+                .session_limits
+                .set(LimitKind::Steps, Some(steps.min(config.limits.max_steps)));
+        }
+    }
     // An unknown skill fails before a session is made or a model is called.
     let skill = match goal.skill {
         Some(name) => match harness.context.skills.get(name) {

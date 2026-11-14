@@ -25,6 +25,8 @@ pub enum Reply {
     Truncated(String),
     /// A 200 SSE response that sends `prefix` and then stops sending without closing.
     StallAfter(String),
+    /// `reply`, sent after waiting this long (beyond any read of the request).
+    Delayed(std::time::Duration, Box<Reply>),
     /// A complete response with exactly these headers (no default content type).
     Raw {
         status: u16,
@@ -167,7 +169,15 @@ async fn serve(mut socket: TcpStream, reply: Reply, recorded: Arc<Mutex<Vec<Reco
     };
     recorded.lock().unwrap().push(request);
 
+    let reply = match reply {
+        Reply::Delayed(delay, reply) => {
+            tokio::time::sleep(delay).await;
+            *reply
+        }
+        reply => reply,
+    };
     match reply {
+        Reply::Delayed(..) => {}
         Reply::Status {
             status,
             headers,
