@@ -4,6 +4,22 @@
 
 # agent 86
 
+[![CI](https://github.com/Maetek-Technologies/agent86/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Maetek-Technologies/agent86/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Maetek-Technologies/agent86)](https://github.com/Maetek-Technologies/agent86/releases/latest)
+[![npm](https://img.shields.io/npm/v/agent86?logo=npm)](https://www.npmjs.com/package/agent86)
+[![License: MIT](https://img.shields.io/github/license/Maetek-Technologies/agent86)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Maetek-Technologies/agent86/badge)](https://scorecard.dev/viewer/?uri=github.com/Maetek-Technologies/agent86)
+
+[![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.package%5B%27rust-version%27%5D&label=rust&suffix=%2B&logo=rust&color=dea584)](https://www.rust-lang.org)
+[![Edition](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.package.edition&label=edition&logo=rust&color=dea584)](https://doc.rust-lang.org/edition-guide/)
+[![Tokio](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.dependencies.tokio.version&label=tokio&color=463f7a)](https://tokio.rs)
+[![candle](https://img.shields.io/badge/candle-0.11-ffd21e?logo=huggingface)](https://github.com/huggingface/candle)
+[![SQLite](https://img.shields.io/badge/SQLite-bundled-003b57?logo=sqlite)](https://www.sqlite.org)
+[![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue?logo=modelcontextprotocol)](https://modelcontextprotocol.io)
+[![ACP](https://img.shields.io/badge/ACP-v1-blue)](https://agentclientprotocol.com)
+[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-OTLP%2FHTTP-425cc7?logo=opentelemetry)](https://opentelemetry.io)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#install)
+
 An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary. It also works as the agent inside editors and terminals that speak the [Agent Client Protocol](#use-it-from-your-editor) (ACP).
 
 This is the standard agent86. It replaced the original [Python implementation](https://github.com/Maetek-Technologies/agent86-python), which is archived. It reads and writes the same config, sessions, memory, traces, and keyring entries, so you can switch from the Python version without losing anything.
@@ -64,7 +80,7 @@ An Ollama model gets the `num_ctx` its Modelfile sets (`PARAMETER num_ctx 262144
 npm install -g agent86
 ```
 
-npm installs the native binary for your platform (it needs Node.js 18 or newer only to install and launch it), and `npm install -g agent86@latest` updates it. Or download the archive for your platform from [Releases](https://github.com/Maetek-Technologies/agent86/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are unsigned: on macOS, run `xattr -d com.apple.quarantine agent86` once. To build from source instead, run `cargo install --git https://github.com/Maetek-Technologies/agent86 --tag v1.0.14` (needs Rust 1.94 or newer).
+npm installs the native binary for your platform (it needs Node.js 18 or newer only to install and launch it), and `npm install -g agent86@latest` updates it. Or download the archive for your platform from [Releases](https://github.com/Maetek-Technologies/agent86/releases), then extract it and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are not code-signed: on macOS, run `xattr -d com.apple.quarantine agent86` once. Releases from v1.0.19 on carry SLSA build provenance (`agent86-<tag>.intoto.jsonl`), so you can check that an archive was built by this repository's release workflow with [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier): `slsa-verifier verify-artifact <archive> --provenance-path agent86-<tag>.intoto.jsonl --source-uri github.com/Maetek-Technologies/agent86 --source-tag <tag>`. To build from source instead, run `cargo install --git https://github.com/Maetek-Technologies/agent86 --tag v1.0.14` (needs Rust 1.94 or newer).
 
 The interface and the plain loop check GitHub for a newer release at most once a day and say so when there is one; `/update` shows how to install it for the way you installed agent86, and `/update now` does it. `[ui] update_check = false` or `AGENT86_NO_UPDATE_CHECK=1` turns the check off, and `run` never checks.
 

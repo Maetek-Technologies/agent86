@@ -1,10 +1,11 @@
 name: Release
 
 # A `v*` tag builds the binaries, publishes a GitHub release with them (its
-# notes taken from `docs/releases/<tag>.md`), and publishes the npm packages
-# (`npm/build.mjs`). A pull request that changes this workflow or the npm files
-# runs everything but the publishing: the builds, the packages with a dry-run
-# publish, and an install of the packed packages on Linux, macOS, and Windows.
+# notes taken from `docs/releases/<tag>.md`) and their SLSA provenance, and
+# publishes the npm packages (`npm/build.mjs`). A pull request that changes
+# this workflow or the npm files runs everything but the publishing: the
+# builds, the packages with a dry-run publish, and an install of the packed
+# packages on Linux, macOS, and Windows.
 
 on:
   push:
@@ -82,6 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -90,6 +93,14 @@ jobs:
           # The archives, one artifact per target triple; not the npm packages.
           pattern: "*-*"
           merge-multiple: true
+      # The subjects of the SLSA provenance: `sha256sum` lines for every
+      # archive, base64-encoded as the generator takes them.
+      - name: Hash the archives
+        id: hash
+        run: |
+          set -euo pipefail
+          cd dist
+          echo "hashes=$(sha256sum -- *.tar.gz *.zip | base64 -w0)" >> "$GITHUB_OUTPUT"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -98,6 +109,26 @@ jobs:
             --title "agent86 $GITHUB_REF_NAME" \
             --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
             --verify-tag
+
+  # SLSA build provenance for the archives, signed keylessly through Sigstore
+  # and attached to the release as `agent86-<tag>.intoto.jsonl` (verify with
+  # `slsa-verifier verify-artifact`). OpenSSF Scorecard's Signed-Releases check
+  # looks for that file among a release's assets.
+  #
+  # The one workflow here not pinned to a commit SHA: the generator checks how
+  # it was referenced and refuses to run unless it is called by a release tag
+  # (Scorecard's Pinned-Dependencies check exempts it for that reason).
+  provenance:
+    needs: release
+    permissions:
+      actions: read # read the workflow run the provenance describes
+      id-token: write # keyless Sigstore signing
+      contents: write # attach the provenance to the release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.release.outputs.hashes }}
+      upload-assets: true
+      provenance-name: agent86-${{ github.ref_name }}.intoto.jsonl
 
   npm:
     needs: build
