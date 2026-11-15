@@ -4,6 +4,8 @@
 
 # agent 86
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Maetek-Technologies/agent86/badge)](https://scorecard.dev/viewer/?uri=github.com/Maetek-Technologies/agent86)
+
 An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary. It also works as the agent inside editors and terminals that speak the [Agent Client Protocol](#use-it-from-your-editor) (ACP).
 
 This is the standard agent86. It replaced the original [Python implementation](https://github.com/Maetek-Technologies/agent86-python), which is archived. It reads and writes the same config, sessions, memory, traces, and keyring entries, so you can switch from the Python version without losing anything.
