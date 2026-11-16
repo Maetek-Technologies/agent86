@@ -35,7 +35,7 @@ use super::{
     TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
-use crate::approval::ApprovalPreview;
+use crate::approval::{ApprovalPreview, Asker, Question};
 use crate::config::{Config, DisplayLevel, McpServerConfig};
 use crate::escape::show_controls;
 use crate::mcp::{var_ref_names, McpManager};
@@ -522,19 +522,95 @@ impl StateReporter {
             ],
             _ => return,
         };
+        self.emit(sink, "subagent", fields);
+    }
+
+    /// The questions in the gate's queue (beyond Python): the one being asked, if
+    /// any, and those waiting behind it in the order they will be asked, each on the
+    /// ids the editor knows (a waiting call's id is assigned now, and is the one its
+    /// permission request will name).
+    fn questions(&self, sink: &dyn TurnSink, asking: Option<&Question>, waiting: &[Question]) {
+        let describe = |question: &Question| {
+            let mut cards = self.cards.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut entry = Map::new();
+            entry.insert("kind".into(), json!(question.kind.as_str()));
+            let fields = [
+                ("tool", question.tool.clone()),
+                ("call", question.call.as_deref().map(|id| cards.lookup(id))),
+                ("agent", question.agent.clone()),
+                ("card", question.card.as_deref().map(|id| cards.lookup(id))),
+                ("subject", question.subject.clone()),
+            ];
+            for (name, value) in fields {
+                if let Some(value) = value {
+                    entry.insert(name.into(), json!(value));
+                }
+            }
+            Value::Object(entry)
+        };
+        let fields = vec![
+            ("asking", asking.map_or(Value::Null, describe)),
+            (
+                "waiting",
+                Value::Array(waiting.iter().map(describe).collect()),
+            ),
+        ];
+        self.emit(sink, "questions", fields);
+    }
+
+    /// The sub-agent asking a permission request, for its `_meta`: on the card id
+    /// the editor knows, redacted as the state events are.
+    fn asker(&self, asker: &Asker) -> Value {
+        let mut record = Map::new();
+        if let Some(card) = &asker.card {
+            record.insert("card".into(), json!(self.card(card)));
+        }
+        record.insert("run".into(), json!(asker.run));
+        record.insert("agent".into(), json!(asker.agent));
+        record.insert("depth".into(), json!(asker.depth));
+        record.insert(
+            "worktree".into(),
+            asker.worktree.as_ref().map_or(
+                Value::Null,
+                |(path, branch)| json!({"path": path, "branch": branch}),
+            ),
+        );
+        record.insert("steps".into(), json!(asker.steps));
+        record.insert("cost_usd".into(), json!(asker.cost_usd));
+        record.insert("turn_cost_usd".into(), json!(self.turn_cost()));
+        record.insert("cost_cap_usd".into(), json!(self.cost_cap));
+        Value::Object(self.redacted(record))
+    }
+
+    /// What the running turn has spent so far, sub-agents included.
+    fn turn_cost(&self) -> f64 {
+        *self
+            .turn_cost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Send an event of `kind` that is agent86's own rather than the recorder's,
+    /// redacted as the recorder's are.
+    fn emit(&self, sink: &dyn TurnSink, kind: &str, fields: Vec<(&str, Value)>) {
         let mut record = Map::new();
         record.insert("ts".into(), json!(crate::observability::now()));
-        record.insert("kind".into(), json!("subagent"));
+        record.insert("kind".into(), json!(kind));
         for (name, value) in fields {
             record.insert(name.into(), value);
         }
+        sink.update(Update::State(Value::Object(self.redacted(record))));
+    }
+
+    /// `record` with the vault's values, then whatever `[observability] redact`
+    /// removes, taken out, as the trace would hold it.
+    fn redacted(&self, record: Map<String, Value>) -> Map<String, Value> {
         let mut record = Value::Object(record);
         self.secrets.redact_value(&mut record);
         let Value::Object(record) = record else {
-            return;
+            unreachable!("redaction keeps an object an object");
         };
-        let record = crate::observability::redact_event(&record, self.redact, self.max_field_chars);
-        sink.update(Update::State(Value::Object(record)));
+        crate::observability::redact_event(&record, self.redact, self.max_field_chars)
     }
 
     /// The id the editor knows a card by.
@@ -828,6 +904,32 @@ impl HarnessBackend {
         let cards: Cards = Arc::default();
         let secrets = assembly.harness.context.secrets.clone();
         let running = |slot: &SinkSlot| slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        // agent86's state events, for a client that asked (beyond Python): the
+        // recorder's events as the trace holds them, and sub-agents' lifecycles.
+        let reporter = self.client.state.then(|| {
+            let model = &self.config.model;
+            let mut known_refs = vec![
+                model.default.clone(),
+                model.route.cheap.clone(),
+                model.route.frontier.clone(),
+            ];
+            known_refs.extend(
+                assembly
+                    .harness
+                    .context
+                    .specialties
+                    .found
+                    .values()
+                    .filter_map(|specialty| specialty.model.clone()),
+            );
+            Arc::new(StateReporter::new(
+                &self.config,
+                known_refs,
+                Arc::clone(&cards),
+                secrets.clone(),
+            ))
+        });
+        let hook_reporter = reporter.clone();
         let (hook_sink, hook_cards, hook_secrets) =
             (Arc::clone(&sink), Arc::clone(&cards), secrets.clone());
         assembly.harness.gate.call_prompt = Some(Box::new(
@@ -863,6 +965,10 @@ impl HarnessBackend {
                     remember: None,
                     diff: preview.change.clone(),
                     locations,
+                    asker: hook_reporter
+                        .as_ref()
+                        .zip(preview.asker.as_ref())
+                        .map(|(reporter, asker)| reporter.asker(asker)),
                 };
                 running.ask(request) == Permission::Allowed
             },
@@ -895,35 +1001,22 @@ impl HarnessBackend {
                     remember: Some(format!("Allow this version of {name}")),
                     diff: None,
                     locations: Vec::new(),
+                    asker: None,
                 };
                 running.ask(request) == Permission::Allowed
             },
         ));
-        // agent86's state events, for a client that asked (beyond Python): the
-        // recorder's events as the trace holds them, and sub-agents' lifecycles.
-        let reporter = self.client.state.then(|| {
-            let model = &self.config.model;
-            let mut known_refs = vec![
-                model.default.clone(),
-                model.route.cheap.clone(),
-                model.route.frontier.clone(),
-            ];
-            known_refs.extend(
-                assembly
-                    .harness
-                    .context
-                    .specialties
-                    .found
-                    .values()
-                    .filter_map(|specialty| specialty.model.clone()),
-            );
-            Arc::new(StateReporter::new(
-                &self.config,
-                known_refs,
-                Arc::clone(&cards),
-                secrets.clone(),
-            ))
-        });
+        // The questions waiting behind the one asked, for an approval inbox.
+        if let Some(reporter) = &reporter {
+            let (hook_sink, hook_reporter) = (Arc::clone(&sink), Arc::clone(reporter));
+            assembly.harness.gate.queue.set_watcher(Some(Arc::new(
+                move |asking: Option<&Question>, waiting: &[Question]| {
+                    if let Some(running) = running(&hook_sink) {
+                        hook_reporter.questions(running.as_ref(), asking, waiting);
+                    }
+                },
+            )));
+        }
         if let Some(reporter) = &reporter {
             let (hook_sink, hook_reporter) = (Arc::clone(&sink), Arc::clone(reporter));
             assembly.harness.recorder.set_tap(Some(Arc::new(
@@ -2424,6 +2517,7 @@ mod tests {
             full: false,
             agent: None,
             change: None,
+            asker: None,
         };
         let text = approval_text(&preview);
         assert!(text.starts_with("--- a/a"));

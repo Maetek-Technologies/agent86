@@ -135,6 +135,7 @@ impl Workspace {
             refuse_writes: None,
             commands: Vec::new(),
             wants_state: false,
+            hold_until_waiting: false,
         }
     }
 }
@@ -168,6 +169,9 @@ struct Client {
     commands: Vec<Value>,
     /// Whether `initialize` asked for agent86's state events.
     wants_state: bool,
+    /// Hold the first permission request unanswered until a `questions` state
+    /// event shows another question waiting behind it.
+    hold_until_waiting: bool,
 }
 
 /// What came back for one request: the notifications before its response, and the
@@ -226,6 +230,7 @@ impl Client {
         let mut files = Vec::new();
         let mut usage = Vec::new();
         let mut state = Vec::new();
+        let mut held: Option<Value> = None;
         loop {
             let mut text = String::new();
             let read = self.stdout.read_line(&mut text).unwrap();
@@ -248,16 +253,11 @@ impl Client {
                 };
             }
             if message["method"] == "session/request_permission" {
-                if let Some(session) = self.cancel_on_request.take() {
-                    self.notify("session/cancel", json!({"sessionId": session}));
+                if self.hold_until_waiting && held.is_none() {
+                    held = Some(message);
+                    continue;
                 }
-                let outcome = match self.choose {
-                    Some(option) => json!({"outcome": "selected", "optionId": option}),
-                    None => json!({"outcome": "cancelled"}),
-                };
-                let reply =
-                    json!({"jsonrpc": "2.0", "id": message["id"], "result": {"outcome": outcome}});
-                self.send(&reply);
+                self.answer_permission(&message);
                 requests.push(message);
                 continue;
             }
@@ -277,6 +277,20 @@ impl Client {
                 );
                 assert!(message.get("id").is_none(), "{message}");
                 state.push(message["params"]["event"].clone());
+                let event = &message["params"]["event"];
+                let waiting = event["kind"] == "questions"
+                    && event["waiting"]
+                        .as_array()
+                        .is_some_and(|waiting| !waiting.is_empty());
+                if waiting {
+                    // The event can arrive before the request it waits behind, which
+                    // then needs no holding.
+                    self.hold_until_waiting = false;
+                    if let Some(request) = held.take() {
+                        self.answer_permission(&request);
+                        requests.push(request);
+                    }
+                }
                 continue;
             }
             assert_eq!(message["method"], "session/update", "{message}");
@@ -297,6 +311,19 @@ impl Client {
                 self.notify("session/cancel", json!({"sessionId": session}));
             }
         }
+    }
+
+    /// Answer a permission request as [`Client::choose`] says.
+    fn answer_permission(&mut self, message: &Value) {
+        if let Some(session) = self.cancel_on_request.take() {
+            self.notify("session/cancel", json!({"sessionId": session}));
+        }
+        let outcome = match self.choose {
+            Some(option) => json!({"outcome": "selected", "optionId": option}),
+            None => json!({"outcome": "cancelled"}),
+        };
+        let reply = json!({"jsonrpc": "2.0", "id": message["id"], "result": {"outcome": outcome}});
+        self.send(&reply);
     }
 
     /// Answer an `fs/*` request the way an editor does.
@@ -2070,6 +2097,131 @@ async fn a_client_that_does_not_ask_sees_exactly_what_it_did() {
     };
     assert_eq!(bodies(&without), bodies(&with));
     assert_eq!(without.response["result"], with.response["result"]);
+}
+
+/// Writes what it is told, and nothing else.
+const WRITER: &str =
+    "---\nname: writer\ndescription: Writes files.\ntools: write_file\n---\nWrite what you are asked to.\n";
+
+/// One priced turn that delegates to two `writer` sub-agents at once, each of which
+/// asks to write `x.txt` and then answers; the client advertises `capabilities`,
+/// and with the state events it holds the first permission request until the
+/// second question is waiting behind it.
+async fn parallel_questions_turn(name: &str, capabilities: Value) -> Exchange {
+    let write = || sse_tool_calls(&[("w", "write_file", r#"{"path":"x.txt","content":"x\n"}"#)]);
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[
+            ("a", "delegate", r#"{"agent": "writer", "task": "one"}"#),
+            ("b", "delegate", r#"{"agent": "writer", "task": "two"}"#),
+        ]),
+        write(),
+        write(),
+        sse_text("wrote", "stop"),
+        sse_text("wrote", "stop"),
+        sse_text("Both done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config(
+        name,
+        Some(&server),
+        "[pricing.models.\"mock:test/model\"]\ninput_per_mtok = 1000.0\noutput_per_mtok = 2000.0\n",
+    );
+    let agents = workspace.root.join("home").join(".agent86").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("writer.md"), WRITER).unwrap();
+    tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize_with(capabilities);
+            client.hold_until_waiting = client.wants_state;
+            let session = client.new_session(&project);
+            let exchange = client.prompt(&session, "Write it twice");
+            client.finish();
+            exchange
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn parallel_sub_agents_questions_say_who_asks_and_what_waits() {
+    // Beyond Python: an approval inbox. Each question a sub-agent asks names it,
+    // its card, where it works, and its spend so far, and the questions waiting
+    // behind the one asked are listed, in the order they will be asked.
+    let turn = parallel_questions_turn(
+        "questions-on",
+        json!({"_meta": {"com.maetek.agent86/state": true}}),
+    )
+    .await;
+    assert_eq!(turn.response["result"]["stopReason"], "end_turn");
+    assert_eq!(turn.requests.len(), 2, "{:?}", turn.requests);
+    let mut cards = Vec::new();
+    for request in &turn.requests {
+        let params = &request["params"];
+        let asker = &params["_meta"]["com.maetek.agent86/subagent"];
+        let card = asker["card"].as_str().unwrap().to_owned();
+        assert_eq!(params["toolCall"]["toolCallId"], format!("{card}/1"));
+        assert_eq!(asker["agent"], "writer");
+        assert_eq!(asker["depth"], 1);
+        assert_eq!(asker["steps"], 1);
+        assert_eq!(asker["worktree"], Value::Null);
+        assert!(asker["run"].is_u64(), "{asker}");
+        // One model call each so far, a tool call at the test's prices.
+        assert!(
+            (asker["cost_usd"].as_f64().unwrap() - 0.036).abs() < 1e-9,
+            "{asker}"
+        );
+        assert!(asker["turn_cost_usd"].as_f64().unwrap() > 0.0, "{asker}");
+        assert!((asker["cost_cap_usd"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+        cards.push(card);
+    }
+    cards.sort();
+    assert_eq!(cards, ["a", "b"]);
+
+    let questions: Vec<&Value> = turn
+        .state
+        .iter()
+        .filter(|event| event["kind"] == "questions")
+        .collect();
+    let first = turn.requests[0]["params"]["toolCall"]["toolCallId"]
+        .as_str()
+        .unwrap();
+    let second = turn.requests[1]["params"]["toolCall"]["toolCallId"]
+        .as_str()
+        .unwrap();
+    // While the first was asked, the second waited behind it.
+    let waited = questions
+        .iter()
+        .find(|event| !event["waiting"].as_array().unwrap().is_empty())
+        .unwrap_or_else(|| panic!("no question waited: {questions:?}"));
+    assert_eq!(waited["asking"]["call"], first);
+    assert_eq!(waited["asking"]["kind"], "approval");
+    assert_eq!(waited["asking"]["tool"], "write_file");
+    let (card, _) = second.split_once('/').unwrap();
+    assert_eq!(
+        waited["waiting"],
+        json!([{"kind": "approval", "tool": "write_file", "call": second, "agent": "writer", "card": card}])
+    );
+    // Then the second was asked with nothing behind it, and the queue emptied.
+    assert!(questions
+        .iter()
+        .any(|event| event["asking"]["call"] == second && event["waiting"] == json!([])));
+    let last = questions.last().unwrap();
+    assert_eq!(last["asking"], Value::Null);
+    assert_eq!(last["waiting"], json!([]));
+}
+
+#[tokio::test]
+async fn a_client_that_does_not_ask_gets_its_questions_without_who_asks() {
+    let turn = parallel_questions_turn("questions-off", json!({})).await;
+    assert_eq!(turn.response["result"]["stopReason"], "end_turn");
+    assert!(!turn.requests.is_empty());
+    for request in &turn.requests {
+        assert!(request["params"].get("_meta").is_none(), "{request}");
+    }
+    assert!(turn.state.is_empty());
 }
 
 #[tokio::test]

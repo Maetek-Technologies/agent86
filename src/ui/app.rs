@@ -1920,6 +1920,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2064,6 +2065,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2094,6 +2096,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2119,6 +2122,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2427,6 +2431,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2452,6 +2457,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2469,6 +2475,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });
@@ -2491,6 +2498,7 @@ mod tests {
                 full: false,
                 agent: None,
                 change: None,
+                asker: None,
             },
             reply,
         });

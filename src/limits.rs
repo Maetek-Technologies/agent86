@@ -351,7 +351,14 @@ impl Harness {
         let raised = self
             .gate
             .queue
-            .ask(|| prompt(&hit))
+            .ask(
+                crate::approval::Question {
+                    agent: hit.agent.clone(),
+                    subject: Some(kind.name().to_owned()),
+                    ..crate::approval::Question::new(crate::approval::QuestionKind::Limit)
+                },
+                || prompt(&hit),
+            )
             .flatten()
             .filter(|value| hit.offers.contains(value))?;
         if !run_only {

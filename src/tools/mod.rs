@@ -869,6 +869,9 @@ pub struct ToolContext {
     /// The card a sub-agent's progress is reported on (beyond Python): the
     /// top-level delegation's, which nested runs share.
     pub card: Option<Arc<crate::subagent::Card>>,
+    /// The sub-agent run this context belongs to (beyond Python), with its progress,
+    /// so a question it asks can say who asks. Set when a sub-agent is spawned.
+    pub subagent: Option<Arc<crate::subagent::SubagentRun>>,
 }
 
 /// What a specialist sub-agent may do (beyond Python): its tools, approval mode,
@@ -973,6 +976,7 @@ impl ToolContext {
             fresh_clients: false,
             worktree: None,
             card: None,
+            subagent: None,
         })
     }
 
