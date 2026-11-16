@@ -4,7 +4,10 @@
 
 mod support;
 
-use agent86::acp::{STATE_CAPABILITY, STATE_METHOD};
+use agent86::acp::{
+    SECRETS_CAPABILITY, SECRET_FORGET_METHOD, SECRET_LIST_METHOD, SECRET_REQUEST_METHOD,
+    SECRET_SET_METHOD, STATE_CAPABILITY, STATE_METHOD,
+};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -136,6 +139,8 @@ impl Workspace {
             commands: Vec::new(),
             wants_state: false,
             hold_until_waiting: false,
+            secret_entry: None,
+            received: Vec::new(),
         }
     }
 }
@@ -172,6 +177,11 @@ struct Client {
     /// Hold the first permission request unanswered until a `questions` state
     /// event shows another question waiting behind it.
     hold_until_waiting: bool,
+    /// What the user types into this client's own masked entry when the agent asks
+    /// for a secret (the secrets extension); `None` declines.
+    secret_entry: Option<&'static str>,
+    /// Every stdout line, as read.
+    received: Vec<String>,
 }
 
 /// What came back for one request: the notifications before its response, and the
@@ -238,6 +248,7 @@ impl Client {
                 read > 0,
                 "the agent closed stdout before answering {method}"
             );
+            self.received.push(text.clone());
             // The protocol forbids any stdout line that is not a message.
             let message: Value = serde_json::from_str(&text)
                 .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {text:?}"));
@@ -258,6 +269,15 @@ impl Client {
                     continue;
                 }
                 self.answer_permission(&message);
+                requests.push(message);
+                continue;
+            }
+            if message["method"] == SECRET_REQUEST_METHOD {
+                let result = match self.secret_entry {
+                    Some(value) => json!({"outcome": "entered", "value": value, "remember": false}),
+                    None => json!({"outcome": "declined"}),
+                };
+                self.send(&json!({"jsonrpc": "2.0", "id": message["id"], "result": result}));
                 requests.push(message);
                 continue;
             }
@@ -364,11 +384,21 @@ impl Client {
 
     /// With `AGENT86_ACP_TRANSCRIPT` set to a path, append every message exchanged,
     /// tagged with the agent's process id and the direction (`C>` client to agent,
-    /// `A>` agent to client), for checking against the protocol's schema.
+    /// `A>` agent to client), for checking against the protocol's schema. A
+    /// secret's value (the `value` a client sends in `secret/set`, or in its answer
+    /// to `secret/request`) is written as `<hidden>`, so a transcript kept and shared
+    /// for a schema check holds none.
     fn log(&self, direction: &str, message: &Value) {
         let Some(path) = std::env::var_os("AGENT86_ACP_TRANSCRIPT") else {
             return;
         };
+        let mut message = message.clone();
+        if message["method"] == SECRET_SET_METHOD && message["params"].get("value").is_some() {
+            message["params"]["value"] = json!("<hidden>");
+        }
+        if message["result"]["outcome"] == "entered" && message["result"].get("value").is_some() {
+            message["result"]["value"] = json!("<hidden>");
+        }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -808,6 +838,123 @@ async fn an_editor_lists_pins_and_forgets_memory_in_the_shared_store() {
         store.entry(agent86::memory::EntryKind::Episode, 1).unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn a_client_with_its_own_entry_hands_over_secrets_and_never_sees_them_again() {
+    const SET_VALUE: &str = "pw-set-by-the-client-0123";
+    const ENTERED: &str = "tok-entered-when-asked-4567";
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "c1",
+            "request_secret",
+            r#"{"name":"API_TOKEN","reason":"to deploy"}"#,
+        )]),
+        sse_tool_calls(&[("c2", "read_file", r#"{"path":"notes.txt"}"#)]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config(
+        "client-secrets",
+        Some(&server),
+        "[guardrails]\napproval = \"auto\"\n",
+    );
+    std::fs::write(
+        workspace.project().join("notes.txt"),
+        format!("db: {SET_VALUE}\napi: {ENTERED}\n"),
+    )
+    .unwrap();
+    let (init, set, short, listed, turn, forgotten, received, output) =
+        tokio::task::spawn_blocking({
+            let project = workspace.project();
+            let mut client = workspace.connect();
+            move || {
+                client.secret_entry = Some(ENTERED);
+                let init = client.initialize_with(json!({"_meta": {SECRETS_CAPABILITY: true}}));
+                let session = client.new_session(&project);
+                let set = client
+                    .request(
+                        SECRET_SET_METHOD,
+                        json!({"sessionId": session, "name": "DB_PASSWORD", "value": SET_VALUE}),
+                    )
+                    .response;
+                let short = client
+                    .request(
+                        SECRET_SET_METHOD,
+                        json!({"sessionId": session, "name": "PIN", "value": "1234"}),
+                    )
+                    .response;
+                let listed = client
+                    .request(SECRET_LIST_METHOD, json!({"sessionId": session}))
+                    .response;
+                let turn = client.prompt(&session, "Read notes.txt");
+                let forgotten = client
+                    .request(
+                        SECRET_FORGET_METHOD,
+                        json!({"sessionId": session, "name": "DB_PASSWORD"}),
+                    )
+                    .response;
+                let received = client.received.clone();
+                let output = client.finish();
+                (init, set, short, listed, turn, forgotten, received, output)
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        init["result"]["agentCapabilities"]["_meta"][SECRETS_CAPABILITY],
+        json!({"version": 1})
+    );
+    assert_eq!(
+        set["result"],
+        json!({"name": "DB_PASSWORD", "remembered": false})
+    );
+    assert_eq!(short["error"]["code"], -32602, "{short}");
+    // `AGENT86_ACP_SECRETS=off`: no keyring to remember one in.
+    assert_eq!(
+        listed["result"],
+        json!({"secrets": [{"name": "DB_PASSWORD", "remembered": false}], "canRemember": false})
+    );
+    assert_eq!(forgotten["result"], json!({"forgotten": true}));
+
+    // The agent asked this client for API_TOKEN, and used its answer.
+    assert_eq!(turn.requests.len(), 1, "{:?}", turn.requests);
+    let asked = &turn.requests[0];
+    assert_eq!(asked["method"], SECRET_REQUEST_METHOD);
+    assert_eq!(asked["params"]["name"], "API_TOKEN");
+    assert_eq!(asked["params"]["reason"], "to deploy");
+    assert_eq!(turn.response["result"]["stopReason"], "end_turn");
+    let shown = format!("{:?}", turn.updates);
+    assert!(shown.contains("db: ${secret:DB_PASSWORD}"), "{shown}");
+    assert!(shown.contains("api: ${secret:API_TOKEN}"), "{shown}");
+
+    // Neither value is on any line the agent wrote, nor in its log, nor sent to
+    // the model.
+    for line in &received {
+        assert!(
+            !line.contains(SET_VALUE) && !line.contains(ENTERED),
+            "{line}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains(SET_VALUE) && !stderr.contains(ENTERED),
+        "{stderr}"
+    );
+    let requests = server.requests();
+    assert!(requests[0].body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "request_secret"));
+    for request in &requests {
+        let body = request.body.to_string();
+        assert!(
+            !body.contains(SET_VALUE) && !body.contains(ENTERED),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -88,6 +88,56 @@ pub const MEMORY_FORGET_METHOD: &str = "_com.maetek.agent86/memory/forget";
 pub const MEMORY_PAGE: usize = 50;
 pub const MEMORY_PAGE_MAX: usize = 200;
 
+/// The capability for handing agent86 secrets (beyond Python). The agent
+/// advertises it in `agentCapabilities._meta` for the three requests below, which
+/// any client may make. A client names it in `clientCapabilities._meta` (`true` or
+/// an object) to say it draws its own masked entry and keeps what is typed there
+/// out of its thread, its history, and its logs; only such a client is sent
+/// [`SECRET_REQUEST_METHOD`] and offered `request_secret`.
+pub const SECRETS_CAPABILITY: &str = "com.maetek.agent86/secrets";
+/// The version of the secret methods' shapes.
+pub const SECRETS_VERSION: u64 = 1;
+/// `{sessionId, name, value, remember?}` to `{name, remembered, warning?}`.
+pub const SECRET_SET_METHOD: &str = "_com.maetek.agent86/secret/set";
+/// `{sessionId}` to `{secrets: [{name, remembered}], canRemember}`.
+pub const SECRET_LIST_METHOD: &str = "_com.maetek.agent86/secret/list";
+/// `{sessionId, name}` to `{forgotten, warning?}`.
+pub const SECRET_FORGET_METHOD: &str = "_com.maetek.agent86/secret/forget";
+/// Agent to client: `{sessionId, name, reason, replacing, canRemember,
+/// remembered}` to `{outcome: "entered", value, remember}` or
+/// `{outcome: "declined"}`.
+pub const SECRET_REQUEST_METHOD: &str = "_com.maetek.agent86/secret/request";
+
+/// One secret method's request, checked (beyond Python). `Debug` never shows a
+/// value: [`crate::vault::SecretAnswer`] hides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretMethod {
+    Set {
+        name: String,
+        answer: crate::vault::SecretAnswer,
+    },
+    List,
+    Forget {
+        name: String,
+    },
+}
+
+/// What a secret method did. Never holds a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretReply {
+    Set(crate::vault::Stored),
+    /// Each name held and whether it is remembered for the project, and whether
+    /// a keyring is there to remember one in.
+    List {
+        secrets: Vec<(String, bool)>,
+        can_remember: bool,
+    },
+    Forgotten {
+        forgotten: bool,
+        warning: Option<String>,
+    },
+}
+
 /// One memory method's request, checked (beyond Python).
 #[derive(Debug, Clone, Copy)]
 pub enum MemoryRequest {
@@ -405,6 +455,10 @@ pub struct ClientCapabilities {
     /// `_meta["com.maetek.agent86/state"]` was given (`true` or an object): the
     /// client wants agent86's state events ([`STATE_METHOD`], beyond Python).
     pub state: bool,
+    /// `_meta["com.maetek.agent86/secrets"]` was given (`true` or an object): the
+    /// client draws its own masked entry, so it is asked for secrets
+    /// ([`SECRET_REQUEST_METHOD`], beyond Python).
+    pub secrets: bool,
 }
 
 impl ClientCapabilities {
@@ -418,15 +472,18 @@ impl ClientCapabilities {
             .and_then(|capabilities| capabilities.get("session"))
             .and_then(|session| session.get("compaction"))
             .is_some_and(Value::is_object);
-        let state = capabilities
-            .and_then(|capabilities| capabilities.get("_meta"))
-            .and_then(|meta| meta.get(STATE_CAPABILITY))
-            .is_some_and(|value| value.is_object() || value == &Value::Bool(true));
+        let extension = |name: &str| {
+            capabilities
+                .and_then(|capabilities| capabilities.get("_meta"))
+                .and_then(|meta| meta.get(name))
+                .is_some_and(|value| value.is_object() || value == &Value::Bool(true))
+        };
         Self {
             read_text_file: flag("readTextFile"),
             write_text_file: flag("writeTextFile"),
             compaction,
-            state,
+            state: extension(STATE_CAPABILITY),
+            secrets: extension(SECRETS_CAPABILITY),
         }
     }
 }
@@ -540,6 +597,26 @@ pub trait Backend: Send {
             MemoryRequest::List(_) => MEMORY_LIST_METHOD,
             MemoryRequest::Pin { .. } => MEMORY_PIN_METHOD,
             MemoryRequest::Forget { .. } => MEMORY_FORGET_METHOD,
+        };
+        Err(BackendError {
+            code: METHOD_NOT_FOUND,
+            message: format!("Method not found: {method}"),
+        })
+    }
+
+    /// Answer one of the secret methods for `session_id` (beyond Python), on its
+    /// vault and the project keyring it was given. An unknown session is
+    /// `not_found`. Runs on the connection's thread, between turns. A backend with
+    /// no vault leaves the methods unknown.
+    fn secrets(
+        &mut self,
+        _session_id: &str,
+        request: SecretMethod,
+    ) -> Result<SecretReply, BackendError> {
+        let method = match request {
+            SecretMethod::Set { .. } => SECRET_SET_METHOD,
+            SecretMethod::List => SECRET_LIST_METHOD,
+            SecretMethod::Forget { .. } => SECRET_FORGET_METHOD,
         };
         Err(BackendError {
             code: METHOD_NOT_FOUND,
@@ -764,6 +841,9 @@ impl<B: Backend> Server<B> {
             | MEMORY_LIST_METHOD
             | MEMORY_PIN_METHOD
             | MEMORY_FORGET_METHOD
+            | SECRET_SET_METHOD
+            | SECRET_LIST_METHOD
+            | SECRET_FORGET_METHOD
                 if !self.initialized =>
             {
                 Err(BackendError {
@@ -780,6 +860,9 @@ impl<B: Backend> Server<B> {
             "session/list" => self.session_list(params),
             MEMORY_LIST_METHOD | MEMORY_PIN_METHOD | MEMORY_FORGET_METHOD => {
                 self.memory_method(method, params)
+            }
+            SECRET_SET_METHOD | SECRET_LIST_METHOD | SECRET_FORGET_METHOD => {
+                self.secret_method(method, params)
             }
             other => Err(BackendError {
                 code: METHOD_NOT_FOUND,
@@ -928,6 +1011,92 @@ impl<B: Backend> Server<B> {
                 let request = MemoryRequest::Forget { kind, id: id()? };
                 match self.backend.memory(session_id, request)? {
                     MemoryReply::Forgotten => Ok(json!({})),
+                    _ => Err(unexpected()),
+                }
+            }
+        }
+    }
+
+    /// The secret methods (beyond Python). A name is the environment variable's
+    /// (`^[A-Za-z_][A-Za-z0-9_]*$`); the user chose it, so the names reserved from
+    /// the model's `request_secret` are allowed, as for the terminal's
+    /// `/secret NAME`. No error message ever holds the value.
+    fn secret_method(&mut self, method: &str, params: &Value) -> Result<Value, BackendError> {
+        use crate::vault::{valid_name, SecretAnswer, MIN_SECRET_CHARS, NAME_PATTERN};
+        let invalid =
+            |message: &str| BackendError::invalid_params(format!("Invalid params: {message}"));
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("sessionId must be a string"))?;
+        let name = || {
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| valid_name(name))
+                .map(str::to_owned)
+                .ok_or_else(|| invalid(&format!("name must be a string matching {NAME_PATTERN}")))
+        };
+        let unexpected = || BackendError::internal("Internal error: unexpected secret reply");
+        match method {
+            SECRET_SET_METHOD => {
+                let name = name()?;
+                let value = match params.get("value") {
+                    Some(Value::String(value)) => value,
+                    _ => return Err(invalid("value must be a string")),
+                };
+                if value.chars().count() < MIN_SECRET_CHARS {
+                    return Err(invalid(&format!(
+                        "value must have at least {MIN_SECRET_CHARS} characters, or hiding \
+                         it would rewrite ordinary text wherever those characters appear"
+                    )));
+                }
+                let remember = match params.get("remember") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(remember)) => *remember,
+                    Some(_) => return Err(invalid("remember must be a boolean")),
+                };
+                let request = SecretMethod::Set {
+                    name: name.clone(),
+                    answer: SecretAnswer {
+                        value: value.clone(),
+                        remember,
+                    },
+                };
+                match self.backend.secrets(session_id, request)? {
+                    SecretReply::Set(stored) => {
+                        let mut result = json!({ "name": name, "remembered": stored.remembered });
+                        if let Some(warning) = stored.warning {
+                            result["warning"] = json!(warning);
+                        }
+                        Ok(result)
+                    }
+                    _ => Err(unexpected()),
+                }
+            }
+            SECRET_LIST_METHOD => match self.backend.secrets(session_id, SecretMethod::List)? {
+                SecretReply::List {
+                    secrets,
+                    can_remember,
+                } => Ok(json!({
+                    "secrets": secrets
+                        .iter()
+                        .map(|(name, remembered)| json!({ "name": name, "remembered": remembered }))
+                        .collect::<Vec<_>>(),
+                    "canRemember": can_remember
+                })),
+                _ => Err(unexpected()),
+            },
+            _ => {
+                let request = SecretMethod::Forget { name: name()? };
+                match self.backend.secrets(session_id, request)? {
+                    SecretReply::Forgotten { forgotten, warning } => {
+                        let mut result = json!({ "forgotten": forgotten });
+                        if let Some(warning) = warning {
+                            result["warning"] = json!(warning);
+                        }
+                        Ok(result)
+                    }
                     _ => Err(unexpected()),
                 }
             }
@@ -1107,7 +1276,10 @@ impl<B: Backend> Server<B> {
                         // can still reach the gate before its next safe point):
                         // dropping the reply declines. `fs/*` calls still go
                         // through, since a running tool is allowed to finish.
-                        if cancel.requested && method == "session/request_permission" {
+                        if cancel.requested
+                            && (method == "session/request_permission"
+                                || method == SECRET_REQUEST_METHOD)
+                        {
                             continue;
                         }
                         let id = *next_request;
@@ -1771,7 +1943,8 @@ fn initialize(params: &Value) -> Result<Value, String> {
             // client that names it in its own capabilities is sent the events.
             "_meta": {
                 STATE_CAPABILITY: { "version": STATE_VERSION },
-                MEMORY_CAPABILITY: { "version": MEMORY_VERSION }
+                MEMORY_CAPABILITY: { "version": MEMORY_VERSION },
+                SECRETS_CAPABILITY: { "version": SECRETS_VERSION }
             }
         },
         "agentInfo": {
@@ -1958,9 +2131,54 @@ mod tests {
         memory: Option<Vec<crate::memory::Entry>>,
         /// Each memory request, with its session.
         memory_asked: Vec<(String, MemoryRequest)>,
+        /// The secrets held, with whether each is remembered; `None` leaves the
+        /// secret methods unknown, as the trait's default does.
+        secrets: Option<Vec<(String, bool)>>,
+        /// Each secret request, with its session.
+        secrets_asked: Vec<(String, SecretMethod)>,
     }
 
     impl Backend for Script {
+        fn secrets(
+            &mut self,
+            session_id: &str,
+            request: SecretMethod,
+        ) -> Result<SecretReply, BackendError> {
+            let Some(held) = &mut self.secrets else {
+                return Err(BackendError {
+                    code: METHOD_NOT_FOUND,
+                    message: "Method not found".into(),
+                });
+            };
+            self.secrets_asked
+                .push((session_id.to_owned(), request.clone()));
+            if session_id != "s" {
+                return Err(BackendError::not_found("Session not found"));
+            }
+            match request {
+                SecretMethod::Set { name, answer } => {
+                    held.retain(|(known, _)| *known != name);
+                    held.push((name, answer.remember));
+                    Ok(SecretReply::Set(crate::vault::Stored {
+                        remembered: answer.remember,
+                        warning: (!answer.remember).then(|| "kept for this session".into()),
+                    }))
+                }
+                SecretMethod::List => Ok(SecretReply::List {
+                    secrets: held.clone(),
+                    can_remember: true,
+                }),
+                SecretMethod::Forget { name } => {
+                    let before = held.len();
+                    held.retain(|(known, _)| *known != name);
+                    Ok(SecretReply::Forgotten {
+                        forgotten: held.len() < before,
+                        warning: None,
+                    })
+                }
+            }
+        }
+
         fn memory(
             &mut self,
             session_id: &str,
@@ -2216,6 +2434,238 @@ mod tests {
             episode,
         ]);
         server
+    }
+
+    /// A value no reply or error may ever hold.
+    const SECRET_VALUE: &str = "sk-live-hunter2-0123456789";
+
+    fn with_secrets() -> Server<Script> {
+        let mut server = ready();
+        server.backend.secrets = Some(vec![("GITHUB_TOKEN".into(), true)]);
+        server
+    }
+
+    #[test]
+    fn the_secret_methods_are_advertised_and_need_initialize() {
+        let mut server = Server::new(Script::default());
+        for method in [SECRET_SET_METHOD, SECRET_LIST_METHOD, SECRET_FORGET_METHOD] {
+            let early = one(&mut server, &memory_line(method, json!({"sessionId": "s"})));
+            assert_eq!(early["error"]["code"], INVALID_REQUEST, "{method}");
+        }
+        let init = one(&mut server, INITIALIZE);
+        assert_eq!(
+            init["result"]["agentCapabilities"]["_meta"][SECRETS_CAPABILITY],
+            json!({"version": 1})
+        );
+        // A backend with no vault leaves the methods unknown.
+        let unknown = one(
+            &mut server,
+            &memory_line(SECRET_LIST_METHOD, json!({"sessionId": "s"})),
+        );
+        assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn the_client_says_it_draws_a_masked_entry_in_its_own_meta() {
+        let capabilities = |meta: Value| {
+            ClientCapabilities::from_params(&json!({ "clientCapabilities": { "_meta": meta } }))
+        };
+        assert!(capabilities(json!({ SECRETS_CAPABILITY: true })).secrets);
+        assert!(capabilities(json!({ SECRETS_CAPABILITY: { "version": 1 } })).secrets);
+        for refused in [json!(false), json!("yes"), json!(1), Value::Null] {
+            assert!(
+                !capabilities(json!({ SECRETS_CAPABILITY: refused })).secrets,
+                "{refused}"
+            );
+        }
+        assert!(!capabilities(json!({ STATE_CAPABILITY: true })).secrets);
+        assert!(!ClientCapabilities::from_params(&json!({})).secrets);
+    }
+
+    #[test]
+    fn secret_set_hands_the_backend_a_checked_answer_and_never_repeats_the_value() {
+        let mut server = with_secrets();
+        let reply = one(
+            &mut server,
+            &memory_line(
+                SECRET_SET_METHOD,
+                json!({"sessionId": "s", "name": "STRIPE_KEY", "value": SECRET_VALUE,
+                       "remember": true}),
+            ),
+        );
+        assert_eq!(
+            reply["result"],
+            json!({"name": "STRIPE_KEY", "remembered": true})
+        );
+        let (session, request) = &server.backend.secrets_asked[0];
+        assert_eq!(session, "s");
+        assert_eq!(
+            request,
+            &SecretMethod::Set {
+                name: "STRIPE_KEY".into(),
+                answer: crate::vault::SecretAnswer {
+                    value: SECRET_VALUE.into(),
+                    remember: true,
+                },
+            }
+        );
+        // The request's `Debug` (a panic message, a log) hides the value.
+        assert!(!format!("{request:?}").contains(SECRET_VALUE));
+        // `remember` defaults to false, and the backend's warning comes back.
+        let reply = one(
+            &mut server,
+            &memory_line(
+                SECRET_SET_METHOD,
+                json!({"sessionId": "s", "name": "PATH", "value": SECRET_VALUE}),
+            ),
+        );
+        assert_eq!(
+            reply["result"],
+            json!({"name": "PATH", "remembered": false, "warning": "kept for this session"})
+        );
+        assert!(!reply.to_string().contains(SECRET_VALUE));
+        let missing = one(
+            &mut server,
+            &memory_line(
+                SECRET_SET_METHOD,
+                json!({"sessionId": "nope", "name": "A_KEY", "value": SECRET_VALUE}),
+            ),
+        );
+        assert_eq!(missing["error"]["code"], RESOURCE_NOT_FOUND);
+        assert!(!missing.to_string().contains(SECRET_VALUE));
+    }
+
+    #[test]
+    fn bad_secret_params_are_refused_before_the_backend_and_never_quote_the_value() {
+        let mut server = with_secrets();
+        let base = json!({"sessionId": "s", "name": "API_KEY", "value": SECRET_VALUE});
+        let with = |key: &str, value: Value| {
+            let mut params = base.clone();
+            params[key] = value;
+            params
+        };
+        let mut without_value = base.clone();
+        without_value.as_object_mut().unwrap().remove("value");
+        for params in [
+            with("sessionId", json!(7)),
+            with("name", json!("1BAD")),
+            with("name", json!("has space")),
+            with("name", json!(SECRET_VALUE)),
+            with("value", json!(12345678)),
+            with("value", json!("short")),
+            with("remember", json!("yes")),
+            without_value,
+        ] {
+            let reply = one(&mut server, &memory_line(SECRET_SET_METHOD, params.clone()));
+            assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{params}");
+            assert!(!reply.to_string().contains("sk-live"), "{reply}");
+        }
+        let reply = one(
+            &mut server,
+            &memory_line(
+                SECRET_FORGET_METHOD,
+                json!({"sessionId": "s", "name": "x y"}),
+            ),
+        );
+        assert_eq!(reply["error"]["code"], INVALID_PARAMS);
+        assert!(server.backend.secrets_asked.is_empty());
+        // A line that is not JSON says so without repeating any of it.
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"{SECRET_SET_METHOD}","params":{{"value":"{SECRET_VALUE}""#
+        );
+        let reply = one(&mut server, &line);
+        assert_eq!(reply["error"]["code"], PARSE_ERROR);
+        assert!(!reply.to_string().contains(SECRET_VALUE));
+    }
+
+    #[test]
+    fn secret_list_and_forget_answer_in_their_shapes() {
+        let mut server = with_secrets();
+        one(
+            &mut server,
+            &memory_line(
+                SECRET_SET_METHOD,
+                json!({"sessionId": "s", "name": "NPM_TOKEN", "value": SECRET_VALUE}),
+            ),
+        );
+        let list = one(
+            &mut server,
+            &memory_line(SECRET_LIST_METHOD, json!({"sessionId": "s"})),
+        );
+        assert_eq!(
+            list["result"],
+            json!({"secrets": [
+                {"name": "GITHUB_TOKEN", "remembered": true},
+                {"name": "NPM_TOKEN", "remembered": false}
+            ], "canRemember": true})
+        );
+        let forget = |server: &mut Server<Script>| {
+            one(
+                server,
+                &memory_line(
+                    SECRET_FORGET_METHOD,
+                    json!({"sessionId": "s", "name": "GITHUB_TOKEN"}),
+                ),
+            )
+        };
+        assert_eq!(forget(&mut server)["result"], json!({"forgotten": true}));
+        assert_eq!(forget(&mut server)["result"], json!({"forgotten": false}));
+    }
+
+    #[test]
+    fn no_secret_request_is_sent_after_a_cancel() {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Call(
+            SECRET_REQUEST_METHOD,
+            json!({"sessionId": "sess_1", "name": "API_KEY"}),
+            None,
+        )];
+        server
+            .sender()
+            .send(Event::Line(cancel_line("sess_1")))
+            .unwrap();
+        let out = replies(&mut server, &prompt_line(HI));
+        assert!(
+            !out.iter()
+                .any(|message| message["method"] == SECRET_REQUEST_METHOD),
+            "{out:?}"
+        );
+        assert!(server.backend.call_results.lock().unwrap()[0].is_err());
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn a_secret_request_reaches_the_client_and_its_answer_comes_back() {
+        let mut server = ready();
+        server.backend.acts = vec![Act::Call(
+            SECRET_REQUEST_METHOD,
+            json!({"sessionId": "sess_1", "name": "API_KEY"}),
+            None,
+        )];
+        let events = server.sender();
+        let mut out = Vec::new();
+        server.handle_line(&prompt_line(HI), &mut |message| {
+            if message["method"] == SECRET_REQUEST_METHOD {
+                let id = message["id"].clone();
+                events
+                    .send(Event::Line(
+                        json!({"jsonrpc":"2.0","id":id,"result":{
+                            "outcome":"entered","value":SECRET_VALUE,"remember":false}})
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+            out.push(message);
+        });
+        assert_eq!(
+            server.backend.call_results.lock().unwrap()[0],
+            Ok(json!({"outcome":"entered","value":SECRET_VALUE,"remember":false}))
+        );
+        // The value went to the turn, and nothing the agent sent holds it.
+        assert!(out
+            .iter()
+            .all(|message| !message.to_string().contains(SECRET_VALUE)));
+        assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn");
     }
 
     #[test]
@@ -3254,6 +3704,7 @@ mod tests {
                     write_text_file: write,
                     compaction: false,
                     state: false,
+                    secrets: false,
                 }),
                 "{capabilities}"
             );

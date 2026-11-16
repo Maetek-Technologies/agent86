@@ -32,7 +32,7 @@
 use super::{
     Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, FileChange,
     Location, McpSpec, MemoryReply, MemoryRequest, Notifier, Permission, PermissionRequest,
-    SessionSummary, Stop, ToolKind, TurnSink, Update,
+    SecretMethod, SecretReply, SessionSummary, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::{ApprovalPreview, Asker, Question};
@@ -61,10 +61,16 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `/secret`: the names the session holds, or `forget NAME`. A secret is never
 /// entered here: what is typed into an editor's box is shown in its thread and kept
 /// in its history, and the protocol forbids asking for one through a form. So the
-/// way in is the terminal's `/secret NAME` with "remember for this project", which
-/// editor sessions in that project then load. Nothing typed after the command is
-/// stored or repeated back.
-fn secret_command(session: &Session, arg: &str) -> String {
+/// way in is a client's own masked entry, through the secrets extension, when it
+/// has one (`client_entry`), and otherwise the terminal's `/secret NAME` with
+/// "remember for this project", which editor sessions in that project then load.
+/// Nothing typed after the command is stored or repeated back.
+fn secret_command(session: &Session, arg: &str, client_entry: bool) -> String {
+    let how = if client_entry {
+        SECRET_HOW_CLIENT
+    } else {
+        SECRET_HOW
+    };
     let vault = &session.harness.context.secrets;
     let words: Vec<&str> = arg.split_whitespace().collect();
     match words.as_slice() {
@@ -82,12 +88,9 @@ fn secret_command(session: &Session, arg: &str) -> String {
                 })
                 .collect();
             if names.is_empty() {
-                format!("no secrets for this project · {SECRET_HOW}")
+                format!("no secrets for this project · {how}")
             } else {
-                format!(
-                    "secrets (values hidden): {}\n{SECRET_HOW}",
-                    names.join(", ")
-                )
+                format!("secrets (values hidden): {}\n{how}", names.join(", "))
             }
         }
         ["forget", name] if crate::vault::valid_name(name) => match vault.forget(name) {
@@ -99,13 +102,63 @@ fn secret_command(session: &Session, arg: &str) -> String {
         },
         ["forget", _] => "that is not a valid secret name (letters, digits, and _)".to_owned(),
         // Not echoed: it may be the value itself.
-        _ => format!("nothing was stored. {SECRET_HOW}"),
+        _ => format!("nothing was stored. {how}"),
     }
 }
 
 const SECRET_HOW: &str = "Don't type a secret here: it would stay in this thread. Enter it \
      at a terminal in this project with agent86 and /secret NAME, choose to remember it, \
      and sessions here will have it; /secret forget NAME removes one.";
+
+/// For a client with its own masked entry (the secrets extension).
+const SECRET_HOW_CLIENT: &str = "Don't type a secret here: it would stay in this thread. \
+     Use this client's own secret entry, which hands it to agent86 without the thread \
+     seeing it; /secret forget NAME removes one.";
+
+/// The vault's prompt for a client with its own masked entry (beyond Python): asks
+/// it with [`super::SECRET_REQUEST_METHOD`] through the running turn's sink, and
+/// waits as long as the user takes. No turn, an error, a reply that is not an
+/// entry, or a cancel (which drops the reply) declines.
+fn client_secret_prompt(
+    sink: SinkSlot,
+    session_id: String,
+    secrets: crate::vault::SecretVault,
+) -> crate::vault::SecretPrompt {
+    Box::new(move |request: &crate::vault::SecretRequest| {
+        let running = sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        let params = json!({
+            "sessionId": session_id,
+            "name": request.name,
+            "reason": show_controls(&secrets.redact(&request.reason)),
+            "replacing": request.replacing,
+            "canRemember": request.can_remember,
+            "remembered": request.remembered,
+        });
+        let reply = running
+            .call(super::SECRET_REQUEST_METHOD, params, None)
+            .ok()?;
+        secret_answer(&reply)
+    })
+}
+
+/// The client's answer to [`super::SECRET_REQUEST_METHOD`]: an entry with a
+/// non-empty value, else `None` (declined).
+fn secret_answer(reply: &Value) -> Option<crate::vault::SecretAnswer> {
+    if reply.get("outcome").and_then(Value::as_str) != Some("entered") {
+        return None;
+    }
+    let value = reply
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    Some(crate::vault::SecretAnswer {
+        value: value.to_owned(),
+        remember: reply.get("remember").and_then(Value::as_bool) == Some(true),
+    })
+}
 
 /// `/thinking` and `/toolview`: show the level, or set it.
 fn show_level(name: &str, level: &mut DisplayLevel, arg: &str) -> String {
@@ -884,9 +937,9 @@ impl HarnessBackend {
         mcp_servers: Vec<McpSpec>,
         resume: Option<&str>,
     ) -> Result<String, BackendError> {
-        // No terminal prompt and no secret store: the editor is asked instead (below),
-        // and the keyring is for a terminal. Without a terminal prompt,
-        // `request_secret` is not offered.
+        // No terminal prompt: the editor is asked instead (below). Without one,
+        // `request_secret` is not offered, unless the client draws its own masked
+        // entry (added below, once the session has its id).
         let mut assembly = assemble_in(&self.config, cwd, None, self.secret_store.clone())
             .map_err(|error| match error {
                 SetupError::Model(message) => BackendError::internal(message),
@@ -1064,6 +1117,24 @@ impl HarnessBackend {
                 read: self.client.read_text_file,
                 write: self.client.write_text_file,
             }));
+        }
+        // A client with its own masked entry is asked for secrets, so the model may
+        // ask for one (beyond Python); any other client is not offered the tool.
+        if self.client.secrets {
+            assembly
+                .harness
+                .context
+                .secrets
+                .set_prompt(Some(client_secret_prompt(
+                    Arc::clone(&sink),
+                    session_id.clone(),
+                    secrets.clone(),
+                )));
+            assembly
+                .harness
+                .registry
+                .register(Box::new(crate::tools::secret::RequestSecretTool))
+                .map_err(|error| BackendError::internal(error.to_string()))?;
         }
         self.remember_cwd(&session_id, cwd);
         let session = Session {
@@ -1682,7 +1753,7 @@ impl Backend for HarnessBackend {
             "thinking" => show_level("thinking", &mut session.thinking, arg),
             "toolview" => show_level("toolview", &mut session.tool_view, arg),
             "resume" => self.resume(&mut session, arg),
-            "secret" => secret_command(&session, arg),
+            "secret" => secret_command(&session, arg, self.client.secrets),
             "rename" => {
                 // Answered here, so nothing reaches the model or the conversation.
                 let (message, title) =
@@ -1793,6 +1864,63 @@ impl Backend for HarnessBackend {
                     Err(missing(kind, id))
                 }
             }
+        }
+    }
+
+    /// The secret methods on the session's vault and the project keyring it was
+    /// given (beyond Python): what the terminal's `/secret NAME`, `/secret`, and
+    /// `/secret forget NAME` do.
+    fn secrets(
+        &mut self,
+        session_id: &str,
+        request: SecretMethod,
+    ) -> Result<SecretReply, BackendError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| BackendError::not_found(format!("Session not found: {session_id}")))?;
+        let vault = &session.harness.context.secrets;
+        match request {
+            SecretMethod::Set { name, answer } => {
+                let wanted = answer.remember;
+                let mut stored = vault.accept(&name, answer).map_err(|why| {
+                    BackendError::invalid_params(format!("Invalid params: {}", why.describe(&name)))
+                })?;
+                if wanted && !vault.can_remember() && stored.warning.is_none() {
+                    stored.warning = Some(
+                        "no keyring is available to remember it, so it is set for this \
+                         session only"
+                            .to_owned(),
+                    );
+                }
+                Ok(SecretReply::Set(stored))
+            }
+            SecretMethod::List => {
+                let remembered = vault.remembered_names();
+                Ok(SecretReply::List {
+                    secrets: vault
+                        .names()
+                        .into_iter()
+                        .map(|name| {
+                            let kept = remembered.contains(&name);
+                            (name, kept)
+                        })
+                        .collect(),
+                    can_remember: vault.can_remember(),
+                })
+            }
+            SecretMethod::Forget { name } => Ok(match vault.forget(&name) {
+                Ok(forgotten) => SecretReply::Forgotten {
+                    forgotten,
+                    warning: None,
+                },
+                Err(error) => SecretReply::Forgotten {
+                    forgotten: true,
+                    warning: Some(format!(
+                        "dropped from this session, but the keyring refused: {error}"
+                    )),
+                },
+            }),
         }
     }
 
