@@ -555,7 +555,7 @@ Decided (2026-11-15): the proposals of 2026-11-15 below, and the provider adapte
 
 | Release | Contents |
 |---|---|
-| 1.0.19 | Search tools (`search_files`, `find_files`); file edits as ACP `diff` content, with `locations` |
+| 1.0.19 | Search tools (`search_files`, `find_files`); file edits as ACP `diff` content, with `locations` (released 2026-11-15) |
 | 1.0.20 | ACP extensions for the harness's state (cost, sub-agent cards, guardrail verdicts, route decisions) |
 | 1.0.21 | Approval inbox context for parallel sub-agents; save after every step (checkpointing tier 1), then ACP `session/resume` |
 | 1.0.22 | Memory over ACP and in the CLI: list, pin, and forget |
@@ -791,6 +791,8 @@ Released as 1.0.16 (2026-11-13; notes in `docs/releases/v1.0.16.md`): skill comm
 Released as 1.0.17 (2026-11-13; notes in `docs/releases/v1.0.17.md`): every session records its directory, terminal sessions included, so editors' and agent86-web's lists filtered by directory are right (sessions saved earlier with no recorded directory drop out of those lists until resumed), and `/rename` in the terminal and over ACP (`rename` is advertised, answered without a model turn, and followed by a `session_info_update` carrying the title, which `schema/v1/schema.json` defines; checked against the schema fetched 2026-11-13). See the session differences above.
 
 Released as 1.0.18 (2026-11-14; notes in `docs/releases/v1.0.18.md`): specialist sub-agents, every slice of [docs/subagents.md](subagents.md) (definitions and built-ins, `delegate`'s `agent`, `skill`, `isolate`, `files`, and `summary`, tool scopes and stricter approvals, per-specialty models and budgets, project-file approval by hash, `/agent`, `/agents`, `#name`, `run --agent`, skills both ways, parallel fan-out, git worktree isolation, and the editor's per-delegation card with unique tool call ids and an `allow_always` option for a project specialty), the sub-agent routing fix, and cancellable sub-agents. Not yet tried against a live model or by hand in an editor.
+
+Released as 1.0.19 (2026-11-15; notes in `docs/releases/v1.0.19.md`): the first release on the roadmap to 1.1.0, both items as planned. The search tools `search_files` and `find_files` (PR #108; see the tool differences above and the as-built notes under "Two items for every client"), and file edits as ACP `diff` content with `locations`, plus the `search` kind for the search tools (PR #109; field names checked against `schema/v1/schema.json` fetched 2026-11-15, and a transcript of `tests/acp.rs` validated against it). Next on the roadmap: 1.0.20, the ACP extensions for the harness's state.
 
 Live check in Zed (2026-11-05): `agent86 acp` was run as a custom external agent in Zed and worked. This is the check the six slices and the schema conformance run left open, so the Zed settings in the guide are no longer written only from Zed's documentation; the remaining clients (JetBrains, Neovim, Emacs, the VS Code extensions) are still unverified. The README, the guide's status section, and the plan's "not implemented" list now say Zed has been used by hand.
 
