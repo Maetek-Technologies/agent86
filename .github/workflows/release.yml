@@ -180,11 +180,14 @@ jobs:
       - name: Publish
         run: |
           set -euo pipefail
-          # The platform packages first, so the launcher never names a missing one.
-          for tgz in ./npm-tgz/maetek-agent86-*.tgz ./npm-tgz/agent86-*.tgz; do
-            manifest=$(tar -xOzf "$tgz" package/package.json)
-            name=$(node -e 'const m = JSON.parse(process.argv[1]); console.log(m.name)' "$manifest")
-            version=$(node -e 'const m = JSON.parse(process.argv[1]); console.log(m.version)' "$manifest")
+          field() {
+            node -e 'const m = JSON.parse(process.argv[1]); console.log(m[process.argv[2]])' \
+              "$(tar -xOzf "$1" package/package.json)" "$2"
+          }
+          publish() {
+            local tgz=$1 name version
+            name=$(field "$tgz" name)
+            version=$(field "$tgz" version)
             if npm view "$name@$version" version > /dev/null 2>&1; then
               # A re-run after a partial publish skips what is already out, and so
               # does a pull request between releases, whose version is the last one
@@ -196,6 +199,36 @@ jobs:
             else
               npm publish "$tgz" --access public --provenance
             fi
+          }
+          # The platform packages first, so the launcher never names a missing one.
+          for tgz in ./npm-tgz/maetek-agent86-*.tgz; do
+            publish "$tgz"
+          done
+          # A published package takes minutes to reach every reader of the
+          # registry, and npm skips an optional dependency it cannot find without
+          # a word: a launcher visible before its binaries installs with no binary
+          # (seen with 1.0.20 on Windows). So the launcher waits until every
+          # platform package can be read back. One that never appears fails the
+          # job before the launcher is published; a re-run then skips what is out.
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            for tgz in ./npm-tgz/maetek-agent86-*.tgz; do
+              name=$(field "$tgz" name)
+              version=$(field "$tgz" version)
+              for attempt in $(seq 1 60); do
+                if npm view "$name@$version" version --prefer-online > /dev/null 2>&1; then
+                  echo "$name@$version is visible"
+                  break
+                fi
+                if [ "$attempt" -eq 60 ]; then
+                  echo "::error::$name@$version is still not visible after 15 minutes; the launcher was not published"
+                  exit 1
+                fi
+                sleep 15
+              done
+            done
+          fi
+          for tgz in ./npm-tgz/agent86-*.tgz; do
+            publish "$tgz"
           done
 
   npm-install:

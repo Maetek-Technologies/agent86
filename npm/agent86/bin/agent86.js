@@ -48,9 +48,14 @@ let binary;
 try {
   binary = require.resolve(`${pkg}/bin/${exe}`);
 } catch (_) {
+  // npm skips an optional dependency it cannot fetch without a word: one left out
+  // with --omit=optional, or one the registry had not served yet (in the minutes
+  // after a release, or from npm's own cache of the registry). `--prefer-online`
+  // makes npm ask the registry again instead of trusting that cache.
   fail(
-    `${pkg}, which holds the binary, is not installed. Reinstall with ` +
-      "npm install -g agent86, without --omit=optional or --no-optional."
+    `${pkg}, which holds the binary, is not installed. Reinstall with:\n` +
+      "  npm install -g agent86@latest --prefer-online\n" +
+      "(not with --omit=optional or --no-optional, which leave the binary out)."
   );
 }
 
