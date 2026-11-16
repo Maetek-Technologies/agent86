@@ -113,6 +113,22 @@ pub enum Update {
     Config(Vec<ConfigOption>),
     /// The session was renamed (`session_info_update` with its `title`).
     Title(String),
+    /// How full the context window is, and what the session has cost
+    /// (`usage_update`, beyond Python): `used` and `size` in tokens, `cost` the
+    /// session's cumulative US dollars, `None` for a model with no price.
+    Usage {
+        used: u64,
+        size: u64,
+        cost: Option<f64>,
+    },
+    /// The history was compacted (`compaction_update`, beyond Python), for a client
+    /// with the `session.compaction` capability: `completed` with the summary, or
+    /// `failed` with why (the history was trimmed instead).
+    Compaction {
+        id: String,
+        summary: Option<String>,
+        error: Option<String>,
+    },
     /// The model asked for a tool call (`tool_call`, status `pending`).
     ToolCall {
         id: String,
@@ -318,18 +334,26 @@ pub struct ClientCapabilities {
     pub read_text_file: bool,
     /// `fs/write_text_file` is available.
     pub write_text_file: bool,
+    /// `session.compaction` was given (an object): the client takes
+    /// `compaction_update`, which the spec forbids sending otherwise.
+    pub compaction: bool,
 }
 
 impl ClientCapabilities {
     fn from_params(params: &Value) -> Self {
-        let fs = params
-            .get("clientCapabilities")
-            .and_then(|capabilities| capabilities.get("fs"));
+        let capabilities = params.get("clientCapabilities");
+        let fs = capabilities.and_then(|capabilities| capabilities.get("fs"));
         let flag =
             |name: &str| fs.and_then(|fs| fs.get(name)).and_then(Value::as_bool) == Some(true);
+        // Omitted, or `null`, at either level means unsupported.
+        let compaction = capabilities
+            .and_then(|capabilities| capabilities.get("session"))
+            .and_then(|session| session.get("compaction"))
+            .is_some_and(Value::is_object);
         Self {
             read_text_file: flag("readTextFile"),
             write_text_file: flag("writeTextFile"),
+            compaction,
         }
     }
 }
@@ -1277,6 +1301,33 @@ fn session_update(session_id: &str, update: &Update) -> Value {
             "sessionUpdate": "session_info_update",
             "title": title
         }),
+        Update::Usage { used, size, cost } => {
+            let mut body = json!({
+                "sessionUpdate": "usage_update",
+                "used": used,
+                "size": size
+            });
+            // An unpriced model's cost is unknown, not zero: left out, as the
+            // terminal shows `cost n/a`.
+            if let Some(amount) = cost {
+                body["cost"] = json!({ "amount": amount, "currency": "USD" });
+            }
+            body
+        }
+        Update::Compaction { id, summary, error } => {
+            let mut body = json!({
+                "sessionUpdate": "compaction_update",
+                "compactionId": id,
+                "status": if summary.is_some() { "completed" } else { "failed" }
+            });
+            if let Some(summary) = summary {
+                body["summary"] = json!([text_content(summary)]);
+            }
+            if let Some(error) = error {
+                body["error"] = json!(error);
+            }
+            body
+        }
         Update::Commands(commands) => json!({
             "sessionUpdate": "available_commands_update",
             "availableCommands": commands.iter().map(|command| {
@@ -2667,7 +2718,8 @@ mod tests {
                 server.backend.capabilities,
                 Some(ClientCapabilities {
                     read_text_file: read,
-                    write_text_file: write
+                    write_text_file: write,
+                    compaction: false,
                 }),
                 "{capabilities}"
             );
@@ -3320,6 +3372,67 @@ mod tests {
         let reply = one(&mut server, &prompt_line(HI));
         assert_eq!(reply["error"]["code"], INTERNAL_ERROR);
         assert_eq!(reply["error"]["message"], "the turn panicked");
+    }
+
+    #[test]
+    fn usage_and_compaction_updates_have_the_specs_shape() {
+        let priced = session_update(
+            "s",
+            &Update::Usage {
+                used: 1200,
+                size: 128_000,
+                cost: Some(0.25),
+            },
+        );
+        assert_eq!(
+            priced["params"]["update"],
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 1200,
+                "size": 128_000,
+                "cost": {"amount": 0.25, "currency": "USD"}
+            })
+        );
+        let unpriced = session_update(
+            "s",
+            &Update::Usage {
+                used: 1,
+                size: 2,
+                cost: None,
+            },
+        );
+        assert!(unpriced["params"]["update"].get("cost").is_none());
+
+        let failed = session_update(
+            "s",
+            &Update::Compaction {
+                id: "cmp-1".into(),
+                summary: None,
+                error: Some("the summary could not be written".into()),
+            },
+        );
+        assert_eq!(
+            failed["params"]["update"],
+            json!({
+                "sessionUpdate": "compaction_update",
+                "compactionId": "cmp-1",
+                "status": "failed",
+                "error": "the summary could not be written"
+            })
+        );
+    }
+
+    #[test]
+    fn the_compaction_capability_needs_an_object() {
+        let parse = |capabilities: Value| {
+            ClientCapabilities::from_params(&json!({ "clientCapabilities": capabilities }))
+                .compaction
+        };
+        assert!(parse(json!({"session": {"compaction": {}}})));
+        assert!(!parse(json!({"session": {"compaction": null}})));
+        assert!(!parse(json!({"session": null})));
+        assert!(!parse(json!({"session": {"compaction": true}})));
+        assert!(!parse(json!({})));
     }
 
     #[test]

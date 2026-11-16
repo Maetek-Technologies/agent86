@@ -174,6 +174,9 @@ struct Exchange {
     requests: Vec<Value>,
     /// The `fs/*` requests the agent made, as received.
     files: Vec<Value>,
+    /// The `usage_update`s, kept out of `updates` (a client may ignore them, and
+    /// they would shift every position the conversation's assertions name).
+    usage: Vec<Value>,
     response: Value,
 }
 
@@ -214,6 +217,7 @@ impl Client {
         let mut updates = Vec::new();
         let mut requests = Vec::new();
         let mut files = Vec::new();
+        let mut usage = Vec::new();
         loop {
             let mut text = String::new();
             let read = self.stdout.read_line(&mut text).unwrap();
@@ -230,6 +234,7 @@ impl Client {
                     updates,
                     requests,
                     files,
+                    usage,
                     response: message,
                 };
             }
@@ -263,6 +268,10 @@ impl Client {
                     .as_array()
                     .unwrap()
                     .clone();
+                continue;
+            }
+            if message["params"]["update"]["sessionUpdate"] == "usage_update" {
+                usage.push(message);
                 continue;
             }
             updates.push(message);
@@ -1766,6 +1775,154 @@ async fn cost_prices_an_openai_compatible_model_under_its_configured_ref() {
     assert!(shown.contains("in 10  out 5 tok"), "{shown}");
     assert!(shown.contains("cost $"), "{shown}");
     assert!(!shown.contains("unpriced"), "{shown}");
+}
+
+/// A turn that calls a tool and answers, in `name`'s workspace with `extra` config,
+/// returning its exchange.
+async fn usage_turn(name: &str, extra: &str) -> Exchange {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("Two files.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config(name, Some(&server), extra);
+    tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let exchange = client.prompt(&session, "What is here?");
+            client.finish();
+            exchange
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn each_model_call_reports_context_and_the_sessions_running_cost() {
+    let exchange = usage_turn(
+        "usage-priced",
+        "[model.context_window]\n\"mock:test/model\" = 50000\n\n\
+         [pricing.models.\"mock:test/model\"]\ninput_per_mtok = 1000.0\noutput_per_mtok = 2000.0\n",
+    )
+    .await;
+
+    // One update per model call: the tool call (20 in, 8 out), then the answer
+    // (10 in, 5 out). The update when the turn ends repeats the last, so it is
+    // left out.
+    let usage: Vec<&Value> = exchange
+        .usage
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .collect();
+    assert_eq!(usage.len(), 2, "{usage:?}");
+    assert_eq!(usage[0]["used"], 20);
+    assert_eq!(usage[1]["used"], 10);
+    for update in &usage {
+        assert_eq!(update["size"], 50000);
+        assert_eq!(update["cost"]["currency"], "USD");
+    }
+    let first = usage[0]["cost"]["amount"].as_f64().unwrap();
+    let total = usage[1]["cost"]["amount"].as_f64().unwrap();
+    assert!((first - 0.036).abs() < 1e-9, "{first}");
+    assert!((total - 0.056).abs() < 1e-9, "{total}");
+    // The conversation itself is what it always was.
+    assert_eq!(
+        exchange.kinds(),
+        ["tool_call", "tool_call_update", "agent_message_chunk"]
+    );
+}
+
+/// Four prompts in one session, the first long, under a budget the fourth goes
+/// over, so the fourth turn compacts; the client advertises `capabilities`.
+/// Returns the fourth prompt's exchange.
+async fn compacting_session(name: &str, capabilities: Value) -> Exchange {
+    let server = MockServer::start(vec![
+        sse_text("ok 1", "stop"),
+        sse_text("ok 2", "stop"),
+        sse_text("ok 3", "stop"),
+        sse_text("GOAL: keep the long note.", "stop"),
+        sse_text("ok 4", "stop"),
+    ])
+    .await;
+    let workspace =
+        Workspace::with_config(name, Some(&server), "[limits]\nmax_context_tokens = 260\n");
+    tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize_with(capabilities);
+            let session = client.new_session(&project);
+            let note = format!("Remember this note: {}", "x".repeat(980));
+            for prompt in [note.as_str(), "second question", "third question"] {
+                let exchange = client.prompt(&session, prompt);
+                assert!(
+                    !exchange.kinds().contains(&"compaction_update"),
+                    "too early"
+                );
+            }
+            let fourth = client.prompt(&session, "fourth question");
+            client.finish();
+            fourth
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_compaction_is_a_compaction_update_only_for_a_client_that_takes_them() {
+    let with = compacting_session("compaction-cap", json!({"session": {"compaction": {}}})).await;
+    assert_eq!(
+        with.kinds(),
+        ["compaction_update", "agent_message_chunk"],
+        "{:?}",
+        with.updates
+    );
+    let update = &with.updates[0]["params"]["update"];
+    assert_eq!(update["status"], "completed");
+    assert!(update["compactionId"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(
+        update["summary"],
+        json!([{"type": "text", "text": "GOAL: keep the long note."}])
+    );
+    assert_eq!(with.text_of("agent_message_chunk"), "ok 4");
+
+    // Without the capability (or with it `null`), the notice is a message, as before.
+    for (name, capabilities) in [
+        ("compaction-none", json!({})),
+        ("compaction-null", json!({"session": {"compaction": null}})),
+    ] {
+        let without = compacting_session(name, capabilities).await;
+        assert_eq!(
+            without.kinds(),
+            ["agent_message_chunk", "agent_message_chunk"],
+            "{name}"
+        );
+        assert!(
+            without
+                .text_of("agent_message_chunk")
+                .contains("[compacted 1 messages into a summary]"),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unpriced_model_reports_its_context_but_no_cost() {
+    let exchange = usage_turn("usage-unpriced", "").await;
+    assert_eq!(exchange.usage.len(), 2);
+    for message in &exchange.usage {
+        let update = &message["params"]["update"];
+        assert!(update["size"].as_u64().unwrap() > 0, "{update}");
+        // Unknown, not zero: `cost` is left out.
+        assert!(update.get("cost").is_none(), "{update}");
+    }
 }
 
 #[tokio::test]

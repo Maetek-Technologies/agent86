@@ -691,7 +691,7 @@ impl<'a> RunPrinter<'a> {
 
     fn event(&mut self, event: TurnEvent<'_>) {
         match (self.mode, event) {
-            (None, _) | (_, TurnEvent::Thinking(_)) => {}
+            (None, _) | (_, TurnEvent::Thinking(_) | TurnEvent::Usage { .. }) => {}
             (Some(RunOutputMode::Full), event) => {
                 // Raw write + flush streams partial lines reliably across terminals.
                 let mut stdout = std::io::stdout().lock();
@@ -699,7 +699,9 @@ impl<'a> RunPrinter<'a> {
                 let _ = stdout.flush();
             }
             (Some(_), TurnEvent::Text(text)) => self.held.push((false, text.to_owned())),
-            (Some(_), TurnEvent::Notice(text)) => self.held.push((true, text.to_owned())),
+            (Some(_), TurnEvent::Notice(text) | TurnEvent::Compacted { notice: text, .. }) => {
+                self.held.push((true, text.to_owned()))
+            }
             (Some(_), event) => {
                 // Tools follow, so what the step said was narration, not the answer.
                 self.release(true);

@@ -320,6 +320,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
             seen.push(match event {
                 TurnEvent::Text(text) => format!("text {text:?}"),
                 TurnEvent::Notice(text) => format!("notice {text:?}"),
+                TurnEvent::Compacted { notice, .. } => format!("compacted {notice:?}"),
                 TurnEvent::Thinking(text) => format!("thinking {text:?}"),
                 TurnEvent::ToolCall { call, .. } => format!("call {} {}", call.id, call.name),
                 TurnEvent::ToolResult {
@@ -328,6 +329,10 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
                     observation,
                     ..
                 } => format!("result {} ok={} {observation:?}", call.id, result.ok),
+                TurnEvent::Usage { step, session } => format!(
+                    "usage step={} session={}",
+                    step.input_tokens, session.input_tokens
+                ),
             });
         })
         .await
@@ -338,14 +343,20 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         "the events carry exactly the streamed text"
     );
     assert_eq!(final_answer(&state.messages), "done");
+    // Each model call's usage follows its reply, with the session's running total.
+    let first = state.steps[0].usage.input_tokens;
+    let second = state.steps[1].usage.input_tokens;
+    assert!(first > 0 && second > 0, "the mock reports usage");
     assert_eq!(
         seen,
         [
-            "call a read_file",
-            "call b read_file",
-            r#"result a ok=true "remember the milk\n""#,
-            r#"result b ok=false "No such file: missing.txt""#,
-            r#"text "done""#,
+            format!("usage step={first} session={first}"),
+            "call a read_file".to_owned(),
+            "call b read_file".to_owned(),
+            r#"result a ok=true "remember the milk\n""#.to_owned(),
+            r#"result b ok=false "No such file: missing.txt""#.to_owned(),
+            r#"text "done""#.to_owned(),
+            format!("usage step={second} session={}", first + second),
         ]
     );
 }
