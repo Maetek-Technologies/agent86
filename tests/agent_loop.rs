@@ -18,7 +18,7 @@ use agent86::observability::Recorder;
 use agent86::otel::{Destination, Tracer};
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent86::router::{RoutedModel, Router};
-use agent86::session::AgentState;
+use agent86::session::{AgentState, SessionStore};
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::{final_answer, RunOutput};
 use agent86::types::{AgentPhase, ApprovalMode, Message, Role};
@@ -677,6 +677,97 @@ async fn provider_failures_mid_turn_surface_as_provider_errors() {
 
     assert!(matches!(error, HarnessError::Provider(_)), "{error:?}");
     assert_eq!(error.to_string(), "HTTP 400: bad request");
+}
+
+/// A harness on the mock model that saves into `store`.
+fn saving_harness(server: &MockServer, workspace: &Workspace, store: SessionStore) -> Harness {
+    Harness {
+        provider: std::sync::Arc::new(provider(server)),
+        router: Default::default(),
+        tracer: Default::default(),
+        registry: builtin_registry(),
+        context: ToolContext::new(&workspace.root).unwrap(),
+        limits: limits(),
+        agents: agents(),
+        system: system(),
+        max_tokens: 1024,
+        session_limits: Default::default(),
+        context_window: 128_000,
+        gate: ApprovalGate::new(ApprovalMode::Ask, None),
+        guardrails: guardrails(IngressMode::Warn, EgressMode::Warn),
+        recorder: Recorder::disabled(),
+        mcp: None,
+        memory: Some(store),
+        cancel: Default::default(),
+        subagents: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn each_finished_step_is_saved_before_the_turn_ends() {
+    // Beyond Python (checkpointing tier 1): the turn dies on its second model call,
+    // and nobody saves after it; the first step is in the store anyway, with every
+    // call answered and the phase still `execute`.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[
+            ("a", "list_dir", "{}"),
+            ("b", "read_file", r#"{"path":"notes.txt"}"#),
+        ]),
+        Reply::Status {
+            status: 400,
+            headers: Vec::new(),
+            body: "bad request".to_owned(),
+        },
+    ])
+    .await;
+    let workspace = Workspace::new("checkpoint");
+    let store = SessionStore::open(&workspace.root.join("memory.db")).unwrap();
+    let harness = saving_harness(&server, &workspace, store.clone());
+    let mut state = AgentState::new();
+    state.phase = AgentPhase::Done;
+    let error = harness
+        .run_turn(&mut state, "go", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(error, HarnessError::Provider(_)), "{error:?}");
+
+    let saved = store.load(&state.session_id).unwrap().unwrap();
+    assert_eq!(saved.phase, AgentPhase::Execute);
+    let roles: Vec<Role> = saved.messages.iter().map(|m| m.role).collect();
+    assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool, Role::Tool]);
+    assert_eq!(saved.messages[1].tool_calls.len(), 2);
+    assert_eq!(saved.messages[2].tool_call_id.as_deref(), Some("a"));
+    assert_eq!(saved.messages[3].tool_call_id.as_deref(), Some("b"));
+    assert!(saved.messages[3].content.contains("remember the milk"));
+    assert_eq!(saved.steps.len(), 1);
+    assert_eq!(saved.steps[0].results.len(), 2);
+    assert_eq!(saved.usage, saved.steps[0].usage);
+    // The caller's own save after the failure is what marks it an error.
+    assert_eq!(state.phase, AgentPhase::Error);
+}
+
+#[tokio::test]
+async fn a_failed_checkpoint_does_not_change_the_turn() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("a", "list_dir", "{}")]),
+        sse_text("Listed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("checkpoint-fails");
+    let path = workspace.root.join("memory.db");
+    let store = SessionStore::open(&path).unwrap();
+    // Every save now fails.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE sessions;")
+        .unwrap();
+    assert!(store.persist(&AgentState::new()).is_err());
+    let harness = saving_harness(&server, &workspace, store);
+    let mut state = AgentState::new();
+    let output = harness.run_turn(&mut state, "go", |_| {}).await.unwrap();
+    assert!(output.ends_with("Listed."), "{output}");
+    assert_eq!(state.phase, AgentPhase::Done);
+    assert_eq!(state.steps.len(), 2);
 }
 
 #[test]
