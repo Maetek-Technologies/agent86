@@ -70,6 +70,47 @@ pub const ASKER_META: &str = "com.maetek.agent86/subagent";
 /// The version of the state events' shape; a change that breaks a reader bumps it.
 pub const STATE_VERSION: u64 = 1;
 
+/// The capability the agent advertises in `agentCapabilities._meta` for its
+/// memory methods (beyond Python): list, pin, and forget single facts and
+/// episodes. A client calls them when it wants to; nothing is sent unasked, so
+/// no client capability is needed.
+pub const MEMORY_CAPABILITY: &str = "com.maetek.agent86/memory";
+/// The version of the memory methods' shapes.
+pub const MEMORY_VERSION: u64 = 1;
+/// `{sessionId, kind?, limit?, cursor?, pinned?}` to `{entries, nextCursor?}`.
+pub const MEMORY_LIST_METHOD: &str = "_com.maetek.agent86/memory/list";
+/// `{sessionId, kind?, id, pinned?}` to `{entry}`.
+pub const MEMORY_PIN_METHOD: &str = "_com.maetek.agent86/memory/pin";
+/// `{sessionId, kind?, id}` to `{}`.
+pub const MEMORY_FORGET_METHOD: &str = "_com.maetek.agent86/memory/forget";
+/// Entries per `memory/list` page when the client names no `limit`, and the most
+/// it may name.
+pub const MEMORY_PAGE: usize = 50;
+pub const MEMORY_PAGE_MAX: usize = 200;
+
+/// One memory method's request, checked (beyond Python).
+#[derive(Debug, Clone, Copy)]
+pub enum MemoryRequest {
+    List(crate::memory::ListQuery),
+    Pin {
+        kind: crate::memory::EntryKind,
+        id: i64,
+        pinned: bool,
+    },
+    Forget {
+        kind: crate::memory::EntryKind,
+        id: i64,
+    },
+}
+
+/// What a memory method found; text already redacted by the backend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemoryReply {
+    Entries(Vec<crate::memory::Entry>),
+    Entry(crate::memory::Entry),
+    Forgotten,
+}
+
 /// The ids of the two options a permission request offers. Only the allowing one
 /// approves: `allow-once` for a tool call, or, for a project specialty's file,
 /// `allow-always` (beyond Python), since agent86 remembers that answer by the
@@ -486,6 +527,26 @@ pub trait Backend: Send {
     /// obtained before the turn starts, since the turn borrows the backend.
     fn cancel_handle(&self, session_id: &str) -> Option<CancelHandle>;
 
+    /// Answer one of the memory methods for `session_id` (beyond Python): its
+    /// memory store, its vault's redaction over every text returned. An unknown
+    /// session or entry is `not_found`. Runs on the connection's thread, between
+    /// turns. A backend without memory leaves the methods unknown.
+    fn memory(
+        &mut self,
+        _session_id: &str,
+        request: MemoryRequest,
+    ) -> Result<MemoryReply, BackendError> {
+        let method = match request {
+            MemoryRequest::List(_) => MEMORY_LIST_METHOD,
+            MemoryRequest::Pin { .. } => MEMORY_PIN_METHOD,
+            MemoryRequest::Forget { .. } => MEMORY_FORGET_METHOD,
+        };
+        Err(BackendError {
+            code: METHOD_NOT_FOUND,
+            message: format!("Method not found: {method}"),
+        })
+    }
+
     /// Run one turn on `session_id` with the user's `text`, reporting through
     /// `sink` as it goes. Runs on a worker thread, and may block on `sink.ask`.
     fn prompt(
@@ -700,6 +761,9 @@ impl<B: Backend> Server<B> {
             | "session/list"
             | "session/prompt"
             | "session/set_config_option"
+            | MEMORY_LIST_METHOD
+            | MEMORY_PIN_METHOD
+            | MEMORY_FORGET_METHOD
                 if !self.initialized =>
             {
                 Err(BackendError {
@@ -714,6 +778,9 @@ impl<B: Backend> Server<B> {
             "session/prompt" => self.session_prompt(params, emit),
             "session/set_config_option" => self.set_config_option(params),
             "session/list" => self.session_list(params),
+            MEMORY_LIST_METHOD | MEMORY_PIN_METHOD | MEMORY_FORGET_METHOD => {
+                self.memory_method(method, params)
+            }
             other => Err(BackendError {
                 code: METHOD_NOT_FOUND,
                 message: format!("Method not found: {other}"),
@@ -771,6 +838,100 @@ impl<B: Backend> Server<B> {
             })
             .collect();
         Ok(json!({ "sessions": sessions }))
+    }
+
+    /// The memory methods (beyond Python). `kind` is `"fact"` (the default) or
+    /// `"episode"`; a list page is `limit` entries (default [`MEMORY_PAGE`], at
+    /// most [`MEMORY_PAGE_MAX`]) from an opaque `cursor`, newest first, and has a
+    /// `nextCursor` while more remain.
+    fn memory_method(&mut self, method: &str, params: &Value) -> Result<Value, BackendError> {
+        use crate::memory::{EntryKind, ListQuery};
+        let invalid =
+            |message: &str| BackendError::invalid_params(format!("Invalid params: {message}"));
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("sessionId must be a string"))?;
+        let kind = match params.get("kind") {
+            None | Some(Value::Null) => EntryKind::Fact,
+            Some(kind) if kind == "fact" => EntryKind::Fact,
+            Some(kind) if kind == "episode" => EntryKind::Episode,
+            Some(_) => return Err(invalid("kind must be \"fact\" or \"episode\"")),
+        };
+        let flag = |name: &str, default: bool| match params.get(name) {
+            None | Some(Value::Null) => Ok(default),
+            Some(Value::Bool(value)) => Ok(*value),
+            Some(_) => Err(invalid(&format!("{name} must be a boolean"))),
+        };
+        let id = || {
+            params
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| invalid("id must be an integer"))
+        };
+        let unexpected = || BackendError::internal("Internal error: unexpected memory reply");
+        match method {
+            MEMORY_LIST_METHOD => {
+                let limit = match params.get("limit") {
+                    None | Some(Value::Null) => MEMORY_PAGE,
+                    Some(limit) => limit
+                        .as_u64()
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .filter(|limit| (1..=MEMORY_PAGE_MAX).contains(limit))
+                        .ok_or_else(|| {
+                            invalid(&format!(
+                                "limit must be an integer from 1 to {MEMORY_PAGE_MAX}"
+                            ))
+                        })?,
+                };
+                let offset = match params.get("cursor") {
+                    None | Some(Value::Null) => 0,
+                    Some(Value::String(cursor)) => cursor
+                        .parse::<usize>()
+                        .map_err(|_| invalid("unknown cursor"))?,
+                    Some(_) => return Err(invalid("cursor must be a string")),
+                };
+                let query = ListQuery {
+                    kind,
+                    // One more than the page, to know whether another follows.
+                    limit: Some(limit + 1),
+                    offset,
+                    pinned_only: flag("pinned", false)?,
+                };
+                let MemoryReply::Entries(mut entries) = self
+                    .backend
+                    .memory(session_id, MemoryRequest::List(query))?
+                else {
+                    return Err(unexpected());
+                };
+                let more = entries.len() > limit;
+                entries.truncate(limit);
+                let mut result =
+                    json!({ "entries": entries.iter().map(entry_json).collect::<Vec<_>>() });
+                if more {
+                    result["nextCursor"] = json!((offset + limit).to_string());
+                }
+                Ok(result)
+            }
+            MEMORY_PIN_METHOD => {
+                let request = MemoryRequest::Pin {
+                    kind,
+                    id: id()?,
+                    pinned: flag("pinned", true)?,
+                };
+                match self.backend.memory(session_id, request)? {
+                    MemoryReply::Entry(entry) => Ok(json!({ "entry": entry_json(&entry) })),
+                    _ => Err(unexpected()),
+                }
+            }
+            _ => {
+                let request = MemoryRequest::Forget { kind, id: id()? };
+                match self.backend.memory(session_id, request)? {
+                    MemoryReply::Forgotten => Ok(json!({})),
+                    _ => Err(unexpected()),
+                }
+            }
+        }
     }
 
     /// Put the session's settings in `result` when it has any.
@@ -1277,6 +1438,32 @@ fn text_content(text: &str) -> Value {
     json!({ "type": "text", "text": text })
 }
 
+/// A fact or episode as the memory methods send it: `kind`, `id`, `text` (the
+/// fact, or the episode's task), `storedAt`, `pinned`, and when present
+/// `pinnedAt`, `category`, and an episode's `outcome` and `sessionId`.
+pub fn entry_json(entry: &crate::memory::Entry) -> Value {
+    let mut value = json!({
+        "kind": entry.kind.as_str(),
+        "id": entry.id,
+        "text": entry.text,
+        "storedAt": iso8601(entry.ts),
+        "pinned": entry.pinned(),
+    });
+    if let Some(at) = entry.pinned_at {
+        value["pinnedAt"] = json!(iso8601(at));
+    }
+    if let Some(category) = &entry.category {
+        value["category"] = json!(category);
+    }
+    if let Some(outcome) = &entry.outcome {
+        value["outcome"] = json!(outcome);
+    }
+    if let Some(session_id) = &entry.session_id {
+        value["sessionId"] = json!(session_id);
+    }
+    value
+}
+
 /// `seconds` since the Unix epoch as `2025-10-29T14:22:15Z`.
 pub fn iso8601(seconds: f64) -> String {
     let whole = seconds.max(0.0) as i64;
@@ -1583,7 +1770,8 @@ fn initialize(params: &Value) -> Result<Value, String> {
             // Advertised to every client, as the spec asks of extensions; only a
             // client that names it in its own capabilities is sent the events.
             "_meta": {
-                STATE_CAPABILITY: { "version": STATE_VERSION }
+                STATE_CAPABILITY: { "version": STATE_VERSION },
+                MEMORY_CAPABILITY: { "version": MEMORY_VERSION }
             }
         },
         "agentInfo": {
@@ -1765,9 +1953,58 @@ mod tests {
         /// The sessions listed, and the `cwd` each request asked about.
         saved: Vec<SessionSummary>,
         listed_for: Vec<Option<String>>,
+        /// The facts and episodes the memory methods act on; `None` leaves the
+        /// methods unknown, as the trait's default does.
+        memory: Option<Vec<crate::memory::Entry>>,
+        /// Each memory request, with its session.
+        memory_asked: Vec<(String, MemoryRequest)>,
     }
 
     impl Backend for Script {
+        fn memory(
+            &mut self,
+            session_id: &str,
+            request: MemoryRequest,
+        ) -> Result<MemoryReply, BackendError> {
+            let Some(entries) = &mut self.memory else {
+                return Err(BackendError {
+                    code: METHOD_NOT_FOUND,
+                    message: "Method not found".into(),
+                });
+            };
+            self.memory_asked.push((session_id.to_owned(), request));
+            let missing = || BackendError::not_found("No such entry");
+            match request {
+                MemoryRequest::List(query) => Ok(MemoryReply::Entries(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.kind == query.kind)
+                        .filter(|entry| !query.pinned_only || entry.pinned())
+                        .skip(query.offset)
+                        .take(query.limit.unwrap_or(usize::MAX))
+                        .cloned()
+                        .collect(),
+                )),
+                MemoryRequest::Pin { kind, id, pinned } => entries
+                    .iter_mut()
+                    .find(|entry| entry.kind == kind && entry.id == id)
+                    .map(|entry| {
+                        entry.pinned_at = pinned.then_some(1_700_000_100.0);
+                        MemoryReply::Entry(entry.clone())
+                    })
+                    .ok_or_else(missing),
+                MemoryRequest::Forget { kind, id } => {
+                    let before = entries.len();
+                    entries.retain(|entry| entry.kind != kind || entry.id != id);
+                    if entries.len() < before {
+                        Ok(MemoryReply::Forgotten)
+                    } else {
+                        Err(missing())
+                    }
+                }
+            }
+        }
+
         fn commands(&self, _session_id: &str) -> Vec<CommandInfo> {
             self.offered.clone()
         }
@@ -1939,6 +2176,212 @@ mod tests {
         assert_eq!(capabilities["mcpCapabilities"]["http"], true);
         assert_eq!(capabilities["mcpCapabilities"]["sse"], true);
         assert!(server.initialized());
+    }
+
+    fn fact(id: i64, text: &str) -> crate::memory::Entry {
+        crate::memory::Entry {
+            kind: crate::memory::EntryKind::Fact,
+            id,
+            ts: 1_700_000_000.0,
+            text: text.into(),
+            outcome: None,
+            session_id: None,
+            category: Some("fact".into()),
+            pinned_at: None,
+        }
+    }
+
+    fn memory_line(method: &str, params: Value) -> String {
+        json!({"jsonrpc":"2.0","id":9,"method":method,"params":params}).to_string()
+    }
+
+    /// A server whose backend holds facts 3, 2, and 1 (newest first) and one
+    /// episode.
+    fn with_memory() -> Server<Script> {
+        let mut server = ready();
+        let episode = crate::memory::Entry {
+            kind: crate::memory::EntryKind::Episode,
+            id: 1,
+            ts: 1_700_000_000.0,
+            text: "list the files".into(),
+            outcome: Some("README.md".into()),
+            session_id: Some("sess-1".into()),
+            category: None,
+            pinned_at: None,
+        };
+        server.backend.memory = Some(vec![
+            fact(3, "ship on fridays"),
+            fact(2, "the db is postgres"),
+            fact(1, "tabs, not spaces"),
+            episode,
+        ]);
+        server
+    }
+
+    #[test]
+    fn the_memory_methods_are_advertised_and_need_initialize() {
+        let mut server = Server::new(Script::default());
+        let early = one(
+            &mut server,
+            &memory_line(MEMORY_LIST_METHOD, json!({"sessionId": "s"})),
+        );
+        assert_eq!(early["error"]["code"], INVALID_REQUEST);
+        let init = one(&mut server, INITIALIZE);
+        assert_eq!(
+            init["result"]["agentCapabilities"]["_meta"][MEMORY_CAPABILITY],
+            json!({"version": 1})
+        );
+        // A backend without memory leaves the methods unknown.
+        let unknown = one(
+            &mut server,
+            &memory_line(MEMORY_LIST_METHOD, json!({"sessionId": "s"})),
+        );
+        assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn memory_list_pages_newest_first_in_its_shape() {
+        let mut server = with_memory();
+        let first = one(
+            &mut server,
+            &memory_line(MEMORY_LIST_METHOD, json!({"sessionId": "s", "limit": 2})),
+        );
+        assert_eq!(
+            first["result"],
+            json!({"entries": [
+                {"kind": "fact", "id": 3, "text": "ship on fridays",
+                 "storedAt": "2023-11-14T22:13:20Z", "pinned": false, "category": "fact"},
+                {"kind": "fact", "id": 2, "text": "the db is postgres",
+                 "storedAt": "2023-11-14T22:13:20Z", "pinned": false, "category": "fact"}
+            ], "nextCursor": "2"})
+        );
+        let rest = one(
+            &mut server,
+            &memory_line(
+                MEMORY_LIST_METHOD,
+                json!({"sessionId": "s", "limit": 2, "cursor": "2"}),
+            ),
+        );
+        let entries = rest["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], 1);
+        assert!(rest["result"].get("nextCursor").is_none());
+
+        let episodes = one(
+            &mut server,
+            &memory_line(
+                MEMORY_LIST_METHOD,
+                json!({"sessionId": "s", "kind": "episode"}),
+            ),
+        );
+        assert_eq!(
+            episodes["result"]["entries"],
+            json!([{"kind": "episode", "id": 1, "text": "list the files",
+                    "storedAt": "2023-11-14T22:13:20Z", "pinned": false,
+                    "outcome": "README.md", "sessionId": "sess-1"}])
+        );
+        // The backend was asked for one more than the page, from the cursor.
+        let (session, request) = &server.backend.memory_asked[1];
+        assert_eq!(session, "s");
+        let MemoryRequest::List(query) = request else {
+            panic!("{request:?}")
+        };
+        assert_eq!((query.limit, query.offset), (Some(3), 2));
+        let MemoryRequest::List(query) = &server.backend.memory_asked[2].1 else {
+            panic!()
+        };
+        assert_eq!(query.limit, Some(MEMORY_PAGE + 1));
+    }
+
+    #[test]
+    fn memory_pin_and_forget_answer_or_say_not_found() {
+        let mut server = with_memory();
+        let pinned = one(
+            &mut server,
+            &memory_line(MEMORY_PIN_METHOD, json!({"sessionId": "s", "id": 2})),
+        );
+        assert_eq!(pinned["result"]["entry"]["pinned"], true);
+        assert_eq!(
+            pinned["result"]["entry"]["pinnedAt"],
+            "2023-11-14T22:15:00Z"
+        );
+        let only = one(
+            &mut server,
+            &memory_line(
+                MEMORY_LIST_METHOD,
+                json!({"sessionId": "s", "pinned": true}),
+            ),
+        );
+        assert_eq!(only["result"]["entries"].as_array().unwrap().len(), 1);
+        let unpinned = one(
+            &mut server,
+            &memory_line(
+                MEMORY_PIN_METHOD,
+                json!({"sessionId": "s", "id": 2, "pinned": false}),
+            ),
+        );
+        assert_eq!(unpinned["result"]["entry"]["pinned"], false);
+        assert!(unpinned["result"]["entry"].get("pinnedAt").is_none());
+        let episode = one(
+            &mut server,
+            &memory_line(
+                MEMORY_PIN_METHOD,
+                json!({"sessionId": "s", "id": 1, "kind": "episode", "pinned": true}),
+            ),
+        );
+        assert_eq!(episode["result"]["entry"]["kind"], "episode");
+        let nowhere = one(
+            &mut server,
+            &memory_line(MEMORY_PIN_METHOD, json!({"sessionId": "s", "id": 99})),
+        );
+        assert_eq!(nowhere["error"]["code"], RESOURCE_NOT_FOUND);
+
+        let forgot = one(
+            &mut server,
+            &memory_line(MEMORY_FORGET_METHOD, json!({"sessionId": "s", "id": 3})),
+        );
+        assert_eq!(forgot["result"], json!({}));
+        let again = one(
+            &mut server,
+            &memory_line(MEMORY_FORGET_METHOD, json!({"sessionId": "s", "id": 3})),
+        );
+        assert_eq!(again["error"]["code"], RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn memory_params_are_checked_before_the_backend_is_asked() {
+        let mut server = with_memory();
+        for (method, params) in [
+            (MEMORY_LIST_METHOD, json!({})),
+            (MEMORY_LIST_METHOD, json!({"sessionId": 5})),
+            (
+                MEMORY_LIST_METHOD,
+                json!({"sessionId": "s", "kind": "facts"}),
+            ),
+            (MEMORY_LIST_METHOD, json!({"sessionId": "s", "limit": 0})),
+            (MEMORY_LIST_METHOD, json!({"sessionId": "s", "limit": 201})),
+            (MEMORY_LIST_METHOD, json!({"sessionId": "s", "limit": "5"})),
+            (MEMORY_LIST_METHOD, json!({"sessionId": "s", "cursor": 2})),
+            (
+                MEMORY_LIST_METHOD,
+                json!({"sessionId": "s", "cursor": "next"}),
+            ),
+            (
+                MEMORY_LIST_METHOD,
+                json!({"sessionId": "s", "pinned": "yes"}),
+            ),
+            (MEMORY_PIN_METHOD, json!({"sessionId": "s"})),
+            (MEMORY_PIN_METHOD, json!({"sessionId": "s", "id": "2"})),
+            (
+                MEMORY_PIN_METHOD,
+                json!({"sessionId": "s", "id": 2, "pinned": 1}),
+            ),
+            (MEMORY_FORGET_METHOD, json!({"sessionId": "s", "id": 2.5})),
+        ] {
+            let reply = one(&mut server, &memory_line(method, params.clone()));
+            assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{method} {params}");
+        }
+        assert!(server.backend.memory_asked.is_empty());
     }
 
     #[test]

@@ -148,7 +148,7 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] 1.0.19: file edits shown to editors as ACP `diff` content, with `locations` for following along, and the search tools' `search` kind (beyond Python)
 - [x] 1.0.20: context and cost in every editor (ACP's `usage_update`), compactions as `compaction_update`, and an opt-in extension (`com.maetek.agent86/state`) that shows agent86-web and other clients each model call's cost, sub-agents, guardrail verdicts, and routing (beyond Python)
 - [x] 1.0.21: approval context for parallel sub-agents (who asks, and the questions waiting), the session saved after every step, and ACP `session/resume` (beyond Python)
-- [ ] 1.0.22: memory you can list, pin, and forget, from the CLI and over ACP (beyond Python; planned)
+- [x] 1.0.22: memory you can list, pin, and forget: `agent86 memory list|pin|unpin|forget`, and the same for agent86-web and other clients through ACP extension methods (`com.maetek.agent86/memory`) (beyond Python)
 - [ ] 1.0.23: Google (Gemini), vLLM, and LM Studio providers: a native `google` adapter, and built-in `vllm` and `lmstudio` providers for local or remote servers (beyond Python; planned, see the project plan)
 - [ ] 1.0.24: scheduled jobs, which the agent schedules for itself and a per-user OS timer runs with no session open, pausing at an approval instead of failing (beyond Python; planned, see [docs/scheduling.md](docs/scheduling.md))
 - [ ] 1.1.0: vault secrets (`${secret:NAME}`) in MCP server settings (beyond Python; planned; the release roadmap is in the project plan)

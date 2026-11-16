@@ -102,6 +102,18 @@ Questions are asked one at a time, in the order they arrive, so specialists runn
 
 The `model_call`, `guardrail`, and `route` events are the flight recorder's own (the same kinds and field names as `~/.agent86/traces/trace.jsonl`, plus the fields named above), and every event, `subagent` and `questions` too (and the permission request's `_meta`), is redacted as the trace is: a secret from the vault becomes `${secret:NAME}`, and `[observability] redact` applies, so a client never sees more than the trace would hold. The events are sent whether or not the trace is written (`[observability] trace = false` turns off the file, not the events).
 
+## agent86's memory (an extension)
+
+Since 1.0.22, a client can show what the agent has learned and let the user correct it: list the stored facts (what `remember` keeps) and episodes (one per finished turn, recalled into similar later tasks), pin one so that pruning and retention never remove it, and forget one. These are the terminal's `agent86 memory list`, `pin`, `unpin`, and `forget`, on the same database. `initialize` advertises them as `agentCapabilities._meta["com.maetek.agent86/memory"] = {"version": 1}`. They are requests the client makes when it wants to, so it needs no capability of its own, and a client that never calls them sees nothing new. Each takes the `sessionId` of a session open on this connection, and works on that session's memory store, with every text passed through its vault (a secret's value becomes `${secret:NAME}`). Facts and episodes number their ids separately, so `kind` (`"fact"`, the default, or `"episode"`) says which one an `id` belongs to.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `_com.maetek.agent86/memory/list` | `sessionId`, `kind`, `limit` (1 to 200, default 50), `cursor`, `pinned` (`true` for pinned entries only) | `entries`, newest first, and `nextCursor` while more remain (pass it back as `cursor`) |
+| `_com.maetek.agent86/memory/pin` | `sessionId`, `kind`, `id`, `pinned` (default `true`; `false` unpins) | `entry`, as it now stands |
+| `_com.maetek.agent86/memory/forget` | `sessionId`, `kind`, `id` | `{}` |
+
+An entry is `kind`, `id`, `text` (the fact, or the episode's task), `storedAt` (ISO 8601, UTC), and `pinned`, plus `pinnedAt` when pinned, `category` (a fact's kind, `"fact"` for everything `remember` stores, or `"compaction"` for an episode that archives a compaction), and an episode's `outcome` and `sessionId` (the session it came from). An unknown session or id is error `-32002`; a session with memory off (`[memory] enabled = false`) is `-32600`; bad params are `-32602`. Like any other request, they are refused while a prompt turn runs.
+
 ## What is different from the terminal
 
 - **Settings come from where the editor starts agent86.** The project's `.agent86/config.toml` is the one in that directory, which is normally the project folder. A multi-folder window uses the folder the editor chose.
