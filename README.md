@@ -145,7 +145,7 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 - [x] Arguments a model sends as JSON strings where the tool wants an array or an object are repaired (beyond Python)
 - [x] Show or hide thinking and tool use in the interface: `full`, `summary`, or `hidden` for each, Ctrl+T and commands, `[ui] thinking` and `[ui] tool_use` (beyond Python)
 - [x] 1.0.19: search tools (`search_files`, `find_files`): read-only, jailed, `.gitignore`-aware search of file contents and paths, with no approval needed (beyond Python)
-- [ ] 1.0.19: file edits shown to editors as ACP diffs with locations (beyond Python; planned)
+- [x] 1.0.19: file edits shown to editors as ACP `diff` content, with `locations` for following along, and the search tools' `search` kind (beyond Python)
 - [ ] 1.0.20: ACP extensions that show editors and agent86-web the harness's own state: cost, sub-agents, guardrail verdicts, and routing (beyond Python; planned)
 - [ ] 1.0.21: approval context for parallel sub-agents, the session saved after every step, and ACP `session/resume` (beyond Python; planned)
 - [ ] 1.0.22: memory you can list, pin, and forget, from the CLI and over ACP (beyond Python; planned)

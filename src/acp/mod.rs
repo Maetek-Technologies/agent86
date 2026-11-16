@@ -65,6 +65,7 @@ pub const REJECT_ONCE: &str = "reject-once";
 pub enum ToolKind {
     Read,
     Edit,
+    Search,
     Execute,
     Fetch,
     Other,
@@ -75,12 +76,25 @@ impl ToolKind {
         match self {
             Self::Read => "read",
             Self::Edit => "edit",
+            Self::Search => "search",
             Self::Execute => "execute",
             Self::Fetch => "fetch",
             Self::Other => "other",
         }
     }
 }
+
+/// A file a tool call reads or changes (ACP's `ToolCallLocation`), so an editor can
+/// follow along (beyond Python).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    /// Absolute.
+    pub path: String,
+    /// 1-based: the first changed line, for an edit.
+    pub line: Option<usize>,
+}
+
+pub use crate::tools::FileChange;
 
 /// Something the agent reports while a prompt runs, sent as a `session/update`.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,10 +120,19 @@ pub enum Update {
         name: String,
         kind: ToolKind,
         raw_input: Value,
+        /// The files it touches, when known before it runs (beyond Python).
+        locations: Vec<Location>,
     },
     /// A tool call's outcome (`tool_call_update`, status `completed` or `failed`),
-    /// with the text the model is shown.
-    ToolResult { id: String, ok: bool, text: String },
+    /// with the text the model is shown, and, for a file write, the change as a
+    /// `diff` content item ahead of it, and where it changed (beyond Python).
+    ToolResult {
+        id: String,
+        ok: bool,
+        text: String,
+        diff: Option<FileChange>,
+        locations: Vec<Location>,
+    },
     /// A running tool call's progress (`tool_call_update`, status `in_progress`),
     /// whose text replaces the call's content: a sub-agent's log on its
     /// delegation's card (beyond Python).
@@ -174,6 +197,11 @@ pub struct PermissionRequest {
     pub raw_input: Value,
     /// What the call would do, in full: a diff, a command, or the arguments.
     pub text: String,
+    /// For a file write, the change as a `diff` content item, sent ahead of `text`
+    /// (beyond Python).
+    pub diff: Option<FileChange>,
+    /// The files the call touches (beyond Python).
+    pub locations: Vec<Location>,
     /// For a question whose answer the agent remembers (a project specialty's file),
     /// the name of the one allowing option, offered as `allow_always` in place of
     /// `allow_once`.
@@ -1268,27 +1296,42 @@ fn session_update(session_id: &str, update: &Update) -> Value {
             name,
             kind,
             raw_input,
-        } => json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": id,
-            "title": title,
-            "name": name,
-            "kind": kind.as_str(),
-            "status": "pending",
-            "rawInput": raw_input
-        }),
+            locations,
+        } => {
+            let mut body = json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": title,
+                "name": name,
+                "kind": kind.as_str(),
+                "status": "pending",
+                "rawInput": raw_input
+            });
+            with_locations(&mut body, locations);
+            body
+        }
         Update::ToolProgress { id, text } => json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": id,
             "status": "in_progress",
             "content": [{ "type": "content", "content": text_content(text) }]
         }),
-        Update::ToolResult { id, ok, text } => json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": id,
-            "status": if *ok { "completed" } else { "failed" },
-            "content": [{ "type": "content", "content": text_content(text) }]
-        }),
+        Update::ToolResult {
+            id,
+            ok,
+            text,
+            diff,
+            locations,
+        } => {
+            let mut body = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": id,
+                "status": if *ok { "completed" } else { "failed" },
+                "content": tool_content(diff.as_ref(), text)
+            });
+            with_locations(&mut body, locations);
+            body
+        }
     };
     json!({
         "jsonrpc": "2.0",
@@ -1297,19 +1340,51 @@ fn session_update(session_id: &str, update: &Update) -> Value {
     })
 }
 
+/// A tool call's `content`: the change as a `diff` item when there is one, then the
+/// text, which stays for clients that do not show diffs (beyond Python).
+fn tool_content(diff: Option<&FileChange>, text: &str) -> Value {
+    let mut items = Vec::new();
+    if let Some(change) = diff {
+        items.push(json!({
+            "type": "diff",
+            "path": change.path,
+            "oldText": change.old_text,
+            "newText": change.new_text
+        }));
+    }
+    items.push(json!({ "type": "content", "content": text_content(text) }));
+    Value::Array(items)
+}
+
+/// Add `locations` to a tool call or update, when there are any.
+fn with_locations(body: &mut Value, locations: &[Location]) {
+    if locations.is_empty() {
+        return;
+    }
+    body["locations"] = locations
+        .iter()
+        .map(|location| match location.line {
+            Some(line) => json!({ "path": location.path, "line": line }),
+            None => json!({ "path": location.path }),
+        })
+        .collect();
+}
+
 /// The parameters of `session/request_permission`: the call, in full, and the two
 /// choices. The text is what the user is deciding on, so it is the whole detail.
 fn permission_params(session_id: &str, request: &PermissionRequest) -> Value {
+    let mut tool_call = json!({
+        "toolCallId": request.tool_call_id,
+        "title": request.title,
+        "kind": request.kind.as_str(),
+        "status": "pending",
+        "rawInput": request.raw_input,
+        "content": tool_content(request.diff.as_ref(), &request.text)
+    });
+    with_locations(&mut tool_call, &request.locations);
     json!({
         "sessionId": session_id,
-        "toolCall": {
-            "toolCallId": request.tool_call_id,
-            "title": request.title,
-            "kind": request.kind.as_str(),
-            "status": "pending",
-            "rawInput": request.raw_input,
-            "content": [{ "type": "content", "content": text_content(&request.text) }]
-        },
+        "toolCall": tool_call,
         "options": match &request.remember {
             Some(name) => json!([
                 { "optionId": ALLOW_ALWAYS, "name": name, "kind": "allow_always" },
@@ -1988,6 +2063,20 @@ mod tests {
             name: "write_file".into(),
             kind: ToolKind::Edit,
             raw_input: json!({"path": "a.txt", "content": "x"}),
+            locations: vec![Location {
+                path: "/w/a.txt".into(),
+                line: None,
+            }],
+        }
+    }
+
+    /// The change `write_call` makes to `/w/a.txt`.
+    fn write_change() -> FileChange {
+        FileChange {
+            path: "/w/a.txt".into(),
+            old_text: Some("y\n".into()),
+            new_text: "x".into(),
+            line: Some(1),
         }
     }
 
@@ -1999,6 +2088,11 @@ mod tests {
             raw_input: json!({"path": "a.txt"}),
             text: "--- a/a.txt\n+++ b/a.txt".into(),
             remember: None,
+            diff: Some(write_change()),
+            locations: vec![Location {
+                path: "/w/a.txt".into(),
+                line: Some(1),
+            }],
         }
     }
 
@@ -2015,6 +2109,11 @@ mod tests {
                 id: "call_1".into(),
                 ok: true,
                 text: "Wrote 1 byte".into(),
+                diff: Some(write_change()),
+                locations: vec![Location {
+                    path: "/w/a.txt".into(),
+                    line: Some(1),
+                }],
             }),
         ];
         let events = server.sender();
@@ -2116,14 +2215,22 @@ mod tests {
         assert_eq!(call["kind"], "edit");
         assert_eq!(call["status"], "pending");
         assert_eq!(call["rawInput"]["path"], "a.txt");
+        assert_eq!(call["locations"], json!([{"path": "/w/a.txt"}]));
 
+        // The diff comes first, the text stays beside it for clients without diffs.
+        let diff = json!({"type": "diff", "path": "/w/a.txt", "oldText": "y\n", "newText": "x"});
         let request = &out[1];
         assert_eq!(request["id"], 0);
         assert_eq!(request["params"]["sessionId"], "sess_1");
         assert_eq!(request["params"]["toolCall"]["toolCallId"], "call_1");
+        assert_eq!(request["params"]["toolCall"]["content"][0], diff);
         assert_eq!(
-            request["params"]["toolCall"]["content"][0]["content"]["text"],
+            request["params"]["toolCall"]["content"][1]["content"]["text"],
             "--- a/a.txt\n+++ b/a.txt"
+        );
+        assert_eq!(
+            request["params"]["toolCall"]["locations"],
+            json!([{"path": "/w/a.txt", "line": 1}])
         );
         let options = request["params"]["options"].as_array().unwrap();
         assert_eq!(options[0]["optionId"], ALLOW_ONCE);
@@ -2134,7 +2241,12 @@ mod tests {
         let result = &out[2]["params"]["update"];
         assert_eq!(result["toolCallId"], "call_1");
         assert_eq!(result["status"], "completed");
-        assert_eq!(result["content"][0]["content"]["text"], "Wrote 1 byte");
+        assert_eq!(result["content"][0], diff);
+        assert_eq!(result["content"][1]["content"]["text"], "Wrote 1 byte");
+        assert_eq!(
+            result["locations"],
+            json!([{"path": "/w/a.txt", "line": 1}])
+        );
 
         assert_eq!(out[3]["result"]["stopReason"], "end_turn");
         assert_eq!(
@@ -2444,11 +2556,14 @@ mod tests {
                 name: "list_dir".into(),
                 kind: ToolKind::Read,
                 raw_input: json!({"path": "."}),
+                locations: Vec::new(),
             },
             Update::ToolResult {
                 id: "c1".into(),
                 ok: true,
                 text: "a.txt".into(),
+                diff: None,
+                locations: Vec::new(),
             },
             Update::Message("One file.".into()),
         ];
@@ -3215,9 +3330,17 @@ mod tests {
                 id: "c".into(),
                 ok: false,
                 text: "boom".into(),
+                diff: None,
+                locations: Vec::new(),
             },
         );
         assert_eq!(update["params"]["update"]["status"], "failed");
+        // No diff and no locations: one text item, and no `locations` key at all.
+        assert_eq!(
+            update["params"]["update"]["content"],
+            json!([{"type": "content", "content": {"type": "text", "text": "boom"}}])
+        );
+        assert!(update["params"]["update"].get("locations").is_none());
     }
 
     #[test]

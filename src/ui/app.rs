@@ -1915,6 +1915,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2058,6 +2059,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2087,6 +2089,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2111,6 +2114,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2418,6 +2422,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2442,6 +2447,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2458,6 +2464,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });
@@ -2479,6 +2486,7 @@ mod tests {
                 warning: None,
                 full: false,
                 agent: None,
+                change: None,
             },
             reply,
         });

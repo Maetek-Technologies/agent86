@@ -8,7 +8,7 @@
 //! `edit_file` preserves bytes: it remembers a file's BOM and CRLF line endings
 //! and writes them back, so a one-line edit does not rewrite every line.
 
-use super::{failure, success, Arguments, Tool, ToolContext, ToolError};
+use super::{failure, success, Arguments, FileChange, Tool, ToolContext, ToolError};
 use crate::difflib::{splitlines, unified_diff};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
@@ -405,6 +405,18 @@ impl Tool for WriteFileTool {
         })
     }
 
+    fn change(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<FileChange> {
+        let path = string_arg(args, &["path"])?;
+        let content = string_arg(args, &["content"])?;
+        let target = preview_target(path, ctx)?;
+        let current = current_text(&target, ctx);
+        if current.is_none() && binary_size(&target).is_some() {
+            // Over a file that is not text: there is no old text to show.
+            return None;
+        }
+        FileChange::capped(&target, current.as_deref(), content)
+    }
+
     fn execute(
         &self,
         args: &Map<String, Value>,
@@ -468,6 +480,9 @@ impl Tool for WriteFileTool {
         result.metadata.insert("path".to_owned(), json!(path));
         result.metadata.insert("diff".to_owned(), json!(diff));
         result.metadata.insert("created".to_owned(), json!(created));
+        if replaced_binary.is_none() {
+            FileChange::record_write(&target, existed.as_deref(), &content, &mut result.metadata);
+        }
         Ok(result)
     }
 }
@@ -574,6 +589,27 @@ impl Tool for EditFileTool {
         })
     }
 
+    fn change(&self, args: &Map<String, Value>, ctx: &ToolContext) -> Option<FileChange> {
+        let path = string_arg(args, &["path"])?;
+        let old = string_arg(args, &["old_string", "old"])?;
+        let new = string_arg(args, &["new_string", "new"])?;
+        let target = preview_target(path, ctx)?;
+        let current = current_text(&target, ctx)?;
+        // Only an edit that would run: the text is found, and found once unless
+        // every occurrence is replaced.
+        let count = current.matches(old).count();
+        let replace_all = args.get("replace_all").is_some_and(truthy);
+        if old.is_empty() || old == new || count == 0 || (count > 1 && !replace_all) {
+            return None;
+        }
+        let updated = if replace_all {
+            current.replace(old, new)
+        } else {
+            current.replacen(old, new, 1)
+        };
+        FileChange::capped(&target, Some(&current), &updated)
+    }
+
     fn execute(
         &self,
         args: &Map<String, Value>,
@@ -677,6 +713,12 @@ impl Tool for EditFileTool {
         result
             .metadata
             .insert("replacements".to_owned(), json!(replaced));
+        FileChange::record_write(
+            &target,
+            Some(&document.text),
+            &updated,
+            &mut result.metadata,
+        );
         Ok(result)
     }
 }

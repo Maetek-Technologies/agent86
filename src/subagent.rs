@@ -461,6 +461,7 @@ impl Harness {
             )),
             full: true,
             agent: Some(name.clone()),
+            change: None,
         };
         match self.gate.ask_specialty(call, &preview) {
             Some(true) => {
