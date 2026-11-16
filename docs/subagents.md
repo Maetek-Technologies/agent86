@@ -411,7 +411,8 @@ stderr, exits 1, and writes nothing to stdout, including with `--json`.
   this, because a shell can write files.
 - The built-ins' tools (settled 2026-10-31): `researcher` has `read_file`, `list_dir`,
   `web_fetch`, and `recall`; `reviewer` has `read_file`, `list_dir`, and `run_command`,
-  with `confirm: run_command`; `planner` has `read_file` and `list_dir`.
+  with `confirm: run_command`; `planner` has `read_file` and `list_dir`. All three
+  gained `search_files` and `find_files` when those tools landed (2026-11-15).
 - Project-level definitions are untrusted input (a cloned repo can ship one),
   and an instruction body is prompt text from the repo. The first use of a
   project specialty asks for approval, showing the file; the approval is
