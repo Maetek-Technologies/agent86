@@ -49,6 +49,37 @@ fn python_written_state_json_is_readable() {
     assert_eq!(again, state);
 }
 
+/// Beyond Python (checkpointing tier 1): a session saved at a step boundary, mid-
+/// turn. The fixture is what the harness saved when a turn died on its second model
+/// call (`tests/agent_loop.rs`), and was checked once against a local mirror of
+/// Python's pydantic models (`AgentState.model_validate_json`), so Python can load
+/// and continue a session cut off this way.
+#[test]
+fn a_mid_turn_state_is_written_as_the_fixture_python_reads() {
+    let text = fixture("session/mid_turn_state.json");
+    let state: AgentState = serde_json::from_str(&text).unwrap();
+    assert_eq!(state.phase, AgentPhase::Execute);
+    assert_eq!(state.last_turn, None);
+    let last = state.messages.last().unwrap();
+    assert_eq!(last.role, Role::Tool);
+    // Every call in the history has its answer.
+    let calls: Vec<&str> = state.messages[1]
+        .tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect();
+    let answered: Vec<&str> = state
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    assert_eq!(calls, answered);
+    // What Rust writes is exactly this shape.
+    let written: serde_json::Value = serde_json::to_value(&state).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(written, expected);
+}
+
 #[test]
 fn new_sessions_start_executing_with_a_fresh_id() {
     let first = AgentState::new();

@@ -92,6 +92,72 @@ impl Drop for Workspace {
     }
 }
 
+#[tokio::test]
+async fn a_run_killed_mid_turn_keeps_its_finished_steps_for_the_next_one() {
+    // Beyond Python (checkpointing tier 1): the process dies while the model is
+    // answering its second request; the first step was saved when it finished, so
+    // `run --session` goes on from it rather than from before the turn.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("a", "read_file", r#"{"path":"notes.txt"}"#)]),
+        Reply::StallAfter(String::new()),
+        sse_text("Carried on.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("checkpoint-kill", &server);
+    std::fs::write(workspace.project().join("notes.txt"), "remember the milk\n").unwrap();
+    let mut child = workspace
+        .command(&["run", "Read the notes"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while server.requests().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second request never came"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let store = agent86::session::SessionStore::open(
+        &workspace
+            .root
+            .join("home")
+            .join(".agent86")
+            .join("memory.db"),
+    )
+    .unwrap();
+    let sessions = store.recent_sessions(5).unwrap();
+    assert_eq!(sessions.len(), 1);
+    let id = sessions[0].session_id.clone();
+    let saved = store.load(&id).unwrap().unwrap();
+    assert_eq!(saved.phase, agent86::types::AgentPhase::Execute);
+    assert_eq!(saved.steps.len(), 1);
+    drop(store);
+
+    let output = workspace.run(&["run", "--session", &id, "Go on"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "Carried on.");
+    // The model saw the first step: the call and what it read.
+    let messages = server.requests()[2].body["messages"].clone();
+    let contents: Vec<&str> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["content"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        contents
+            .iter()
+            .any(|text| text.contains("remember the milk")),
+        "{messages}"
+    );
+    assert_eq!(contents.last().copied(), Some("Go on"));
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }

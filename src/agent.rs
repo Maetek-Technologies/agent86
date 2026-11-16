@@ -989,6 +989,7 @@ impl Harness {
                             usage: completion.usage,
                         },
                     );
+                    self.checkpoint(state);
                     emit(TurnEvent::Notice(EMPTY_ANSWER_NOTICE));
                     continue;
                 }
@@ -1059,6 +1060,7 @@ impl Harness {
                             usage: completion.usage,
                         },
                     );
+                    self.checkpoint(state);
                     continue;
                 }
             }
@@ -1082,6 +1084,7 @@ impl Harness {
                     continuation_parts.push(text);
                     state.messages.push(message(Role::User, CONTINUE_PROMPT));
                     record_step(state, step);
+                    self.checkpoint(state);
                     self.recorder.event(
                         &sid,
                         "continuation",
@@ -1207,10 +1210,24 @@ impl Harness {
             // Every call has an observation by now, including any skipped because
             // the cancel landed mid-batch.
             record_step(state, step);
+            self.checkpoint(state);
             if self.cancel.is_cancelled() {
                 self.cancelled(state, breaker.steps(), &mut emit);
                 return Ok(output);
             }
+        }
+    }
+
+    /// Save the session at a step boundary (beyond Python; checkpointing tier 1,
+    /// `docs/checkpointing.md`), so a process that dies mid-turn keeps the steps it
+    /// finished. Only called once every tool call in the history has its answer.
+    /// The phase reads `execute` until the turn ends, when every exit sets `done`
+    /// or `error`, so a saved state that still says `execute` is a turn cut off.
+    /// A failed write loses one checkpoint, never the turn.
+    fn checkpoint(&self, state: &mut AgentState) {
+        state.phase = AgentPhase::Execute;
+        if let Some(memory) = &self.memory {
+            let _ = memory.persist(state);
         }
     }
 

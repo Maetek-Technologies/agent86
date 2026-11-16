@@ -1,7 +1,7 @@
 # Checkpointing and resume: recovering a turn without starting over
 
-**Status:** design (not yet implemented)
-**Last updated:** 2026-11-04
+**Status:** tier 1 implemented (1.0.21); tiers 2 to 4 are design
+**Last updated:** 2026-11-16
 
 This document records a recommendation for making agent86 recover from a
 failure partway through a turn more cheaply and more safely. It came out of an
@@ -107,6 +107,16 @@ and the one the cancel path already keeps.
 | 4 | Verification hooks | The actual reliability gain | High (code execution, gaming) | Design first; decide later |
 
 ### Tier 1: save after every step
+
+**Built (2026-11-16, 1.0.21).** `Harness::checkpoint` in `src/agent.rs` saves
+at each step boundary and sets the phase to `execute`; every exit from the
+turn sets `done` or `error`. The mid-turn fixture is
+`tests/fixtures/session/mid_turn_state.json`, checked against a local mirror of
+Python's pydantic models; the tests are in `tests/agent_loop.rs` (a turn that
+dies after its first step, a save that fails), `tests/sessions.rs` (the
+fixture), and `tests/cli_run.rs` (a `run` killed mid-turn, then continued with
+`run --session`). The open question below about making it optional was
+settled as always on; the cost per step has not been measured.
 
 **What.** Call `persist` after each `record_step` inside the turn, in addition to
 the existing saves before and after the turn.
