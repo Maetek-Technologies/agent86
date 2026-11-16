@@ -191,6 +191,7 @@ impl SessionStore {
             }
             let connection = Connection::open(path)?;
             connection.execute_batch(SCHEMA)?;
+            connection.execute_batch(crate::memory::entries::PINS_SCHEMA)?;
             Ok(connection)
         })();
         opened

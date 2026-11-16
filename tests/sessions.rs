@@ -175,7 +175,9 @@ fn the_store_creates_its_directory_and_python_schema() {
         .map(Result::unwrap)
         .collect();
     tables.sort();
-    assert_eq!(tables, ["episodes", "memories", "sessions"]);
+    // Python's three tables, plus agent86's own pins (beyond Python), which
+    // Python never reads.
+    assert_eq!(tables, ["agent86_pins", "episodes", "memories", "sessions"]);
     let columns: Vec<String> = connection
         .prepare("SELECT name FROM pragma_table_info('sessions')")
         .unwrap()

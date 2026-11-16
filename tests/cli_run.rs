@@ -1497,6 +1497,116 @@ async fn finished_turns_are_recalled_into_later_similar_tasks() {
 }
 
 #[tokio::test]
+async fn memory_list_pin_and_forget_act_on_single_entries() {
+    let server = MockServer::start(vec![
+        sse_text("hello", "stop"),
+        sse_text("README.md", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_mock_provider("memory-entries", &server);
+    let run = workspace.run(&["run", "--json", "say hi"]).await;
+    assert!(run.status.success(), "{}", stderr(&run));
+    let memory = |args: &[&str]| workspace.command(args).output().unwrap();
+
+    let none = memory(&["memory", "list"]);
+    assert!(none.status.success(), "{}", stderr(&none));
+    assert_eq!(stdout(&none), "no facts yet\n");
+
+    {
+        let store = agent86::session::SessionStore::open(&workspace.memory_db()).unwrap();
+        let empty = serde_json::Map::new();
+        store
+            .add_memory("tabs, not spaces", "fact", &empty)
+            .unwrap();
+        // Stored text may be the model's: shown on one line, controls visible.
+        store
+            .add_memory("the db is\npostgres\u{1b}[31m", "fact", &empty)
+            .unwrap();
+    }
+
+    // A cell's width, as `print_table` pads it; the time is local, so only its
+    // shape is checked.
+    let listed = memory(&["memory", "list"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let lines: Vec<String> = stdout(&listed).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[0].starts_with("Id  Pinned  Stored            Text"),
+        "{lines:?}"
+    );
+    assert!(lines[1].starts_with("2           20"), "{lines:?}");
+    assert!(lines[1].ends_with("  the db is postgres␛[31m"), "{lines:?}");
+    assert!(lines[2].starts_with("1           20"), "{lines:?}");
+    assert!(lines[2].ends_with("  tabs, not spaces"), "{lines:?}");
+
+    let pinned = memory(&["memory", "pin", "1"]);
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    assert_eq!(stdout(&pinned), "Pinned fact 1.\n");
+    assert_eq!(
+        stdout(&memory(&["memory", "pin", "9"])),
+        "No fact with id 9.\n"
+    );
+    let only = memory(&["memory", "list", "--pinned"]);
+    let lines: Vec<String> = stdout(&only).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].starts_with("1   yes     20"), "{lines:?}");
+    assert_eq!(
+        stdout(&memory(&["memory", "list", "--pinned", "--episodes"])),
+        "no pinned episodes\n"
+    );
+
+    // A pinned fact outlives a prune that takes every other row.
+    let pruned = memory(&["memory", "prune", "--older-than", "0", "--memories", "-y"]);
+    assert!(pruned.status.success(), "{}", stderr(&pruned));
+    assert_eq!(
+        stdout(&pruned),
+        "Pruned 3 row(s): {'episodes': 1, 'sessions': 1, 'memories': 1}\n\
+         {'sessions': 0, 'episodes': 0, 'memories': 1}\n"
+    );
+    assert_eq!(
+        stdout(&memory(&["memory", "unpin", "1"])),
+        "Unpinned fact 1.\n"
+    );
+    assert_eq!(
+        stdout(&memory(&["memory", "forget", "1"])),
+        "Deleted memory 1.\n"
+    );
+
+    // Episodes: a second run records one, listed with its session and outcome.
+    let run = workspace.run(&["run", "--json", "list the files"]).await;
+    assert!(run.status.success(), "{}", stderr(&run));
+    let session = serde_json::from_str::<Value>(&stdout(&run)).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let episodes = memory(&["memory", "list", "--episodes", "-n", "-1"]);
+    let lines: Vec<String> = stdout(&episodes).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("Id  Pinned  Stored "), "{lines:?}");
+    assert!(lines[0].ends_with("Session       Task"), "{lines:?}");
+    assert!(
+        lines[1].ends_with(&format!("{session}  list the files  -> README.md")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        stdout(&memory(&["memory", "pin", "--episode", "2"])),
+        "Pinned episode 2.\n"
+    );
+    assert_eq!(
+        stdout(&memory(&["memory", "forget", "--episode", "2"])),
+        "Deleted episode 2.\n"
+    );
+    assert_eq!(
+        stdout(&memory(&["memory", "forget", "--episode", "2"])),
+        "No episode with id 2.\n"
+    );
+    assert_eq!(
+        stdout(&memory(&["memory", "list", "--episodes"])),
+        "no episodes yet\n"
+    );
+}
+
+#[tokio::test]
 async fn memory_commands_report_and_prune_the_store() {
     let server = MockServer::start(vec![sse_text("hello", "stop")]).await;
     let workspace = Workspace::with_mock_provider("memory-commands", &server);

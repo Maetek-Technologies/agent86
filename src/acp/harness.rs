@@ -31,14 +31,15 @@
 
 use super::{
     Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, FileChange,
-    Location, McpSpec, Notifier, Permission, PermissionRequest, SessionSummary, Stop, ToolKind,
-    TurnSink, Update,
+    Location, McpSpec, MemoryReply, MemoryRequest, Notifier, Permission, PermissionRequest,
+    SessionSummary, Stop, ToolKind, TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::{ApprovalPreview, Asker, Question};
 use crate::config::{Config, DisplayLevel, McpServerConfig};
 use crate::escape::show_controls;
 use crate::mcp::{var_ref_names, McpManager};
+use crate::memory::{Entry, EntryKind};
 use crate::pyjson::python_json_dumps;
 use crate::secrets::{NoSecretStore, OsKeyring, SharedStore};
 use crate::session::{AgentState, SessionStore};
@@ -1748,6 +1749,53 @@ impl Backend for HarnessBackend {
         ))
     }
 
+    /// The memory methods on the session's own store, every text through its
+    /// vault (beyond Python). A session without memory (`[memory] enabled =
+    /// false`, or a database that would not open) refuses them.
+    fn memory(
+        &mut self,
+        session_id: &str,
+        request: MemoryRequest,
+    ) -> Result<MemoryReply, BackendError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| BackendError::not_found(format!("Session not found: {session_id}")))?;
+        let Some(store) = &session.store else {
+            return Err(BackendError {
+                code: super::INVALID_REQUEST,
+                message: "Memory is off for this session".into(),
+            });
+        };
+        let secrets = &session.harness.context.secrets;
+        let failed = |error: crate::session::StoreError| BackendError::internal(error.to_string());
+        let missing = |kind: EntryKind, id: i64| {
+            BackendError::not_found(format!("No {} with id {id}", kind.as_str()))
+        };
+        match request {
+            MemoryRequest::List(query) => Ok(MemoryReply::Entries(
+                store
+                    .list_entries(query)
+                    .map_err(failed)?
+                    .into_iter()
+                    .map(|entry| redact_entry(entry, secrets))
+                    .collect(),
+            )),
+            MemoryRequest::Pin { kind, id, pinned } => store
+                .set_pinned(kind, id, pinned)
+                .map_err(failed)?
+                .map(|entry| MemoryReply::Entry(redact_entry(entry, secrets)))
+                .ok_or_else(|| missing(kind, id)),
+            MemoryRequest::Forget { kind, id } => {
+                if store.forget(kind, id).map_err(failed)? {
+                    Ok(MemoryReply::Forgotten)
+                } else {
+                    Err(missing(kind, id))
+                }
+            }
+        }
+    }
+
     fn cancel_handle(&self, session_id: &str) -> Option<CancelHandle> {
         let token = self.sessions.get(session_id)?.harness.cancel.clone();
         Some(Arc::new(move || token.cancel()))
@@ -1990,6 +2038,15 @@ fn replay(state: &AgentState, secrets: &crate::vault::SecretVault, cards: &Cards
     updates
 }
 
+/// A fact or episode with every vault value in its text replaced by the
+/// value's placeholder, as everything else bound for the editor is.
+fn redact_entry(mut entry: Entry, secrets: &crate::vault::SecretVault) -> Entry {
+    entry.text = secrets.redact(&entry.text);
+    entry.outcome = entry.outcome.map(|outcome| secrets.redact(&outcome));
+    entry.category = entry.category.map(|category| secrets.redact(&category));
+    entry
+}
+
 fn persist(store: &Option<SessionStore>, state: &AgentState) {
     if let Some(Err(error)) = store.as_ref().map(|store| store.persist(state)) {
         eprintln!("memory: could not save the session: {error}");
@@ -2193,6 +2250,29 @@ fn result_text(result: &ToolResult, observation: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn memory_entries_reach_the_editor_with_vault_values_as_placeholders() {
+        let secrets = crate::vault::SecretVault::default();
+        secrets.set("DEPLOY_TOKEN", "tok-0123456789".into());
+        let entry = Entry {
+            kind: EntryKind::Episode,
+            id: 4,
+            ts: 1_700_000_000.0,
+            text: "deploy with tok-0123456789".into(),
+            outcome: Some("used tok-0123456789".into()),
+            session_id: Some("sess-1".into()),
+            category: None,
+            pinned_at: None,
+        };
+        let shown = redact_entry(entry, &secrets);
+        assert_eq!(shown.text, "deploy with ${secret:DEPLOY_TOKEN}");
+        assert_eq!(
+            shown.outcome.as_deref(),
+            Some("used ${secret:DEPLOY_TOKEN}")
+        );
+        assert_eq!(shown.session_id.as_deref(), Some("sess-1"));
+    }
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall {

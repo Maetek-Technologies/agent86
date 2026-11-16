@@ -12,15 +12,18 @@
 //! `float32` BLOBs. Search is a brute-force cosine scan, as Python's store does
 //! without `sqlite-vec`; retention caps bound the log tables, though curated
 //! facts are never pruned automatically. Rows embedded with a different
-//! dimension (another embedder) are skipped, never compared.
+//! dimension (another embedder) are skipped, never compared. Beyond Python, a
+//! fact or episode can be pinned ([`entries`]), which exempts it from both.
 
 pub mod embeddings;
+pub mod entries;
 pub mod hub;
 pub mod sentence_transformers;
 pub mod working;
 
 use crate::session::{SessionStore, StoreError};
 use embeddings::{cosine, pack, unpack};
+pub use entries::{Entry, EntryKind, ListQuery};
 use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -146,12 +149,9 @@ impl SessionStore {
         )
     }
 
-    /// Delete one fact by id; `true` if a row was removed.
+    /// Delete one fact by id, pinned or not; `true` if a row was removed.
     pub fn delete_memory(&self, id: i64) -> Result<bool, StoreError> {
-        self.connection()
-            .execute("DELETE FROM memories WHERE id = ?1", params![id])
-            .map(|removed| removed > 0)
-            .map_err(error)
+        self.forget(EntryKind::Fact, id)
     }
 
     // ---- episodic and semantic facets ---------------------------------------
@@ -229,6 +229,8 @@ impl SessionStore {
 
     /// Apply retention limits, as Python's `prune`: episodes and sessions (the
     /// append-only log) always, curated facts only when `memories` is set.
+    /// Pinned rows are exempt and do not count toward `keep_last` (beyond
+    /// Python).
     pub fn prune(
         &self,
         older_than_days: Option<f64>,
@@ -252,12 +254,13 @@ impl SessionStore {
                 prune_table(&connection, Table::Memories, older_than_days, keep_last)?,
             ));
         }
+        entries::sweep_pins(&connection)?;
         Ok(removed)
     }
 
     /// Per-table retention caps for the log, as Python's `enforce_retention`. A cap
     /// of 0 disables it; facts are never touched. Only tables that lost rows are
-    /// reported.
+    /// reported. Pinned episodes are exempt and do not count toward the cap.
     pub fn enforce_retention(
         &self,
         max_episodes: i64,
@@ -278,6 +281,7 @@ impl SessionStore {
                 }
             }
         }
+        entries::sweep_pins(&connection)?;
         Ok(removed)
     }
 }
@@ -348,24 +352,36 @@ impl Table {
             Self::Memories => ("memories", "ts", "id"),
         }
     }
+
+    /// SQL true of the rows a prune may remove: every session, and the facts and
+    /// episodes that are not pinned.
+    fn prunable(self) -> String {
+        match self {
+            Self::Episodes => EntryKind::Episode.unpinned(),
+            Self::Sessions => "1".to_owned(),
+            Self::Memories => EntryKind::Fact.unpinned(),
+        }
+    }
 }
 
 /// Delete rows failing any given constraint and count them, as Python's
 /// `_prune_table`: a row survives only if it is newer than the age cutoff and
-/// among the `keep_last` most recent.
+/// among the `keep_last` most recent, or is pinned (beyond Python); pinned rows
+/// are left out of the `keep_last` count.
 fn prune_table(
     connection: &Connection,
     table: Table,
     older_than_days: Option<f64>,
     keep_last: Option<i64>,
 ) -> Result<i64, StoreError> {
+    let prunable = table.prunable();
     let (table, ts, id) = table.columns();
     let mut deleted = 0;
     if let Some(days) = older_than_days {
         let cutoff = now() - days * 86400.0;
         deleted += connection
             .execute(
-                &format!("DELETE FROM {table} WHERE {ts} < ?1"),
+                &format!("DELETE FROM {table} WHERE {ts} < ?1 AND {prunable}"),
                 params![cutoff],
             )
             .map_err(error)?;
@@ -374,8 +390,8 @@ fn prune_table(
         deleted += connection
             .execute(
                 &format!(
-                    "DELETE FROM {table} WHERE {id} NOT IN \
-                     (SELECT {id} FROM {table} ORDER BY {ts} DESC LIMIT ?1)"
+                    "DELETE FROM {table} WHERE {prunable} AND {id} NOT IN \
+                     (SELECT {id} FROM {table} WHERE {prunable} ORDER BY {ts} DESC LIMIT ?1)"
                 ),
                 params![keep.max(0)],
             )

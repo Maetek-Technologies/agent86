@@ -11,7 +11,7 @@
 mod support;
 
 use agent86::memory::embeddings::{build_embedder, pack, Embedder, HashingEmbedder};
-use agent86::memory::{Hit, COMPACTION_KIND};
+use agent86::memory::{Entry, EntryKind, Hit, ListQuery, COMPACTION_KIND};
 use agent86::session::SessionStore;
 use agent86::tools::memory::format_2f;
 use agent86::tools::{default_registry, Arguments, ToolContext};
@@ -377,4 +377,255 @@ fn compaction_strings_match_python() {
             .unwrap()
             .replace("{count}", "3")
     );
+}
+
+fn temp_store(name: &str) -> (SessionStore, PathBuf) {
+    let path =
+        std::env::temp_dir().join(format!("agent86-memory-{name}-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    (SessionStore::open(&path).unwrap(), path)
+}
+
+fn ids(entries: &[Entry]) -> Vec<i64> {
+    entries.iter().map(|entry| entry.id).collect()
+}
+
+fn all(kind: EntryKind) -> ListQuery {
+    ListQuery {
+        kind,
+        limit: None,
+        offset: 0,
+        pinned_only: false,
+    }
+}
+
+fn pinned_only(kind: EntryKind) -> ListQuery {
+    ListQuery {
+        pinned_only: true,
+        ..all(kind)
+    }
+}
+
+#[test]
+fn entries_list_newest_first_with_paging_and_what_each_kind_carries() {
+    let memory = store();
+    let first = memory
+        .add_memory("tabs, not spaces", "fact", &Map::new())
+        .unwrap();
+    let second = memory
+        .add_memory("the db is postgres", "fact", &Map::new())
+        .unwrap();
+    let third = memory
+        .add_memory("ship on fridays", "fact", &Map::new())
+        .unwrap();
+    let episode = memory
+        .add_episode("sess-1", "list the files", "README.md", &Map::new())
+        .unwrap();
+    let compaction = memory
+        .record_compaction("sess-1", "they listed files", &[])
+        .unwrap();
+
+    let facts = memory.list_entries(all(EntryKind::Fact)).unwrap();
+    assert_eq!(ids(&facts), [third, second, first]);
+    assert_eq!(facts[0].text, "ship on fridays");
+    assert_eq!(facts[0].category.as_deref(), Some("fact"));
+    assert_eq!(facts[0].outcome, None);
+    assert_eq!(facts[0].session_id, None);
+    assert!(!facts[0].pinned());
+    assert!(facts[0].ts > 1_700_000_000.0);
+
+    let page = memory
+        .list_entries(ListQuery {
+            limit: Some(1),
+            offset: 1,
+            ..all(EntryKind::Fact)
+        })
+        .unwrap();
+    assert_eq!(ids(&page), [second]);
+
+    let episodes = memory.list_entries(all(EntryKind::Episode)).unwrap();
+    assert_eq!(ids(&episodes), [compaction, episode]);
+    assert_eq!(episodes[0].category.as_deref(), Some(COMPACTION_KIND));
+    assert_eq!(episodes[1].text, "list the files");
+    assert_eq!(episodes[1].outcome.as_deref(), Some("README.md"));
+    assert_eq!(episodes[1].session_id.as_deref(), Some("sess-1"));
+    assert_eq!(episodes[1].category, None);
+
+    // Facts and episodes number their rows separately.
+    assert_eq!(
+        memory
+            .entry(EntryKind::Episode, episode)
+            .unwrap()
+            .unwrap()
+            .text,
+        "list the files"
+    );
+    assert_eq!(memory.entry(EntryKind::Fact, 99).unwrap(), None);
+}
+
+#[test]
+fn pins_are_kept_by_prune_and_retention_and_not_counted() {
+    let memory = store();
+    let facts: Vec<i64> = (0..4)
+        .map(|index| {
+            memory
+                .add_memory(&format!("fact {index}"), "fact", &Map::new())
+                .unwrap()
+        })
+        .collect();
+    let episodes: Vec<i64> = (0..4)
+        .map(|index| {
+            memory
+                .add_episode("s", &format!("task {index}"), "done", &Map::new())
+                .unwrap()
+        })
+        .collect();
+
+    // The oldest of each is pinned; pinning twice keeps the first time.
+    let pinned = memory
+        .set_pinned(EntryKind::Fact, facts[0], true)
+        .unwrap()
+        .unwrap();
+    let again = memory
+        .set_pinned(EntryKind::Fact, facts[0], true)
+        .unwrap()
+        .unwrap();
+    assert!(pinned.pinned());
+    assert_eq!(again.pinned_at, pinned.pinned_at);
+    memory
+        .set_pinned(EntryKind::Episode, episodes[0], true)
+        .unwrap();
+    assert_eq!(memory.set_pinned(EntryKind::Fact, 999, true).unwrap(), None);
+    assert_eq!(
+        ids(&memory.list_entries(pinned_only(EntryKind::Fact)).unwrap()),
+        [facts[0]]
+    );
+
+    // Retention's cap counts unpinned episodes only, so two of those three stay.
+    assert_eq!(
+        memory.enforce_retention(2, 0, 0.0).unwrap(),
+        [("episodes", 1)]
+    );
+    assert_eq!(
+        ids(&memory.list_entries(all(EntryKind::Episode)).unwrap()),
+        [episodes[3], episodes[2], episodes[0]]
+    );
+
+    // keep_last 1: the newest unpinned row and every pinned one survive.
+    assert_eq!(
+        memory.prune(None, Some(1), true).unwrap(),
+        [("episodes", 1), ("sessions", 0), ("memories", 2)]
+    );
+    assert_eq!(
+        ids(&memory.list_entries(all(EntryKind::Fact)).unwrap()),
+        [facts[3], facts[0]]
+    );
+
+    // An age cutoff that takes everything still leaves the pinned rows.
+    assert_eq!(
+        memory.prune(Some(0.0), None, true).unwrap(),
+        [("episodes", 1), ("sessions", 0), ("memories", 1)]
+    );
+    assert_eq!(
+        ids(&memory.list_entries(all(EntryKind::Fact)).unwrap()),
+        [facts[0]]
+    );
+    assert_eq!(
+        ids(&memory.list_entries(all(EntryKind::Episode)).unwrap()),
+        [episodes[0]]
+    );
+
+    // Unpinned, it goes like any other.
+    let unpinned = memory
+        .set_pinned(EntryKind::Fact, facts[0], false)
+        .unwrap()
+        .unwrap();
+    assert!(!unpinned.pinned());
+    assert_eq!(
+        memory.prune(Some(0.0), None, true).unwrap(),
+        [("episodes", 0), ("sessions", 0), ("memories", 1)]
+    );
+}
+
+#[test]
+fn forget_removes_a_pinned_entry_and_its_pin() {
+    let memory = store();
+    let fact = memory.add_memory("keep me", "fact", &Map::new()).unwrap();
+    let episode = memory
+        .add_episode("s", "task", "done", &Map::new())
+        .unwrap();
+    memory.set_pinned(EntryKind::Fact, fact, true).unwrap();
+    memory
+        .set_pinned(EntryKind::Episode, episode, true)
+        .unwrap();
+
+    assert!(memory.forget(EntryKind::Episode, episode).unwrap());
+    assert!(!memory.forget(EntryKind::Episode, episode).unwrap());
+    // `delete_memory` (Python's `memory forget`) is `forget` for a fact.
+    assert!(memory.delete_memory(fact).unwrap());
+    assert_eq!(memory.counts().unwrap().memories, 0);
+    assert!(memory
+        .list_entries(pinned_only(EntryKind::Fact))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn pins_leave_pythons_rows_untouched_and_survive_python_deleting_them() {
+    let (memory, path) = temp_store("pins");
+    let mut metadata = Map::new();
+    metadata.insert("source".into(), Value::from("test"));
+    let fact = memory.add_memory("tabs", "fact", &metadata).unwrap();
+    let episode = memory.add_episode("s", "task", "done", &metadata).unwrap();
+
+    let dump = || -> Vec<String> {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT id, ts, kind, text, hex(embedding), metadata_json FROM memories",
+            "SELECT id, session_id, ts, task, outcome, hex(embedding), metadata_json FROM episodes",
+        ] {
+            let mut statement = connection.prepare(sql).unwrap();
+            let count = statement.column_count();
+            let mut query = statement.query([]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                let cells: Vec<String> = (0..count)
+                    .map(|index| format!("{:?}", row.get_ref(index).unwrap()))
+                    .collect();
+                rows.push(cells.join("|"));
+            }
+        }
+        rows
+    };
+    let before = dump();
+    memory.set_pinned(EntryKind::Fact, fact, true).unwrap();
+    memory
+        .set_pinned(EntryKind::Episode, episode, true)
+        .unwrap();
+    assert_eq!(dump(), before);
+
+    // Python knows nothing of pins: its prune deletes the rows. The pins left
+    // behind never land on a new row, since `AUTOINCREMENT` never reuses an id,
+    // and the next prune here sweeps them away.
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute("DELETE FROM memories", []).unwrap();
+        connection.execute("DELETE FROM episodes", []).unwrap();
+    }
+    let newer = memory.add_memory("spaces", "fact", &Map::new()).unwrap();
+    assert!(newer > fact);
+    assert!(!memory
+        .entry(EntryKind::Fact, newer)
+        .unwrap()
+        .unwrap()
+        .pinned());
+    memory.prune(None, None, true).unwrap();
+    let pins: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM agent86_pins", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pins, 0);
+
+    drop(memory);
+    let _ = std::fs::remove_file(&path);
 }

@@ -716,6 +716,125 @@ async fn bad_session_requests_are_refused_without_running_anything() {
     assert!(server.requests().is_empty());
 }
 
+#[tokio::test]
+async fn an_editor_lists_pins_and_forgets_memory_in_the_shared_store() {
+    use agent86::acp::{MEMORY_FORGET_METHOD, MEMORY_LIST_METHOD, MEMORY_PIN_METHOD};
+    let server = MockServer::start(vec![]).await;
+    let workspace = Workspace::new("memory", Some(&server));
+    let db = workspace
+        .root
+        .join("home")
+        .join(".agent86")
+        .join("memory.db");
+    {
+        let store = agent86::session::SessionStore::open(&db).unwrap();
+        let empty = serde_json::Map::new();
+        store
+            .add_memory("tabs, not spaces", "fact", &empty)
+            .unwrap();
+        store
+            .add_memory("the db is postgres", "fact", &empty)
+            .unwrap();
+        store
+            .add_episode("old-session", "list the files", "README.md", &empty)
+            .unwrap();
+    }
+    let (listed, paged, pinned, forgotten, gone, unknown) = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let list = |client: &mut Client, params: Value| {
+                let mut params = params;
+                params["sessionId"] = json!(session);
+                client.request(MEMORY_LIST_METHOD, params).response
+            };
+            let listed = list(&mut client, json!({}));
+            let paged = list(&mut client, json!({"limit": 1}));
+            let pinned = client
+                .request(MEMORY_PIN_METHOD, json!({"sessionId": session, "id": 1}))
+                .response;
+            let forgotten = client
+                .request(
+                    MEMORY_FORGET_METHOD,
+                    json!({"sessionId": session, "kind": "episode", "id": 1}),
+                )
+                .response;
+            let gone = list(&mut client, json!({"kind": "episode"}));
+            let unknown = client
+                .request(MEMORY_LIST_METHOD, json!({"sessionId": "no-such-session"}))
+                .response;
+            client.finish();
+            (listed, paged, pinned, forgotten, gone, unknown)
+        }
+    })
+    .await
+    .unwrap();
+
+    let entries = listed["result"]["entries"].as_array().unwrap();
+    let texts: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        ["the db is postgres", "tabs, not spaces"],
+        "{listed}"
+    );
+    assert_eq!(entries[1]["id"], 1);
+    assert_eq!(entries[1]["kind"], "fact");
+    assert_eq!(entries[1]["pinned"], false);
+    assert!(entries[1]["storedAt"].as_str().unwrap().ends_with('Z'));
+    assert!(listed["result"].get("nextCursor").is_none());
+    assert_eq!(paged["result"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(paged["result"]["nextCursor"], "1");
+
+    assert_eq!(pinned["result"]["entry"]["pinned"], true, "{pinned}");
+    assert_eq!(pinned["result"]["entry"]["text"], "tabs, not spaces");
+    assert_eq!(forgotten["result"], json!({}), "{forgotten}");
+    assert_eq!(gone["result"]["entries"], json!([]));
+    assert_eq!(unknown["error"]["code"], -32002);
+    assert!(server.requests().is_empty());
+
+    // It is the database the terminal reads: the pin and the deletion are there.
+    let store = agent86::session::SessionStore::open(&db).unwrap();
+    let fact = store
+        .entry(agent86::memory::EntryKind::Fact, 1)
+        .unwrap()
+        .unwrap();
+    assert!(fact.pinned());
+    assert_eq!(
+        store.entry(agent86::memory::EntryKind::Episode, 1).unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn memory_methods_say_when_the_session_has_no_memory() {
+    use agent86::acp::MEMORY_LIST_METHOD;
+    let server = MockServer::start(vec![]).await;
+    let workspace =
+        Workspace::with_config("memory-off", Some(&server), "[memory]\nenabled = false\n");
+    let reply = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let reply = client
+                .request(MEMORY_LIST_METHOD, json!({"sessionId": session}))
+                .response;
+            client.finish();
+            reply
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reply["error"]["code"], -32600, "{reply}");
+    assert_eq!(reply["error"]["message"], "Memory is off for this session");
+}
+
 const WRITE: (&str, &str, &str) = (
     "call_w",
     "write_file",

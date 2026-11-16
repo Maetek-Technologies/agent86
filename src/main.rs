@@ -4,6 +4,7 @@ use agent86::config::{home_dir, load_config, Config, ConfigPaths, Overrides, Run
 use agent86::keys;
 use agent86::limits::{LimitKind, LimitOverrides};
 use agent86::mcp::McpManager;
+use agent86::memory::{Entry, EntryKind, ListQuery};
 use agent86::observability::{
     otlp_document, parse_since, python_repr_value, read_trace, trace_generations, TraceFilter,
     SPAN_KINDS,
@@ -200,11 +201,52 @@ enum MemoryCommand {
         yes: bool,
     },
 
-    /// Delete a single semantic fact by id.
+    /// List stored facts (or episodes), newest first, with their ids.
+    List {
+        /// List episodes (finished turns) instead of facts.
+        #[arg(long)]
+        episodes: bool,
+
+        /// Only pinned entries.
+        #[arg(long)]
+        pinned: bool,
+
+        /// Max entries to show (negative for all).
+        #[arg(short = 'n', long, default_value_t = 20, allow_negative_numbers = true)]
+        limit: i64,
+    },
+
+    /// Pin a fact (or episode), so prune and retention never remove it.
+    Pin {
+        /// Id of the fact or episode (see list).
+        #[arg(allow_negative_numbers = true)]
+        id: i64,
+
+        /// The id is an episode's, not a fact's.
+        #[arg(long, visible_alias = "episodes")]
+        episode: bool,
+    },
+
+    /// Unpin a fact (or episode).
+    Unpin {
+        /// Id of the fact or episode (see list).
+        #[arg(allow_negative_numbers = true)]
+        id: i64,
+
+        /// The id is an episode's, not a fact's.
+        #[arg(long, visible_alias = "episodes")]
+        episode: bool,
+    },
+
+    /// Delete a single semantic fact (or episode) by id.
     Forget {
-        /// Id of the semantic memory to delete (see search).
+        /// Id of the semantic memory to delete (see search or list).
         #[arg(allow_negative_numbers = true)]
         mem_id: i64,
+
+        /// Delete an episode instead of a fact.
+        #[arg(long, visible_alias = "episodes")]
+        episode: bool,
     },
 }
 
@@ -1286,13 +1328,133 @@ fn memory_command(config: &Config, command: MemoryCommand, stderr: &Stderr) -> E
                 Err(error) => return failed(error),
             }
         }
-        MemoryCommand::Forget { mem_id } => match store.delete_memory(mem_id) {
-            Ok(true) => style.line("\x1b[32m", &format!("Deleted memory {mem_id}."), ""),
-            Ok(false) => style.line("\x1b[33m", &format!("No memory with id {mem_id}."), ""),
-            Err(error) => return failed(error),
-        },
+        MemoryCommand::List {
+            episodes,
+            pinned,
+            limit,
+        } => {
+            let kind = entry_kind(episodes);
+            let entries = match store.list_entries(ListQuery {
+                kind,
+                limit: usize::try_from(limit).ok(),
+                offset: 0,
+                pinned_only: pinned,
+            }) {
+                Ok(entries) => entries,
+                Err(error) => return failed(error),
+            };
+            if entries.is_empty() {
+                let noun = match kind {
+                    EntryKind::Fact => "facts",
+                    EntryKind::Episode => "episodes",
+                };
+                let message = if pinned {
+                    format!("no pinned {noun}")
+                } else {
+                    format!("no {noun} yet")
+                };
+                stdout_dim(&message, stderr);
+            } else {
+                print_entries(&entries, &style);
+            }
+        }
+        MemoryCommand::Pin { id, episode } | MemoryCommand::Unpin { id, episode } => {
+            let pin = matches!(command, MemoryCommand::Pin { .. });
+            let kind = entry_kind(episode);
+            match store.set_pinned(kind, id, pin) {
+                Ok(Some(_)) => style.line(
+                    "\x1b[32m",
+                    &format!(
+                        "{} {} {id}.",
+                        if pin { "Pinned" } else { "Unpinned" },
+                        kind.as_str()
+                    ),
+                    "",
+                ),
+                Ok(None) => style.line(
+                    "\x1b[33m",
+                    &format!("No {} with id {id}.", kind.as_str()),
+                    "",
+                ),
+                Err(error) => return failed(error),
+            }
+        }
+        MemoryCommand::Forget { mem_id, episode } => {
+            // Python's words for a fact; the same shape for an episode.
+            let noun = if episode { "episode" } else { "memory" };
+            match store.forget(entry_kind(episode), mem_id) {
+                Ok(true) => style.line("\x1b[32m", &format!("Deleted {noun} {mem_id}."), ""),
+                Ok(false) => style.line("\x1b[33m", &format!("No {noun} with id {mem_id}."), ""),
+                Err(error) => return failed(error),
+            }
+        }
     }
     ExitCode::SUCCESS
+}
+
+fn entry_kind(episode: bool) -> EntryKind {
+    if episode {
+        EntryKind::Episode
+    } else {
+        EntryKind::Fact
+    }
+}
+
+/// `memory list`'s table: one line per entry, its text on one line with control
+/// characters shown (stored text may be the model's), an episode's task and
+/// outcome cut at 80 characters, as `memory search` cuts the outcome.
+fn print_entries(entries: &[Entry], style: &Styled) {
+    let episodes = entries
+        .first()
+        .is_some_and(|entry| entry.kind == EntryKind::Episode);
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|entry| {
+            let mut row = vec![
+                entry.id.to_string(),
+                if entry.pinned() { "yes" } else { "" }.to_owned(),
+                local_time(entry.ts),
+            ];
+            if episodes {
+                row.push(entry.session_id.clone().unwrap_or_else(|| "-".to_owned()));
+                let outcome = one_line(entry.outcome.as_deref().unwrap_or_default(), 80);
+                row.push(format!(
+                    "{}  {}",
+                    one_line(&entry.text, 80),
+                    style.paint("\x1b[2m", &format!("-> {outcome}"))
+                ));
+            } else {
+                row.push(one_line(&entry.text, usize::MAX));
+            }
+            row
+        })
+        .collect();
+    if episodes {
+        print_table(&["Id", "Pinned", "Stored", "Session", "Task"], &rows);
+    } else {
+        print_table(&["Id", "Pinned", "Stored", "Text"], &rows);
+    }
+}
+
+/// `text` on one line (whitespace runs as one space), control characters shown,
+/// cut to `max` characters with `...`.
+fn one_line(text: &str, max: usize) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let shown = agent86::escape::show_controls(&joined);
+    if shown.chars().count() > max {
+        shown.chars().take(max).collect::<String>() + "..."
+    } else {
+        shown
+    }
+}
+
+/// Seconds since the epoch as local `YYYY-MM-DD HH:MM`.
+fn local_time(seconds: f64) -> String {
+    chrono::DateTime::from_timestamp(seconds as i64, 0).map_or_else(String::new, |time| {
+        time.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
 }
 
 /// The counts as Python prints the dict: `{'sessions': 1, 'episodes': 2, 'memories': 0}`.
