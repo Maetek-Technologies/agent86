@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{sse_text, MockServer};
+use support::{sse_text, sse_tool_calls, MockServer};
 
 const VALUE: &str = "tok_9f8e7d6c5b4a3921";
 
@@ -232,4 +232,143 @@ async fn without_a_keyring_there_is_nothing_to_load_and_the_command_says_how() {
     .unwrap();
     assert!(listing.contains("no secrets for this project"), "{listing}");
     assert!(listing.contains("Enter it at a terminal"), "{listing}");
+}
+
+/// A turn's sink that keeps every update and every question, and allows them all.
+#[derive(Default)]
+struct Recorded {
+    updates: Mutex<Vec<Update>>,
+    asked: Mutex<Vec<PermissionRequest>>,
+}
+
+impl TurnSink for Recorded {
+    fn update(&self, update: Update) {
+        self.updates.lock().unwrap().push(update);
+    }
+    fn ask(&self, request: PermissionRequest) -> Permission {
+        self.asked.lock().unwrap().push(request);
+        Permission::Allowed
+    }
+    fn call(&self, _: &str, _: Value, _: Option<Duration>) -> Result<Value, String> {
+        Err("no editor".into())
+    }
+}
+
+#[tokio::test]
+async fn an_expanded_secret_comes_back_to_the_editor_as_its_placeholder_in_every_diff() {
+    let dirs = Dirs::new("diff");
+    let project = dirs.root.join("project").canonicalize().unwrap();
+    let keyring = Arc::new(FakeKeyring::default());
+    let terminal = ToolContext::new(&project).unwrap();
+    terminal
+        .secrets
+        .attach_store(keyring.clone(), terminal.policy.workspace());
+    terminal
+        .secrets
+        .accept(
+            "API_TOKEN",
+            SecretAnswer {
+                value: VALUE.to_owned(),
+                remember: true,
+            },
+        )
+        .unwrap();
+
+    // The model writes the placeholder into `.env`, then edits the line holding it,
+    // so the edit's old text read back from the disk holds the value.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "c1",
+            "write_file",
+            r#"{"path":".env","content":"TOKEN=${secret:API_TOKEN}\n"}"#,
+        )]),
+        sse_tool_calls(&[(
+            "c2",
+            "edit_file",
+            r#"{"path":".env","old_string":"TOKEN=","new_string":"API_TOKEN="}"#,
+        )]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let config_file = dirs.root.join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!(
+            "[model]\ndefault = \"mock:test/model\"\n\n[providers.mock]\nbase_url = \"{}\"\nmax_retries = 0\n\n[memory]\nenabled = false\n\n[observability]\ntrace = false\n\n[ui]\ntool_use = \"full\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let config = load_config(
+        &ConfigPaths {
+            user: None,
+            project: config_file,
+            project_trust: ProjectTrust::Trusted,
+        },
+        &Overrides::default(),
+    )
+    .unwrap();
+    let store: SharedStore = keyring.clone();
+    let home = dirs.root.join("home");
+    let sink = Arc::new(Recorded::default());
+    tokio::task::spawn_blocking({
+        let project = project.clone();
+        let sink = Arc::clone(&sink);
+        move || {
+            let mut backend = HarnessBackend::with_secret_store(config, Some(store))
+                .unwrap()
+                .with_home(Some(home));
+            let session = backend.new_session(&project, Vec::new()).unwrap();
+            let sink: Arc<dyn TurnSink> = sink;
+            backend
+                .prompt(&session, "Set up the env file", sink)
+                .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    // The file holds the value: the expansion really happened.
+    let written = std::fs::read_to_string(project.join(".env"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(written, format!("API_TOKEN={VALUE}\n"));
+
+    let placeholder = "${secret:API_TOKEN}";
+    let path = agent86::tools::display_path(&project.join(".env"));
+    let asked = sink.asked.lock().unwrap();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    let write = asked[0].diff.as_ref().expect("the write's diff");
+    assert_eq!(write.path, path);
+    assert_eq!(write.old_text, None);
+    assert_eq!(write.new_text, format!("TOKEN={placeholder}\n"));
+    let edit = asked[1].diff.as_ref().expect("the edit's diff");
+    assert_eq!(
+        edit.old_text.as_deref(),
+        Some(format!("TOKEN={placeholder}\n").as_str())
+    );
+    assert_eq!(edit.new_text, format!("API_TOKEN={placeholder}\n"));
+
+    let updates = sink.updates.lock().unwrap();
+    let diffs: Vec<&agent86::acp::FileChange> = updates
+        .iter()
+        .filter_map(|update| match update {
+            Update::ToolResult { diff, .. } => diff.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(diffs.len(), 2, "{updates:?}");
+    assert_eq!(diffs[0].new_text, format!("TOKEN={placeholder}\n"));
+    assert_eq!(
+        diffs[1].old_text.as_deref(),
+        Some(format!("TOKEN={placeholder}\n").as_str())
+    );
+    assert_eq!(diffs[1].new_text, format!("API_TOKEN={placeholder}\n"));
+
+    // Nothing the editor was sent held the value, anywhere.
+    let everything = format!("{asked:?}{updates:?}");
+    assert!(!everything.contains(VALUE), "{everything}");
+    for request in server.requests() {
+        assert!(!request.body.to_string().contains(VALUE));
+    }
 }

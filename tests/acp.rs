@@ -710,12 +710,28 @@ async fn an_approved_write_is_asked_about_then_done() {
     let request = &exchange.requests[0]["params"];
     assert_eq!(request["toolCall"]["toolCallId"], "call_w");
     assert_eq!(request["toolCall"]["kind"], "edit");
-    // The user sees what would be written: the tool's own preview.
-    let shown = request["toolCall"]["content"][0]["content"]["text"]
+    // The user sees what would be written: a diff of a new file (no old text),
+    // then the tool's own preview as text, for a client that does not show diffs.
+    let out_path =
+        agent86::tools::display_path(&workspace.project().canonicalize().unwrap().join("out.txt"));
+    assert_eq!(
+        request["toolCall"]["content"][0],
+        json!({"type": "diff", "path": out_path, "oldText": null, "newText": "hi\n"})
+    );
+    let shown = request["toolCall"]["content"][1]["content"]["text"]
         .as_str()
         .unwrap();
     assert!(shown.contains("new file: out.txt"), "{shown}");
     assert!(shown.contains("hi"), "{shown}");
+    assert_eq!(
+        request["toolCall"]["locations"],
+        json!([{"path": out_path, "line": 1}])
+    );
+    // The call was announced with where it writes, before anyone was asked.
+    assert_eq!(
+        exchange.updates[0]["params"]["update"]["locations"],
+        json!([{"path": out_path}])
+    );
     let ids: Vec<&str> = request["options"]
         .as_array()
         .unwrap()
@@ -728,8 +744,156 @@ async fn an_approved_write_is_asked_about_then_done() {
     let done = &exchange.updates[1]["params"]["update"];
     assert_eq!(done["toolCallId"], "call_w");
     assert_eq!(done["status"], "completed");
+    // What was written, as a diff, ahead of the text the model was shown.
+    assert_eq!(
+        done["content"][0],
+        json!({"type": "diff", "path": out_path, "oldText": null, "newText": "hi\n"})
+    );
+    assert_eq!(done["content"][1]["type"], "content");
+    assert_eq!(done["locations"], json!([{"path": out_path, "line": 1}]));
     assert_eq!(exchange.text_of("agent_message_chunk"), "All done.");
     assert_eq!(exchange.response["result"]["stopReason"], "end_turn");
+}
+
+/// One auto-approved turn in `name`'s workspace (holding `files`) in which the
+/// model makes `calls`, then says it is done.
+async fn file_turn(
+    name: &str,
+    files: &[(&str, &str)],
+    calls: &[(&str, &str, &str)],
+) -> (Exchange, Workspace) {
+    let server =
+        MockServer::start(vec![sse_tool_calls(calls), sse_text("All done.", "stop")]).await;
+    let workspace = Workspace::with_config(
+        name,
+        Some(&server),
+        "[guardrails]\napproval = \"auto\"\n\n[ui]\ntool_use = \"full\"\n",
+    );
+    for (path, text) in files {
+        std::fs::write(workspace.project().join(path), text).unwrap();
+    }
+    let exchange = tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let exchange = client.prompt(&session, "Change the files");
+            client.finish();
+            exchange
+        }
+    })
+    .await
+    .unwrap();
+    (exchange, workspace)
+}
+
+/// The completed `tool_call_update` for `id`.
+fn completed<'a>(exchange: &'a Exchange, id: &str) -> &'a Value {
+    exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "tool_call_update" && update["toolCallId"] == id)
+        .unwrap_or_else(|| panic!("no update for {id}"))
+}
+
+#[tokio::test]
+async fn an_edit_is_a_diff_of_the_whole_file_at_its_first_changed_line() {
+    let (exchange, workspace) = file_turn(
+        "diff-edit",
+        &[("notes.txt", "one\ntwo\nthree\n")],
+        &[(
+            "call_e",
+            "edit_file",
+            r#"{"path":"notes.txt","old_string":"three","new_string":"THREE"}"#,
+        )],
+    )
+    .await;
+    let path = agent86::tools::display_path(
+        &workspace
+            .project()
+            .canonicalize()
+            .unwrap()
+            .join("notes.txt"),
+    );
+
+    let call = &exchange.updates[0]["params"]["update"];
+    assert_eq!(call["kind"], "edit");
+    assert_eq!(call["locations"], json!([{"path": path}]));
+    let done = completed(&exchange, "call_e");
+    assert_eq!(done["status"], "completed");
+    assert_eq!(
+        done["content"][0],
+        json!({
+            "type": "diff",
+            "path": path,
+            "oldText": "one\ntwo\nthree\n",
+            "newText": "one\ntwo\nTHREE\n"
+        })
+    );
+    // The text item is still there, holding the unified diff the model saw.
+    let text = done["content"][1]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("-three\n+THREE"), "{text}");
+    assert_eq!(done["locations"], json!([{"path": path, "line": 3}]));
+}
+
+#[tokio::test]
+async fn a_file_over_the_cap_keeps_only_the_text_and_its_location() {
+    let big = "x\n".repeat(agent86::tools::MAX_CHANGE_TEXT_BYTES / 2 + 1);
+    let content = format!("{big}tail\n");
+    let arguments = json!({"path": "big.txt", "content": content}).to_string();
+    let (exchange, workspace) = file_turn(
+        "diff-cap",
+        &[("big.txt", &big)],
+        &[("call_b", "write_file", &arguments)],
+    )
+    .await;
+    let path =
+        agent86::tools::display_path(&workspace.project().canonicalize().unwrap().join("big.txt"));
+
+    let done = completed(&exchange, "call_b");
+    assert_eq!(done["status"], "completed");
+    let content = done["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{content:?}");
+    assert_eq!(content[0]["type"], "content");
+    assert!(content[0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("+tail"));
+    let line = agent86::tools::MAX_CHANGE_TEXT_BYTES / 2 + 2;
+    assert_eq!(done["locations"], json!([{"path": path, "line": line}]));
+}
+
+#[tokio::test]
+async fn reads_carry_their_path_and_searches_their_kind() {
+    let (exchange, workspace) = file_turn(
+        "diff-kinds",
+        &[("a.txt", "needle\n")],
+        &[
+            ("call_r", "read_file", r#"{"path":"a.txt"}"#),
+            ("call_s", "search_files", r#"{"pattern":"needle"}"#),
+            ("call_f", "find_files", r#"{"pattern":"*.txt"}"#),
+        ],
+    )
+    .await;
+    let path =
+        agent86::tools::display_path(&workspace.project().canonicalize().unwrap().join("a.txt"));
+
+    let calls: Vec<&Value> = exchange
+        .updates
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "tool_call")
+        .collect();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["kind"], "read");
+    assert_eq!(calls[0]["locations"], json!([{"path": path}]));
+    assert_eq!(calls[1]["kind"], "search");
+    assert_eq!(calls[2]["kind"], "search");
+    assert!(calls[1].get("locations").is_none());
+    let found = completed(&exchange, "call_s");
+    assert_eq!(found["content"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1196,7 +1360,10 @@ fn tool_result_text(exchange: &Exchange) -> String {
         .iter()
         .map(|message| &message["params"]["update"])
         .find(|update| update["sessionUpdate"] == "tool_call_update")
-        .expect("a call finished")["content"][0]["content"]["text"]
+        .expect("a call finished")["content"]
+        .as_array()
+        .and_then(|content| content.last())
+        .expect("content")["content"]["text"]
         .as_str()
         .unwrap()
         .to_owned()
@@ -1256,10 +1423,13 @@ async fn writes_land_in_the_editor_and_the_approval_shows_the_change_from_its_bu
         )],
     )
     .await;
-    // The user was shown the change from what the editor holds.
-    let shown = exchange.requests[0]["params"]["toolCall"]["content"][0]["content"]["text"]
-        .as_str()
-        .unwrap();
+    // The user was shown the change from what the editor holds, as a diff and as
+    // text.
+    let content = &exchange.requests[0]["params"]["toolCall"]["content"];
+    assert_eq!(content[0]["type"], "diff");
+    assert_eq!(content[0]["oldText"], "unsaved\n");
+    assert_eq!(content[0]["newText"], "replaced\n");
+    let shown = content[1]["content"]["text"].as_str().unwrap();
     assert!(
         shown.contains("-unsaved") && shown.contains("+replaced"),
         "{shown}"

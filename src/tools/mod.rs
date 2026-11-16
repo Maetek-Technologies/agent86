@@ -104,6 +104,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Beyond Python: the file text this call would change, before and after, for a
+    /// surface that shows a reviewable diff (an editor over ACP). Receives the raw
+    /// arguments (already expanded, for a tool that [`Tool::expands_secrets`]) and
+    /// must never fail; `None` when the call would not change a text file, or when
+    /// either side is over [`MAX_CHANGE_TEXT_BYTES`].
+    fn change(&self, _args: &Map<String, Value>, _ctx: &ToolContext) -> Option<FileChange> {
+        None
+    }
+
     /// What [`Tool::preview`] is written in (`diff`, `bash`, `python`), as Python's
     /// `preview_lexer`, so the interface can colour it.
     fn preview_lexer(&self) -> Option<&'static str> {
@@ -150,6 +159,119 @@ pub trait Tool: Send + Sync {
             result.name = self.name().to_owned();
         }
         result
+    }
+}
+
+/// Beyond Python: the most text, in bytes, a [`FileChange`] keeps on either side.
+/// Above it only the unified diff is kept, as before.
+pub const MAX_CHANGE_TEXT_BYTES: usize = 256 * 1024;
+
+/// Beyond Python: a text file's contents before and after a write, for an editor to
+/// show as a diff (ACP's `diff` content). `write_file` and `edit_file` put one in
+/// their result's metadata (`abs_path`, `old_text`, `new_text`, `line`) and give one
+/// for the approval ([`Tool::change`]); `dispatch` and `build_preview` redact it, so
+/// an expanded `${secret:NAME}` comes back as its placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// Absolute, jail-resolved, without Windows' `\\?\` prefix.
+    pub path: String,
+    /// `None` for a new file.
+    pub old_text: Option<String>,
+    pub new_text: String,
+    /// The first changed line, 1-based; `None` when nothing changes.
+    pub line: Option<usize>,
+}
+
+impl FileChange {
+    /// The change, unless either side is over [`MAX_CHANGE_TEXT_BYTES`].
+    pub fn capped(target: &Path, old_text: Option<&str>, new_text: &str) -> Option<Self> {
+        let over = |text: &str| text.len() > MAX_CHANGE_TEXT_BYTES;
+        if over(new_text) || old_text.is_some_and(over) {
+            return None;
+        }
+        Some(Self {
+            path: display_path(target),
+            old_text: old_text.map(str::to_owned),
+            new_text: new_text.to_owned(),
+            line: first_changed_line(old_text, new_text),
+        })
+    }
+
+    /// The change with every vault value replaced by its placeholder.
+    pub fn redacted(mut self, secrets: &crate::vault::SecretVault) -> Self {
+        if !secrets.is_empty() {
+            self.path = secrets.redact(&self.path);
+            self.old_text = self.old_text.map(|text| secrets.redact(&text));
+            self.new_text = secrets.redact(&self.new_text);
+        }
+        self
+    }
+
+    /// Put this change into a result's metadata.
+    pub fn record(&self, metadata: &mut Map<String, Value>) {
+        metadata.insert("abs_path".to_owned(), json!(self.path));
+        metadata.insert("old_text".to_owned(), json!(self.old_text));
+        metadata.insert("new_text".to_owned(), json!(self.new_text));
+        metadata.insert("line".to_owned(), json!(self.line));
+    }
+
+    /// Record a write of `target` from `old_text` to `new_text` in a result's
+    /// metadata: the whole change under the cap, else only where it is
+    /// (`abs_path` and `line`), beside the unified diff the tool keeps anyway.
+    pub fn record_write(
+        target: &Path,
+        old_text: Option<&str>,
+        new_text: &str,
+        metadata: &mut Map<String, Value>,
+    ) {
+        match Self::capped(target, old_text, new_text) {
+            Some(change) => change.record(metadata),
+            None => {
+                metadata.insert("abs_path".to_owned(), json!(display_path(target)));
+                metadata.insert(
+                    "line".to_owned(),
+                    json!(first_changed_line(old_text, new_text)),
+                );
+            }
+        }
+    }
+
+    /// The change a result's metadata records, if it holds one.
+    pub fn from_metadata(metadata: &Map<String, Value>) -> Option<Self> {
+        Some(Self {
+            path: metadata.get("abs_path")?.as_str()?.to_owned(),
+            old_text: match metadata.get("old_text")? {
+                Value::Null => None,
+                value => Some(value.as_str()?.to_owned()),
+            },
+            new_text: metadata.get("new_text")?.as_str()?.to_owned(),
+            line: metadata
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|line| usize::try_from(line).ok()),
+        })
+    }
+}
+
+/// The first line, 1-based, where `new` differs from `old` (line 1 for a new file),
+/// or `None` when they are the same.
+pub fn first_changed_line(old: Option<&str>, new: &str) -> Option<usize> {
+    let Some(old) = old else {
+        return Some(1);
+    };
+    if old == new {
+        return None;
+    }
+    let mut old_lines = old.split('\n');
+    let mut new_lines = new.split('\n');
+    let mut line: usize = 1;
+    loop {
+        match (old_lines.next(), new_lines.next()) {
+            (Some(a), Some(b)) if a == b => line += 1,
+            // A change at the very end (lines removed) is shown at the last line left.
+            (Some(_), None) => return Some(line.saturating_sub(1).max(1)),
+            _ => return Some(line),
+        }
     }
 }
 

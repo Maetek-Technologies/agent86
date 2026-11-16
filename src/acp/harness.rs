@@ -30,8 +30,9 @@
 //! A server that fails to start is reported on stderr and the session goes on.
 
 use super::{
-    Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, McpSpec,
-    Notifier, Permission, PermissionRequest, SessionSummary, Stop, ToolKind, TurnSink, Update,
+    Backend, BackendError, CancelHandle, ClientCapabilities, CommandInfo, ConfigOption, FileChange,
+    Location, McpSpec, Notifier, Permission, PermissionRequest, SessionSummary, Stop, ToolKind,
+    TurnSink, Update,
 };
 use crate::agent::{Harness, HarnessError, TurnEvent};
 use crate::approval::ApprovalPreview;
@@ -133,6 +134,8 @@ struct Presenter {
     thought: Option<(std::time::Instant, usize)>,
     /// The session's tool call ids and cards, shared with the sub-agent observer.
     cards: Cards,
+    /// The jail, to report the files a call touches as absolute `locations`.
+    policy: Option<crate::tools::SandboxPolicy>,
 }
 
 /// How many lines of a sub-agent's log its card shows; earlier ones are counted.
@@ -227,7 +230,14 @@ impl Presenter {
             tools,
             thought: None,
             cards,
+            policy: None,
         }
+    }
+
+    /// Report the files calls touch, resolved through `policy`.
+    fn with_policy(mut self, policy: crate::tools::SandboxPolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     fn cards(&self) -> std::sync::MutexGuard<'_, CardState> {
@@ -262,6 +272,7 @@ impl Presenter {
             } else {
                 Value::Null
             },
+            locations: call_locations(call, self.policy.as_ref(), secrets),
         });
     }
 
@@ -314,10 +325,17 @@ impl Presenter {
                     (DisplayLevel::Full, _) | (_, false) => result_text(result, observation),
                     _ => crate::agent::summarize(result),
                 };
+                // The diff is what an editor reviews, so it is sent at `summary` too.
+                let locations = match result_location(result) {
+                    Some(location) => vec![location],
+                    None => call_locations(call, self.policy.as_ref(), secrets),
+                };
                 sink.update(Update::ToolResult {
                     id,
                     ok: result.ok,
                     text,
+                    diff: result_diff(result),
+                    locations,
                 });
             }
             _ => {}
@@ -371,6 +389,7 @@ fn on_subagent(
                     name: "agent".into(),
                     kind: ToolKind::Other,
                     raw_input: json!({ "agent": name, "task": secrets.redact(task) }),
+                    locations: Vec::new(),
                 });
             }
             let line = if *depth <= 1 {
@@ -401,6 +420,8 @@ fn on_subagent(
                         id: own,
                         ok: result.ok,
                         text: clean(&result_text(result, &result.content)),
+                        diff: result_diff(result),
+                        locations: result_location(result).into_iter().collect(),
                     });
                 }
             }
@@ -446,7 +467,13 @@ fn on_subagent(
                 // `/agent`'s card: its answer arrives as the reply, so the card
                 // ends with its log.
                 let text = state.card_text(&id);
-                sink.update(Update::ToolResult { id, ok: *ok, text });
+                sink.update(Update::ToolResult {
+                    id,
+                    ok: *ok,
+                    text,
+                    diff: None,
+                    locations: Vec::new(),
+                });
             }
         }
     }
@@ -607,12 +634,21 @@ impl HarnessBackend {
                 // A sub-agent's call was never shown: it is announced first, so the
                 // question names a call the editor has.
                 let title = labeled(preview, title(call, &hook_secrets));
+                // The change was built from the caller's own jail (a sub-agent's
+                // worktree included) and redacted with the preview.
+                let locations: Vec<Location> = preview
+                    .change
+                    .as_ref()
+                    .map(change_location)
+                    .into_iter()
+                    .collect();
                 let id = announce_for_question(
                     &hook_cards,
                     running.as_ref(),
                     call,
                     &title,
                     &hook_secrets,
+                    &locations,
                 );
                 let request = PermissionRequest {
                     tool_call_id: id,
@@ -621,6 +657,8 @@ impl HarnessBackend {
                     raw_input: redacted_input(call, &hook_secrets),
                     text: approval_text(preview),
                     remember: None,
+                    diff: preview.change.clone(),
+                    locations,
                 };
                 running.ask(request) == Permission::Allowed
             },
@@ -642,6 +680,7 @@ impl HarnessBackend {
                     call,
                     &title,
                     &hook_secrets,
+                    &[],
                 );
                 let request = PermissionRequest {
                     tool_call_id: id,
@@ -650,6 +689,8 @@ impl HarnessBackend {
                     raw_input: redacted_input(call, &hook_secrets),
                     text: approval_text(preview),
                     remember: Some(format!("Allow this version of {name}")),
+                    diff: None,
+                    locations: Vec::new(),
                 };
                 running.ask(request) == Permission::Allowed
             },
@@ -1395,7 +1436,8 @@ impl Backend for HarnessBackend {
             session.thinking,
             session.tool_view,
             Arc::clone(&session.cards),
-        );
+        )
+        .with_policy(session.harness.context.policy.clone());
         let Session {
             harness,
             store,
@@ -1568,15 +1610,20 @@ fn replay(state: &AgentState, secrets: &crate::vault::SecretVault, cards: &Cards
                         name: call.name.clone(),
                         kind: tool_kind(&call.name),
                         raw_input: redacted_input(call, secrets),
+                        locations: Vec::new(),
                     });
                 }
             }
+            // The saved message holds what the model was shown, not the result's
+            // metadata, so a replayed write has no diff.
             Role::Tool => {
                 if let Some(id) = &message.tool_call_id {
                     updates.push(Update::ToolResult {
                         id: cards.lookup(id),
                         ok: true,
                         text: message.content.clone(),
+                        diff: None,
+                        locations: Vec::new(),
                     });
                 }
             }
@@ -1597,6 +1644,7 @@ pub fn tool_kind(name: &str) -> ToolKind {
     match name {
         "read_file" | "list_dir" => ToolKind::Read,
         "write_file" | "edit_file" => ToolKind::Edit,
+        "search_files" | "find_files" => ToolKind::Search,
         "run_command" | "python_exec" => ToolKind::Execute,
         "web_fetch" => ToolKind::Fetch,
         _ => ToolKind::Other,
@@ -1656,6 +1704,7 @@ fn announce_for_question(
     call: &ToolCall,
     title: &str,
     secrets: &crate::vault::SecretVault,
+    locations: &[Location],
 ) -> String {
     let mut state = cards.lock().unwrap_or_else(PoisonError::into_inner);
     let id = state.lookup(&call.id);
@@ -1666,9 +1715,68 @@ fn announce_for_question(
             name: call.name.clone(),
             kind: tool_kind(&call.name),
             raw_input: redacted_input(call, secrets),
+            locations: locations.to_vec(),
         });
     }
     id
+}
+
+/// The tools whose `path` argument names one file they read or write.
+const FILE_TOOLS: [&str; 3] = ["read_file", "write_file", "edit_file"];
+
+/// Where `call` reads or writes, before it runs (beyond Python): the absolute,
+/// jail-resolved path for the file tools, redacted; nothing for the rest, or for
+/// a path the jail refuses (the call will fail and say so).
+fn call_locations(
+    call: &ToolCall,
+    policy: Option<&crate::tools::SandboxPolicy>,
+    secrets: &crate::vault::SecretVault,
+) -> Vec<Location> {
+    let path = FILE_TOOLS
+        .contains(&call.name.as_str())
+        .then(|| call.arguments.get("path").and_then(Value::as_str))
+        .flatten();
+    match (policy, path) {
+        (Some(policy), Some(path)) => match policy.resolve_within(path) {
+            Ok(target) => vec![Location {
+                path: secrets.redact(&crate::tools::display_path(&target)),
+                line: None,
+            }],
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Where a change lands: its file, at the first changed line.
+fn change_location(change: &FileChange) -> Location {
+    Location {
+        path: change.path.clone(),
+        line: change.line,
+    }
+}
+
+/// The change a file tool recorded in its result, for a `diff` content item.
+/// `dispatch` redacted it already, so a secret is its placeholder here.
+fn result_diff(result: &ToolResult) -> Option<FileChange> {
+    if !result.ok {
+        return None;
+    }
+    FileChange::from_metadata(&result.metadata)
+}
+
+/// Where a file tool's write landed, from its result (recorded even when the texts
+/// were over the cap and left out).
+fn result_location(result: &ToolResult) -> Option<Location> {
+    let path = result.metadata.get("abs_path")?.as_str()?;
+    Some(Location {
+        path: path.to_owned(),
+        line: result
+            .metadata
+            .get("line")
+            .and_then(Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok()),
+    })
 }
 
 /// The call's arguments for the editor, with every vault value replaced by its
@@ -1994,6 +2102,8 @@ mod tests {
         assert_eq!(tool_kind("list_dir"), ToolKind::Read);
         assert_eq!(tool_kind("write_file"), ToolKind::Edit);
         assert_eq!(tool_kind("edit_file"), ToolKind::Edit);
+        assert_eq!(tool_kind("search_files"), ToolKind::Search);
+        assert_eq!(tool_kind("find_files"), ToolKind::Search);
         assert_eq!(tool_kind("run_command"), ToolKind::Execute);
         assert_eq!(tool_kind("python_exec"), ToolKind::Execute);
         assert_eq!(tool_kind("web_fetch"), ToolKind::Fetch);
@@ -2027,6 +2137,7 @@ mod tests {
             warning: None,
             full: false,
             agent: None,
+            change: None,
         };
         let text = approval_text(&preview);
         assert!(text.starts_with("--- a/a"));

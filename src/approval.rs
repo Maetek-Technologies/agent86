@@ -36,6 +36,10 @@ pub struct ApprovalPreview {
     /// Beyond Python: the specialist sub-agent asking (or, for a project specialty's
     /// own approval, its name), so a surface can say who asks.
     pub agent: Option<String>,
+    /// Beyond Python: the file text the call would change, before and after, for
+    /// a surface that shows a reviewable diff (an editor over ACP). Built from the
+    /// expanded call, then redacted, as `detail` is.
+    pub change: Option<crate::tools::FileChange>,
 }
 
 /// The caution for a write into agent86's own configuration or skills.
@@ -294,20 +298,21 @@ pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> App
             text.chars().take(SUMMARY_LIMIT).collect::<String>()
         )
     };
+    let expanded = crate::tools::with_secrets(tool, call, ctx)
+        .map_or_else(|_| call.arguments.clone(), |call| call.arguments.clone());
     ApprovalPreview {
         summary,
         detail: tool
-            .preview(
-                &crate::tools::with_secrets(tool, call, ctx)
-                    .map_or_else(|_| call.arguments.clone(), |call| call.arguments.clone()),
-                ctx,
-            )
+            .preview(&expanded, ctx)
             .map(|detail| ctx.secrets.redact(&detail))
             .filter(|detail| !detail.is_empty()),
         lexer: tool.preview_lexer(),
         warning: None,
         full: false,
         agent: None,
+        change: tool
+            .change(&expanded, ctx)
+            .map(|change| change.redacted(&ctx.secrets)),
     }
 }
 
@@ -425,6 +430,7 @@ mod tests {
             warning: None,
             full: false,
             agent: None,
+            change: None,
         }
     }
 

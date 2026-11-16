@@ -3,7 +3,10 @@
 mod support;
 
 use agent86::approval::{build_preview, ApprovalGate, ApprovalPreview, ApprovalPrompt};
-use agent86::tools::{builtin_registry, ToolContext};
+use agent86::tools::{
+    builtin_registry, display_path, first_changed_line, FileChange, ToolContext,
+    MAX_CHANGE_TEXT_BYTES,
+};
 use agent86::types::{ApprovalMode, ToolCall, ToolResult};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -1054,4 +1057,105 @@ fn without_an_editor_nothing_changes() {
         dispatch(&ctx, "read_file", json!({"path": "a.txt"})).content,
         "new\n"
     );
+}
+
+/// The change a result or a preview carries, for an editor's diff (beyond Python).
+fn change_of(ctx: &ToolContext, name: &str, arguments: Value) -> Option<FileChange> {
+    let registry = builtin_registry();
+    let tool = registry.get(name).unwrap();
+    build_preview(tool.as_ref(), &call(name, arguments), ctx).change
+}
+
+#[test]
+fn writes_record_the_texts_before_and_after_for_an_editors_diff() {
+    let workspace = Workspace::new("change");
+    workspace.write("notes.txt", b"one\r\ntwo\r\nthree\r\n");
+    let ctx = workspace.context();
+    let path = display_path(&workspace.root.canonicalize().unwrap().join("notes.txt"));
+    let new_path = display_path(&workspace.root.canonicalize().unwrap().join("new.txt"));
+
+    // The approval gets the change before anything runs; line endings are the
+    // text's, not the disk's, as in the unified diff.
+    let edit = json!({"path": "notes.txt", "old_string": "two", "new_string": "TWO"});
+    assert_eq!(
+        change_of(&ctx, "edit_file", edit.clone()),
+        Some(FileChange {
+            path: path.clone(),
+            old_text: Some("one\ntwo\nthree\n".into()),
+            new_text: "one\nTWO\nthree\n".into(),
+            line: Some(2),
+        })
+    );
+    // And the result records what was done.
+    let result = dispatch(&ctx, "edit_file", edit);
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.metadata["abs_path"], json!(path));
+    assert_eq!(result.metadata["old_text"], json!("one\ntwo\nthree\n"));
+    assert_eq!(result.metadata["new_text"], json!("one\nTWO\nthree\n"));
+    assert_eq!(result.metadata["line"], json!(2));
+    assert_eq!(
+        FileChange::from_metadata(&result.metadata).unwrap().line,
+        Some(2)
+    );
+
+    // A new file has no old text and starts at line 1.
+    let create = json!({"path": "new.txt", "content": "hi\n"});
+    assert_eq!(
+        change_of(&ctx, "write_file", create.clone()),
+        Some(FileChange {
+            path: new_path,
+            old_text: None,
+            new_text: "hi\n".into(),
+            line: Some(1),
+        })
+    );
+    let result = dispatch(&ctx, "write_file", create);
+    assert_eq!(result.metadata["old_text"], Value::Null);
+    assert_eq!(result.metadata["line"], json!(1));
+
+    // An edit that would fail has no change to show.
+    let missing = json!({"path": "notes.txt", "old_string": "absent", "new_string": "x"});
+    assert_eq!(change_of(&ctx, "edit_file", missing), None);
+    // Nor does a write over a file that is not text.
+    workspace.write("blob.bin", &[0xff, 0xfe, 0x00, 0x01]);
+    let over_binary = json!({"path": "blob.bin", "content": "text\n"});
+    assert_eq!(change_of(&ctx, "write_file", over_binary.clone()), None);
+    let result = dispatch(&ctx, "write_file", over_binary);
+    assert!(
+        result.ok && !result.metadata.contains_key("abs_path"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn above_the_cap_only_the_location_is_recorded() {
+    let workspace = Workspace::new("change-cap");
+    let ctx = workspace.context();
+    let big = "x".repeat(MAX_CHANGE_TEXT_BYTES + 1);
+    let arguments = json!({"path": "big.txt", "content": big});
+
+    assert_eq!(change_of(&ctx, "write_file", arguments.clone()), None);
+    let result = dispatch(&ctx, "write_file", arguments);
+    assert!(result.ok, "{result:?}");
+    assert!(result.metadata.contains_key("abs_path"));
+    assert_eq!(result.metadata["line"], json!(1));
+    assert!(!result.metadata.contains_key("new_text"));
+    assert!(!result.metadata.contains_key("old_text"));
+    assert!(FileChange::from_metadata(&result.metadata).is_none());
+
+    // Exactly at the cap is kept.
+    let at = json!({"path": "at.txt", "content": "y".repeat(MAX_CHANGE_TEXT_BYTES)});
+    assert!(change_of(&ctx, "write_file", at).is_some());
+}
+
+#[test]
+fn the_first_changed_line_is_where_an_editor_lands() {
+    assert_eq!(first_changed_line(None, "a"), Some(1));
+    assert_eq!(first_changed_line(Some("a\nb\n"), "a\nb\n"), None);
+    assert_eq!(first_changed_line(Some("a\nb\nc"), "a\nB\nc"), Some(2));
+    // Lines added at the end land on the first new one.
+    assert_eq!(first_changed_line(Some("a\n"), "a\nb\n"), Some(2));
+    // Lines removed from the end land on the last line left.
+    assert_eq!(first_changed_line(Some("a\nb\nc\n"), "a\n"), Some(2));
+    assert_eq!(first_changed_line(Some("a"), ""), Some(1));
 }
