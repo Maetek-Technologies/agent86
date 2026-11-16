@@ -1,6 +1,8 @@
 # Scheduled jobs: the agent schedules work for itself
 
-**Status:** design (not yet implemented)
+**Status:** design (not yet implemented); targeted for 1.0.24, together with
+parking a job at an approval (see the release roadmap in
+`docs/PROJECT_PLAN.md`)
 **Last updated:** 2026-11-15 (decision 2 and the new decision 7: how the OS
 fires jobs). `docs/PROJECT_PLAN.md` also records the maintainer's decisions of
 2026-10-31 (one release, desktop notifications, per-job approval, results);

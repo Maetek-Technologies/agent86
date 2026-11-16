@@ -548,6 +548,22 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 
 ## 9. Next actions
 
+### Release roadmap to 1.1.0
+
+Decided (2026-11-15): the proposals of 2026-11-15 below, and the provider adapters planned 2026-11-14, ship as six patch releases, then 1.1.0. Each release lands its agent86 work with tests, and agent86-web picks up each piece as it ships, so every extension or field is designed with a client using it (see "Supervision and long-running work" and "Two items for every client" below for the designs).
+
+| Release | Contents |
+|---|---|
+| 1.0.19 | Search tools (`search_files`, `find_files`); file edits as ACP `diff` content, with `locations` |
+| 1.0.20 | ACP extensions for the harness's state (cost, sub-agent cards, guardrail verdicts, route decisions) |
+| 1.0.21 | Approval inbox context for parallel sub-agents; save after every step (checkpointing tier 1), then ACP `session/resume` |
+| 1.0.22 | Memory over ACP and in the CLI: list, pin, and forget |
+| 1.0.23 | Google (Gemini), vLLM, and LM Studio provider adapters (see "Planned (2026-11-14)" below) |
+| 1.0.24 | Parking at approvals, then scheduled jobs ([docs/scheduling.md](scheduling.md)); parking needs checkpointing tier 2 (explicit resume of an unfinished turn), which therefore lands here too, if 1.0.21 has not already brought it |
+| 1.1.0 | `${secret:NAME}` in MCP server `env` and `headers`, resolved from the vault; the minor version marks the supervision and long-running work as complete |
+
+Order within a release follows the list. A release that slips moves the rest along rather than shipping half an item; an item that proves too large splits across two patch releases, recorded here.
+
 - [x] Implement the async provider interface and OpenAI-compatible SSE client
 - [x] Add recorded fixtures and mock-provider integration tests
 - [x] Add TOML provider config, env-var key resolution, and the `provider:model` factory
@@ -570,17 +586,17 @@ A feature request has been drafted for Kimi to support secure, native secret inp
 - [x] Fix what the 1.0.11 security review found, in four PRs (beyond Python; done 2026-11-01, see below). PR 1 (project trust and agent86's own files) and PR 2 (approval and jail integrity) shipped in 1.0.12; PRs 3, 4a, and 4b shipped in 1.0.13
 - [x] Session directories for every session and `/rename`, requested by agent86-web for 1.0.17: terminal sessions record their directory beside ACP ones, filtered `session/list` results leave out sessions whose directory is unknown, and `/rename <title>` renames a session in the terminal and over ACP, with a `session_info_update` (beyond Python; done 2026-11-13, see the session differences above)
 - [x] Skill commands: the user runs a skill directly as `/<skill-name> [task]` or `/skill <name> [task]` in the interactive interface, the plain loop, and editors over ACP, or with `run --skill`, with each skill listed in the command menus, through one shared harness entry point (beyond Python; designed and built 2026-11-12, see [docs/skill-commands.md](skill-commands.md) and the skill differences above)
-- [ ] Scheduled jobs: the model creates durable recurring or one-shot jobs for itself, and agent86 fires them and runs a real agent turn with no session open, from a per-user OS timer calling `agent86 schedule tick` or from `agent86 schedule daemon` (beyond Python; planned after the show/hide feature above, revised 2026-11-15, see below)
+- [ ] **1.0.24** Scheduled jobs: the model creates durable recurring or one-shot jobs for itself, and agent86 fires them and runs a real agent turn with no session open, from a per-user OS timer calling `agent86 schedule tick` or from `agent86 schedule daemon` (beyond Python; planned after the show/hide feature above, revised 2026-11-15, see below)
 - [x] Specialist sub-agents: users and projects define named sub-agents in Markdown files, with their own instructions, tool allowlist, model, step budget, and approval mode, which the model, the user, or `run --agent` can call (beyond Python; designed 2026-10-31, 2026-11-08, and 2026-11-09 in [docs/subagents.md](subagents.md), see below). All slices built 2026-11-14
-- [ ] Google (Gemini), vLLM, and LM Studio provider adapters, for the next version: a native `google` adapter on the Gemini API, and built-in `vllm` and `lmstudio` providers for local or remote servers (beyond Python; planned 2026-11-14, see below)
-- [ ] ACP extensions that carry the harness's own state (cost, sub-agent cards, guardrail verdicts, route decisions) to clients that ask for it (beyond Python; proposed 2026-11-15, see "Supervision and long-running work" below)
-- [ ] One approval inbox across parallel sub-agents, for clients, on top of the extensions above (beyond Python; proposed 2026-11-15, see below)
-- [ ] Sessions that outlive the client: save after every step (checkpointing tier 1) and ACP `session/resume` (beyond Python; proposed 2026-11-15, see below)
-- [ ] Scheduled jobs that park at an approval instead of failing, after checkpointing tier 2 (beyond Python; proposed 2026-11-15, see below)
-- [ ] `${secret:NAME}` in MCP server `env` and `headers`, resolved from the vault (beyond Python; proposed 2026-11-15, see below)
-- [ ] Memory over ACP and in the CLI: list, pin, and forget single facts and episodes (beyond Python; proposed 2026-11-15, see below)
-- [ ] File edits as ACP `diff` content, with `locations`, in tool calls and permission requests (beyond Python; proposed 2026-11-15, see "Two items for every client" below)
-- [ ] Search tools: `search_files` (regex over file contents) and `find_files` (glob over paths), read-only and jailed (beyond Python; proposed 2026-11-15, see below)
+- [ ] **1.0.23** Google (Gemini), vLLM, and LM Studio provider adapters: a native `google` adapter on the Gemini API, and built-in `vllm` and `lmstudio` providers for local or remote servers (beyond Python; planned 2026-11-14, see below)
+- [ ] **1.0.20** ACP extensions that carry the harness's own state (cost, sub-agent cards, guardrail verdicts, route decisions) to clients that ask for it (beyond Python; proposed 2026-11-15, see "Supervision and long-running work" below)
+- [ ] **1.0.21** One approval inbox across parallel sub-agents, for clients, on top of the extensions above (beyond Python; proposed 2026-11-15, see below)
+- [ ] **1.0.21** Sessions that outlive the client: save after every step (checkpointing tier 1) and ACP `session/resume` (beyond Python; proposed 2026-11-15, see below)
+- [ ] **1.0.24** Scheduled jobs that park at an approval instead of failing, after checkpointing tier 2 (beyond Python; proposed 2026-11-15, see below)
+- [ ] **1.1.0** `${secret:NAME}` in MCP server `env` and `headers`, resolved from the vault (beyond Python; proposed 2026-11-15, see below)
+- [ ] **1.0.22** Memory over ACP and in the CLI: list, pin, and forget single facts and episodes (beyond Python; proposed 2026-11-15, see below)
+- [ ] **1.0.19** File edits as ACP `diff` content, with `locations`, in tool calls and permission requests (beyond Python; proposed 2026-11-15, see "Two items for every client" below)
+- [ ] **1.0.19** Search tools: `search_files` (regex over file contents) and `find_files` (glob over paths), read-only and jailed (beyond Python; proposed 2026-11-15, see below)
 - [x] ACP server: `agent86 acp` speaks the Agent Client Protocol over stdio so editors such as Zed can drive agent86 (beyond Python; planned 2026-11-05 and built the same day in six slices, see below and [docs/ACP.md](ACP.md); checked against the protocol's schema and used in Intelligent Terminal, not yet tried in Zed or the other editors)
 
 Decided (2026-10-30): this implementation is the standard agent86, and the Python implementation is the legacy one. Python was the behavioral oracle while the port was under way; every stage of the roadmap has landed, and the work since (the reasoning guard, routing, secrets, limits) goes beyond it. The formats the two share stay compatible (the session database and `state_json`, the config files, the trace, and the keyring layout), so a Python user can switch without losing sessions, keys, or config. The steps, in order:
@@ -795,7 +811,7 @@ Planned (2026-11-08): specialist sub-agents, beyond Python. Python's `delegate` 
 
 Slices, each landing with tests that need no credentials or network: (0) the sub-agent routing fix, on its own and first, then (0b) cancellable sub-agents, including on an ACP disconnect, also on its own; (1) parsing and discovery, with no behavior change; (2) the `agent` argument, persona replacement, and the filtered prompt, with project files still ignored; (3) the tool allowlist, approval mode, always-asked tools, step budget, and narrowing through nested delegation; (4) per-specialty models with their own limits, and the fallback notice; (5) project-specialty approval, with the whole file shown, which turns project files on; (6) context passing; (7) user entry points, `run --agent`, interface display, and ACP; (8) parallel fan-out of adjacent delegations, with an HTTP client per thread, the per-turn spend counter, and the prompt queue, the riskiest slice; (9) worktree isolation; (10) skills both ways; (11) the built-in specialties; (12) documentation and README status.
 
-Planned (2026-11-14), for the next version: Google (Gemini), vLLM, and LM Studio provider adapters, beyond Python, whose built-in providers are `anthropic`, `openai`, `ollama`, and `llamacpp`. Both are configured and chosen the way every provider is: a `[providers.<name>]` block, `provider:model` references, keys from the environment or the keyring, and the same `Provider::stream` contract. Neither changes `run --json`, the trace, or the session schema beyond what is noted here. Facts about the Gemini API were checked against Google's documentation on 2026-11-14. Each slice re-checks the parts it builds on, because the API is still changing (Google's function-calling page now leads with a new stateful "Interactions" API).
+Planned (2026-11-14), for 1.0.23 (placed on the release roadmap 2026-11-15): Google (Gemini), vLLM, and LM Studio provider adapters, beyond Python, whose built-in providers are `anthropic`, `openai`, `ollama`, and `llamacpp`. Both are configured and chosen the way every provider is: a `[providers.<name>]` block, `provider:model` references, keys from the environment or the keyring, and the same `Provider::stream` contract. Neither changes `run --json`, the trace, or the session schema beyond what is noted here. Facts about the Gemini API were checked against Google's documentation on 2026-11-14. Each slice re-checks the parts it builds on, because the API is still changing (Google's function-calling page now leads with a new stateful "Interactions" API).
 
 **Why Gemini needs its own adapter.** Gemini's OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/`) already works today with only a config block, but it breaks on tool calls with Gemini 3 and later. These models return a `thoughtSignature` with each step's first `functionCall`. The same turn's next request must send it back, or the API answers 400 ("function call is missing a thought_signature"). The OpenAI-compatible adapter has nowhere to keep the signature, so a turn's second model call fails as soon as the model uses a tool. Gemini 2.5 returns signatures but does not require them.
 
@@ -866,7 +882,7 @@ Proposed (2026-11-15): supervision and long-running work, six items, all beyond 
 5. **`${secret:NAME}` for MCP servers.** The vault reaches exec tools (environment variables) and `write_file`/`edit_file` (placeholders), but an MCP server's `env` and `headers` are expanded by `mcp::expand_var_refs`, from the environment and then the keyring, never from the vault. Accept `${secret:NAME}` there too, resolved from the session's vault (including secrets remembered for the project) when the server starts or reconnects, so a key handed over through `request_secret` or `/secret` can configure a server without being written to a config file or an environment variable. Rules to keep: values from an ACP editor stay literal (`harness::server_config` maps every reference to itself, and that must cover `${secret:...}` too); `/config mcp`'s save keeps the placeholder, never the value; a missing name is the same "is not set" error as for `${VAR}`; anything the server sends back already goes through `dispatch`'s redaction. Tests: the stdio test server echoes its environment, with a fake store.
 6. **Memory over ACP and in the CLI.** `agent86 memory` has `stats`, `sessions`, `search`, and `prune`, but no way to look at or act on one fact or episode. Add `agent86 memory list` (facts, or episodes with `--episodes`), `pin <id>` (exempt from `prune` and retention), and `forget <id>`, and the same as extension methods for ACP clients (item 1's capability), so agent86-web can show what the agent has learned and let the user correct it. A pin must not change `state_json` or the episode and fact rows in a way Python cannot read; if the shared schema has no place for it, keep pins beside the database as `SessionDirs` does. Every value shown goes through the vault's redaction.
 
-Order: 1 first (it carries 2 and 6), 5 any time (it is small and independent), 3 before 4.
+Order: 1 first (it carries 2 and 6), 5 any time (it is small and independent), 3 before 4. Releases (decided 2026-11-15, see "Release roadmap to 1.1.0" above): item 1 in 1.0.20, items 2 and 3 in 1.0.21, item 6 in 1.0.22, item 4 in 1.0.24, item 5 in 1.1.0.
 
 Proposed (2026-11-15): two items for every client, beyond Python. They came out of asking what a desktop coding app on agent86 would need from the agent; both improve the terminal, Zed, and agent86-web today, whether or not that app is built. Each lands with tests that need no credentials or network.
 
@@ -886,7 +902,7 @@ Proposed (2026-11-15): two items for every client, beyond Python. They came out 
    - **The prompt.** `BASE_IDENTITY` stays byte-identical to Python's, so the tools describe themselves in their own descriptions, not the system prompt. Their schemas are new, so there is no pydantic fixture to match, but they follow the same shape (`tests/fixtures/tools/schemas.json` gains them, marked beyond Python).
    - Tests: a fixture tree with `.gitignore`d files, a binary file, a symlink out of the workspace, and a deep tree past the caps; both tools on every CI platform, including Windows paths in the output (always `/`-separated and relative to the workspace).
 
-Order: the search tools first (no protocol work, and every surface benefits), then the diff content.
+Order: the search tools first (no protocol work, and every surface benefits), then the diff content. Both ship in 1.0.19 (decided 2026-11-15).
 
 Decided (2026-10-28): no differential test harness that runs the Python implementation. Parity is pinned instead by per-feature fixtures produced from Python's own sources or CPython (`ast` extractions, CPython `re`, `difflib`, `ipaddress`, `json`, and `sum` outputs, sentence-transformers vectors, mirror scripts of the pydantic models and trace code) and by recorded provider streams. Running the reference implementation would mean executing third-party code on the development machine, and the fixtures already cover the contract. Revisit if a behavior turns out to have drifted in a way the fixtures did not catch.
 
