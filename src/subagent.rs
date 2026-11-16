@@ -169,6 +169,9 @@ pub enum SubagentEvent<'a> {
         name: &'a str,
         depth: u32,
         ok: bool,
+        /// What it and anything it delegated used (beyond Python: for an editor's
+        /// per-delegation cost).
+        usage: &'a Usage,
     },
 }
 
@@ -866,12 +869,17 @@ impl Harness {
             let name = spawn.role.clone();
             let result = self.run_subagent(spawn, depth, caller, run).await;
             if let Some(card) = &card {
+                let usage = match &result {
+                    Ok((_, usage)) => *usage,
+                    Err(failure) => failure.1,
+                };
                 self.subagents.observe(&SubagentEvent::Finished {
                     card,
                     run,
                     name: &name,
                     depth,
                     ok: result.is_ok(),
+                    usage: &usage,
                 });
             }
             // The worktree's diff goes back with the answer, through the vault's

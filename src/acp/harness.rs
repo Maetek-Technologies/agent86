@@ -47,7 +47,7 @@ use crate::setup::{assemble_in, SetupError};
 use crate::subagent::SubagentEvent;
 use crate::tools::EditorFiles;
 use crate::types::{ApprovalMode, Role, ToolCall, ToolResult};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -174,6 +174,9 @@ struct CardState {
     /// Each card's log, by reported id.
     logs: HashMap<String, CardLog>,
     counter: u64,
+    /// The card each sub-agent run reports on, by its run number, so the state
+    /// events can name the card a sub-agent's model calls belong to.
+    runs: HashMap<u64, String>,
 }
 
 #[derive(Default)]
@@ -375,6 +378,174 @@ impl Presenter {
     }
 }
 
+/// The recorder's event kinds a client that asked is sent, as the trace holds them.
+const STATE_KINDS: [&str; 3] = ["model_call", "guardrail", "route"];
+
+/// Turns the harness's own events into state events for a client that asked for
+/// them (`com.maetek.agent86/state`, beyond Python). Every event is redacted as
+/// the trace is (the vault's values, then `[observability] redact`), so a client
+/// never sees more than the trace would hold, whether or not the trace is written.
+struct StateReporter {
+    cards: Cards,
+    secrets: crate::vault::SecretVault,
+    redact: crate::config::RedactMode,
+    max_field_chars: usize,
+    prices: crate::pricing::PriceTable,
+    /// The `provider:model` refs the session can run on as configured (the default,
+    /// the triage routes, the specialties' own models), to price a model call whose
+    /// event names only the bare model id.
+    known_refs: Vec<String>,
+    /// `[limits] max_cost_usd`, or `None` when it is off (`0`).
+    cost_cap: Option<f64>,
+    /// What the running turn has spent, sub-agents included, from its model calls.
+    turn_cost: Mutex<f64>,
+}
+
+impl StateReporter {
+    fn new(
+        config: &Config,
+        known_refs: Vec<String>,
+        cards: Cards,
+        secrets: crate::vault::SecretVault,
+    ) -> Self {
+        Self {
+            cards,
+            secrets,
+            redact: config.observability.redact,
+            max_field_chars: config.observability.max_field_chars,
+            prices: crate::pricing::PriceTable::from_config(config),
+            known_refs,
+            cost_cap: (config.limits.max_cost_usd > 0.0).then_some(config.limits.max_cost_usd),
+            turn_cost: Mutex::new(0.0),
+        }
+    }
+
+    /// Whether a call's cost means anything. `model` is the bare id `model_call`
+    /// records, so: a call that cost something was priced; a model priced as
+    /// written is; and one of the configured refs with that model is priced or not
+    /// as that ref is (a free local model included). A model reached some other way
+    /// (`/model` to an unconfigured ref) that cost nothing reads as unpriced.
+    fn priced(&self, model: &str, cost: f64) -> bool {
+        cost > 0.0
+            || self.prices.is_priced(model)
+            || self.known_refs.iter().any(|reference| {
+                reference.split_once(':').map(|(_, bare)| bare.trim()) == Some(model)
+                    && self.prices.is_priced(reference)
+            })
+    }
+
+    /// One recorder event, already redacted: forwarded if it is a kind clients are
+    /// sent, a model call with what it means for the turn's spend.
+    fn record(&self, sink: &dyn TurnSink, record: &Map<String, Value>) {
+        let kind = record
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind == "turn_start" {
+            *self
+                .turn_cost
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = 0.0;
+        }
+        if !STATE_KINDS.contains(&kind) {
+            return;
+        }
+        let mut event = record.clone();
+        // The notification names the session; the recorder's own label for it
+        // (`sub` for some sub-agent events) would only confuse.
+        event.remove("session");
+        if kind == "model_call" {
+            let cost = record
+                .get("cost_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let spent = {
+                let mut total = self
+                    .turn_cost
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *total += cost;
+                *total
+            };
+            let model = record
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            event.insert("priced".into(), json!(self.priced(model, cost)));
+            event.insert("turn_cost_usd".into(), json!(spent));
+            event.insert("cost_cap_usd".into(), json!(self.cost_cap));
+            if let Some(run) = record.get("run").and_then(Value::as_u64) {
+                let cards = self.cards.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(card) = cards.runs.get(&run) {
+                    event.insert("card".into(), json!(card));
+                }
+            }
+        }
+        sink.update(Update::State(Value::Object(event)));
+    }
+
+    /// A sub-agent starting or finishing, on the card id the editor already has.
+    fn subagent(&self, sink: &dyn TurnSink, event: &SubagentEvent<'_>) {
+        let fields = match event {
+            SubagentEvent::Started {
+                card,
+                run,
+                name,
+                depth,
+                task,
+            } => vec![
+                ("phase", json!("started")),
+                ("card", json!(self.card(&card.id))),
+                ("run", json!(run)),
+                ("agent", json!(name)),
+                ("depth", json!(depth)),
+                // As the trace's `spawn` keeps it.
+                ("task", json!(task.chars().take(200).collect::<String>())),
+            ],
+            SubagentEvent::Finished {
+                card,
+                run,
+                name,
+                depth,
+                ok,
+                usage,
+            } => vec![
+                ("phase", json!("finished")),
+                ("card", json!(self.card(&card.id))),
+                ("run", json!(run)),
+                ("agent", json!(name)),
+                ("depth", json!(depth)),
+                ("ok", json!(ok)),
+                ("input_tokens", json!(usage.input_tokens)),
+                ("output_tokens", json!(usage.output_tokens)),
+                ("cost_usd", json!(usage.cost_usd)),
+            ],
+            _ => return,
+        };
+        let mut record = Map::new();
+        record.insert("ts".into(), json!(crate::observability::now()));
+        record.insert("kind".into(), json!("subagent"));
+        for (name, value) in fields {
+            record.insert(name.into(), value);
+        }
+        let mut record = Value::Object(record);
+        self.secrets.redact_value(&mut record);
+        let Value::Object(record) = record else {
+            return;
+        };
+        let record = crate::observability::redact_event(&record, self.redact, self.max_field_chars);
+        sink.update(Update::State(Value::Object(record)));
+    }
+
+    /// The id the editor knows a card by.
+    fn card(&self, provider_id: &str) -> String {
+        self.cards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .lookup(provider_id)
+    }
+}
+
 /// Report a sub-agent on its delegation's card (beyond Python;
 /// `docs/subagents.md` section 10): `in_progress` when it starts, one line per
 /// tool call at `full` (a running count at `summary`, nothing at `hidden` but
@@ -403,12 +574,13 @@ fn on_subagent(
     match event {
         SubagentEvent::Started {
             card,
+            run,
             name,
             depth,
             task,
-            ..
         } => {
             let id = state.lookup(&card.id);
+            state.runs.insert(*run, id.clone());
             if level == DisplayLevel::Hidden {
                 return;
             }
@@ -727,6 +899,41 @@ impl HarnessBackend {
                 running.ask(request) == Permission::Allowed
             },
         ));
+        // agent86's state events, for a client that asked (beyond Python): the
+        // recorder's events as the trace holds them, and sub-agents' lifecycles.
+        let reporter = self.client.state.then(|| {
+            let model = &self.config.model;
+            let mut known_refs = vec![
+                model.default.clone(),
+                model.route.cheap.clone(),
+                model.route.frontier.clone(),
+            ];
+            known_refs.extend(
+                assembly
+                    .harness
+                    .context
+                    .specialties
+                    .found
+                    .values()
+                    .filter_map(|specialty| specialty.model.clone()),
+            );
+            Arc::new(StateReporter::new(
+                &self.config,
+                known_refs,
+                Arc::clone(&cards),
+                secrets.clone(),
+            ))
+        });
+        if let Some(reporter) = &reporter {
+            let (hook_sink, hook_reporter) = (Arc::clone(&sink), Arc::clone(reporter));
+            assembly.harness.recorder.set_tap(Some(Arc::new(
+                move |_session: &str, record: &Map<String, Value>| {
+                    if let Some(running) = running(&hook_sink) {
+                        hook_reporter.record(running.as_ref(), record);
+                    }
+                },
+            )));
+        }
         // Sub-agents report on their delegation's card.
         let (hook_sink, hook_cards, hook_secrets) =
             (Arc::clone(&sink), Arc::clone(&cards), secrets.clone());
@@ -734,6 +941,9 @@ impl HarnessBackend {
             move |event: &SubagentEvent<'_>| {
                 if let Some(running) = running(&hook_sink) {
                     on_subagent(&hook_cards, running.as_ref(), &hook_secrets, event);
+                    if let Some(reporter) = &reporter {
+                        reporter.subagent(running.as_ref(), event);
+                    }
                 }
             },
         )));
@@ -2015,6 +2225,7 @@ mod tests {
                     name: "planner",
                     depth: 1,
                     ok: true,
+                    usage: &crate::types::Usage::default(),
                 },
             ] {
                 on_subagent(&cards, &sink, &secrets, &event);
@@ -2253,5 +2464,168 @@ mod tests {
             ..failed
         };
         assert_eq!(result_text(&empty, ""), "(no output)");
+    }
+
+    fn default_config() -> Config {
+        let dir = std::env::temp_dir().join(format!("agent86-acp-state-{}", std::process::id()));
+        let paths = crate::config::ConfigPaths {
+            user: None,
+            project: dir.join("absent.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
+        };
+        crate::config::load_config(&paths, &crate::config::Overrides::default()).unwrap()
+    }
+
+    fn record(kind: &str, fields: Value) -> Map<String, Value> {
+        let mut record = Map::new();
+        record.insert("ts".into(), json!(1.5));
+        record.insert("session".into(), json!("s1"));
+        record.insert("kind".into(), json!(kind));
+        if let Value::Object(fields) = fields {
+            record.extend(fields);
+        }
+        record
+    }
+
+    fn states(sink: &Recorder) -> Vec<Value> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                Update::State(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn state_events_forward_only_their_kinds_and_spend_resets_each_turn() {
+        let reporter = StateReporter::new(
+            &default_config(),
+            Vec::new(),
+            Cards::default(),
+            crate::vault::SecretVault::default(),
+        );
+        let sink = Recorder::default();
+        let call = |cost: f64| {
+            record(
+                "model_call",
+                json!({"step": 1, "model": "gpt-4o", "cost_usd": cost}),
+            )
+        };
+        for event in [
+            record("turn_start", json!({"task": "go"})),
+            call(0.5),
+            record(
+                "guardrail",
+                json!({"stage": "ingress_input", "findings": "injection"}),
+            ),
+            record("route", json!({"model": "cheap"})),
+            record("tool_call", json!({"tool": "list_dir"})),
+            call(0.25),
+            record("turn_end", json!({"status": "ok"})),
+            record("turn_start", json!({"task": "again"})),
+            call(0.125),
+        ] {
+            reporter.record(&sink, &event);
+        }
+        let events = states(&sink);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "model_call",
+                "guardrail",
+                "route",
+                "model_call",
+                "model_call"
+            ]
+        );
+        // The recorder's session label is dropped; the notification names it.
+        assert!(events.iter().all(|event| event.get("session").is_none()));
+        assert_eq!(events[1]["findings"], "injection");
+        assert_eq!(events[2]["model"], "cheap");
+        assert_eq!(events[0]["turn_cost_usd"], 0.5);
+        assert_eq!(events[3]["turn_cost_usd"], 0.75);
+        // A new turn starts its spend again.
+        assert_eq!(events[4]["turn_cost_usd"], 0.125);
+        assert_eq!(events[0]["cost_cap_usd"], 5.0);
+        assert_eq!(events[0]["priced"], true);
+    }
+
+    #[test]
+    fn a_call_is_priced_by_its_cost_its_model_or_a_configured_ref() {
+        let reporter = StateReporter::new(
+            &default_config(),
+            vec!["ollama:llama3.1".into(), String::new()],
+            Cards::default(),
+            crate::vault::SecretVault::default(),
+        );
+        // Built in under its bare id, even when it cost nothing.
+        assert!(reporter.priced("gpt-4o", 0.0));
+        // A configured local model is free, not unknown.
+        assert!(reporter.priced("llama3.1", 0.0));
+        // Unknown and free: no price.
+        assert!(!reporter.priced("mystery-model", 0.0));
+        // A cost means a price was found.
+        assert!(reporter.priced("mystery-model", 0.01));
+    }
+
+    #[test]
+    fn a_sub_agents_task_reaches_the_client_as_the_trace_would_hold_it() {
+        let secrets = crate::vault::SecretVault::default();
+        secrets.set("API_TOKEN", "tok_9f8e7d6c5b4a3921".to_owned());
+        let cards = Cards::default();
+        let reporter =
+            StateReporter::new(&default_config(), Vec::new(), Arc::clone(&cards), secrets);
+        let sink = Recorder::default();
+        let card = crate::subagent::Card::new("call_9", true);
+        let task = format!("Use tok_9f8e7d6c5b4a3921 to {}", "x".repeat(400));
+        reporter.subagent(
+            &sink,
+            &SubagentEvent::Started {
+                card: &card,
+                run: 3,
+                name: "planner",
+                depth: 1,
+                task: &task,
+            },
+        );
+        reporter.subagent(
+            &sink,
+            &SubagentEvent::Finished {
+                card: &card,
+                run: 3,
+                name: "planner",
+                depth: 1,
+                ok: false,
+                usage: &crate::types::Usage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                    cost_usd: 0.01,
+                    ..Default::default()
+                },
+            },
+        );
+        let events = states(&sink);
+        assert_eq!(events.len(), 2);
+        let started = &events[0];
+        assert_eq!(started["kind"], "subagent");
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["card"], "call_9");
+        let shown = started["task"].as_str().unwrap();
+        assert!(shown.starts_with("Use ${secret:API_TOKEN} to "), "{shown}");
+        assert!(!shown.contains("tok_9f8e7d6c5b4a3921"));
+        // Cut as the trace's `spawn` cuts it.
+        assert!(shown.chars().count() <= 200 + "${secret:API_TOKEN}".len());
+        let finished = &events[1];
+        assert_eq!(finished["phase"], "finished");
+        assert_eq!(finished["ok"], false);
+        assert_eq!(finished["input_tokens"], 7);
+        assert_eq!(finished["cost_usd"], 0.01);
     }
 }

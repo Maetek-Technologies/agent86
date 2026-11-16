@@ -52,6 +52,18 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// ACP's "resource not found": a session that does not exist.
 pub const RESOURCE_NOT_FOUND: i64 = -32002;
 
+/// agent86's extension namespace (beyond Python): the spec asks for reverse-DNS
+/// names from a domain the implementer controls, `<ns>/<name>` in `_meta` and
+/// `_<ns>/<name>` for methods (`docs/protocol/v1/extensibility.mdx`).
+pub const EXTENSION_NAMESPACE: &str = "com.maetek.agent86";
+/// The capability a client names in `clientCapabilities._meta` to receive the
+/// harness's state, and the agent advertises in `agentCapabilities._meta`.
+pub const STATE_CAPABILITY: &str = "com.maetek.agent86/state";
+/// The notification that carries one state event to a client that asked.
+pub const STATE_METHOD: &str = "_com.maetek.agent86/session/event";
+/// The version of the state events' shape; a change that breaks a reader bumps it.
+pub const STATE_VERSION: u64 = 1;
+
 /// The ids of the two options a permission request offers. Only the allowing one
 /// approves: `allow-once` for a tool call, or, for a project specialty's file,
 /// `allow-always` (beyond Python), since agent86 remembers that answer by the
@@ -121,6 +133,9 @@ pub enum Update {
         size: u64,
         cost: Option<f64>,
     },
+    /// One of the harness's state events (beyond Python), sent as [`STATE_METHOD`]
+    /// rather than `session/update`, and only to a client that asked for them.
+    State(Value),
     /// The history was compacted (`compaction_update`, beyond Python), for a client
     /// with the `session.compaction` capability: `completed` with the summary, or
     /// `failed` with why (the history was trimmed instead).
@@ -337,6 +352,9 @@ pub struct ClientCapabilities {
     /// `session.compaction` was given (an object): the client takes
     /// `compaction_update`, which the spec forbids sending otherwise.
     pub compaction: bool,
+    /// `_meta["com.maetek.agent86/state"]` was given (`true` or an object): the
+    /// client wants agent86's state events ([`STATE_METHOD`], beyond Python).
+    pub state: bool,
 }
 
 impl ClientCapabilities {
@@ -350,10 +368,15 @@ impl ClientCapabilities {
             .and_then(|capabilities| capabilities.get("session"))
             .and_then(|session| session.get("compaction"))
             .is_some_and(Value::is_object);
+        let state = capabilities
+            .and_then(|capabilities| capabilities.get("_meta"))
+            .and_then(|meta| meta.get(STATE_CAPABILITY))
+            .is_some_and(|value| value.is_object() || value == &Value::Bool(true));
         Self {
             read_text_file: flag("readTextFile"),
             write_text_file: flag("writeTextFile"),
             compaction,
+            state,
         }
     }
 }
@@ -713,7 +736,12 @@ impl<B: Backend> Server<B> {
                     entry["title"] = json!(title);
                 }
                 if !session.cwd_known {
-                    entry["_meta"] = json!({ "agent86": { "cwdKnown": false } });
+                    // The bare `agent86` key predates the namespace and stays while
+                    // agent86-web reads it; the namespaced one replaces it later.
+                    entry["_meta"] = json!({
+                        "agent86": { "cwdKnown": false },
+                        "com.maetek.agent86/cwdKnown": false
+                    });
                 }
                 entry
             })
@@ -1280,7 +1308,17 @@ fn config_options_json(options: &[ConfigOption]) -> Value {
 
 /// The `session/update` notification for `update`.
 fn session_update(session_id: &str, update: &Update) -> Value {
+    if let Update::State(event) = update {
+        // A custom notification, not a `session/update`: the spec reserves the
+        // update kinds for itself.
+        return json!({
+            "jsonrpc": "2.0",
+            "method": STATE_METHOD,
+            "params": { "sessionId": session_id, "event": event }
+        });
+    }
     let body = match update {
+        Update::State(_) => unreachable!("sent as its own notification above"),
         Update::User(text) => json!({
             "sessionUpdate": "user_message_chunk",
             "content": text_content(text)
@@ -1495,6 +1533,11 @@ fn initialize(params: &Value) -> Result<Value, String> {
             "mcpCapabilities": {
                 "http": true,
                 "sse": true
+            },
+            // Advertised to every client, as the spec asks of extensions; only a
+            // client that names it in its own capabilities is sent the events.
+            "_meta": {
+                STATE_CAPABILITY: { "version": STATE_VERSION }
             }
         },
         "agentInfo": {
@@ -2720,6 +2763,7 @@ mod tests {
                     read_text_file: read,
                     write_text_file: write,
                     compaction: false,
+                    state: false,
                 }),
                 "{capabilities}"
             );
@@ -3162,7 +3206,7 @@ mod tests {
         assert!(sessions[0].get("_meta").is_none(), "{reply}");
         assert_eq!(
             sessions[1]["_meta"],
-            json!({"agent86": {"cwdKnown": false}})
+            json!({"agent86": {"cwdKnown": false}, "com.maetek.agent86/cwdKnown": false})
         );
         // The schema requires a directory either way.
         assert!(sessions[1]["cwd"].is_string());

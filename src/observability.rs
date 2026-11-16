@@ -134,7 +134,16 @@ pub struct Recorder {
     /// The user's secrets (`crate::vault`), taken out of every event before the
     /// configured redaction runs, whatever `redact` is set to.
     secrets: crate::vault::SecretVault,
+    /// Beyond Python: who else sees each event, already redacted as the trace is
+    /// (an editor that asked for agent86's state over ACP). Called whether or not
+    /// the trace file is written.
+    tap: std::sync::RwLock<Option<RecorderTap>>,
 }
+
+/// Receives each event as the trace would hold it: the session it belongs to and
+/// the record (`ts`, `session`, `kind`, then its fields), after the vault's
+/// redaction and the configured one. Called from whichever thread records it.
+pub type RecorderTap = std::sync::Arc<dyn Fn(&str, &Map<String, Value>) + Send + Sync>;
 
 impl Recorder {
     /// A recorder that writes nothing.
@@ -147,13 +156,19 @@ impl Recorder {
             keep: 0,
             writer: Mutex::new(None),
             secrets: Default::default(),
+            tap: std::sync::RwLock::new(None),
         }
     }
 
     /// The recorder `config` asks for; a trace that cannot be opened is skipped.
     pub fn from_config(config: &ObservabilityConfig) -> Self {
         if !config.trace {
-            return Self::disabled();
+            // Nothing is written, but a tap sees events redacted as configured.
+            return Self {
+                redact: config.redact,
+                max_field_chars: config.max_field_chars,
+                ..Self::disabled()
+            };
         }
         let path = crate::session::expand_home(&config.path).join("trace.jsonl");
         let mut recorder = Self {
@@ -164,6 +179,7 @@ impl Recorder {
             keep: config.keep_traces,
             writer: Mutex::new(None),
             secrets: Default::default(),
+            tap: std::sync::RwLock::new(None),
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -189,14 +205,24 @@ impl Recorder {
         self
     }
 
-    /// Record one event: `ts`, `session`, and `kind`, then `fields` in order.
-    pub fn event(&self, session: &str, kind: &str, fields: Vec<(&str, Value)>) {
-        let Ok(mut guard) = self.writer.lock() else {
-            return;
-        };
-        let Some(writer) = guard.as_mut() else {
-            return;
-        };
+    /// Send each event to `tap` too, or stop with `None` (beyond Python).
+    pub fn set_tap(&self, tap: Option<RecorderTap>) {
+        *self
+            .tap
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = tap;
+    }
+
+    /// An event as the trace would hold it (`ts`, `session`, `kind`, then
+    /// `fields`), redacted by the vault and then as configured, without writing
+    /// it anywhere: for a record built outside the recorder that must not show
+    /// more than the trace would.
+    pub fn redacted(
+        &self,
+        session: &str,
+        kind: &str,
+        fields: Vec<(&str, Value)>,
+    ) -> Map<String, Value> {
         let mut record = Map::new();
         record.insert("ts".to_owned(), json!(now()));
         record.insert("session".to_owned(), json!(session));
@@ -207,9 +233,37 @@ impl Recorder {
         let mut record = Value::Object(record);
         self.secrets.redact_value(&mut record);
         let Value::Object(record) = record else {
+            return Map::new();
+        };
+        redact_event(&record, self.redact, self.max_field_chars)
+    }
+
+    /// Record one event: `ts`, `session`, and `kind`, then `fields` in order.
+    pub fn event(&self, session: &str, kind: &str, fields: Vec<(&str, Value)>) {
+        let tap = self
+            .tap
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let writing = self
+            .writer
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        if !writing && tap.is_none() {
+            return;
+        }
+        let record = self.redacted(session, kind, fields);
+        // Outside the writer's lock, so a slow tap never holds up the trace.
+        if let Some(tap) = &tap {
+            tap(session, &record);
+        }
+        let Ok(mut guard) = self.writer.lock() else {
             return;
         };
-        let record = redact_event(&record, self.redact, self.max_field_chars);
+        let Some(writer) = guard.as_mut() else {
+            return;
+        };
         let line = format!("{}\n", python_json_dumps(&Value::Object(record), false));
         if writer
             .file
@@ -268,7 +322,8 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
-fn now() -> f64 {
+/// Seconds since the Unix epoch, as an event's `ts`.
+pub fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
