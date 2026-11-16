@@ -8,9 +8,10 @@
 //! Built so far (slices 1 to 5 of the plan): the transport, the `initialize`
 //! handshake, `session/new`, `session/prompt` with streamed text and reasoning, tool
 //! calls reported as they happen, `session/request_permission` for the calls the
-//! approval mode asks about, `session/cancel`, and `session/load` with the history
-//! replayed, the MCP servers the editor names, and the editor's own files (`fs/read_text_file`
-//! and `fs/write_text_file`) for the file tools when it offers them. Slice 6 is
+//! approval mode asks about, `session/cancel`, `session/load` with the history
+//! replayed (and, since 1.0.21, `session/resume` without it), the MCP servers the
+//! editor names, and the editor's own files (`fs/read_text_file` and
+//! `fs/write_text_file`) for the file tools when it offers them. Slice 6 is
 //! documentation, so for now every other method answers "method not
 //! found" rather than pretending, and the capabilities advertised are only what is
 //! built.
@@ -467,6 +468,19 @@ pub trait Backend: Send {
         mcp_servers: Vec<McpSpec>,
     ) -> Result<Vec<Update>, BackendError>;
 
+    /// Open an existing session without replaying its history (`session/resume`,
+    /// beyond Python), or a `not_found` error when there is no such session. The
+    /// client's `cwd` and servers are as for [`Backend::new_session`]. By default it
+    /// loads the session and drops the replay.
+    fn resume_session(
+        &mut self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: Vec<McpSpec>,
+    ) -> Result<(), BackendError> {
+        self.load_session(session_id, cwd, mcp_servers).map(drop)
+    }
+
     /// How to stop `session_id`'s running turn at its next safe point, callable from
     /// any thread while the turn runs; `None` for an unknown session. It must be
     /// obtained before the turn starts, since the turn borrows the backend.
@@ -682,6 +696,7 @@ impl<B: Backend> Server<B> {
             }
             "session/new"
             | "session/load"
+            | "session/resume"
             | "session/list"
             | "session/prompt"
             | "session/set_config_option"
@@ -695,6 +710,7 @@ impl<B: Backend> Server<B> {
             "authenticate" => authenticate(params).map_err(BackendError::invalid_params),
             "session/new" => self.session_new(params),
             "session/load" => self.session_load(params, emit),
+            "session/resume" => self.session_resume(params),
             "session/prompt" => self.session_prompt(params, emit),
             "session/set_config_option" => self.set_config_option(params),
             "session/list" => self.session_list(params),
@@ -809,6 +825,24 @@ impl<B: Backend> Server<B> {
         for update in &history {
             emit(session_update(session_id, update));
         }
+        self.advertise_commands(session_id);
+        let mut result = json!({});
+        self.add_config_options(&mut result, session_id);
+        Ok(result)
+    }
+
+    /// `session/resume`: the session reopened with no replay, as the spec requires,
+    /// then the same commands and options as after `session/load`.
+    fn session_resume(&mut self, params: &Value) -> Result<Value, BackendError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BackendError::invalid_params("Invalid params: sessionId must be a string")
+            })?;
+        let (cwd, servers) = session_location(params)?;
+        self.backend
+            .resume_session(session_id, Path::new(&cwd), servers)?;
         self.advertise_commands(session_id);
         let mut result = json!({});
         self.add_config_options(&mut result, session_id);
@@ -1536,7 +1570,7 @@ fn initialize(params: &Value) -> Result<Value, String> {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
             "loadSession": true,
-            "sessionCapabilities": { "list": {} },
+            "sessionCapabilities": { "list": {}, "resume": {} },
             "promptCapabilities": {
                 "image": false,
                 "audio": false,
@@ -1956,7 +1990,7 @@ mod tests {
     #[test]
     fn methods_not_built_yet_say_so() {
         let mut server = ready();
-        for method in ["session/resume", "session/set_mode", "nonsense"] {
+        for method in ["session/close", "session/set_mode", "nonsense"] {
             let line = format!(r#"{{"jsonrpc":"2.0","id":9,"method":"{method}","params":{{}}}}"#);
             let reply = one(&mut server, &line);
             assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
@@ -3191,7 +3225,7 @@ mod tests {
         let init = one(&mut server, INITIALIZE);
         assert_eq!(
             init["result"]["agentCapabilities"]["sessionCapabilities"],
-            json!({"list": {}})
+            json!({"list": {}, "resume": {}})
         );
         server.backend.saved = vec![saved("a1", Some("Fix the build")), saved("b2", None)];
         let reply = one(&mut server, &list_line(json!({})));

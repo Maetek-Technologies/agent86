@@ -472,7 +472,7 @@ const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","param
 #[test]
 fn the_handshake_works_and_stdout_holds_only_protocol_messages() {
     let workspace = Workspace::new("handshake", None);
-    let input = format!("{INITIALIZE}\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/resume\",\"params\":{{}}}}\n");
+    let input = format!("{INITIALIZE}\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/close\",\"params\":{{}}}}\n");
     let output = workspace.run(&["acp"], &input);
     assert!(output.status.success(), "{output:?}");
 
@@ -1169,6 +1169,92 @@ async fn a_saved_session_loads_with_its_history_replayed_and_goes_on() {
     assert!(sent.contains("What is here?"), "{sent}");
     assert!(sent.contains("One directory."), "{sent}");
     assert!(sent.contains("And again?"), "{sent}");
+}
+
+#[tokio::test]
+async fn a_saved_session_resumes_without_its_history_and_goes_on() {
+    // Beyond Python: `session/resume` reopens a session as `session/load` does but
+    // replays nothing, as the spec requires; the model still sees the history.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("One directory.", "stop"),
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("Same one.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("session-resume", Some(&server));
+    let project = workspace.project();
+    let session = tokio::task::spawn_blocking({
+        let project = project.clone();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.prompt(&session, "What is here?");
+            client.finish();
+            session
+        }
+    })
+    .await
+    .unwrap();
+
+    let (initialized, early, missing, resumed, next) = tokio::task::spawn_blocking({
+        let session = session.clone();
+        let mut client = workspace.connect();
+        move || {
+            let resume = |client: &mut Client, id: &str| {
+                client.request(
+                    "session/resume",
+                    json!({"sessionId": id, "cwd": project.to_str().unwrap(), "mcpServers": []}),
+                )
+            };
+            let early = resume(&mut client, &session);
+            let initialized = client.initialize();
+            let missing = resume(&mut client, "0123456789ab");
+            let resumed = resume(&mut client, &session);
+            let next = client.prompt(&session, "And again?");
+            client.finish();
+            (initialized, early, missing, resumed, next)
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        initialized["result"]["agentCapabilities"]["sessionCapabilities"]["resume"],
+        json!({})
+    );
+    assert_eq!(
+        early.response["error"]["code"], -32600,
+        "{}",
+        early.response
+    );
+    assert_eq!(
+        missing.response["error"]["code"], -32002,
+        "{}",
+        missing.response
+    );
+    // No replay: not one update before the response, and the same result as a load.
+    assert!(resumed.updates.is_empty(), "{:?}", resumed.updates);
+    assert_eq!(
+        resumed.response["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["configOptions"]
+    );
+    assert_eq!(next.text_of("agent_message_chunk"), "Same one.");
+    let sent = server.requests()[3].body["messages"].to_string();
+    assert!(sent.contains("What is here?"), "{sent}");
+    assert!(sent.contains("One directory."), "{sent}");
+    assert!(sent.contains("And again?"), "{sent}");
+    // The earlier call's id stays taken though it was not replayed, so the new call
+    // does not reuse an id the editor may already hold.
+    assert_eq!(
+        next.updates[0]["params"]["update"]["toolCallId"],
+        "call_1#1"
+    );
 }
 
 /// `python3` or `python`, whichever runs; the live-server tests skip without one.
