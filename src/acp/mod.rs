@@ -61,6 +61,11 @@ pub const EXTENSION_NAMESPACE: &str = "com.maetek.agent86";
 pub const STATE_CAPABILITY: &str = "com.maetek.agent86/state";
 /// The notification that carries one state event to a client that asked.
 pub const STATE_METHOD: &str = "_com.maetek.agent86/session/event";
+
+/// The `_meta` key of a permission request that a sub-agent asks, for a client
+/// with [`STATE_CAPABILITY`]: which sub-agent, where it works, and what it has
+/// spent (beyond Python).
+pub const ASKER_META: &str = "com.maetek.agent86/subagent";
 /// The version of the state events' shape; a change that breaks a reader bumps it.
 pub const STATE_VERSION: u64 = 1;
 
@@ -237,6 +242,9 @@ pub struct PermissionRequest {
     /// the name of the one allowing option, offered as `allow_always` in place of
     /// `allow_once`.
     pub remember: Option<String>,
+    /// For a client with [`STATE_CAPABILITY`], the sub-agent asking, sent as the
+    /// request's `_meta[`[`ASKER_META`]`]` (beyond Python). Already redacted.
+    pub asker: Option<Value>,
 }
 
 /// The editor's answer. Anything but the user choosing `allow-once` is a refusal:
@@ -1471,7 +1479,7 @@ fn permission_params(session_id: &str, request: &PermissionRequest) -> Value {
         "content": tool_content(request.diff.as_ref(), &request.text)
     });
     with_locations(&mut tool_call, &request.locations);
-    json!({
+    let mut params = json!({
         "sessionId": session_id,
         "toolCall": tool_call,
         "options": match &request.remember {
@@ -1484,7 +1492,11 @@ fn permission_params(session_id: &str, request: &PermissionRequest) -> Value {
                 { "optionId": REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
             ]),
         }
-    })
+    });
+    if let Some(asker) = &request.asker {
+        params["_meta"] = json!({ ASKER_META: asker });
+    }
+    params
 }
 
 /// The id of the one authentication method: terminal setup, `agent86 auth`.
@@ -2182,6 +2194,7 @@ mod tests {
             raw_input: json!({"path": "a.txt"}),
             text: "--- a/a.txt\n+++ b/a.txt".into(),
             remember: None,
+            asker: None,
             diff: Some(write_change()),
             locations: vec![Location {
                 path: "/w/a.txt".into(),

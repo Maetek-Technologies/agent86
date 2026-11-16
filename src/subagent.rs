@@ -137,6 +137,39 @@ impl Card {
     }
 }
 
+/// One sub-agent run as its questions describe it (beyond Python): who it is, and
+/// its model calls and spend so far, kept current as it runs, so an editor's
+/// approval inbox can show them beside each question
+/// ([`crate::approval::Asker`]). On its [`ToolContext`]; a nested run has its own.
+#[derive(Debug)]
+pub struct SubagentRun {
+    pub run: u64,
+    /// The specialty or role it runs as.
+    pub name: String,
+    pub depth: u32,
+    progress: Mutex<(u32, f64)>,
+}
+
+impl SubagentRun {
+    pub fn new(run: u64, name: impl Into<String>, depth: u32) -> Self {
+        Self {
+            run,
+            name: name.into(),
+            depth,
+            progress: Mutex::new((0, 0.0)),
+        }
+    }
+
+    /// Its model calls so far, and what it and anything it delegated have spent.
+    pub fn progress(&self) -> (u32, f64) {
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn record(&self, steps: u32, cost_usd: f64) {
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = (steps, cost_usd);
+    }
+}
+
 /// What the observer is told about a sub-agent (beyond Python): an editor turns it
 /// into the delegation's card, the terminal interface into notes. Everything here
 /// is already redacted by the time it is reported, except a call's arguments,
@@ -465,6 +498,7 @@ impl Harness {
             full: true,
             agent: Some(name.clone()),
             change: None,
+            asker: None,
         };
         match self.gate.ask_specialty(call, &preview) {
             Some(true) => {
@@ -1115,6 +1149,8 @@ impl Harness {
         if card.is_some() {
             ctx.card = card;
         }
+        let progress = Arc::new(SubagentRun::new(run, role, depth));
+        ctx.subagent = Some(Arc::clone(&progress));
         if let Some(card) = &ctx.card {
             self.subagents.observe(&SubagentEvent::Started {
                 card,
@@ -1277,6 +1313,7 @@ impl Harness {
             };
             breaker.record_step(&completion.usage);
             spent = spent + completion.usage;
+            progress.record(breaker.steps(), spent.cost_usd + delegated.cost_usd);
             if let Some(fanout) = &ctx.fanout {
                 fanout.add(completion.usage.cost_usd);
             }
@@ -1421,6 +1458,7 @@ impl Harness {
                 }
                 let (result, usage) = self.run_subagent_tool(&ctx, call, &sid, depth, run).await;
                 delegated = delegated + usage;
+                progress.record(breaker.steps(), spent.cost_usd + delegated.cost_usd);
                 let (content, findings) = self.guardrails.observe(observation(&result));
                 if let Some(findings) = findings {
                     self.recorder.event(

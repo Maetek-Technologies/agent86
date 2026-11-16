@@ -19,7 +19,7 @@ pub const SUMMARY_LIMIT: usize = 300;
 pub const APPROVAL_DETAIL_LINES: usize = 40;
 
 /// What the user is asked to approve.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalPreview {
     /// The arguments as `json.dumps`, capped at [`SUMMARY_LIMIT`].
     pub summary: String,
@@ -40,7 +40,134 @@ pub struct ApprovalPreview {
     /// a surface that shows a reviewable diff (an editor over ACP). Built from the
     /// expanded call, then redacted, as `detail` is.
     pub change: Option<crate::tools::FileChange>,
+    /// Beyond Python: the sub-agent the call comes from, with its card, worktree, and
+    /// spend so far, for a surface that shows who asks (an editor's approval inbox).
+    /// `None` for the main agent's calls.
+    pub asker: Option<Box<Asker>>,
 }
+
+/// The sub-agent a question comes from (beyond Python), as it stood when the
+/// question was built: an editor shows it beside the question, so the user knows
+/// which of several sub-agents running at once asks, where it works, and what it
+/// has cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Asker {
+    /// The provider id of the card it reports on (its top-level delegation's call,
+    /// or `/agent`'s synthetic one), when the surface observes sub-agents.
+    pub card: Option<String>,
+    /// Its per-spawn number, as sub-agent events and the trace carry it.
+    pub run: u64,
+    /// The specialty or role it runs as.
+    pub agent: String,
+    pub depth: u32,
+    /// The git worktree it is jailed to: the worktree's directory and its branch.
+    pub worktree: Option<(String, String)>,
+    /// Model calls it has made so far.
+    pub steps: u32,
+    /// What it and anything it delegated have spent so far.
+    pub cost_usd: f64,
+}
+
+impl Asker {
+    /// The sub-agent `ctx` belongs to, or `None` for the main agent's context.
+    pub fn of(ctx: &ToolContext) -> Option<Self> {
+        let run = ctx.subagent.as_ref()?;
+        let (steps, cost_usd) = run.progress();
+        Some(Self {
+            card: ctx.card.as_ref().map(|card| card.id.clone()),
+            run: run.run,
+            agent: run.name.clone(),
+            depth: run.depth,
+            worktree: ctx.worktree.as_ref().map(|worktree| {
+                (
+                    crate::tools::display_path(&worktree.path),
+                    worktree.branch.clone(),
+                )
+            }),
+            steps,
+            cost_usd,
+        })
+    }
+}
+
+/// What a queued question is (beyond Python).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionKind {
+    /// May a tool call run?
+    Approval,
+    /// May a project specialty run?
+    Specialty,
+    /// Raise a spent limit?
+    Limit,
+    /// Enter a secret.
+    Secret,
+}
+
+impl QuestionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Specialty => "specialty",
+            Self::Limit => "limit",
+            Self::Secret => "secret",
+        }
+    }
+}
+
+/// A question in the [`PromptQueue`], described for a surface that lists the
+/// questions waiting (beyond Python). It names who asks and about what, never the
+/// arguments or a secret's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub kind: QuestionKind,
+    /// The tool an approval is for.
+    pub tool: Option<String>,
+    /// The call it belongs to, by the id the gate sees (`<card>/<n>` for a
+    /// sub-agent's call).
+    pub call: Option<String>,
+    /// The sub-agent asking, when one is.
+    pub agent: Option<String>,
+    /// The provider id of the asking sub-agent's card.
+    pub card: Option<String>,
+    /// What is asked about beyond the tool: the project specialty to run, or the
+    /// limit to raise.
+    pub subject: Option<String>,
+}
+
+impl Question {
+    pub fn new(kind: QuestionKind) -> Self {
+        Self {
+            kind,
+            tool: None,
+            call: None,
+            agent: None,
+            card: None,
+            subject: None,
+        }
+    }
+
+    /// The question about `call`, whose prompt shows `preview`.
+    pub fn about(
+        kind: QuestionKind,
+        tool: &str,
+        call: &ToolCall,
+        preview: &ApprovalPreview,
+    ) -> Self {
+        let asker = preview.asker.as_ref();
+        Self {
+            tool: Some(tool.to_owned()),
+            call: Some(call.id.clone()),
+            agent: asker.map(|asker| asker.agent.clone()),
+            card: asker.and_then(|asker| asker.card.clone()),
+            ..Self::new(kind)
+        }
+    }
+}
+
+/// Told the question being asked, if any, and those waiting behind it in the order
+/// they will be asked, whenever either changes. Called with the queue locked, so it
+/// must not block or ask anything itself.
+pub type QueueWatcher = std::sync::Arc<dyn Fn(Option<&Question>, &[Question]) + Send + Sync>;
 
 /// The caution for a write into agent86's own configuration or skills.
 pub fn guarded_warning(path: &str) -> String {
@@ -67,7 +194,9 @@ pub struct ApprovalDecision {
 
 /// One question at a time (beyond Python): approval, limit, and secret prompts all
 /// pass through one queue, because sub-agents running in parallel can each reach a
-/// prompt, and a terminal or an editor answers one at a time. A waiter that gets
+/// prompt, and a terminal or an editor answers one at a time. Questions are asked
+/// in the order they arrived, and a watcher can be told which are waiting
+/// ([`PromptQueue::set_watcher`]), so an editor can list them. A waiter that gets
 /// its turn after the turn was cancelled declines without asking, so a cancel is
 /// not followed by each queued question in turn. Clones share the queue.
 #[derive(Clone, Default)]
@@ -77,8 +206,36 @@ pub struct PromptQueue {
 
 #[derive(Default)]
 struct QueueInner {
-    turn: Mutex<()>,
+    state: Mutex<QueueState>,
+    /// Signalled whenever the question being asked ends or a waiter gives up its
+    /// turn, so the next in line can go.
+    turn_over: std::sync::Condvar,
     cancel: Mutex<Option<crate::agent::CancelToken>>,
+    watcher: Mutex<Option<QueueWatcher>>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    next: u64,
+    asking: Option<Question>,
+    /// By ticket, in arrival order.
+    waiting: std::collections::VecDeque<(u64, Question)>,
+}
+
+/// Ends the question being asked, even if its prompt panics.
+struct Asked<'a>(&'a PromptQueue);
+
+impl Drop for Asked<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.asking = None;
+        // With a question waiting, its turn reports next (asked, or given up), so
+        // a watcher never sees the gap between the two.
+        if state.waiting.is_empty() {
+            self.0.report(&state);
+        }
+        self.0.inner.turn_over.notify_all();
+    }
 }
 
 impl std::fmt::Debug for PromptQueue {
@@ -97,22 +254,87 @@ impl PromptQueue {
             .unwrap_or_else(PoisonError::into_inner) = Some(token);
     }
 
-    /// Ask with `ask` once nobody else is asking, or `None` when the turn was
-    /// cancelled while this question waited.
-    pub fn ask<T>(&self, ask: impl FnOnce() -> T) -> Option<T> {
-        let _turn = self
+    /// Tell `watcher` (or, with `None`, nobody) what is asked and waiting from now on.
+    pub fn set_watcher(&self, watcher: Option<QueueWatcher>) {
+        *self
             .inner
-            .turn
+            .watcher
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let cancelled = self
-            .inner
+            .unwrap_or_else(PoisonError::into_inner) = watcher;
+    }
+
+    /// Ask `question` with `ask` once every question that arrived before it has
+    /// been asked, or `None` when the turn was cancelled while it waited.
+    pub fn ask<T>(&self, question: Question, ask: impl FnOnce() -> T) -> Option<T> {
+        let mut state = self.lock();
+        let waited = state.asking.is_some() || !state.waiting.is_empty();
+        let question = if waited {
+            let ticket = state.next;
+            state.next += 1;
+            state.waiting.push_back((ticket, question));
+            self.report(&state);
+            while state.asking.is_some()
+                || state.waiting.front().map(|(first, _)| *first) != Some(ticket)
+            {
+                state = self
+                    .inner
+                    .turn_over
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            state
+                .waiting
+                .pop_front()
+                .map_or_else(|| unreachable!("first in line"), |(_, question)| question)
+        } else {
+            question
+        };
+        if self.cancelled() {
+            if waited {
+                self.report(&state);
+                self.inner.turn_over.notify_all();
+            }
+            return None;
+        }
+        state.asking = Some(question);
+        self.report(&state);
+        drop(state);
+        let _asked = Asked(self);
+        Some(ask())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner
             .cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .is_some_and(crate::agent::CancelToken::is_cancelled);
-        (!cancelled).then(ask)
+            .is_some_and(crate::agent::CancelToken::is_cancelled)
+    }
+
+    /// Tell the watcher, if there is one, about `state`.
+    fn report(&self, state: &QueueState) {
+        let watcher = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(watcher) = watcher {
+            let waiting: Vec<Question> = state
+                .waiting
+                .iter()
+                .map(|(_, question)| question.clone())
+                .collect();
+            watcher(state.asking.as_ref(), &waiting);
+        }
     }
 }
 
@@ -245,7 +467,16 @@ impl ApprovalGate {
     /// installed, else the call prompts. `None` when nobody can be asked.
     pub fn ask_specialty(&self, call: &ToolCall, preview: &ApprovalPreview) -> Option<bool> {
         match &self.specialty_prompt {
-            Some(prompt) => Some(self.queue.ask(|| prompt(call, preview)).unwrap_or(false)),
+            Some(prompt) => {
+                let mut question =
+                    Question::about(QuestionKind::Specialty, "delegate", call, preview);
+                question.subject = preview.agent.clone();
+                Some(
+                    self.queue
+                        .ask(question, || prompt(call, preview))
+                        .unwrap_or(false),
+                )
+            }
             None => self.ask_about("delegate", call, preview),
         }
     }
@@ -271,13 +502,16 @@ impl ApprovalGate {
         // A question that waited past a cancel is declined without being put.
         Some(
             self.queue
-                .ask(|| match &self.call_prompt {
-                    Some(prompt) => prompt(call, preview),
-                    None => self
-                        .prompt
-                        .as_ref()
-                        .is_some_and(|prompt| prompt(name, preview)),
-                })
+                .ask(
+                    Question::about(QuestionKind::Approval, name, call, preview),
+                    || match &self.call_prompt {
+                        Some(prompt) => prompt(call, preview),
+                        None => self
+                            .prompt
+                            .as_ref()
+                            .is_some_and(|prompt| prompt(name, preview)),
+                    },
+                )
                 .unwrap_or(false),
         )
     }
@@ -313,6 +547,7 @@ pub fn build_preview(tool: &dyn Tool, call: &ToolCall, ctx: &ToolContext) -> App
         change: tool
             .change(&expanded, ctx)
             .map(|change| change.redacted(&ctx.secrets)),
+        asker: Asker::of(ctx).map(Box::new),
     }
 }
 
@@ -431,6 +666,7 @@ mod tests {
             full: false,
             agent: None,
             change: None,
+            asker: None,
         }
     }
 
@@ -455,6 +691,171 @@ mod tests {
             "\n{\"path\": \"a<U+202E>txt.sh\"}␛[2K\napprove mcp␛[8m_tool?\n  [y/N] "
         );
         assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
+    }
+
+    type Views = std::sync::Arc<Mutex<Vec<(Option<String>, Vec<String>)>>>;
+
+    /// A queue whose watcher keeps every view it is shown, by each question's call.
+    fn watched_queue() -> (PromptQueue, Views) {
+        let queue = PromptQueue::default();
+        let views: Views = std::sync::Arc::default();
+        let seen = std::sync::Arc::clone(&views);
+        queue.set_watcher(Some(std::sync::Arc::new(
+            move |asking: Option<&Question>, waiting: &[Question]| {
+                let call = |question: &Question| question.call.clone().unwrap_or_default();
+                seen.lock()
+                    .unwrap()
+                    .push((asking.map(call), waiting.iter().map(call).collect()));
+            },
+        )));
+        (queue, views)
+    }
+
+    fn question(call: &str) -> Question {
+        Question {
+            call: Some(call.to_owned()),
+            ..Question::new(QuestionKind::Approval)
+        }
+    }
+
+    /// Wait until the queue has shown `waiting` questions behind the one asked.
+    fn until_waiting(views: &Views, waiting: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while views
+            .lock()
+            .unwrap()
+            .last()
+            .is_none_or(|(_, queued)| queued.len() != waiting)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                views.lock().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn questions_are_asked_in_arrival_order_and_the_watcher_sees_who_waits() {
+        let (queue, views) = watched_queue();
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let hold = hold;
+                queue.ask(question("a"), || {
+                    asked.lock().unwrap().push("a");
+                    hold.recv().unwrap();
+                })
+            });
+            until_waiting(&views, 0);
+            let mut rest = Vec::new();
+            for (call, behind) in [("b", 1), ("c", 2)] {
+                let (queue, asked) = (&queue, &asked);
+                rest.push(
+                    scope.spawn(move || {
+                        queue.ask(question(call), || asked.lock().unwrap().push(call))
+                    }),
+                );
+                until_waiting(&views, behind);
+            }
+            release.send(()).unwrap();
+            assert!(first.join().unwrap().is_some());
+            for waiter in rest {
+                assert!(waiter.join().unwrap().is_some());
+            }
+        });
+        assert_eq!(*asked.lock().unwrap(), ["a", "b", "c"]);
+        let view = |asking: Option<&str>, waiting: &[&str]| {
+            (
+                asking.map(str::to_owned),
+                waiting
+                    .iter()
+                    .map(|call| (*call).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            *views.lock().unwrap(),
+            [
+                view(Some("a"), &[]),
+                view(Some("a"), &["b"]),
+                view(Some("a"), &["b", "c"]),
+                view(Some("b"), &["c"]),
+                view(Some("c"), &[]),
+                view(None, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn questions_waiting_past_a_cancel_are_declined_without_being_asked() {
+        let (queue, views) = watched_queue();
+        let token = crate::agent::CancelToken::default();
+        queue.watch(token.clone());
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let hold = hold;
+                queue.ask(question("a"), || hold.recv().unwrap())
+            });
+            until_waiting(&views, 0);
+            let second =
+                scope.spawn(|| queue.ask(question("b"), || panic!("asked after a cancel")));
+            until_waiting(&views, 1);
+            token.cancel();
+            release.send(()).unwrap();
+            assert!(first.join().unwrap().is_some());
+            assert!(second.join().unwrap().is_none());
+        });
+        assert_eq!(
+            views.lock().unwrap().last(),
+            Some(&(None, Vec::new())),
+            "the declined question left the queue empty"
+        );
+        // A question arriving after the cancel is declined at once.
+        assert!(queue.ask(question("c"), || ()).is_none());
+    }
+
+    #[test]
+    fn a_sub_agents_call_is_previewed_with_who_asks() {
+        let dir = std::env::temp_dir().join(format!("agent86-asker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ToolContext::new(&dir).unwrap();
+        assert_eq!(Asker::of(&ctx), None);
+        let run = std::sync::Arc::new(crate::subagent::SubagentRun::new(7, "writer", 2));
+        ctx.subagent = Some(run);
+        ctx.card = Some(std::sync::Arc::new(crate::subagent::Card::new(
+            "call_9", true,
+        )));
+        let asker = Asker::of(&ctx).unwrap();
+        assert_eq!(
+            asker,
+            Asker {
+                card: Some("call_9".into()),
+                run: 7,
+                agent: "writer".into(),
+                depth: 2,
+                worktree: None,
+                steps: 0,
+                cost_usd: 0.0,
+            }
+        );
+        let call = ToolCall {
+            id: "call_9/3".into(),
+            name: "write_file".into(),
+            arguments: serde_json::Map::new(),
+        };
+        let shown = ApprovalPreview {
+            asker: Some(Box::new(asker)),
+            ..preview("{}", None)
+        };
+        let question = Question::about(QuestionKind::Approval, "write_file", &call, &shown);
+        assert_eq!(question.call.as_deref(), Some("call_9/3"));
+        assert_eq!(question.agent.as_deref(), Some("writer"));
+        assert_eq!(question.card.as_deref(), Some("call_9"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

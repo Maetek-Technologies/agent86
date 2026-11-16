@@ -309,7 +309,12 @@ impl SecretVault {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let answer = match queue {
-            Some(queue) => queue.ask(|| prompt(&request)).flatten(),
+            Some(queue) => queue
+                .ask(
+                    crate::approval::Question::new(crate::approval::QuestionKind::Secret),
+                    || prompt(&request),
+                )
+                .flatten(),
             None => prompt(&request),
         }
         .filter(|answer| !answer.value.is_empty())
