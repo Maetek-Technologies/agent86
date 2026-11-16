@@ -11,6 +11,7 @@ pub mod exec;
 pub mod files;
 pub mod memory;
 pub mod sandbox;
+pub mod search;
 pub mod secret;
 pub mod skills;
 pub mod web;
@@ -347,6 +348,29 @@ impl<'a> Arguments<'a> {
         })
     }
 
+    /// An `int` field constrained to `min..=max`, as pydantic's `Field(ge=, le=)`
+    /// reports a value outside it.
+    pub fn bounded_integer(&mut self, field: &str, default: i64, min: i64, max: i64) -> i64 {
+        let before = self.errors.len();
+        let value = self.integer(field, default);
+        if self.errors.len() > before {
+            return default;
+        }
+        if value < min {
+            self.errors.push(format!(
+                "{field}: Input should be greater than or equal to {min}"
+            ));
+            default
+        } else if value > max {
+            self.errors.push(format!(
+                "{field}: Input should be less than or equal to {max}"
+            ));
+            default
+        } else {
+            value
+        }
+    }
+
     /// A required `Literal[...]` string field.
     pub fn choice(&mut self, field: &str, choices: &[&str]) -> String {
         match self.args.get(field) {
@@ -552,6 +576,16 @@ impl SandboxPolicy {
                 ),
             ))
         }
+    }
+
+    /// The jail root `path` (as [`SandboxPolicy::resolve_within`] gave it) lies
+    /// under: the workspace, or the allowed root holding it. The search tools keep
+    /// a walk inside the root it started in (beyond Python).
+    pub fn root_of(&self, path: &Path) -> Option<&Path> {
+        std::iter::once(&self.workspace)
+            .chain(&self.allow_paths)
+            .find(|root| path.starts_with(root))
+            .map(PathBuf::as_path)
     }
 
     /// Fail unless network access is allowed.
@@ -1186,11 +1220,11 @@ fn same_tool(a: &Arc<dyn Tool>, b: &Arc<dyn Tool>) -> bool {
     std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
 }
 
-/// Python's built-in tools, plus `remember` and `recall` when memory is on,
+/// Python's built-in tools, then, beyond Python, the read-only search tools
+/// (`search_files`, `find_files`), then `remember` and `recall` when memory is on,
 /// `use_skill` when a skill was found, and `delegate` when `[agents]` is on, in
-/// its registration order (`default_registry`). Then, beyond Python,
-/// `request_secret` when someone is there to answer it (`with_secrets`), so an
-/// unattended run offers exactly Python's tools.
+/// Python's registration order (`default_registry`). Last, beyond Python,
+/// `request_secret` when someone is there to answer it (`with_secrets`).
 pub fn default_registry(
     with_memory: bool,
     with_skills: bool,
@@ -1198,6 +1232,14 @@ pub fn default_registry(
     with_secrets: bool,
 ) -> ToolRegistry {
     let registry = builtin_registry();
+    for tool in [
+        Box::new(search::SearchFilesTool) as Box<dyn Tool>,
+        Box::new(search::FindFilesTool),
+    ] {
+        registry
+            .register(tool)
+            .expect("search tool names are unique");
+    }
     if with_memory {
         for tool in [
             Box::new(memory::RememberTool) as Box<dyn Tool>,

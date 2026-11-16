@@ -319,7 +319,7 @@ async fn tools_model_and_config_commands_report_the_session() {
 
     assert!(
         text.contains(
-            "agent86> tools: delegate, edit_file, list_dir, python_exec, read_file, recall, remember, run_command, web_fetch, write_file\n"
+            "agent86> tools: delegate, edit_file, find_files, list_dir, python_exec, read_file, recall, remember, run_command, search_files, web_fetch, write_file\n"
         ),
         "{text}"
     );
@@ -429,7 +429,7 @@ async fn skills_lists_the_discovered_skills() {
         "{text}"
     );
     assert!(
-        text.contains(", run_command, use_skill, web_fetch,"),
+        text.contains(", run_command, search_files, use_skill, web_fetch,"),
         "{text}"
     );
 }
@@ -783,7 +783,9 @@ async fn agents_lists_specialties_and_agent_runs_one_without_the_main_agent() {
         "{text}"
     );
     assert!(
-        text.contains("tools: read_file, list_dir, run_command\nalways asked: run_command\n"),
+        text.contains(
+            "tools: read_file, list_dir, search_files, find_files, run_command\nalways asked: run_command\n"
+        ),
         "{text}"
     );
     assert!(

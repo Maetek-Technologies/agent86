@@ -438,11 +438,30 @@ mod tests {
         let tools = |name: &str| built_in.get(name).unwrap().tools.clone().unwrap();
         assert_eq!(
             tools("researcher"),
-            ["read_file", "list_dir", "web_fetch", "recall"]
+            [
+                "read_file",
+                "list_dir",
+                "search_files",
+                "find_files",
+                "web_fetch",
+                "recall"
+            ]
         );
-        assert_eq!(tools("reviewer"), ["read_file", "list_dir", "run_command"]);
+        assert_eq!(
+            tools("reviewer"),
+            [
+                "read_file",
+                "list_dir",
+                "search_files",
+                "find_files",
+                "run_command"
+            ]
+        );
         assert_eq!(built_in.get("reviewer").unwrap().confirm, ["run_command"]);
-        assert_eq!(tools("planner"), ["read_file", "list_dir"]);
+        assert_eq!(
+            tools("planner"),
+            ["read_file", "list_dir", "search_files", "find_files"]
+        );
         for specialty in built_in.found.values() {
             assert!(!specialty.instructions.is_empty());
             assert!(specialty.model.is_none() && specialty.approval.is_none());

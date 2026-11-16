@@ -2472,7 +2472,10 @@ async fn run_agent_makes_a_specialty_the_main_agent() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["read_file", "list_dir"]);
+    assert_eq!(
+        tools,
+        ["read_file", "list_dir", "search_files", "find_files"]
+    );
 }
 
 #[tokio::test]
