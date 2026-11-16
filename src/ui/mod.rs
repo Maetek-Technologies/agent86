@@ -695,7 +695,10 @@ fn run_turn(
         let prompt = mentions.prompt;
         scope.spawn(move || {
             let on_event = |event: crate::agent::TurnEvent<'_>| {
-                let _ = worker_events.send(event.into());
+                // The status line reads usage from the session when the turn ends.
+                if !matches!(event, crate::agent::TurnEvent::Usage { .. }) {
+                    let _ = worker_events.send(event.into());
+                }
             };
             let result = runtime.block_on(harness.run_kind(state, &kind, &prompt, line, on_event));
             let error = result

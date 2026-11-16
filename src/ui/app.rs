@@ -148,7 +148,11 @@ pub enum CatalogPurpose {
 impl From<TurnEvent<'_>> for UiEvent {
     fn from(event: TurnEvent<'_>) -> Self {
         match event {
-            TurnEvent::Text(text) | TurnEvent::Notice(text) => Self::Text(text.to_owned()),
+            TurnEvent::Text(text)
+            | TurnEvent::Notice(text)
+            | TurnEvent::Compacted { notice: text, .. } => Self::Text(text.to_owned()),
+            // Never sent (the worker drops it); it adds no text.
+            TurnEvent::Usage { .. } => Self::Text(String::new()),
             TurnEvent::Thinking(text) => Self::Thinking(text.to_owned()),
             TurnEvent::ToolCall { call, .. } => Self::ToolCall {
                 id: call.id.clone(),

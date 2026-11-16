@@ -160,6 +160,21 @@ pub enum TurnEvent<'a> {
         observation: &'a str,
         text: &'a str,
     },
+    /// Beyond Python: a model call finished. `step` is what it used; `session` is
+    /// the session's usage with it added (sub-agents' spend joins when their batch
+    /// ends). Adds nothing to the turn's output.
+    Usage {
+        step: &'a crate::types::Usage,
+        session: &'a crate::types::Usage,
+    },
+    /// The history was compacted: `notice` is what the other surfaces stream (a
+    /// notice, as before), and `summary` the summary written, `None` when it could
+    /// not be and the history was trimmed instead (beyond Python: an editor shows it
+    /// as ACP's `compaction_update`).
+    Compacted {
+        notice: &'a str,
+        summary: Option<&'a str>,
+    },
 }
 
 impl<'a> TurnEvent<'a> {
@@ -169,8 +184,9 @@ impl<'a> TurnEvent<'a> {
             Self::Text(text)
             | Self::Notice(text)
             | Self::ToolCall { text, .. }
-            | Self::ToolResult { text, .. } => text,
-            Self::Thinking(_) => "",
+            | Self::ToolResult { text, .. }
+            | Self::Compacted { notice: text, .. } => text,
+            Self::Thinking(_) | Self::Usage { .. } => "",
         }
     }
 }
@@ -431,7 +447,8 @@ impl Harness {
     ///
     /// Never fails the turn: a summary that cannot be written falls back to the drop
     /// that fitting the request does anyway, and says so. Returns the notice to
-    /// stream and how many messages the history lost, so indices into it can follow.
+    /// stream, how many messages the history lost, so indices into it can follow,
+    /// and the summary when one was written.
     async fn compact_if_needed(
         &self,
         state: &mut AgentState,
@@ -439,7 +456,7 @@ impl Harness {
         summary: &mut TurnSummary,
         breaker: &mut CircuitBreaker,
         protect_from: usize,
-    ) -> Option<(String, usize)> {
+    ) -> Option<(String, usize, Option<String>)> {
         if self.limits.compaction != CompactionMode::Summarize {
             return None;
         }
@@ -486,7 +503,7 @@ impl Harness {
                 fields.push(("error", json!(error)));
             }
             self.recorder.event(&sid, "compaction", fields);
-            Some((compaction_failed_notice(cut), 0))
+            Some((compaction_failed_notice(cut), 0, None))
         };
         let completion = match completion {
             Ok(completion) => completion,
@@ -527,7 +544,11 @@ impl Harness {
         if let Some(memory) = &self.memory {
             let _ = memory.persist(state);
         }
-        Some((compacted_notice(cut), before - state.messages.len()))
+        Some((
+            compacted_notice(cut),
+            before - state.messages.len(),
+            Some(text),
+        ))
     }
 
     /// Run one user turn on `state`, passing every piece of streamed text,
@@ -769,7 +790,7 @@ impl Harness {
 
             // Compact before the request is built, so the model call sees the
             // compacted history. Once per step, never nested.
-            if let Some((notice, removed)) = self
+            if let Some((notice, removed, compacted)) = self
                 .compact_if_needed(
                     state,
                     recall_note.as_deref(),
@@ -787,7 +808,10 @@ impl Harness {
                 }
                 // Said out loud: a conversation that quietly lost its oldest turns
                 // looks, from the user's seat, like a model that forgot.
-                emit(TurnEvent::Notice(&notice));
+                emit(TurnEvent::Compacted {
+                    notice: &notice,
+                    summary: compacted.as_deref(),
+                });
             }
 
             let mut completion = {
@@ -899,6 +923,12 @@ impl Harness {
             breaker.record_step(&completion.usage);
             summary.steps = u64::from(breaker.steps());
             summary.add_usage(&completion.usage);
+            // Beyond Python: what this call used, and the session so far, for a
+            // surface that shows it as it goes (an editor's `usage_update`).
+            emit(TurnEvent::Usage {
+                step: &completion.usage,
+                session: &(state.usage + completion.usage),
+            });
             let names: Vec<&str> = completion
                 .tool_calls
                 .iter()

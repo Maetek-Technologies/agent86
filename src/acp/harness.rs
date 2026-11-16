@@ -136,6 +136,20 @@ struct Presenter {
     cards: Cards,
     /// The jail, to report the files a call touches as absolute `locations`.
     policy: Option<crate::tools::SandboxPolicy>,
+    /// The client takes `compaction_update` (`session.compaction`); otherwise a
+    /// compaction is the agent message it always was.
+    compaction: bool,
+}
+
+/// A compaction id no other compaction in the session has: the spec requires one
+/// per compaction, never reused, and the session can outlive this process.
+fn compaction_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("cmp-{millis}-{n}")
 }
 
 /// How many lines of a sub-agent's log its card shows; earlier ones are counted.
@@ -231,12 +245,19 @@ impl Presenter {
             thought: None,
             cards,
             policy: None,
+            compaction: false,
         }
     }
 
     /// Report the files calls touch, resolved through `policy`.
     fn with_policy(mut self, policy: crate::tools::SandboxPolicy) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    /// Report compactions as `compaction_update` (the client said it takes them).
+    fn with_compaction(mut self, compaction: bool) -> Self {
+        self.compaction = compaction;
         self
     }
 
@@ -286,7 +307,18 @@ impl Presenter {
             self.end_thought(sink);
         }
         match event {
-            TurnEvent::Text(chunk) | TurnEvent::Notice(chunk) if !chunk.is_empty() => {
+            TurnEvent::Compacted { notice, summary } if self.compaction => {
+                sink.update(Update::Compaction {
+                    id: compaction_id(),
+                    summary: summary.map(|summary| secrets.redact(summary)),
+                    error: summary.is_none().then(|| notice.trim().to_owned()),
+                })
+            }
+            TurnEvent::Text(chunk)
+            | TurnEvent::Notice(chunk)
+            | TurnEvent::Compacted { notice: chunk, .. }
+                if !chunk.is_empty() =>
+            {
                 sink.update(Update::Message(chunk.to_owned()))
             }
             TurnEvent::Thinking(chunk) if !chunk.is_empty() => match self.thinking {
@@ -1437,7 +1469,10 @@ impl Backend for HarnessBackend {
             session.tool_view,
             Arc::clone(&session.cards),
         )
-        .with_policy(session.harness.context.policy.clone());
+        .with_policy(session.harness.context.policy.clone())
+        .with_compaction(self.client.compaction);
+        let prices = crate::pricing::PriceTable::from_config(&self.config);
+        let default_ref = session.model_ref.clone();
         let Session {
             harness,
             store,
@@ -1446,10 +1481,25 @@ impl Backend for HarnessBackend {
             ..
         } = session;
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&sink));
+        let harness: &Harness = harness;
         let secrets = harness.context.secrets.clone();
+        // Sent after each model call and once more when the turn ends; an update the
+        // same as the last one sent is left out.
+        let last_usage = std::cell::RefCell::new(None);
+        let send_usage = |used: u64, total: &crate::types::Usage| {
+            let update = usage_update(harness, &prices, &default_ref, used, total);
+            let mut last = last_usage.borrow_mut();
+            if last.as_ref() != Some(&update) {
+                *last = Some(update.clone());
+                sink.update(update);
+            }
+        };
 
-        let on_event = |event: crate::agent::TurnEvent<'_>| {
-            presenter.event(event, sink.as_ref(), &secrets);
+        let on_event = |event: crate::agent::TurnEvent<'_>| match event {
+            crate::agent::TurnEvent::Usage { step, session } => {
+                send_usage(step.input_tokens, session);
+            }
+            event => presenter.event(event, sink.as_ref(), &secrets),
         };
         // Beyond Python: `/skill <name> [task]` and a skill's own `/<name> [task]` run
         // a turn with that skill chosen, as at a terminal.
@@ -1476,6 +1526,10 @@ impl Backend for HarnessBackend {
                     .block_on(harness.run_turn_events(state, text, text, on_event)),
             };
         presenter.end_thought(sink.as_ref());
+        // The session's settled totals, sub-agents' spend and `/agent` turns included.
+        if let Some(last) = state.steps.last() {
+            send_usage(last.usage.input_tokens, &state.usage);
+        }
         // The turn is over: nothing may be asked of the editor until the next one.
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // Saved whether the turn finished or failed, so the session stays resumable.
@@ -1797,6 +1851,27 @@ fn approval_text(preview: &ApprovalPreview) -> String {
         None => detail.to_owned(),
     };
     show_controls(&text)
+}
+
+/// A `usage_update` (beyond Python): `used` is the last call's input tokens, as the
+/// terminal's status line counts it, against the routed model's window, and the
+/// session's cost when that model has a price (an unpriced model's cost is unknown,
+/// so it is left out rather than sent as zero).
+fn usage_update(
+    harness: &Harness,
+    prices: &crate::pricing::PriceTable,
+    default_ref: &str,
+    used: u64,
+    session: &crate::types::Usage,
+) -> Update {
+    let reference = harness
+        .routed_ref()
+        .unwrap_or_else(|| default_ref.to_owned());
+    Update::Usage {
+        used,
+        size: harness.active_context_window(),
+        cost: prices.is_priced(&reference).then_some(session.cost_usd),
+    }
 }
 
 /// A result for the editor: what the model is shown, or the error when that is
