@@ -74,13 +74,30 @@ The session database has no working-directory column (it is shared with Python's
    "_meta": {"agent86": {"cwdKnown": false}}}
   ```
 
-  An entry with a recorded directory has no such `_meta`. A client that groups sessions by folder should leave the marked ones out of any folder.
+  Since 1.0.20 the marker is also sent under the extension namespace, as `"com.maetek.agent86/cwdKnown": false` beside `agent86`; the bare `agent86` key will be dropped in a later release, so a new client should read the namespaced one. An entry with a recorded directory has no such `_meta`. A client that groups sessions by folder should leave the marked ones out of any folder.
 
 agent86 never guesses a directory from what a session's tool calls touched, and nothing else in a saved session records where it ran.
 
 ### Renaming a session
 
 `/rename <title>` names the thread's session, as in the terminal. It is answered without a model turn and is not saved into the conversation; the reply is a one-line confirmation, followed by a `session_info_update` carrying the new `title`, so a client can update its list at once. The title is trimmed, cut to its first line, stripped of control and bidirectional-formatting characters, and capped at 200 characters; one with nothing left is refused. `/rename` alone shows the current name. The new name is what `session/list`, the terminal's `/sessions`, and its `/resume` picker show, and later turns keep it.
+
+## agent86's state (an extension)
+
+Standard ACP carries the conversation, tool calls, permissions, and (since 1.0.20) context and cost. A client that wants more of what agent86 knows, such as agent86-web, can ask for agent86's own state events. They follow the spec's extension rules: the namespace is `com.maetek.agent86`, the capability lives in `_meta`, and the method starts with an underscore. A client that does not ask gets nothing extra, and its messages are the same as before.
+
+- **Discover it.** `initialize`'s result advertises the extension to every client: `agentCapabilities._meta["com.maetek.agent86/state"] = {"version": 1}`. The version changes only when a change could break a reader.
+- **Ask for it.** Send `clientCapabilities._meta["com.maetek.agent86/state"]` as `true` (or an object) in `initialize`. Every session of that connection then sends the events.
+- **Receive it.** Each event is one notification, `_com.maetek.agent86/session/event`, with `{"sessionId": "...", "event": {...}}`, sent while the turn runs, before the prompt's response. Every event has `kind` and `ts` (seconds since the Unix epoch). A client should ignore kinds and fields it does not know.
+
+| `kind` | When | Fields |
+| --- | --- | --- |
+| `model_call` | Every model call, the main agent's and each sub-agent's | `step`, `model` (the bare model id), `input_tokens`, `output_tokens`, `cost_usd`, `stop_reason`, `tool_calls` (names); `priced` (whether `cost_usd` means anything: `false` reads as unknown, not free), `turn_cost_usd` (the turn's spend so far, sub-agents included), `cost_cap_usd` (`[limits] max_cost_usd`, `null` when off). A sub-agent's call adds `agent`, `depth`, `run`, and `card` (the tool call id of its delegation's card) |
+| `subagent` | A sub-agent starts or finishes | `phase` (`started` or `finished`), `card`, `run`, `agent`, `depth`; `task` (first 200 characters) when started; `ok`, `input_tokens`, `output_tokens`, `cost_usd` when finished |
+| `guardrail` | A guardrail flags something | `stage` (`ingress_input`, `egress`, `egress_tool_args`, or `observation`), `findings`, and the stage's other fields |
+| `route` | Triage routing picks the turn's model | `model` (the route chosen) |
+
+The `model_call`, `guardrail`, and `route` events are the flight recorder's own (the same kinds and field names as `~/.agent86/traces/trace.jsonl`, plus the fields named above), and every event, `subagent` too, is redacted as the trace is: a secret from the vault becomes `${secret:NAME}`, and `[observability] redact` applies, so a client never sees more than the trace would hold. The events are sent whether or not the trace is written (`[observability] trace = false` turns off the file, not the events).
 
 ## What is different from the terminal
 

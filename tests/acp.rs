@@ -4,6 +4,7 @@
 
 mod support;
 
+use agent86::acp::{STATE_CAPABILITY, STATE_METHOD};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -133,6 +134,7 @@ impl Workspace {
             buffers: Default::default(),
             refuse_writes: None,
             commands: Vec::new(),
+            wants_state: false,
         }
     }
 }
@@ -164,6 +166,8 @@ struct Client {
     refuse_writes: Option<&'static str>,
     /// The commands the agent last advertised, kept out of every exchange's updates.
     commands: Vec<Value>,
+    /// Whether `initialize` asked for agent86's state events.
+    wants_state: bool,
 }
 
 /// What came back for one request: the notifications before its response, and the
@@ -177,6 +181,9 @@ struct Exchange {
     /// The `usage_update`s, kept out of `updates` (a client may ignore them, and
     /// they would shift every position the conversation's assertions name).
     usage: Vec<Value>,
+    /// The `_com.maetek.agent86/session/event` notifications' events, for a client
+    /// that asked for them; any other client fails on one.
+    state: Vec<Value>,
     response: Value,
 }
 
@@ -218,6 +225,7 @@ impl Client {
         let mut requests = Vec::new();
         let mut files = Vec::new();
         let mut usage = Vec::new();
+        let mut state = Vec::new();
         loop {
             let mut text = String::new();
             let read = self.stdout.read_line(&mut text).unwrap();
@@ -235,6 +243,7 @@ impl Client {
                     requests,
                     files,
                     usage,
+                    state,
                     response: message,
                 };
             }
@@ -259,6 +268,15 @@ impl Client {
                 let reply = self.serve_file(method, &message);
                 self.send(&reply);
                 files.push(message);
+                continue;
+            }
+            if message["method"] == STATE_METHOD {
+                assert!(
+                    self.wants_state,
+                    "state sent to a client that did not ask: {message}"
+                );
+                assert!(message.get("id").is_none(), "{message}");
+                state.push(message["params"]["event"].clone());
                 continue;
             }
             assert_eq!(message["method"], "session/update", "{message}");
@@ -353,6 +371,7 @@ impl Client {
 
     /// `initialize` advertising `capabilities`, e.g. `{"fs": {"readTextFile": true}}`.
     fn initialize_with(&mut self, capabilities: Value) -> Value {
+        self.wants_state = capabilities["_meta"][STATE_CAPABILITY] == json!(true);
         self.request(
             "initialize",
             json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
@@ -1913,6 +1932,146 @@ async fn a_compaction_is_a_compaction_update_only_for_a_client_that_takes_them()
     }
 }
 
+/// One priced turn that delegates to `planner`, which lists the directory and
+/// answers; the client advertises `capabilities`. Returns `initialize`'s result
+/// and the turn's exchange.
+async fn delegating_turn(name: &str, capabilities: Value) -> (Value, Exchange) {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "call_1",
+            "delegate",
+            r#"{"agent": "planner", "task": "Plan the change"}"#,
+        )]),
+        sse_tool_calls(&[("call_1", "list_dir", r#"{"path":"."}"#)]),
+        sse_text("1. Do it.", "stop"),
+        sse_text("Planned.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config(
+        name,
+        Some(&server),
+        "[pricing.models.\"mock:test/model\"]\ninput_per_mtok = 1000.0\noutput_per_mtok = 2000.0\n",
+    );
+    tokio::task::spawn_blocking({
+        let project = workspace.project();
+        let mut client = workspace.connect();
+        move || {
+            let initialized = client.initialize_with(capabilities);
+            let session = client.new_session(&project);
+            let exchange = client.prompt(&session, "Plan it");
+            client.finish();
+            (initialized, exchange)
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_client_that_asks_gets_each_model_call_and_sub_agent_on_its_card() {
+    let (initialized, turn) = delegating_turn(
+        "state-on",
+        json!({"_meta": {"com.maetek.agent86/state": true}}),
+    )
+    .await;
+    assert_eq!(
+        initialized["result"]["agentCapabilities"]["_meta"]["com.maetek.agent86/state"],
+        json!({"version": 1})
+    );
+
+    let kinds: Vec<String> = turn
+        .state
+        .iter()
+        .map(|event| match event["kind"].as_str().unwrap() {
+            "subagent" => format!("subagent {}", event["phase"].as_str().unwrap()),
+            kind => kind.to_owned(),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "model_call",
+            "subagent started",
+            "model_call",
+            "model_call",
+            "subagent finished",
+            "model_call"
+        ],
+        "{:?}",
+        turn.state
+    );
+    let near = |value: &Value, expected: f64| {
+        let value = value.as_f64().unwrap();
+        assert!((value - expected).abs() < 1e-9, "{value} != {expected}");
+    };
+    let calls: Vec<&Value> = turn
+        .state
+        .iter()
+        .filter(|event| event["kind"] == "model_call")
+        .collect();
+    // The main loop's call, then the planner's two, then the main loop's answer:
+    // each priced, the turn's spend running across all of them.
+    for (call, (cost, spent)) in
+        calls
+            .iter()
+            .zip([(0.036, 0.036), (0.036, 0.072), (0.02, 0.092), (0.02, 0.112)])
+    {
+        near(&call["cost_usd"], cost);
+        near(&call["turn_cost_usd"], spent);
+        assert_eq!(call["priced"], true, "{call}");
+        near(&call["cost_cap_usd"], 5.0);
+        assert_eq!(call["model"], "test/model");
+        assert!(call.get("session").is_none(), "{call}");
+        assert!(call["ts"].is_f64(), "{call}");
+    }
+    // The planner's calls name the card the editor shows for the delegation.
+    assert!(calls[0].get("card").is_none());
+    assert_eq!(calls[1]["card"], "call_1");
+    assert_eq!(calls[1]["agent"], "planner");
+    assert_eq!(calls[2]["card"], "call_1");
+
+    let started = &turn.state[1];
+    assert_eq!(started["card"], "call_1");
+    assert_eq!(started["agent"], "planner");
+    assert_eq!(started["depth"], 1);
+    assert_eq!(started["task"], "Plan the change");
+    let finished = &turn.state[4];
+    assert_eq!(finished["card"], "call_1");
+    assert_eq!(finished["ok"], true);
+    assert_eq!(finished["input_tokens"], 30);
+    assert_eq!(finished["output_tokens"], 13);
+    near(&finished["cost_usd"], 0.056);
+}
+
+#[tokio::test]
+async fn a_client_that_does_not_ask_sees_exactly_what_it_did() {
+    let (initialized, without) = delegating_turn("state-off", json!({})).await;
+    // Advertised to everyone, as the spec asks; the client's assertion fails on any
+    // state event, so none was sent.
+    assert_eq!(
+        initialized["result"]["agentCapabilities"]["_meta"]["com.maetek.agent86/state"],
+        json!({"version": 1})
+    );
+    assert!(without.state.is_empty());
+
+    // And the conversation itself is the same as for a client that asked.
+    let (_, with) = delegating_turn(
+        "state-compare",
+        json!({"_meta": {"com.maetek.agent86/state": true}}),
+    )
+    .await;
+    let bodies = |exchange: &Exchange| -> Vec<Value> {
+        exchange
+            .updates
+            .iter()
+            .chain(&exchange.usage)
+            .map(|message| message["params"]["update"].clone())
+            .collect()
+    };
+    assert_eq!(bodies(&without), bodies(&with));
+    assert_eq!(without.response["result"], with.response["result"]);
+}
+
 #[tokio::test]
 async fn an_unpriced_model_reports_its_context_but_no_cost() {
     let exchange = usage_turn("usage-unpriced", "").await;
@@ -2311,7 +2470,10 @@ async fn terminal_sessions_are_listed_under_their_own_directory_only() {
     // Unfiltered: both, the unknown one with the stand-in directory marked.
     let all = list(elsewhere.clone(), None);
     assert_eq!(ids(&all), [older.as_str(), recorded.as_str()]);
-    assert_eq!(all[0]["_meta"], json!({"agent86": {"cwdKnown": false}}));
+    assert_eq!(
+        all[0]["_meta"],
+        json!({"agent86": {"cwdKnown": false}, "com.maetek.agent86/cwdKnown": false})
+    );
     assert!(all[0]["cwd"].is_string());
     assert!(all[1].get("_meta").is_none());
     assert_eq!(
