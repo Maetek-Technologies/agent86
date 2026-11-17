@@ -75,7 +75,7 @@ interval costs little; jobs fire within a minute of their time, which suits
 
 - `at`: one-shot timestamp (RFC 3339).
 - `every`: interval in seconds.
-- `daily_at`: `HH:MM` in a timezone (default `chrono::Local`, optional explicit
+- `daily_at`: `HH:MM` in a timezone (default the system time zone through `jiff`, optional explicit
   offset).
 
 This covers the common cases without adding a cron dependency (the codebase is
