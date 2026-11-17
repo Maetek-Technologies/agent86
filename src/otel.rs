@@ -513,9 +513,10 @@ fn iso_time(ns: u128) -> String {
     let micros = (ns + 500) / 1_000;
     let seconds = (micros / 1_000_000) as i64;
     let micro = (micros % 1_000_000) as u32;
-    chrono::DateTime::from_timestamp(seconds, micro * 1_000).map_or_else(String::new, |time| {
-        time.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
-    })
+    jiff::Timestamp::from_second(seconds).map_or_else(
+        |_| String::new(),
+        |time| format!("{}.{micro:06}Z", time.strftime("%Y-%m-%dT%H:%M:%S")),
+    )
 }
 
 fn now_ns() -> u128 {
