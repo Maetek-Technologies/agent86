@@ -1,0 +1,2 @@
+data: {"candidates": [{"content": {"parts": [{"functionCall": {"id": "fc-a","name": "read_file","args": {"path": "a.txt"}},"thoughtSignature": "c2lnbmF0dXJlLUI="},{"functionCall": {"id": "fc-b","name": "read_file","args": {"path": "b.txt"}}}],"role": "model"},"finishReason": "STOP","index": 0}],"usageMetadata": {"promptTokenCount": 1800,"candidatesTokenCount": 30,"totalTokenCount": 1830},"modelVersion": "gemini-3.1-flash-lite"}
+

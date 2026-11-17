@@ -11,7 +11,9 @@ use agent86::provider::google::{GoogleConfig, GoogleProvider, SKIP_SIGNATURE};
 use agent86::provider::remote_windows::google_context_window;
 use agent86::provider::{provider_for_ref_with_store, Provider, ProviderError};
 use agent86::secrets::{NoSecretStore, SecretStore};
-use agent86::types::{CompletionDelta, CompletionRequest, Message, ModelRef, Role, ToolCall};
+use agent86::types::{
+    CompletionDelta, CompletionRequest, Message, ModelRef, Role, ToolCall, ToolSpec,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use support::{fixture, MockServer, Reply};
@@ -265,6 +267,99 @@ async fn an_error_body_keeps_googles_text_with_the_key_redacted() {
     };
     assert!(body.contains("INVALID_ARGUMENT"));
     assert!(!body.contains(TEST_KEY), "{body}");
+}
+
+fn tool(name: &str) -> ToolSpec {
+    ToolSpec {
+        name: name.to_owned(),
+        description: format!("The {name} tool."),
+        parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        side_effecting: false,
+    }
+}
+
+fn call_reply(name: &str, id: Option<&str>) -> Reply {
+    let mut call = json!({"name": name, "args": {"path": "x"}});
+    if let Some(id) = id {
+        call["id"] = json!(id);
+    }
+    let chunk = json!({"candidates": [{"content": {"role": "model", "parts": [{"functionCall": call}]},
+                                       "finishReason": "STOP"}]});
+    Reply::Sse(format!("data: {chunk}\n\n"))
+}
+
+#[tokio::test]
+async fn a_tool_whose_name_gemini_refuses_is_declared_renamed_and_mapped_back() {
+    let server = MockServer::start(vec![call_reply("_1password-get", Some("fc-1"))]).await;
+    let mut ask = hello();
+    ask.tools = vec![tool("1password-get"), tool("read_file")];
+    let (deltas, error) = drain(&provider(&server), ask).await;
+    assert_eq!(error, None);
+    let completion = deltas.last().unwrap().completion.clone().unwrap();
+    assert_eq!(completion.tool_calls[0].name, "1password-get");
+    assert_eq!(completion.tool_calls[0].id, "fc-1");
+    assert_eq!(completion.stop_reason.as_deref(), Some("tool_use"));
+    let requests = server.requests();
+    let names: Vec<&str> = requests[0].body["tools"][0]["functionDeclarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|declaration| declaration["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["_1password-get", "read_file"]);
+}
+
+#[tokio::test]
+async fn a_call_without_an_id_gets_one_of_ours_which_never_goes_back() {
+    let server = MockServer::start(vec![
+        call_reply("read_file", None),
+        Reply::Sse(fixture("google/text.sse")),
+    ])
+    .await;
+    let provider = provider(&server);
+    let mut ask = hello();
+    ask.tools = vec![tool("read_file")];
+    let (deltas, _) = drain(&provider, ask.clone()).await;
+    let call = deltas
+        .last()
+        .unwrap()
+        .completion
+        .clone()
+        .unwrap()
+        .tool_calls[0]
+        .clone();
+    assert!(call.id.starts_with("call_g"), "{}", call.id);
+
+    let mut step = message(Role::Assistant, "");
+    step.tool_calls = vec![call.clone()];
+    let mut result = message(Role::Tool, "x's contents");
+    result.tool_call_id = Some(call.id.clone());
+    result.name = Some("read_file".into());
+    ask.messages.extend([step, result]);
+    assert_eq!(drain(&provider, ask).await.1, None);
+    let contents = server.requests()[1].body["contents"].clone();
+    let contents = contents.as_array().unwrap();
+    let sent_call = &contents[contents.len() - 2]["parts"][0];
+    assert!(sent_call["functionCall"].get("id").is_none());
+    // No signature came with it, so the step's first call gets the placeholder.
+    assert_eq!(sent_call["thoughtSignature"], json!(SKIP_SIGNATURE));
+    assert!(contents[contents.len() - 1]["parts"][0]["functionResponse"]
+        .get("id")
+        .is_none());
+}
+
+#[tokio::test]
+async fn a_missing_signature_400_is_called_a_bug() {
+    let body = r#"{"error": {"code": 400, "message": "Function call is missing a thought_signature in functionCall parts. This is required for tools to work correctly.", "status": "INVALID_ARGUMENT"}}"#;
+    let server = MockServer::start(vec![status(400, body)]).await;
+    let (_, error) = drain(&provider(&server), hello()).await;
+    let Some(ProviderError::HttpHint {
+        status: 400, hint, ..
+    }) = error
+    else {
+        panic!("a hinted 400");
+    };
+    assert!(hint.contains("this is a bug"), "{hint}");
 }
 
 #[test]
