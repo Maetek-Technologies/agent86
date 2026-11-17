@@ -1444,7 +1444,8 @@ impl HarnessBackend {
 impl HarnessBackend {
     /// Ask each provider that can answer for its model list, in the background, once.
     /// A provider is asked when its key resolves (the environment, then the keyring),
-    /// or when it is Ollama, which has none. Each list that arrives is kept and every
+    /// when it is Ollama, which has none, or when its key is optional (vLLM, beyond
+    /// Python), once something listens at its URL. Each list that arrives is kept and every
     /// open session told, so the picker fills in after the session is already usable;
     /// a failure is a line on stderr and nothing else. `AGENT86_ACP_MODEL_LISTS`
     /// narrows it: `off` asks nobody (a picker of just the configured models), and a
@@ -1474,7 +1475,10 @@ impl HarnessBackend {
                 section.api_key_env.as_deref(),
                 &crate::secrets::OsKeyring,
             );
-            if key.is_none() && name != "ollama" {
+            // A key-optional server (vLLM) is asked with or without a key, but is
+            // usually just not running, so nothing listening is no line on stderr.
+            let optional = crate::provider::key_optional(name, Some(section));
+            if key.is_none() && name != "ollama" && !optional {
                 continue;
             }
             let (name, section) = (name.clone(), section.clone());
@@ -1482,6 +1486,19 @@ impl HarnessBackend {
             let open = Arc::clone(&self.open);
             let notifier = self.notifier.clone();
             std::thread::spawn(move || {
+                if optional {
+                    let base_url = section.base_url.clone().unwrap_or_else(|| {
+                        crate::provider::server_kind(&name, Some(&section))
+                            .map(|kind| kind.default_base_url().to_owned())
+                            .unwrap_or_default()
+                    });
+                    if !crate::provider::catalog::server_listening(
+                        &base_url,
+                        std::time::Duration::from_millis(500),
+                    ) {
+                        return;
+                    }
+                }
                 match crate::provider::catalog::fetch_catalog(&name, &section, key.as_deref()) {
                     Ok(entries) => {
                         let entries =

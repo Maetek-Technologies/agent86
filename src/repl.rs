@@ -956,8 +956,14 @@ pub fn find_command_for_line(line: &str) -> Option<(&'static CommandEntry, Strin
     })
 }
 
-/// Where a provider's key comes from, never the key itself.
-fn key_source(name: &str, api_key_env: Option<&str>, secrets: &dyn SecretStore) -> (Style, String) {
+/// Where a provider's key comes from, never the key itself. A server whose key is
+/// optional (vLLM, beyond Python) shows `optional` when none resolves, not `none`.
+fn key_source(
+    name: &str,
+    section: &crate::config::ProviderConfig,
+    secrets: &dyn SecretStore,
+) -> (Style, String) {
+    let api_key_env = section.api_key_env.as_deref();
     let Some(variable) = api_key_env.filter(|variable| !variable.is_empty()) else {
         return (Style::Dim, "n/a".into());
     };
@@ -965,6 +971,8 @@ fn key_source(name: &str, api_key_env: Option<&str>, secrets: &dyn SecretStore) 
         (Style::Green, "env".into())
     } else if secrets.get_password(SERVICE_NAME, name).is_some() {
         (Style::Green, "keyring".into())
+    } else if crate::provider::key_optional(name, Some(section)) {
+        (Style::Dim, "optional".into())
     } else {
         (Style::Yellow, "none".into())
     }
@@ -1011,7 +1019,7 @@ fn providers_table(config: &Config, secrets: &dyn SecretStore) -> Text {
                     .api_key_env
                     .clone()
                     .map_or_else(dash, |env| (Style::Plain, env)),
-                key_source(name, provider.api_key_env.as_deref(), secrets),
+                key_source(name, provider, secrets),
             ]
         })
         .collect();
@@ -2463,6 +2471,17 @@ mod tests {
             ["ollama", "http://localhost:11434", "-", "n/a"]
         );
         assert_eq!(row("route.cheap"), ["route.cheap", "ollama:llama3.1", "ok"]);
+        if std::env::var_os("VLLM_API_KEY").is_none() {
+            assert_eq!(
+                row("vllm"),
+                [
+                    "vllm",
+                    "http://localhost:8000/v1",
+                    "VLLM_API_KEY",
+                    "optional"
+                ]
+            );
+        }
         assert!(!text.contains("stored"));
     }
 

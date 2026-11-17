@@ -35,6 +35,7 @@ This is the standard agent86. It replaced the original [Python implementation](h
 - An Ollama provider for local models (`--model ollama:<model>`), streaming from `/api/chat` with tool calls, at no cost
 - An Anthropic provider (`--model anthropic:<model>`) on the Messages API, with tool use, prompt caching, and the SDK's retries and error messages
 - A llama.cpp and LM Studio provider (`--model llamacpp:<model>`), keyless and free, through the OpenAI-compatible adapter
+- A vLLM provider (`--model vllm:<model>`, beyond Python) for a server at `localhost:8000` or anywhere else: the key is sent when one is set (`VLLM_API_KEY`, or `agent86 keys set vllm`) and not needed otherwise, the context window is the server's `max_model_len`, it is free, and vLLM's errors for missing tool-call flags, the context length, and the key come with what to do. `adapter = "vllm"` makes any section a vLLM server (see below)
 - Recorded SSE fixtures and a local mock server, so provider tests need no credentials or network
 - Layered TOML configuration (`~/.agent86/config.toml`, then `./.agent86/config.toml`, then `AGENT86_MODEL`, then `--model`) with the built-in OpenAI, OpenRouter, and Groq provider blocks. A project's file is not trusted until you say so (beyond Python): settings that could start programs, send your keys elsewhere, or loosen approvals (MCP servers, providers, guardrails, the sandbox, and so on) are listed at a terminal for a `[y/N]`, remembered by the file's hash, and ignored otherwise unless you pass `--trust-project` or set `AGENT86_TRUST_PROJECT=1`. The project's own specialist sub-agents (`.agent86/agents/`) are approved separately, per file: each is shown to you in full before it first runs, and `--trust-project` approves them too (except in an editor, which always asks). The model's writes into `.agent86/` or a skills directory are always asked about, even with `--yes`
 - Cost estimates from Python's price table, plus your own rates under `[pricing.models]`; models without a known price (including every OpenRouter model, as in Python) show `cost n/a`
@@ -197,6 +198,15 @@ cargo run -- --model openrouter:<model>                  # the interactive REPL
 ```
 
 Any `[providers.<name>]` block with a `base_url` is treated as OpenAI-compatible; add `api_key_env` if the endpoint needs a key.
+
+A vLLM server elsewhere, a GPU box on your network for example, is a section with `adapter = "vllm"` (beyond Python). It then behaves like the built-in `vllm` provider: its key is optional, its window comes from the server, and it is priced as local. Its key lives under its own name (`agent86 keys set gpu-box`). vLLM answers tool calls only when started with `--enable-auto-tool-choice` and a `--tool-call-parser` that matches the model.
+
+```toml
+[providers.gpu-box]
+adapter = "vllm"
+base_url = "http://gpu-box.lan:8000/v1"
+api_key_env = "GPU_BOX_API_KEY"   # only if the server was started with --api-key
+```
 
 OpenRouter models have no built-in price. To see costs, add your model's rates (USD per million tokens) to `.agent86/config.toml`:
 

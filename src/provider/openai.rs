@@ -8,7 +8,7 @@
 use super::capabilities::supports_sampling_params;
 use super::reasoning::{ReasoningFilter, REASONING_LOOP};
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy, DEFAULT_MAX_RETRIES};
-use super::{DeltaStream, Provider, ProviderError};
+use super::{hints, DeltaStream, Provider, ProviderError, ServerKind};
 use crate::pricing::PriceTable;
 use crate::pyjson::python_json_dumps;
 use crate::secrets::redact;
@@ -53,7 +53,7 @@ pub struct OpenAiConfig {
     /// The config section name, which is also the keyring account for its key.
     pub config_name: String,
     /// The adapter's name, which Python's messages start with: `openai`, or
-    /// `llamacpp` for its thin specialization.
+    /// `llamacpp` or a [`ServerKind`] name (`vllm`) for its thin specializations.
     pub adapter: &'static str,
     /// Whether construction fails without an API key. Keyless local endpoints set this to false.
     pub require_key: bool,
@@ -207,6 +207,27 @@ impl OpenAiProvider {
 
     fn redact(&self, text: &str) -> String {
         redact(text, &[self.api_key.as_deref().unwrap_or_default()])
+    }
+
+    /// The server kind this adapter speaks for (vLLM), if any.
+    fn server_kind(&self) -> Option<ServerKind> {
+        ServerKind::parse(self.config.adapter)
+    }
+
+    /// An HTTP failure with `body` already cut and redacted: Python's text, and for
+    /// a known server a hint when the body is one it is known to send.
+    fn http_error(&self, status: u16, body: String) -> ProviderError {
+        let section = hints::Section {
+            name: &self.config.config_name,
+            api_key_env: self.config.api_key_env.as_deref(),
+        };
+        match self
+            .server_kind()
+            .and_then(|kind| hints::for_http(kind, status, &body, section))
+        {
+            Some(hint) => ProviderError::HttpHint { status, body, hint },
+            None => ProviderError::Http { status, body },
+        }
     }
 
     fn connect_error(&self, error: &reqwest::Error) -> ProviderError {
@@ -544,10 +565,7 @@ impl StreamState<'_> {
             }
 
             let body: String = body.trim().chars().take(ERROR_BODY_LIMIT).collect();
-            return Err(ProviderError::Http {
-                status,
-                body: provider.redact(&body),
-            });
+            return Err(provider.http_error(status, provider.redact(&body)));
         }
     }
 
@@ -577,6 +595,24 @@ impl StreamState<'_> {
                 model: self.provider.model.clone(),
                 detail: error.to_string(),
             })?;
+
+        // A known server reports a failure mid-stream as `data: {"error": {...}}`
+        // (vLLM, then `[DONE]`). Python's adapter skips the chunk and ends with an
+        // empty reply; for these servers the failure is shown instead (beyond Python).
+        if let (Some(error), Some(_)) = (
+            chunk.get("error").filter(|error| error.is_object()),
+            self.provider.server_kind(),
+        ) {
+            let status = error
+                .get("code")
+                .and_then(Value::as_u64)
+                .and_then(|code| u16::try_from(code).ok())
+                .unwrap_or(500);
+            let body: String = data.chars().take(ERROR_BODY_LIMIT).collect();
+            return Err(self
+                .provider
+                .http_error(status, self.provider.redact(&body)));
+        }
 
         if let Some(usage) = chunk.get("usage").and_then(Value::as_object) {
             let turn = &mut self.turn;

@@ -8,6 +8,7 @@
 pub mod anthropic;
 pub mod capabilities;
 pub mod catalog;
+pub mod hints;
 pub mod ollama;
 pub mod openai;
 pub mod reasoning;
@@ -29,10 +30,72 @@ use thiserror::Error;
 /// llama.cpp's server; LM Studio is `:1234/v1`.
 const LLAMACPP_DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
 
+/// vLLM's own default port (`vllm serve --port`).
+pub const VLLM_DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
+
+/// A server agent86 knows beyond the OpenAI-compatible API it speaks (beyond
+/// Python): chosen by a section's `adapter`, or by the built-in section's name.
+/// The requests are the OpenAI adapter's; the kind decides the rest: whether a
+/// key is optional, where the context window comes from, local pricing, and the
+/// hints its errors get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerKind {
+    Vllm,
+}
+
+impl ServerKind {
+    /// The `adapter` value that selects this kind, and the built-in section's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vllm => "vllm",
+        }
+    }
+
+    /// The URL a section of this kind reaches when it sets none.
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Vllm => VLLM_DEFAULT_BASE_URL,
+        }
+    }
+
+    /// A key is sent when one resolves, and its absence is not an error: the
+    /// server is open unless it was started with one (vLLM's `--api-key`).
+    pub fn key_optional(self) -> bool {
+        true
+    }
+
+    pub(crate) fn parse(adapter: &str) -> Option<Self> {
+        match adapter.trim() {
+            "vllm" => Some(Self::Vllm),
+            _ => None,
+        }
+    }
+}
+
+/// The server kind behind section `name`: its `adapter` when it sets one, else
+/// the built-in section's own. `None` for an unknown `adapter`, which
+/// [`provider_for_ref`] refuses; callers that only label or price (the provider
+/// list, the price table) treat it as no kind.
+pub fn server_kind(name: &str, section: Option<&ProviderConfig>) -> Option<ServerKind> {
+    match section.and_then(|section| section.adapter.as_deref()) {
+        Some(adapter) => ServerKind::parse(adapter),
+        None => ServerKind::parse(name),
+    }
+}
+
+/// Is a key optional for section `name`? True for every [`ServerKind`]: the
+/// third key state beside "required" (an `api_key_env`) and "none" (no
+/// `api_key_env`), which the provider list, `keys set`, and the editor's model
+/// lists all know.
+pub fn key_optional(name: &str, section: Option<&ProviderConfig>) -> bool {
+    server_kind(name, section).is_some_and(ServerKind::key_optional)
+}
+
 /// Construct the provider that serves `reference`, e.g. `openrouter:openai/gpt-4o-mini`.
 ///
 /// Any provider section with a `base_url` is treated as OpenAI-compatible, so
-/// OpenRouter, Groq, Together, vLLM, and LM Studio work with only a config block.
+/// OpenRouter, Groq, Together, and LM Studio work with only a config block; vLLM
+/// has a section of its own, and `adapter = "vllm"` ([`ServerKind`]) for others.
 /// A key is required for `openai` itself, and for other sections only when they
 /// name an `api_key_env`; a `base_url` without one is a keyless local endpoint.
 ///
@@ -74,6 +137,18 @@ fn build_provider(
 ) -> Result<Box<dyn Provider>, ProviderError> {
     let name = reference.provider.as_str();
     let section = config.providers.get(name).cloned().unwrap_or_default();
+
+    if let Some(adapter) = section.adapter.as_deref() {
+        if ServerKind::parse(adapter).is_none() {
+            return Err(ProviderError::InvalidSetting {
+                provider: name.to_owned(),
+                detail: format!(
+                    "adapter must be \"vllm\", not {adapter:?}; remove it for a plain \
+                     OpenAI-compatible endpoint"
+                ),
+            });
+        }
+    }
 
     if name == "anthropic" {
         // Python leaves the section's timeouts to the SDK's own (see anthropic.rs).
@@ -122,6 +197,24 @@ fn build_provider(
             .get_or_insert_with(|| LLAMACPP_DEFAULT_BASE_URL.to_owned());
         let mut openai_config = openai_config(name, &section, false)?;
         openai_config.adapter = "llamacpp";
+        let provider = OpenAiProvider::new(
+            reference.model.clone(),
+            openai_config,
+            api_key(name, &section),
+        )?
+        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        return Ok(Box::new(provider));
+    }
+
+    // A known server (vLLM): the OpenAI adapter under the kind's name, its URL
+    // defaulted, and a key sent only when one resolves.
+    if let Some(kind) = server_kind(name, Some(&section)) {
+        let mut section = section;
+        section
+            .base_url
+            .get_or_insert_with(|| kind.default_base_url().to_owned());
+        let mut openai_config = openai_config(name, &section, !kind.key_optional())?;
+        openai_config.adapter = kind.name();
         let provider = OpenAiProvider::new(
             reference.model.clone(),
             openai_config,
@@ -253,7 +346,7 @@ pub async fn collect_completion(
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ProviderError {
     #[error(
-        "Unknown provider '{provider}'. Built-in: anthropic, openai, ollama, llamacpp. \
+        "Unknown provider '{provider}'. Built-in: anthropic, openai, ollama, llamacpp, vllm. \
          For an OpenAI-compatible endpoint, add a [providers.{provider}] block with a base_url \
          (e.g. OpenRouter, Groq, Together) to your config."
     )]
@@ -272,6 +365,15 @@ pub enum ProviderError {
 
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
+
+    /// An HTTP failure from a known server whose body says what to fix (beyond
+    /// Python; see [`hints`]): Python's text, then the hint.
+    #[error("HTTP {status}: {body} -- {hint}")]
+    HttpHint {
+        status: u16,
+        body: String,
+        hint: String,
+    },
 
     #[error("Cannot reach {endpoint}: {detail}")]
     Connect { endpoint: String, detail: String },

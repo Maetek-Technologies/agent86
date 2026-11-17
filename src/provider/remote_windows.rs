@@ -10,9 +10,14 @@
 //! Ollama is asked too (`/api/show`), for the window to run a model at
 //! ([`ollama_window`]); that is beyond Python, which always asks Ollama for 8192.
 //! It is memoized per process only: a local model can be re-pulled at any time.
+//! So is a vLLM server's `max_model_len` ([`vllm_context_window`]), also beyond
+//! Python.
 
 use super::capabilities::DEFAULT_OLLAMA_NUM_CTX_MAX;
-use super::catalog::{fetch_ollama_show, fetch_openai_compatible_context_lengths, OllamaShow};
+use super::catalog::{
+    fetch_ollama_show, fetch_openai_compatible_context_lengths, fetch_vllm_model_lengths,
+    OllamaShow,
+};
 use crate::config::{Config, ProviderConfig};
 use crate::secrets::{resolve_api_key, SecretStore};
 use serde_json::{json, Value};
@@ -34,6 +39,11 @@ static MEMO: LazyLock<Mutex<HashMap<String, HashMap<String, u64>>>> =
 /// negative memo, so a server that is down is not asked again on every redraw.
 type OllamaLengths = HashMap<(String, String), Option<OllamaShow>>;
 static OLLAMA_MEMO: LazyLock<Mutex<OllamaLengths>> = LazyLock::new(Default::default);
+
+/// Normalized vLLM base URL to {lowercased model id: `max_model_len`}; `None` is
+/// a negative memo for a server that did not answer.
+type VllmLengths = HashMap<String, Option<HashMap<String, u64>>>;
+static VLLM_MEMO: LazyLock<Mutex<VllmLengths>> = LazyLock::new(Default::default);
 
 /// The cache file Python shares: `~/.agent86/cache/model_context_windows.json`,
 /// given the directory that holds the user config.
@@ -186,9 +196,45 @@ pub fn ollama_context_window(provider: &str, model: &str, config: &Config) -> Op
     ollama_window(config.providers.get(provider), &show?)
 }
 
+/// A vLLM server's `max_model_len` for `model` (beyond Python), from its
+/// `/v1/models`, with the section's key when one resolves. Memoized per process
+/// and never written to the cache file: a local server can be restarted with
+/// another `--max-model-len`. `None` for any other section, a server that does
+/// not answer, or a model it does not list.
+pub fn vllm_context_window(
+    provider: &str,
+    model: &str,
+    config: &Config,
+    secrets: &dyn SecretStore,
+) -> Option<u64> {
+    let section = config.providers.get(provider);
+    let kind = super::server_kind(provider, section)?;
+    if kind != super::ServerKind::Vllm {
+        return None;
+    }
+    let base_url = section
+        .and_then(|section| section.base_url.as_deref())
+        .unwrap_or(kind.default_base_url())
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let mut memo = VLLM_MEMO
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lengths = memo.entry(base_url.clone()).or_insert_with(|| {
+        let key = resolve_api_key(
+            provider,
+            section.and_then(|section| section.api_key_env.as_deref()),
+            secrets,
+        );
+        fetch_vllm_model_lengths(&base_url, key.as_deref(), FETCH_TIMEOUT).ok()
+    });
+    lengths.as_ref()?.get(&model.trim().to_lowercase()).copied()
+}
+
 /// What the server behind `provider` reports for `model`'s window: OpenRouter's
-/// figure, or an Ollama model's maximum. The `discover` of
-/// [`super::capabilities::context_window_with`].
+/// figure, an Ollama model's maximum, or a vLLM server's `max_model_len`. The
+/// `discover` of [`super::capabilities::context_window_with`].
 pub fn discover_context_window(
     provider: &str,
     model: &str,
@@ -198,6 +244,7 @@ pub fn discover_context_window(
 ) -> Option<u64> {
     openrouter_context_window(provider, model, config, cache, secrets)
         .or_else(|| ollama_context_window(provider, model, config))
+        .or_else(|| vllm_context_window(provider, model, config, secrets))
 }
 
 #[cfg(test)]
