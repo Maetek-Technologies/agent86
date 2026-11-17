@@ -368,6 +368,11 @@ pub struct SaveDiff {
     edit: Result<ConfigEdit, String>,
     /// The first diff row shown.
     top: usize,
+    /// Only the user file can be chosen (a server's address and key variable,
+    /// beyond Python: an endpoint that receives your key belongs to you).
+    user_only: bool,
+    /// Shown above the diff, in yellow.
+    warning: Option<String>,
 }
 
 impl SaveDiff {
@@ -379,9 +384,25 @@ impl SaveDiff {
             scope: Scope::User,
             edit: Err(String::new()),
             top: 0,
+            user_only: false,
+            warning: None,
         };
         panel.refresh(Scope::User);
         panel
+    }
+
+    /// A save to the user file only, with `warning` above the diff.
+    pub fn user_only(
+        purpose: SavePurpose,
+        changes: Vec<Change>,
+        paths: ConfigPaths,
+        warning: Option<String>,
+    ) -> Self {
+        Self {
+            user_only: true,
+            warning,
+            ..Self::new(purpose, changes, paths)
+        }
     }
 
     fn refresh(&mut self, scope: Scope) {
@@ -408,6 +429,12 @@ impl SaveDiff {
         }
         let rows = self.body().len();
         match key.code {
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('2')
+                if self.user_only => {}
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 let other = match self.scope {
                     Scope::User => Scope::Project,
@@ -443,9 +470,19 @@ impl SaveDiff {
             Line::styled(Style::Bold, "Save configuration"),
             Line::default(),
             radio(Scope::User, "user  (~/.agent86/config.toml)"),
-            radio(Scope::Project, "project  (./.agent86/config.toml)"),
-            Line::default(),
         ];
+        if self.user_only {
+            rows.push(Line::styled(
+                Style::Dim,
+                "    a server's address and key variable are saved for you only",
+            ));
+        } else {
+            rows.push(radio(Scope::Project, "project  (./.agent86/config.toml)"));
+        }
+        rows.push(Line::default());
+        if let Some(warning) = &self.warning {
+            rows.push(Line::styled(Style::Yellow, format!("warning: {warning}")));
+        }
         match &self.edit {
             Ok(edit) => rows.push(Line::styled(
                 Style::Dim,
@@ -471,10 +508,11 @@ impl SaveDiff {
                 format!("… {} more lines", body.len() - end),
             ));
         }
-        let hint = if self.edit.is_ok() {
-            "←→ scope · ↑↓ scroll · enter to save · esc to cancel"
-        } else {
-            "←→ scope · esc to cancel"
+        let hint = match (self.edit.is_ok(), self.user_only) {
+            (true, false) => "←→ scope · ↑↓ scroll · enter to save · esc to cancel",
+            (false, false) => "←→ scope · esc to cancel",
+            (true, true) => "↑↓ scroll · enter to save · esc to cancel",
+            (false, true) => "esc to cancel",
         };
         framed(rows, width, hint)
     }

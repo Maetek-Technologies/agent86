@@ -48,7 +48,7 @@ This is the standard agent86. It replaced the original [Python implementation](h
   - Python's slash commands with a `/` menu, `@file` mentions with path completion, and shared prompt history
   - specialist sub-agents: `/agents` lists them, `/agent <name> <task>` runs one now, and `#name` (with completion) asks the agent to delegate to one (beyond Python)
   - pickers for the approval mode, the model (with the provider's live model list), and the session to resume
-  - `/config model`: pick a provider, enter its key (kept in the OS keyring only after a live connection test passes), pick a model, and save it to your user or project config with your comments kept
+  - `/config model`: pick a provider, enter its key (kept in the OS keyring only after a live connection test passes), pick a model, and save it to your user or project config with your comments kept. Its last entry, "add a vLLM or LM Studio server" (beyond Python), takes a server's kind, name, address, and optional key: the server's models are asked for with no key first, a server that refuses asks for one, and the address is saved to your user config only, with a warning when a key would go over plain HTTP to another machine. Choosing a server added this way opens the same form to change its address; a stored key never follows a new address unless you confirm it or type a new one
   - `/config mcp`: add an MCP server from a pasted JSON block or by hand, test it live, save it, and use its tools at once; edit, disable, or remove servers the same way
   - answers rendered as Markdown, coloured diffs in approvals, and Ctrl+O for the full transcript with every tool call expanded
   - Esc or Ctrl+C to cancel a turn

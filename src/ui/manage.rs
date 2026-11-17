@@ -9,6 +9,14 @@
 //! the catalog picker, a live connection test, then the save panel. A typed key is
 //! held in memory only and reaches the keyring only after the test passes (or the
 //! user saves anyway); the config file only ever names the environment variable.
+//!
+//! Beyond Python, the list ends with "add a server" ([`ServerForm`]): a vLLM or LM
+//! Studio server by address, and choosing a section with an `adapter` opens the
+//! same form to change it. Its model list is asked with no key (or the typed
+//! one), and a 401 or 403 from a server whose key is optional opens key entry, so
+//! an open server never asks for a key and a secured one always does. Until it is
+//! saved the section lives only in [`Manager`] (and in the session's config once
+//! the test passes); the save goes to the user file only.
 
 use super::app::{App, CatalogPurpose, Panel, UiEvent};
 use super::manage_mcp::McpFlow;
@@ -16,11 +24,14 @@ use super::panels::{
     ConnectionTest, KeyEntry, KeyPurpose, SaveDiff, SavePurpose, TestOutcome, TestResult,
 };
 use super::picker::Picker;
+use super::server_form::{SectionInfo, ServerDraft, ServerForm, PLAIN_HTTP_WARNING};
 use super::text::sanitize;
-use crate::config::ConfigPaths;
+use crate::config::{Config, ConfigPaths, ProviderConfig};
 use crate::config_writer::{apply_edit, Change, ConfigEdit};
 use crate::provider::catalog::{catalog_has_ref, fetch_catalog, prefix_catalog_refs, CatalogEntry};
-use crate::provider::{provider_for_ref_with_key, provider_for_ref_with_store, Provider};
+use crate::provider::{
+    provider_for_ref_with_key, provider_for_ref_with_store, server_kind, Provider,
+};
 use crate::repl::{model_choices, Repl, Style, Text};
 use crate::secrets::{resolve_api_key, SERVICE_NAME};
 use crate::types::{CompletionRequest, Message, ModelRef, Role};
@@ -30,6 +41,9 @@ use std::time::Duration;
 
 /// The connection test's hard cap.
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The provider list's last row: no section can have this name.
+const ADD_SERVER: &str = "\u{0}add-server";
 
 /// Provider names that build without a `[providers.X]` block. Used only to judge
 /// whether a failed `/model` looks like a bare model id; see [`is_bare_ref_candidate`].
@@ -155,6 +169,10 @@ pub struct Manager {
     key: Option<String>,
     reference: Option<String>,
     tests: u64,
+    /// The server the "add a server" form described, until it is saved.
+    server: Option<ServerDraft>,
+    /// A key was typed this pass, so a save names its variable.
+    key_typed: bool,
 }
 
 impl Manager {
@@ -169,6 +187,8 @@ impl Manager {
             key: None,
             reference: None,
             tests: 0,
+            server: None,
+            key_typed: false,
         }
     }
 
@@ -189,12 +209,7 @@ impl Manager {
             return;
         }
         app.note(Style::Dim, &format!("fetching {provider} model catalog…"));
-        let section = repl
-            .config
-            .providers
-            .get(provider)
-            .cloned()
-            .unwrap_or_default();
+        let section = self.section_for(repl, provider);
         let events = self.events.clone();
         let provider = provider.to_owned();
         std::thread::spawn(move || {
@@ -223,6 +238,28 @@ impl Manager {
             Ok(entries) => {
                 self.catalogs.insert(provider.to_owned(), entries.clone());
                 entries
+            }
+            // A server whose key is optional refused without one: ask for it, and
+            // fetch again with it (beyond Python).
+            Err(error)
+                if purpose == CatalogPurpose::Manager
+                    && is_refusal(&error)
+                    && self.key.is_none()
+                    && self
+                        .row
+                        .as_ref()
+                        .is_some_and(|row| row.name == provider && row.key_optional) =>
+            {
+                app.note(
+                    Style::Dim,
+                    &format!("{provider} asks for a key; enter it to continue"),
+                );
+                app.open_panel(Panel::Key(KeyEntry::new(
+                    KeyPurpose::Provider,
+                    provider,
+                    repl.secrets.available(),
+                )));
+                return Vec::new();
             }
             Err(error) => {
                 let mut text = Text::styled(Style::Yellow, "catalog unavailable:");
@@ -388,16 +425,40 @@ impl Manager {
         self.row = None;
         self.key = None;
         self.reference = None;
-        let choices = provider_rows(repl)
+        self.server = None;
+        self.key_typed = false;
+        let mut choices: Vec<(String, String)> = provider_rows(repl)
             .into_iter()
             .map(|row| (row.label(), row.name))
             .collect();
+        choices.push((
+            "+ add a vLLM or LM Studio server…".to_owned(),
+            ADD_SERVER.to_owned(),
+        ));
         app.open_picker(Picker::providers(choices));
     }
 
     /// A provider was chosen: its catalog when it has a key or needs none, else
-    /// key entry first. A provider without a key is never a dead end.
+    /// key entry first. A provider without a key is never a dead end. "Add a
+    /// server", or a section with an `adapter`, opens the server form instead.
     pub fn on_provider(&mut self, app: &mut App, repl: &Repl, name: &str) {
+        if name == ADD_SERVER {
+            let form = ServerForm::add(section_infos(repl));
+            app.open_panel(Panel::Server(Box::new(form)));
+            return;
+        }
+        let configured = repl.config.providers.get(name);
+        if let Some(kind) = configured
+            .filter(|section| section.adapter.is_some())
+            .and_then(|section| server_kind(name, Some(section)))
+        {
+            let infos = section_infos(repl);
+            if let Some(info) = infos.iter().find(|info| info.name == name).cloned() {
+                let form = ServerForm::edit(&info, kind, infos);
+                app.open_panel(Panel::Server(Box::new(form)));
+                return;
+            }
+        }
         let Some(row) = provider_rows(repl).into_iter().find(|row| row.name == name) else {
             return;
         };
@@ -424,7 +485,58 @@ impl Manager {
             return;
         };
         self.key = Some(key.clone());
+        self.key_typed = true;
+        // A list fetched without the key is not the list this key sees.
+        self.catalogs.remove(&row.name);
         self.request_catalog(app, repl, &row.name, Some(key), CatalogPurpose::Manager);
+    }
+
+    /// The server form was completed: ask the server for its models, with the
+    /// typed key or the section's own, before anything is saved.
+    pub fn on_server_form(&mut self, app: &mut App, repl: &Repl, draft: ServerDraft) {
+        let existing = repl.config.providers.get(&draft.name);
+        let stored = existing
+            .filter(|section| section.api_key_env.is_some())
+            .and_then(|_| provider_key(repl, &draft.name));
+        self.key = draft.key.clone();
+        self.key_typed = draft.key.is_some();
+        self.catalogs.remove(&draft.name);
+        self.row = Some(ProviderRow {
+            name: draft.name.clone(),
+            base_url: Some(draft.url.clone()),
+            api_key_env: existing.and_then(|section| section.api_key_env.clone()),
+            has_key: draft.key.is_some() || stored.is_some(),
+            keyless: false,
+            key_optional: true,
+        });
+        let key = draft.key.clone().or(stored);
+        let name = draft.name.clone();
+        self.server = Some(draft);
+        self.request_catalog(app, repl, &name, key, CatalogPurpose::Manager);
+    }
+
+    /// The section `name` as this pass sees it: the server form's when it
+    /// describes `name`, else the config's.
+    fn section_for(&self, repl: &Repl, name: &str) -> ProviderConfig {
+        let mut section = repl.config.providers.get(name).cloned().unwrap_or_default();
+        if let Some(server) = self.server.as_ref().filter(|server| server.name == name) {
+            section.base_url = Some(server.url.clone());
+            section.adapter = Some(server.kind.name().to_owned());
+            if section.api_key_env.is_none() && self.key_typed {
+                section.api_key_env = Some(key_variable(name));
+            }
+        }
+        section
+    }
+
+    /// The config with the server form's section in it, for building the provider.
+    fn config_for(&self, repl: &Repl) -> Config {
+        let mut config = repl.config.clone();
+        if let Some(server) = &self.server {
+            let section = self.section_for(repl, &server.name);
+            config.providers.insert(server.name.clone(), section);
+        }
+        config
     }
 
     /// A model was picked: test it for real, with the typed key if there is one.
@@ -443,9 +555,10 @@ impl Manager {
         let id = self.tests;
         app.open_panel(Panel::Test(ConnectionTest::new(id, reference)));
         // Built here, where the keyring is; only the request runs on the worker.
+        let config = self.config_for(repl);
         let built = match &self.key {
-            Some(key) => provider_for_ref_with_key(&parsed, &repl.config, key),
-            None => provider_for_ref_with_store(&parsed, &repl.config, &*repl.secrets),
+            Some(key) => provider_for_ref_with_key(&parsed, &config, key),
+            None => provider_for_ref_with_store(&parsed, &config, &*repl.secrets),
         };
         let events = self.events.clone();
         std::thread::spawn(move || {
@@ -462,7 +575,7 @@ impl Manager {
     pub fn on_tested(
         &mut self,
         app: &mut App,
-        repl: &Repl,
+        repl: &mut Repl,
         outcome: TestOutcome,
     ) -> Option<String> {
         let error = outcome.error.as_deref().unwrap_or("None");
@@ -498,11 +611,21 @@ impl Manager {
             .config_paths
             .clone()
             .unwrap_or_else(ConfigPaths::discover);
-        app.open_panel(Panel::Save(SaveDiff::new(
-            SavePurpose::Model,
-            self.persist_changes(),
-            paths,
-        )));
+        let panel = match &self.server {
+            // The switch below needs the section before any save: for this session.
+            Some(server) => {
+                let section = self.section_for(repl, &server.name);
+                repl.config.providers.insert(server.name.clone(), section);
+                SaveDiff::user_only(
+                    SavePurpose::Model,
+                    self.persist_changes(),
+                    paths,
+                    server.plain_http_key.then(|| PLAIN_HTTP_WARNING.to_owned()),
+                )
+            }
+            None => SaveDiff::new(SavePurpose::Model, self.persist_changes(), paths),
+        };
+        app.open_panel(Panel::Save(panel));
         let reference = self.reference.clone().unwrap_or_default();
         outcome.ok.then(|| format!("/model {reference}"))
     }
@@ -514,11 +637,39 @@ impl Manager {
             path(&["model", "default"]),
             Some(self.reference.clone().unwrap_or_default().into()),
         )];
+        if let Some(server) = &self.server {
+            // A server's address, its kind (unless the section is the built-in one
+            // of that kind), and its key variable when a key was used.
+            let name = server.name.as_str();
+            changes.push((
+                path(&["providers", name, "base_url"]),
+                Some(server.url.clone().into()),
+            ));
+            if name != server.kind.name() {
+                changes.push((
+                    path(&["providers", name, "adapter"]),
+                    Some(server.kind.name().into()),
+                ));
+            }
+            let named = self
+                .row
+                .as_ref()
+                .is_some_and(|row| row.api_key_env.is_some());
+            if self.key_typed && !named {
+                changes.push((
+                    path(&["providers", name, "api_key_env"]),
+                    Some(key_variable(name).into()),
+                ));
+            }
+            return changes;
+        }
         if let Some(row) = &self.row {
-            if !row.keyless && !row.key_optional && row.api_key_env.is_none() {
+            let needs_variable =
+                (!row.keyless && !row.key_optional) || (row.key_optional && self.key_typed);
+            if needs_variable && row.api_key_env.is_none() {
                 changes.push((
                     path(&["providers", &row.name, "api_key_env"]),
-                    Some(format!("{}_API_KEY", row.name.to_uppercase()).into()),
+                    Some(key_variable(&row.name).into()),
                 ));
             }
             if let Some(base_url) = &row.base_url {
@@ -555,6 +706,31 @@ impl Manager {
             }
         }
     }
+}
+
+/// What the server form needs to know about each configured section.
+fn section_infos(repl: &Repl) -> Vec<SectionInfo> {
+    repl.config
+        .providers
+        .iter()
+        .map(|(name, section)| SectionInfo {
+            name: name.clone(),
+            kind: server_kind(name, Some(section)),
+            base_url: section.base_url.clone(),
+            has_key: section.api_key_env.is_some() && provider_key(repl, name).is_some(),
+        })
+        .collect()
+}
+
+/// The key variable a save names for section `name`: `GPU_BOX_API_KEY`.
+fn key_variable(name: &str) -> String {
+    format!("{}_API_KEY", name.to_uppercase().replace('-', "_"))
+}
+
+/// A catalog failure that is the server refusing the request for want of a key:
+/// the 401 or 403 that `catalog::status_error` words.
+fn is_refusal(error: &str) -> bool {
+    error.contains("'401 ") || error.contains("'403 ")
 }
 
 /// A real one-token completion, so a pass proves the key, the address, the model
@@ -757,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_optional_provider_goes_to_its_catalog_without_asking_for_a_key() {
+    fn a_server_section_opens_its_form_and_never_asks_for_a_key_first() {
         let (mut manager, _inbox) = manager();
         let (mut app, mut repl) = (app(), repl());
         repl.config.providers.insert(
@@ -775,9 +951,18 @@ mod tests {
             .unwrap();
         assert_eq!(row.status(), "key optional");
         manager.on_provider(&mut app, &repl, "gpu-box");
+        let Some(Panel::Server(form)) = app.panel() else {
+            panic!("a section with an adapter opens the server form");
+        };
+        let drawn: String = form
+            .render(100)
+            .iter()
+            .map(|line| line.plain_text() + "\n")
+            .collect();
+        assert!(drawn.contains("Change a server"), "{drawn}");
         assert!(
-            !matches!(app.panel(), Some(Panel::Key(_))),
-            "no key entry for a server that may be open"
+            drawn.contains("http://127.0.0.1:9/v1"),
+            "its address filled in"
         );
         // And a save never invents an api_key_env for it.
         manager.reference = Some("gpu-box:qwen3".into());
@@ -838,7 +1023,7 @@ mod tests {
     #[test]
     fn a_passing_test_switches_the_model_and_offers_the_save() {
         let (mut manager, _inbox) = manager();
-        let (mut app, repl) = (app(), repl());
+        let (mut app, mut repl) = (app(), repl());
         manager.on_key_entered(&mut app, &repl, Some("gsk_typed".into()));
         assert_eq!(
             printed(&mut app),
@@ -852,7 +1037,7 @@ mod tests {
             error: Some("HTTP 404".into()),
             override_: false,
         };
-        assert_eq!(manager.on_tested(&mut app, &repl, failed), None);
+        assert_eq!(manager.on_tested(&mut app, &mut repl, failed), None);
         assert_eq!(printed(&mut app), ["connection test failed: HTTP 404"]);
         assert!(app.panel().is_none());
 
@@ -862,7 +1047,7 @@ mod tests {
             override_: false,
         };
         assert_eq!(
-            manager.on_tested(&mut app, &repl, passed),
+            manager.on_tested(&mut app, &mut repl, passed),
             Some("/model local:vendor/model".into())
         );
         assert!(matches!(app.panel(), Some(Panel::Save(_))));
@@ -887,8 +1072,256 @@ mod tests {
             error: Some("HTTP 500".into()),
             override_: true,
         };
-        assert_eq!(manager.on_tested(&mut app, &repl, anyway), None);
+        assert_eq!(manager.on_tested(&mut app, &mut repl, anyway), None);
         assert_eq!(printed(&mut app), ["saving anyway despite: HTTP 500"]);
         assert!(matches!(app.panel(), Some(Panel::Save(_))));
+    }
+
+    // ---- the "add a server" form ------------------------------------------
+
+    /// A keyring in memory whose writes the test can read back.
+    #[derive(Clone, Default)]
+    struct MemoryKeyring(std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>);
+
+    impl crate::secrets::SecretStore for MemoryKeyring {
+        fn get_password(&self, _service: &str, account: &str) -> Option<String> {
+            self.0.lock().unwrap().get(account).cloned()
+        }
+
+        fn set_password(
+            &self,
+            _service: &str,
+            account: &str,
+            secret: &str,
+        ) -> Result<(), crate::secrets::SecretStoreError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(account.to_owned(), secret.to_owned());
+            Ok(())
+        }
+    }
+
+    fn repl_with(store: MemoryKeyring) -> Repl {
+        let mut repl = repl();
+        repl.secrets = Box::new(store);
+        repl
+    }
+
+    /// Answer one connection per response, in order, on a local port; the
+    /// requests come back on the receiver.
+    fn serve(responses: Vec<String>) -> (String, mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = socket.read(&mut buffer).unwrap_or(0);
+                let _ = sent.send(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}/v1"), requests)
+    }
+
+    fn http(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const MODELS: &str =
+        r#"{"object":"list","data":[{"id":"qwen3","object":"model","max_model_len":32768}]}"#;
+
+    /// Wait for the catalog the worker fetched, and hand it to the manager.
+    fn deliver_catalog(
+        manager: &mut Manager,
+        inbox: &mpsc::Receiver<UiEvent>,
+        app: &mut App,
+        repl: &Repl,
+    ) {
+        loop {
+            match inbox
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a catalog")
+            {
+                UiEvent::Catalog {
+                    provider,
+                    result,
+                    purpose,
+                } => {
+                    manager.on_catalog(app, repl, &provider, result, purpose);
+                    return;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    fn passed() -> TestOutcome {
+        TestOutcome {
+            ok: true,
+            error: None,
+            override_: false,
+        }
+    }
+
+    fn changes(manager: &Manager) -> Vec<(String, String)> {
+        manager
+            .persist_changes()
+            .into_iter()
+            .map(|(path, value)| (path.join("."), value.unwrap().as_str().unwrap().to_owned()))
+            .collect()
+    }
+
+    fn draft(name: &str, url: &str, key: Option<&str>) -> ServerDraft {
+        ServerDraft {
+            kind: crate::provider::ServerKind::Vllm,
+            name: name.to_owned(),
+            url: url.to_owned(),
+            key: key.map(str::to_owned),
+            plain_http_key: false,
+        }
+    }
+
+    #[test]
+    fn the_provider_list_ends_with_add_a_server_which_opens_the_form() {
+        let (mut manager, _inbox) = manager();
+        let (mut app, repl) = (app(), repl());
+        manager.open_provider_manager(&mut app, &repl);
+        manager.on_provider(&mut app, &repl, ADD_SERVER);
+        let Some(Panel::Server(form)) = app.panel() else {
+            panic!("the server form");
+        };
+        assert!(form
+            .render(100)
+            .iter()
+            .any(|line| line.plain_text().contains("Add a vLLM or LM Studio server")));
+    }
+
+    #[test]
+    fn an_open_server_is_listed_tested_and_saved_without_a_key() {
+        let store = MemoryKeyring::default();
+        let (mut manager, inbox) = manager();
+        let (mut app, mut repl) = (app(), repl_with(store.clone()));
+        let (url, requests) = serve(vec![http("200 OK", MODELS)]);
+        manager.on_server_form(&mut app, &repl, draft("gpu-box", &url, None));
+        deliver_catalog(&mut manager, &inbox, &mut app, &repl);
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.starts_with("GET /v1/models"), "{request}");
+        assert!(
+            !request.to_lowercase().contains("authorization"),
+            "no key sent"
+        );
+        assert!(
+            matches!(app.panel(), Some(Panel::Picker(_))),
+            "the served models"
+        );
+
+        manager.reference = Some("gpu-box:qwen3".into());
+        assert_eq!(
+            manager.on_tested(&mut app, &mut repl, passed()),
+            Some("/model gpu-box:qwen3".into())
+        );
+        // The section is in the session's config at once, so the switch works.
+        let section = &repl.config.providers["gpu-box"];
+        assert_eq!(section.base_url.as_deref(), Some(url.as_str()));
+        assert_eq!(section.adapter.as_deref(), Some("vllm"));
+        assert_eq!(
+            changes(&manager),
+            [
+                ("model.default".to_owned(), "gpu-box:qwen3".to_owned()),
+                ("providers.gpu-box.base_url".to_owned(), url.clone()),
+                ("providers.gpu-box.adapter".to_owned(), "vllm".to_owned()),
+            ]
+        );
+        let Some(Panel::Save(save)) = app.panel() else {
+            panic!("the save panel");
+        };
+        let drawn: String = save
+            .render(100)
+            .iter()
+            .map(|l| l.plain_text() + "\n")
+            .collect();
+        assert!(!drawn.contains("project"), "user file only: {drawn}");
+        assert!(store.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_secured_server_asks_for_its_key_and_keeps_it_only_after_the_test() {
+        let store = MemoryKeyring::default();
+        let (mut manager, inbox) = manager();
+        let (mut app, mut repl) = (app(), repl_with(store.clone()));
+        let (url, requests) = serve(vec![
+            http("401 Unauthorized", r#"{"error":"Unauthorized"}"#),
+            http("200 OK", MODELS),
+        ]);
+        manager.on_server_form(&mut app, &repl, draft("gpu-box", &url, None));
+        deliver_catalog(&mut manager, &inbox, &mut app, &repl);
+        assert!(
+            matches!(app.panel(), Some(Panel::Key(_))),
+            "a 401 opens key entry"
+        );
+
+        manager.on_key_entered(&mut app, &repl, Some("vllm-key-0123".into()));
+        deliver_catalog(&mut manager, &inbox, &mut app, &repl);
+        let _ = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(second.contains("Bearer vllm-key-0123"), "{second}");
+        assert!(matches!(app.panel(), Some(Panel::Picker(_))));
+        assert!(store.0.lock().unwrap().is_empty(), "not before the test");
+
+        manager.reference = Some("gpu-box:qwen3".into());
+        manager.on_tested(&mut app, &mut repl, passed());
+        assert_eq!(
+            store.0.lock().unwrap().get("gpu-box").map(String::as_str),
+            Some("vllm-key-0123")
+        );
+        assert!(changes(&manager).contains(&(
+            "providers.gpu-box.api_key_env".to_owned(),
+            "GPU_BOX_API_KEY".to_owned()
+        )));
+    }
+
+    #[test]
+    fn a_key_over_plain_http_is_warned_about_again_in_the_save_panel() {
+        let (mut manager, _inbox) = manager();
+        let (mut app, mut repl) = (app(), repl());
+        manager.server = Some(ServerDraft {
+            plain_http_key: true,
+            ..draft("gpu-box", "http://10.0.0.5:8000/v1", Some("k"))
+        });
+        manager.reference = Some("gpu-box:qwen3".into());
+        manager.on_tested(&mut app, &mut repl, passed());
+        let Some(Panel::Save(save)) = app.panel() else {
+            panic!("the save panel");
+        };
+        let drawn: String = save
+            .render(100)
+            .iter()
+            .map(|l| l.plain_text() + "\n")
+            .collect();
+        assert!(drawn.contains("unencrypted"), "{drawn}");
+    }
+
+    #[test]
+    fn the_built_in_vllm_section_asks_for_a_key_only_when_refused() {
+        let (mut manager, inbox) = manager();
+        let (mut app, mut repl) = (app(), repl());
+        let (url, _requests) = serve(vec![http("403 Forbidden", "{}")]);
+        let section = repl.config.providers.get_mut("vllm").unwrap();
+        section.base_url = Some(url);
+        section.api_key_env = Some("AGENT86_TEST_UNSET_VLLM_KEY".into());
+        manager.on_provider(&mut app, &repl, "vllm");
+        assert!(app.panel().is_none(), "no key asked for first");
+        deliver_catalog(&mut manager, &inbox, &mut app, &repl);
+        assert!(matches!(app.panel(), Some(Panel::Key(_))));
     }
 }

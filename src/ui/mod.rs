@@ -30,6 +30,7 @@ mod menu;
 mod panels;
 mod picker;
 mod screen;
+mod server_form;
 pub mod status;
 mod text;
 
@@ -419,6 +420,10 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             }
             Request::McpTested(outcome) => {
                 manager.mcp.on_tested(&mut app, repl, outcome);
+                None
+            }
+            Request::ServerForm(draft) => {
+                manager.on_server_form(&mut app, repl, *draft);
                 None
             }
             // A passing test switches the model at once, as a dispatched line.
