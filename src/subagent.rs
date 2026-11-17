@@ -1170,7 +1170,7 @@ impl Harness {
         };
         let provider = Arc::clone(&model.provider);
         // Beyond Python: the time the sub-agent started ends its system message.
-        let time = time_note(&chrono::Local::now());
+        let time = time_note(&jiff::ZonedDateTime::now());
         let system = match (&specialty, &ctx.scope) {
             (Some(specialty), _) => self.filtered_system(
                 &Self::specialty_persona(specialty),

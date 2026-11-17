@@ -745,7 +745,7 @@ impl Harness {
             .as_ref()
             .and_then(|memory| memory.recall_note(goal));
         // Beyond Python: the time the turn started, then what was recalled.
-        let time = time_note(&chrono::Local::now());
+        let time = time_note(&jiff::ZonedDateTime::now());
         let recall_note = Some(match recall_note {
             Some(recalled) => format!("{time}\n\n{recalled}"),
             None => time,
