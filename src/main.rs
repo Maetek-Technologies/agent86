@@ -1450,11 +1450,14 @@ fn one_line(text: &str, max: usize) -> String {
 
 /// Seconds since the epoch as local `YYYY-MM-DD HH:MM`.
 fn local_time(seconds: f64) -> String {
-    chrono::DateTime::from_timestamp(seconds as i64, 0).map_or_else(String::new, |time| {
-        time.with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string()
-    })
+    jiff::Timestamp::from_second(seconds as i64).map_or_else(
+        |_| String::new(),
+        |time| {
+            time.to_zoned_datetime(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
+                .to_string()
+        },
+    )
 }
 
 /// The counts as Python prints the dict: `{'sessions': 1, 'episodes': 2, 'memories': 0}`.
@@ -1576,10 +1579,10 @@ fn print_trace_table(events: &[serde_json::Map<String, serde_json::Value>], stde
         let clock = event
             .get("ts")
             .and_then(serde_json::Value::as_f64)
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts.trunc() as i64, 0))
+            .and_then(|ts| jiff::Timestamp::from_second(ts.trunc() as i64).ok())
             .map(|utc| {
-                utc.with_timezone(&chrono::Local)
-                    .format("%H:%M:%S")
+                utc.to_zoned_datetime(jiff::tz::TimeZone::system())
+                    .strftime("%H:%M:%S")
                     .to_string()
             })
             .unwrap_or_default();
