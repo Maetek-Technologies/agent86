@@ -523,8 +523,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let open = format!("http://{}/v1", listener.local_addr().unwrap());
         assert!(server_listening(&open, Duration::from_millis(500)));
-        drop(listener);
-        assert!(!server_listening(&open, Duration::from_millis(500)));
+        // Port 0 never accepts a connection. A port just let go of is no closed
+        // port: a test running alongside can be given it at once (seen on macOS).
+        assert!(!server_listening(
+            "http://127.0.0.1:0/v1",
+            Duration::from_millis(500)
+        ));
         assert!(!server_listening("not a url", Duration::from_millis(500)));
     }
 
