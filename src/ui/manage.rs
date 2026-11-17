@@ -49,6 +49,7 @@ const ADD_SERVER: &str = "\u{0}add-server";
 /// whether a failed `/model` looks like a bare model id; see [`is_bare_ref_candidate`].
 const BUILTIN_PROVIDERS: &[&str] = &[
     "anthropic",
+    "google",
     "openai",
     "openai-compatible",
     "ollama",
@@ -908,6 +909,7 @@ mod tests {
             names,
             [
                 "anthropic",
+                "google",
                 "openai",
                 "openrouter",
                 "groq",
@@ -924,11 +926,11 @@ mod tests {
             "local  http://127.0.0.1:9/v1  (local, no key needed)"
         );
         // The environment may hold real keys; only the shape is checked here.
-        assert!(matches!(rows[1].status(), "key ok" | "no key"));
-        let vllm = &rows[6];
+        assert!(matches!(rows[2].status(), "key ok" | "no key"));
+        let vllm = &rows[7];
         assert!(vllm.key_optional && !vllm.keyless);
         assert!(matches!(vllm.status(), "key ok" | "key optional"));
-        let lmstudio = &rows[7];
+        let lmstudio = &rows[8];
         assert!(lmstudio.key_optional && !lmstudio.keyless);
     }
 

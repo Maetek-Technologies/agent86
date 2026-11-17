@@ -2426,6 +2426,7 @@ async fn models_and_config_list_providers_roles_and_where_config_is_read() {
         let mut command = workspace.command(args);
         for variable in [
             "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
             "OPENAI_API_KEY",
             "OPENROUTER_API_KEY",
             "GROQ_API_KEY",

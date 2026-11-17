@@ -8,6 +8,7 @@
 pub mod anthropic;
 pub mod capabilities;
 pub mod catalog;
+pub mod google;
 pub mod hints;
 pub mod ollama;
 pub mod openai;
@@ -172,6 +173,31 @@ fn build_provider(
                 prompt_cache: section.prompt_cache,
                 max_retries: section.max_retries,
                 ..AnthropicConfig::default()
+            },
+            api_key(name, &section),
+        )?
+        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        return Ok(Box::new(provider));
+    }
+
+    // Gemini has its own adapter (beyond Python), for the thought signatures its
+    // OpenAI-compatible endpoint loses.
+    if name == "google" {
+        let seconds = durations(name);
+        let provider = google::GoogleProvider::new(
+            reference.model.clone(),
+            google::GoogleConfig {
+                base_url: section.base_url.clone(),
+                api_key_env: section
+                    .api_key_env
+                    .clone()
+                    .unwrap_or_else(|| google::DEFAULT_API_KEY_ENV.to_owned()),
+                config_name: name.to_owned(),
+                max_tokens: section.max_tokens,
+                connect_timeout: seconds("connect_timeout_s", section.connect_timeout_s)?,
+                read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
+                max_retries: section.max_retries,
+                store: section.store,
             },
             api_key(name, &section),
         )?
@@ -374,7 +400,7 @@ pub async fn collect_completion(
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ProviderError {
     #[error(
-        "Unknown provider '{provider}'. Built-in: anthropic, openai, ollama, llamacpp, vllm, lmstudio. \
+        "Unknown provider '{provider}'. Built-in: anthropic, google, openai, ollama, llamacpp, vllm, lmstudio. \
          For an OpenAI-compatible endpoint, add a [providers.{provider}] block with a base_url \
          (e.g. OpenRouter, Groq, Together) to your config."
     )]

@@ -1,0 +1,2 @@
+data: {"candidates": [{"finishReason": "SAFETY","index": 0,"safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT","probability": "HIGH","blocked": true}]}],"usageMetadata": {"promptTokenCount": 40,"totalTokenCount": 40},"modelVersion": "gemini-3.8-flash"}
+
