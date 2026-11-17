@@ -12,6 +12,10 @@
 //!   `anthropic-version` (not Bearer), answering `{"data": [{"id", "display_name"}]}`.
 //! - Ollama: `GET {base}/api/tags`, no auth, answering `{"models": [{"name": ...}]}`.
 //!
+//! A vLLM section (beyond Python) is OpenAI-compatible here, its key sent when one
+//! resolves; its `/v1/models` also gives each model's `max_model_len`, read by
+//! [`fetch_vllm_model_lengths`] for the window.
+//!
 //! llama.cpp and LM Studio expose no listing, so they report the catalog as
 //! unavailable and the caller falls back to typing `provider:model`, the same
 //! fallback every failed fetch takes. Never a dead end.
@@ -182,6 +186,26 @@ pub fn fetch_openai_compatible_context_lengths(
     api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<HashMap<String, u64>, CatalogUnavailable> {
+    context_lengths(base_url, api_key, timeout, "context_length")
+}
+
+/// Lowercased model id to `max_model_len`, from a vLLM server's `/v1/models`
+/// (beyond Python). Every name the server serves (`--served-model-name`) has its
+/// own card with the length; a LoRA adapter's card has `null`, which is skipped.
+pub fn fetch_vllm_model_lengths(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HashMap<String, u64>, CatalogUnavailable> {
+    context_lengths(base_url, api_key, timeout, "max_model_len")
+}
+
+fn context_lengths(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+    field: &str,
+) -> Result<HashMap<String, u64>, CatalogUnavailable> {
     let body = get_json(
         &format!("{}/models", v1(base_url)),
         &bearer(api_key),
@@ -192,10 +216,32 @@ pub fn fetch_openai_compatible_context_lengths(
         .filter_map(|model| {
             let id = model.get("id")?.as_str()?;
             // Python accepts ints and floats (truncated), but not booleans.
-            let length = model.get("context_length")?.as_f64()?;
+            let length = model.get(field)?.as_f64()?;
             (length >= 1.0).then(|| (id.to_lowercase(), length as u64))
         })
         .collect())
+}
+
+/// Is anything listening at `base_url`'s host and port? A TCP connect within
+/// `timeout`, nothing sent. The editor's model lists ask it before a key-optional
+/// server (vLLM), which is usually just not running, so that case stays quiet.
+pub fn server_listening(base_url: &str, timeout: Duration) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (host, port)
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .any(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok())
+        })
+        .unwrap_or(false)
 }
 
 pub fn fetch_anthropic(api_key: Option<&str>) -> Result<Vec<CatalogEntry>, CatalogUnavailable> {
@@ -365,6 +411,20 @@ pub fn catalog_has_ref(id: &str, entries: &[CatalogEntry]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listening_port_is_found_and_a_closed_one_is_not() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = format!("http://{}/v1", listener.local_addr().unwrap());
+        assert!(server_listening(&open, Duration::from_millis(500)));
+        // Port 0 never accepts a connection. A port just let go of is no closed
+        // port: a test running alongside can be given it at once (seen on macOS).
+        assert!(!server_listening(
+            "http://127.0.0.1:0/v1",
+            Duration::from_millis(500)
+        ));
+        assert!(!server_listening("not a url", Duration::from_millis(500)));
+    }
 
     #[test]
     fn base_urls_gain_v1_once() {

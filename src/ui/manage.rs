@@ -39,9 +39,12 @@ const BUILTIN_PROVIDERS: &[&str] = &[
     "openai-compatible",
     "ollama",
     "llamacpp",
+    "vllm",
 ];
 
-/// One row of the provider list. `keyless` means the endpoint needs no key at all.
+/// One row of the provider list. `keyless` means the endpoint needs no key at all;
+/// `key_optional` that a key is sent when one resolves and is not needed otherwise
+/// (a vLLM server, beyond Python).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRow {
     pub name: String,
@@ -49,6 +52,7 @@ pub struct ProviderRow {
     pub api_key_env: Option<String>,
     pub has_key: bool,
     pub keyless: bool,
+    pub key_optional: bool,
 }
 
 impl ProviderRow {
@@ -57,9 +61,16 @@ impl ProviderRow {
             "local, no key needed"
         } else if self.has_key {
             "key ok"
+        } else if self.key_optional {
+            "key optional"
         } else {
             "no key"
         }
+    }
+
+    /// Can the catalog be asked without typing a key first?
+    fn needs_no_entry(&self) -> bool {
+        self.keyless || self.key_optional || self.has_key
     }
 
     fn label(&self) -> String {
@@ -86,6 +97,7 @@ pub fn provider_rows(repl: &Repl) -> Vec<ProviderRow> {
                 api_key_env: section.api_key_env.clone(),
                 has_key: !keyless && provider_key(repl, name).is_some(),
                 keyless,
+                key_optional: crate::provider::key_optional(name, Some(section)),
             }
         })
         .collect()
@@ -389,7 +401,7 @@ impl Manager {
             return;
         };
         self.row = Some(row.clone());
-        if row.keyless || row.has_key {
+        if row.needs_no_entry() {
             let key = provider_key(repl, &row.name);
             self.request_catalog(app, repl, &row.name, key, CatalogPurpose::Manager);
         } else {
@@ -502,7 +514,7 @@ impl Manager {
             Some(self.reference.clone().unwrap_or_default().into()),
         )];
         if let Some(row) = &self.row {
-            if !row.keyless && row.api_key_env.is_none() {
+            if !row.keyless && !row.key_optional && row.api_key_env.is_none() {
                 changes.push((
                     path(&["providers", &row.name, "api_key_env"]),
                     Some(format!("{}_API_KEY", row.name.to_uppercase()).into()),
@@ -726,6 +738,7 @@ mod tests {
                 "groq",
                 "ollama",
                 "llamacpp",
+                "vllm",
                 "local"
             ]
         );
@@ -736,6 +749,40 @@ mod tests {
         );
         // The environment may hold real keys; only the shape is checked here.
         assert!(matches!(rows[1].status(), "key ok" | "no key"));
+        let vllm = &rows[6];
+        assert!(vllm.key_optional && !vllm.keyless);
+        assert!(matches!(vllm.status(), "key ok" | "key optional"));
+    }
+
+    #[test]
+    fn a_key_optional_provider_goes_to_its_catalog_without_asking_for_a_key() {
+        let (mut manager, _inbox) = manager();
+        let (mut app, mut repl) = (app(), repl());
+        repl.config.providers.insert(
+            "gpu-box".into(),
+            ProviderConfig {
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                api_key_env: Some("AGENT86_TEST_UNSET_GPU_BOX_KEY".into()),
+                adapter: Some("vllm".into()),
+                ..Default::default()
+            },
+        );
+        let row = provider_rows(&repl)
+            .into_iter()
+            .find(|row| row.name == "gpu-box")
+            .unwrap();
+        assert_eq!(row.status(), "key optional");
+        manager.on_provider(&mut app, &repl, "gpu-box");
+        assert!(
+            !matches!(app.panel(), Some(Panel::Key(_))),
+            "no key entry for a server that may be open"
+        );
+        // And a save never invents an api_key_env for it.
+        manager.reference = Some("gpu-box:qwen3".into());
+        assert!(!manager
+            .persist_changes()
+            .iter()
+            .any(|(path, _)| path.last().is_some_and(|key| key == "api_key_env")));
     }
 
     /// Answer one HTTP request with `response`, on a local port.

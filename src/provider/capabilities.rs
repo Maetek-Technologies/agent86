@@ -135,8 +135,9 @@ pub fn context_window_for(model_ref: &str, config: &crate::config::Config) -> u6
 /// Tokens of context the model behind `model_ref` can hold, as Python's
 /// `context_window_for`: a `[model.context_window]` override (by the full ref, then
 /// the bare id), then what `discover(provider, model)` reports (OpenRouter's own
-/// figure, see [`super::remote_windows`]), then the server's own setting for Ollama
-/// and llama.cpp, then the table, then [`DEFAULT_CONTEXT_WINDOW`].
+/// figure, or a vLLM server's `max_model_len`, see [`super::remote_windows`]),
+/// then the server's own setting for Ollama and llama.cpp, then the table, then
+/// [`DEFAULT_CONTEXT_WINDOW`].
 ///
 /// Ollama serves whatever `num_ctx` asks for, so its window is [`ollama_num_ctx`],
 /// with `discover` reporting the model's maximum.

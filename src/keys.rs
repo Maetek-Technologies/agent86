@@ -133,7 +133,8 @@ mod tests {
     #[test]
     fn keyed_providers_are_accepted() {
         let config = default_config();
-        for provider in ["openrouter", "openai", "groq", "anthropic"] {
+        // vllm's key is optional, but it is looked up, so it can be stored.
+        for provider in ["openrouter", "openai", "groq", "anthropic", "vllm"] {
             assert_eq!(check_provider(&config, provider), Ok(()), "{provider}");
         }
     }

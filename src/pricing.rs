@@ -15,7 +15,7 @@
 
 use crate::config::Config;
 use crate::types::Usage;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A cache read is a tenth of the input price.
 pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
@@ -26,7 +26,7 @@ pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 const CACHE_READ_MULTIPLIER_OVERRIDES: &[(&str, f64)] = &[("claude-fable-5-1", 0.025)];
 
 /// Providers whose models run on the user's own hardware. Zero is the real price.
-const LOCAL_PROVIDERS: &[&str] = &["ollama", "llamacpp", "llama.cpp", "local"];
+const LOCAL_PROVIDERS: &[&str] = &["ollama", "llamacpp", "llama.cpp", "local", "vllm"];
 
 /// Where a price came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +148,9 @@ const PRICES: &[(&str, Price)] = &[
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PriceTable {
     overrides: BTreeMap<String, Price>,
+    /// Config sections that reach a server the user runs (`adapter = "vllm"`),
+    /// priced as local under any name (beyond Python, which has no such sections).
+    local_sections: BTreeSet<String>,
 }
 
 impl PriceTable {
@@ -171,7 +174,16 @@ impl PriceTable {
                 (model.clone(), price)
             })
             .collect();
-        Self { overrides }
+        let local_sections = config
+            .providers
+            .iter()
+            .filter(|(name, section)| crate::provider::server_kind(name, Some(section)).is_some())
+            .map(|(name, _)| name.to_lowercase())
+            .collect();
+        Self {
+            overrides,
+            local_sections,
+        }
     }
 
     /// Resolve a price for a `provider:model` ref or bare model id.
@@ -179,7 +191,8 @@ impl PriceTable {
         if let Some(price) = find(self.overrides.iter().map(|(k, v)| (k.as_str(), v)), model) {
             return Some(price);
         }
-        if LOCAL_PROVIDERS.contains(&provider_of(model).as_str()) {
+        let provider = provider_of(model);
+        if LOCAL_PROVIDERS.contains(&provider.as_str()) || self.local_sections.contains(&provider) {
             return Some(LOCAL_PRICE);
         }
         find(PRICES.iter().map(|(k, v)| (*k, v)), model)
@@ -348,6 +361,51 @@ mod tests {
         assert_eq!(price.source, PriceSource::Local);
         assert_eq!(price.cost(&usage(1000, 1000, 0, 0), "ollama:llama3.1"), 0.0);
         assert!(table.lookup("llama3.1").is_none());
+        assert_eq!(
+            table.lookup("vllm:qwen3").unwrap().source,
+            PriceSource::Local
+        );
+    }
+
+    #[test]
+    fn a_section_with_a_server_adapter_is_free_under_any_name() {
+        let paths = crate::config::ConfigPaths {
+            user: None,
+            project: std::path::PathBuf::from("no-such-dir/config.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
+        };
+        let mut config = crate::config::load_config(&paths, &Default::default()).unwrap();
+        config.providers.insert(
+            "gpu-box".into(),
+            crate::config::ProviderConfig {
+                base_url: Some("https://gpu.example/v1".into()),
+                adapter: Some("vllm".into()),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "plain".into(),
+            crate::config::ProviderConfig {
+                base_url: Some("https://plain.example/v1".into()),
+                ..Default::default()
+            },
+        );
+        let table = PriceTable::from_config(&config);
+        assert_eq!(
+            table.lookup("gpu-box:qwen3").unwrap().source,
+            PriceSource::Local
+        );
+        assert!(table.lookup("plain:qwen3").is_none());
+        // An override still wins, for a paid host.
+        config.pricing.models.insert(
+            "gpu-box:qwen3".into(),
+            crate::config::ModelPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+            },
+        );
+        let table = PriceTable::from_config(&config);
+        assert_eq!(table.lookup("gpu-box:qwen3").unwrap().input_per_mtok, 1.0);
     }
 
     #[test]

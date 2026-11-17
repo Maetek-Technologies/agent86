@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1740000000,"model":"Qwen/Qwen3-8B","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1740000000,"model":"Qwen/Qwen3-8B","choices":[{"index":0,"delta":{"reasoning_content":"The user greets me."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1740000000,"model":"Qwen/Qwen3-8B","choices":[{"index":0,"delta":{"reasoning_content":" Reply briefly."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1740000000,"model":"Qwen/Qwen3-8B","choices":[{"index":0,"delta":{"content":"Hello!"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1740000000,"model":"Qwen/Qwen3-8B","choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"stop","stop_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1740000000,"model":"Qwen/Qwen3-8B","choices":[],"usage":{"prompt_tokens":12,"total_tokens":24,"completion_tokens":12}}
+
+data: [DONE]
+
