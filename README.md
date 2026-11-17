@@ -20,7 +20,7 @@
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-OTLP%2FHTTP-425cc7?logo=opentelemetry)](https://opentelemetry.io)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#install)
 
-An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary. It also works as the agent inside editors and terminals that speak the [Agent Client Protocol](#use-it-from-your-editor) (ACP).
+An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary. It also works as the agent inside editors and terminals that speak the [Agent Client Protocol](#use-it-from-your-editor) (ACP). Website: [maetek-technologies.github.io/agent86](https://maetek-technologies.github.io/agent86/).
 
 This is the standard agent86. It replaced the original [Python implementation](https://github.com/Maetek-Technologies/agent86-python), which is archived. It reads and writes the same config, sessions, memory, traces, and keyring entries, so you can switch from the Python version without losing anything.
 
