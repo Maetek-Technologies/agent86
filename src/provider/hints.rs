@@ -4,8 +4,9 @@
 //! text, and gain a hint when the body is one the server is known to send for a
 //! problem the user can fix: a launch flag, the context length, the key. Bodies
 //! are matched on the server's own wording, taken from its source (vLLM `main`
-//! at `f39d833`, 2026-11-17), so an unrecognized body gets no hint rather than a
-//! wrong one.
+//! at `f39d833`, 2026-11-17) or, for LM Studio, which documents none, from the
+//! messages its bug tracker shows, so an unrecognized body gets no hint rather
+//! than a wrong one.
 
 use super::ServerKind;
 
@@ -20,7 +21,47 @@ pub struct Section<'a> {
 pub fn for_http(kind: ServerKind, status: u16, body: &str, section: Section<'_>) -> Option<String> {
     match kind {
         ServerKind::Vllm => vllm(status, body, section),
+        ServerKind::LmStudio => lmstudio(status, body, section),
     }
+}
+
+/// The hint the empty-answer path adds for LM Studio: one open report says a
+/// GGUF model can answer an overflowing request with 200 and nothing streamed.
+pub const LMSTUDIO_EMPTY_ANSWER: &str = "[LM Studio sends nothing when a request no longer \
+     fits the context length the model was loaded with: reload the model with a larger \
+     context length in LM Studio, or set [model] context_window so agent86 compacts sooner]";
+
+const LMSTUDIO_CONTEXT: &str = "the conversation no longer fits the context length the model \
+     was loaded with: reload it with a larger context length in LM Studio, or set [model] \
+     context_window so agent86 compacts sooner";
+
+/// LM Studio documents none of its error bodies, so these follow the messages
+/// its bug tracker shows (0.4.x): two context overflows, in a 400 or a 500, and
+/// `model_not_found`.
+fn lmstudio(status: u16, body: &str, section: Section<'_>) -> Option<String> {
+    if status == 401 {
+        let env = section.api_key_env.unwrap_or("LM_API_TOKEN");
+        return Some(format!(
+            "this LM Studio server requires an API token (Server Settings, Require \
+             Authentication): set {env}, or store the token with `agent86 keys set {}`",
+            section.name
+        ));
+    }
+    let low = body.to_lowercase();
+    if low.contains("greater than the context length")
+        || low.contains("context size has been exceeded")
+        || (low.contains("context length") && low.contains("larger"))
+    {
+        return Some(LMSTUDIO_CONTEXT.to_owned());
+    }
+    if low.contains("model_not_found") || low.contains("not found in downloaded models") {
+        return Some(
+            "LM Studio has no model by this name: download it with `lms get <model>`, or \
+             pick one it lists with /model"
+                .to_owned(),
+        );
+    }
+    None
 }
 
 fn vllm(status: u16, body: &str, section: Section<'_>) -> Option<String> {
@@ -142,6 +183,42 @@ mod tests {
         assert_eq!(hint(500, r#"{"error":{"message":"boom"}}"#), None);
         assert_eq!(hint(404, "Not Found"), None);
         assert_eq!(hint(400, ""), None);
+    }
+
+    // Bodies as LM Studio's bug tracker shows them (#2205, #1757, #1462); its
+    // documentation describes none.
+    #[test]
+    fn lmstudio_bodies_get_the_hint_for_what_the_user_can_fix() {
+        let hint = |status, body| {
+            for_http(
+                ServerKind::LmStudio,
+                status,
+                body,
+                Section {
+                    name: "lmstudio",
+                    api_key_env: Some("LM_API_TOKEN"),
+                },
+            )
+        };
+        let keep = hint(
+            400,
+            r#"{"error":"The number of tokens to keep from the initial prompt is greater than the context length. Try to load the model with a larger context length, or provide a shorter input."}"#,
+        )
+        .unwrap();
+        assert!(keep.contains("reload it with a larger context length"));
+        assert_eq!(
+            hint(500, r#"{"error":"Context size has been exceeded."}"#),
+            Some(keep)
+        );
+        let missing = hint(
+            404,
+            r#"{"error":{"type":"model_not_found","message":"Model qwen3 not found in downloaded models"}}"#,
+        )
+        .unwrap();
+        assert!(missing.contains("lms get"));
+        let token = hint(401, "").unwrap();
+        assert!(token.contains("LM_API_TOKEN") && token.contains("agent86 keys set lmstudio"));
+        assert_eq!(hint(500, r#"{"error":"boom"}"#), None);
     }
 
     #[test]

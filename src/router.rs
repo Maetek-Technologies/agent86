@@ -154,11 +154,17 @@ impl Harness {
             .map_or(self.max_tokens, |model| model.max_tokens)
     }
 
-    /// The context window of the active model.
+    /// The context window of the active model: what the server reports now when
+    /// it sets the window at runtime (LM Studio, [`Provider::live_context_window`]),
+    /// else the window computed at startup or on `/model`.
     pub fn active_context_window(&self) -> u64 {
-        self.router
+        let configured = self
+            .router
             .current()
-            .map_or(self.context_window, |model| model.context_window)
+            .map_or(self.context_window, |model| model.context_window);
+        self.active_provider()
+            .live_context_window()
+            .unwrap_or(configured)
     }
 
     /// The `[table] key` the active model's output cap comes from.

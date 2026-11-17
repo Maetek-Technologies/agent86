@@ -16,9 +16,15 @@
 //! resolves; its `/v1/models` also gives each model's `max_model_len`, read by
 //! [`fetch_vllm_model_lengths`] for the window.
 //!
-//! llama.cpp and LM Studio expose no listing, so they report the catalog as
-//! unavailable and the caller falls back to typing `provider:model`, the same
-//! fallback every failed fetch takes. Never a dead end.
+//! An LM Studio section (beyond Python) is asked through LM Studio's native REST
+//! API (`GET {base without /v1}/api/v1/models`, [`fetch_lmstudio_models`]), which
+//! lists every downloaded model with whether it is loaded, the context length it
+//! was loaded with, and whether it was trained for tool use; `/v1/models` (ids
+//! only) is the fallback for an older LM Studio or a proxy that passes only `/v1`.
+//!
+//! llama.cpp exposes no listing, so it reports the catalog as unavailable and the
+//! caller falls back to typing `provider:model`, the same fallback every failed
+//! fetch takes. Never a dead end.
 //!
 //! Entries are `(ref, label)` pairs where `ref` is the bare model id; the caller
 //! adds the `provider:` prefix.
@@ -222,6 +228,96 @@ fn context_lengths(
         .collect())
 }
 
+/// One model from LM Studio's native `GET /api/v1/models` (beyond Python).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LmStudioModel {
+    /// The id requests name (`key`).
+    pub key: String,
+    pub display_name: String,
+    /// `llm`, `embedding`, or `decision`; only `llm` can chat.
+    pub kind: String,
+    /// The first loaded instance's `config.context_length`, when loaded.
+    pub loaded_context: Option<u64>,
+    /// `max_context_length`, which LM Studio leaves null for some models.
+    pub max_context: Option<u64>,
+    /// `capabilities.trained_for_tool_use`, when reported.
+    pub tool_use: Option<bool>,
+}
+
+/// LM Studio's native API root for an OpenAI-compatible `base_url`: the URL
+/// without its `/v1`.
+fn lmstudio_root(base_url: &str) -> &str {
+    let base = base_url.trim_end_matches('/');
+    base.strip_suffix("/v1").unwrap_or(base)
+}
+
+/// Every model LM Studio has downloaded, from its native API, with the key as a
+/// bearer token when one is given (LM Studio's API tokens).
+pub fn fetch_lmstudio_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<LmStudioModel>, CatalogUnavailable> {
+    let url = format!("{}/api/v1/models", lmstudio_root(base_url));
+    let body = get_json(&url, &bearer(api_key), timeout)?;
+    let length = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_f64)
+            .filter(|&length| length >= 1.0)
+            .map(|length| length as u64)
+    };
+    Ok(list(&body, "models")
+        .iter()
+        .filter_map(|model| {
+            let key = model.get("key")?.as_str()?.to_owned();
+            let loaded_context = model
+                .get("loaded_instances")
+                .and_then(Value::as_array)
+                .and_then(|instances| instances.first())
+                .and_then(|instance| length(instance.pointer("/config/context_length")));
+            Some(LmStudioModel {
+                display_name: model
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&key)
+                    .to_owned(),
+                kind: model
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("llm")
+                    .to_owned(),
+                loaded_context,
+                max_context: length(model.get("max_context_length")),
+                tool_use: model
+                    .pointer("/capabilities/trained_for_tool_use")
+                    .and_then(Value::as_bool),
+                key,
+            })
+        })
+        .collect())
+}
+
+/// The catalog from LM Studio's list: chat models only, each label marking a
+/// model that is loaded (it answers at once; others load on first use) and one
+/// not trained for tool use (its tool calls will be unreliable).
+fn lmstudio_entries(models: &[LmStudioModel]) -> Vec<CatalogEntry> {
+    models
+        .iter()
+        .filter(|model| model.kind == "llm")
+        .map(|model| {
+            let mut label = model.display_name.clone();
+            if model.loaded_context.is_some() {
+                label.push_str(" · loaded");
+            }
+            if model.tool_use == Some(false) {
+                label.push_str(" · no tool use");
+            }
+            (model.key.clone(), label)
+        })
+        .collect()
+}
+
 /// Is anything listening at `base_url`'s host and port? A TCP connect within
 /// `timeout`, nothing sent. The editor's model lists ask it before a key-optional
 /// server (vLLM), which is usually just not running, so that case stays quiet.
@@ -350,9 +446,19 @@ pub fn fetch_catalog(
         )?,
         "llamacpp" => {
             return Err(CatalogUnavailable(
-                "llama.cpp / LM Studio expose no model list -- enter provider:model directly."
-                    .to_owned(),
+                "llama.cpp exposes no model list -- enter provider:model directly.".to_owned(),
             ))
+        }
+        _ if super::server_kind(provider, Some(section)) == Some(super::ServerKind::LmStudio) => {
+            let base_url = section
+                .base_url
+                .as_deref()
+                .unwrap_or(super::LMSTUDIO_DEFAULT_BASE_URL);
+            match fetch_lmstudio_models(base_url, api_key, TIMEOUT) {
+                Ok(models) => lmstudio_entries(&models),
+                // An older LM Studio, or a proxy that passes only `/v1`: ids only.
+                Err(_) => fetch_openai_compatible(base_url, api_key)?,
+            }
         }
         _ if provider == "openai" || section.base_url.is_some() => fetch_openai_compatible(
             section
@@ -454,7 +560,7 @@ mod tests {
         let section = ProviderConfig::default();
         assert_eq!(
             fetch_catalog("llamacpp", &section, None).unwrap_err().0,
-            "llama.cpp / LM Studio expose no model list -- enter provider:model directly."
+            "llama.cpp exposes no model list -- enter provider:model directly."
         );
         assert!(fetch_catalog("mystery", &section, None)
             .unwrap_err()

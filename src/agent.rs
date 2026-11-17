@@ -995,6 +995,14 @@ impl Harness {
                 }
                 if unanswered_thinking.trim().is_empty() {
                     emit(TurnEvent::Notice(NO_ANSWER_NOTICE));
+                    // Beyond Python: LM Studio has been seen to answer a request that
+                    // overflows the loaded context with nothing at all.
+                    if provider.name() == crate::provider::ServerKind::LmStudio.name() {
+                        emit(TurnEvent::Notice(&format!(
+                            "{}\n",
+                            crate::provider::hints::LMSTUDIO_EMPTY_ANSWER
+                        )));
+                    }
                 } else {
                     completion.text = std::mem::take(&mut unanswered_thinking);
                     from_thinking = true;

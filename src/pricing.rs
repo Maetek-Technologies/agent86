@@ -26,7 +26,14 @@ pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 const CACHE_READ_MULTIPLIER_OVERRIDES: &[(&str, f64)] = &[("claude-fable-5-1", 0.025)];
 
 /// Providers whose models run on the user's own hardware. Zero is the real price.
-const LOCAL_PROVIDERS: &[&str] = &["ollama", "llamacpp", "llama.cpp", "local", "vllm"];
+const LOCAL_PROVIDERS: &[&str] = &[
+    "ollama",
+    "llamacpp",
+    "llama.cpp",
+    "local",
+    "vllm",
+    "lmstudio",
+];
 
 /// Where a price came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
