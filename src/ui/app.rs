@@ -21,6 +21,7 @@ use super::panels::{
 };
 use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
+use super::server_form::{ServerDraft, ServerForm};
 use super::status::{fit_status_line, StatusState};
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
@@ -205,6 +206,8 @@ pub enum Request {
     McpForm(Box<McpDraft>),
     /// The MCP test ended.
     McpTested(McpTestOutcome),
+    /// The "add a server" form was completed.
+    ServerForm(Box<ServerDraft>),
     /// A line from background work, to print now. Held as a catalog is.
     Note(Style, String),
     /// A catalog arrived. Held until no turn runs and no panel is open.
@@ -224,6 +227,8 @@ pub enum Panel {
     McpList(McpList),
     McpForm(Box<McpForm>),
     McpTest(McpTest),
+    /// `/config model`'s "add a server" form (beyond Python).
+    Server(Box<ServerForm>),
 }
 
 /// What a key asks of the harness while a turn runs.
@@ -1103,7 +1108,9 @@ impl App {
             return Effect::None;
         }
         // In the MCP form, Shift+Tab moves between fields instead.
-        if key.code == KeyCode::BackTab && !matches!(self.panel, Some(Panel::McpForm(_))) {
+        if key.code == KeyCode::BackTab
+            && !matches!(self.panel, Some(Panel::McpForm(_) | Panel::Server(_)))
+        {
             return Effect::CycleMode;
         }
         if self.view.is_some() {
@@ -1162,6 +1169,10 @@ impl App {
                 Panel::McpTest(test) => match test.on_key(key) {
                     None => return Effect::None,
                     Some(outcome) => Some(Request::McpTested(outcome)),
+                },
+                Panel::Server(form) => match form.on_key(key) {
+                    None => return Effect::None,
+                    Some(draft) => draft.map(|draft| Request::ServerForm(Box::new(draft))),
                 },
             };
             self.panel = None;
@@ -1250,6 +1261,9 @@ impl App {
             entry.on_paste(text);
             self.dirty = true;
         } else if let Some(Panel::McpForm(form)) = &mut self.panel {
+            form.on_paste(text);
+            self.dirty = true;
+        } else if let Some(Panel::Server(form)) = &mut self.panel {
             form.on_paste(text);
             self.dirty = true;
         } else if self.running.is_none() && self.panel.is_none() {
@@ -1460,6 +1474,7 @@ impl App {
                 Panel::Save(save) => save.render(width),
                 Panel::McpList(list) => list.render(width),
                 Panel::McpForm(form) => form.render(width),
+                Panel::Server(form) => form.render(width),
                 Panel::McpTest(test) => test.render(width, SPINNER[4]),
             });
             caret_base = 0;

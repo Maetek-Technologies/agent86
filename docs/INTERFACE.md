@@ -248,6 +248,7 @@ Each slice is one PR to `main`. Each passes `cargo test --all-targets`, `cargo f
 - **`/config model` chain:**
   - The provider manager, then key entry (masked, held in memory until the test passes), the catalog picker, the connection test (a real one-token completion with a 15-second cap and "Save anyway"), and the save-diff panel.
   - Storing the key in the keyring only after the test passes.
+  - Beyond Python (1.0.24): "add a vLLM or LM Studio server" at the end of the provider list, `ServerForm` in `src/ui/server_form.rs` (kind, name, address, a masked optional key; a stored key that would follow a changed address must be confirmed or replaced; plain HTTP to another machine with a key is warned about in the form and the save panel), then the same chain against the form's section, with a 401 or 403 from any key-optional server opening key entry, and a save to the user file only (`SaveDiff::user_only`).
 - **Command wording:** `/config model` in the plain loop changes to Python's wording.
 
 ### Slice 5 (stage 9, part 6): MCP management
