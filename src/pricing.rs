@@ -69,6 +69,13 @@ impl Price {
         Self::new(input_per_mtok, output_per_mtok, PriceSource::Builtin)
     }
 
+    /// A built-in price whose cache reads have a rate of their own.
+    const fn builtin_cached(input_per_mtok: f64, output_per_mtok: f64, cached: f64) -> Self {
+        let mut price = Self::builtin(input_per_mtok, output_per_mtok);
+        price.cache_read_per_mtok = Some(cached);
+        price
+    }
+
     /// USD per million tokens served from the prompt cache.
     pub fn cache_read_rate(&self, model: &str) -> f64 {
         self.cache_read_per_mtok
@@ -105,6 +112,43 @@ const LOCAL_PRICE: Price = Price::new(0.0, 0.0, PriceSource::Local);
 /// Groq and OpenRouter are intentionally absent: OpenRouter ids are `vendor/model`
 /// with per-route pricing that cannot be verified from the id alone. Unknown beats wrong.
 const PRICES: &[(&str, Price)] = &[
+    // Google, Standard tier, from aistudio.google.com/docs/pricing (fetched
+    // 2026-11-17, beyond Python). Output includes thinking. Changes Google has
+    // announced are noted per row; a release after one updates the row. The
+    // over-200k tier of 3.1 Pro and 2.5 Pro is not modelled (base rates apply).
+    // Introductory until 2026-11-30, then 4.00 / 20.00 / 0.20.
+    ("gemini-4-carbon", Price::builtin_cached(2.00, 10.00, 0.10)),
+    // Announced to rise to 4.00 / 20.00 / 0.20.
+    ("gemini-4-argon", Price::builtin_cached(2.00, 10.00, 0.10)),
+    (
+        "gemini-4-hydrogen",
+        Price::builtin_cached(1.50, 7.50, 0.075),
+    ),
+    // Both double from 2027-01-01.
+    ("gemini-3.8-flash", Price::builtin_cached(0.75, 3.75, 0.075)),
+    ("gemini-3.6-flash", Price::builtin_cached(0.75, 3.75, 0.075)),
+    (
+        "gemini-3.5-flash-lite",
+        Price::builtin_cached(0.30, 2.50, 0.03),
+    ),
+    (
+        "gemini-3.1-flash-lite",
+        Price::builtin_cached(0.25, 1.50, 0.025),
+    ),
+    (
+        "gemini-3.1-pro-preview",
+        Price::builtin_cached(2.00, 12.00, 0.20),
+    ),
+    (
+        "gemini-3-flash-preview",
+        Price::builtin_cached(0.50, 3.00, 0.05),
+    ),
+    ("gemini-2.5-pro", Price::builtin_cached(1.25, 10.00, 0.125)),
+    ("gemini-2.5-flash", Price::builtin_cached(0.30, 2.50, 0.03)),
+    (
+        "gemini-2.5-flash-lite",
+        Price::builtin_cached(0.10, 0.40, 0.01),
+    ),
     // Anthropic
     ("claude-fable-5-1", Price::builtin(10.00, 50.00)),
     ("claude-mythos-5-1", Price::builtin(10.00, 50.00)),

@@ -111,6 +111,11 @@ scan_observations = true
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
 
+[providers.google]
+api_key_env = "GEMINI_API_KEY"
+read_timeout_s = 1200.0
+store = false
+
 [providers.openai]
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
@@ -700,6 +705,11 @@ pub struct ProviderConfig {
     /// rules; the built-in sections need none. See `provider::ServerKind`.
     #[serde(default)]
     pub adapter: Option<String>,
+    /// `[providers.google] store` (beyond Python): let Google keep the requests in
+    /// AI Studio's logs. Off unless set, and sent as `store: false` on every
+    /// request, since a request holds every file the agent read.
+    #[serde(default)]
+    pub store: bool,
 }
 
 impl Default for ProviderConfig {
@@ -716,6 +726,7 @@ impl Default for ProviderConfig {
             prompt_cache: true,
             routing: None,
             adapter: None,
+            store: false,
         }
     }
 }

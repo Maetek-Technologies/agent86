@@ -15,8 +15,8 @@
 
 use super::capabilities::{DEFAULT_CONTEXT_WINDOW, DEFAULT_OLLAMA_NUM_CTX_MAX};
 use super::catalog::{
-    fetch_lmstudio_models, fetch_ollama_show, fetch_openai_compatible_context_lengths,
-    fetch_vllm_model_lengths, OllamaShow,
+    fetch_google_with, fetch_lmstudio_models, fetch_ollama_show,
+    fetch_openai_compatible_context_lengths, fetch_vllm_model_lengths, OllamaShow,
 };
 use crate::config::{Config, ProviderConfig};
 use crate::secrets::{resolve_api_key, SecretStore};
@@ -232,6 +232,45 @@ pub fn vllm_context_window(
     lengths.as_ref()?.get(&model.trim().to_lowercase()).copied()
 }
 
+/// A Gemini model's `inputTokenLimit` (beyond Python), from Google's model list,
+/// with the section's key; memoized and kept in the cache file for a day under
+/// the Google base URL, as OpenRouter's lengths are. Python reads only its own
+/// OpenRouter entry from that file, so another key there is harmless.
+pub fn google_context_window(
+    provider: &str,
+    model: &str,
+    config: &Config,
+    cache: Option<&Path>,
+    secrets: &dyn SecretStore,
+) -> Option<u64> {
+    if provider != "google" {
+        return None;
+    }
+    let section = config.providers.get(provider);
+    let base_url = section
+        .and_then(|section| section.base_url.as_deref())
+        .unwrap_or(super::google::DEFAULT_BASE_URL)
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let models = load_models(&base_url, cache, || {
+        let key = resolve_api_key(
+            provider,
+            section.and_then(|section| section.api_key_env.as_deref()),
+            secrets,
+        )?;
+        let models = fetch_google_with(&base_url, Some(&key), FETCH_TIMEOUT).ok()?;
+        Some(
+            models
+                .into_iter()
+                .filter_map(|model| Some((model.id.to_lowercase(), model.input_token_limit?)))
+                .collect(),
+        )
+    });
+    let bare = model.trim().strip_prefix("models/").unwrap_or(model.trim());
+    models.get(&bare.to_lowercase()).copied()
+}
+
 /// The window an LM Studio model runs at (beyond Python): the context length its
 /// first loaded instance was loaded with, which is often far below the model's
 /// maximum, and which the server enforces. A model that is not loaded yet gets
@@ -281,6 +320,7 @@ pub fn discover_context_window(
 ) -> Option<u64> {
     openrouter_context_window(provider, model, config, cache, secrets)
         .or_else(|| ollama_context_window(provider, model, config))
+        .or_else(|| google_context_window(provider, model, config, cache, secrets))
         .or_else(|| vllm_context_window(provider, model, config, secrets))
         .or_else(|| lmstudio_context_window(provider, model, config, secrets))
 }

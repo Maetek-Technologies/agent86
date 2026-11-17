@@ -139,6 +139,7 @@ mod tests {
             "openai",
             "groq",
             "anthropic",
+            "google",
             "vllm",
             "lmstudio",
         ] {

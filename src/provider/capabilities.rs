@@ -95,6 +95,9 @@ const CONTEXT_WINDOWS: &[(&str, u64)] = &[
     ("mixtral", 32_768),
     ("mistral", 32_768),
     ("gemma", 8_192),
+    // Every current Gemini model takes 1,048,576 input tokens; the API's own
+    // `inputTokenLimit` is asked first (beyond Python).
+    ("gemini", 1_048_576),
     ("phi", 16_384),
 ];
 

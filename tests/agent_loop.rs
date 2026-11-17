@@ -145,11 +145,19 @@ async fn run_with(
     gate: ApprovalGate,
     guardrails: Guardrails,
 ) -> Result<RunOutput, HarnessError> {
-    run_on(provider(server), workspace, limits, goal, gate, guardrails).await
+    run_on(
+        std::sync::Arc::new(provider(server)),
+        workspace,
+        limits,
+        goal,
+        gate,
+        guardrails,
+    )
+    .await
 }
 
 async fn run_on(
-    provider: OpenAiProvider,
+    provider: std::sync::Arc<dyn agent86::provider::Provider>,
     workspace: &Workspace,
     limits: LimitsConfig,
     goal: &str,
@@ -157,7 +165,7 @@ async fn run_on(
     guardrails: Guardrails,
 ) -> Result<RunOutput, HarnessError> {
     let harness = Harness {
-        provider: std::sync::Arc::new(provider),
+        provider,
         router: Default::default(),
         tracer: Default::default(),
         registry: builtin_registry(),
@@ -612,7 +620,7 @@ async fn lm_studio_saying_nothing_twice_gets_the_context_hint() {
     };
     let provider = OpenAiProvider::new("qwen3-8b", config, None).unwrap();
     let output = run_on(
-        provider,
+        std::sync::Arc::new(provider),
         &workspace,
         limits(),
         "hello",
@@ -628,6 +636,36 @@ async fn lm_studio_saying_nothing_twice_gets_the_context_hint() {
             agent86::provider::hints::LMSTUDIO_EMPTY_ANSWER
         )
     );
+}
+
+#[tokio::test]
+async fn a_reply_the_provider_stops_is_announced_once_and_not_asked_again() {
+    let stopped = "data: {\"candidates\": [{\"finishReason\": \"SAFETY\", \"index\": 0}]}\n\n";
+    let server = MockServer::start(vec![Reply::Sse(stopped.to_owned())]).await;
+    let workspace = Workspace::new("stopped-by-provider");
+    let config = agent86::provider::google::GoogleConfig {
+        base_url: Some(format!("{}/v1", server.base_url)),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let provider = agent86::provider::google::GoogleProvider::new(
+        "gemini-3.8-flash",
+        config,
+        Some("gemini-test-key".into()),
+    )
+    .unwrap();
+    let output = run_on(
+        std::sync::Arc::new(provider),
+        &workspace,
+        limits(),
+        "hello",
+        ApprovalGate::new(ApprovalMode::Ask, None),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.output, "\n[google stopped the reply: SAFETY]\n");
+    assert_eq!(server.requests().len(), 1, "not asked again");
 }
 
 #[tokio::test]

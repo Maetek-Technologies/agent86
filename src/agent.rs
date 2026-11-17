@@ -951,6 +951,19 @@ impl Harness {
             if completion.stop_reason.as_deref() == Some(REASONING_LOOP) {
                 emit(TurnEvent::Notice(REASONING_LOOP_NOTICE));
             }
+            // Beyond Python: the provider ended the reply itself (Gemini's SAFETY,
+            // RECITATION, ...). Said once, and not asked about again.
+            let stopped = completion
+                .stop_reason
+                .as_deref()
+                .and_then(|reason| reason.strip_prefix(crate::provider::google::STOPPED_PREFIX))
+                .map(str::to_owned);
+            if let Some(reason) = &stopped {
+                emit(TurnEvent::Notice(&format!(
+                    "\n[{} stopped the reply: {reason}]\n",
+                    provider.name()
+                )));
+            }
 
             // Beyond Python: a reply that ends cleanly with nothing to say (a thinking
             // model can put its whole answer in its reasoning) is asked about once.
@@ -960,6 +973,7 @@ impl Harness {
             let mut from_thinking = false;
             if completion.tool_calls.is_empty()
                 && completion.stop_reason.as_deref() != Some("max_tokens")
+                && stopped.is_none()
                 && completion.text.trim().is_empty()
                 && continuation_start.is_none()
             {

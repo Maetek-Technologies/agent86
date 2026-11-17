@@ -12,6 +12,10 @@
 //!   `anthropic-version` (not Bearer), answering `{"data": [{"id", "display_name"}]}`.
 //! - Ollama: `GET {base}/api/tags`, no auth, answering `{"models": [{"name": ...}]}`.
 //!
+//! Google (beyond Python): `GET {base}/models?pageSize=1000` with `x-goog-api-key`,
+//! following `nextPageToken`, keeping models that support `generateContent`,
+//! [`fetch_google`].
+//!
 //! A vLLM section (beyond Python) is OpenAI-compatible here, its key sent when one
 //! resolves; its `/v1/models` also gives each model's `max_model_len`, read by
 //! [`fetch_vllm_model_lengths`] for the window.
@@ -226,6 +230,102 @@ fn context_lengths(
             (length >= 1.0).then(|| (id.to_lowercase(), length as u64))
         })
         .collect())
+}
+
+/// One model from Google's `GET /models` (beyond Python).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleModel {
+    /// `name` without `models/`.
+    pub id: String,
+    /// `displayName`, else the id.
+    pub label: String,
+    pub input_token_limit: Option<u64>,
+}
+
+/// Google's models that can chat, every page, with the key in `x-goog-api-key`.
+pub fn fetch_google(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<GoogleModel>, CatalogUnavailable> {
+    fetch_google_with(base_url, api_key, TIMEOUT)
+}
+
+/// [`fetch_google`] with its own timeout, for the window lookup.
+pub fn fetch_google_with(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<GoogleModel>, CatalogUnavailable> {
+    let Some(key) = api_key else {
+        return Err(CatalogUnavailable(
+            "Google's model list needs an API key.".to_owned(),
+        ));
+    };
+    let headers = [("x-goog-api-key", key.to_owned())];
+    let base = base_url.trim_end_matches('/');
+    let mut models = Vec::new();
+    let mut token: Option<String> = None;
+    // A server that never stops paging is cut off.
+    for _ in 0..20 {
+        let mut url = format!("{base}/models?pageSize=1000");
+        if let Some(token) = &token {
+            url.push_str("&pageToken=");
+            url.push_str(&url_component(token));
+        }
+        let body = get_json(&url, &headers, timeout)?;
+        for model in list(&body, "models") {
+            let Some(name) = model.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let methods = model
+                .get("supportedGenerationMethods")
+                .or_else(|| model.get("supported_actions"))
+                .and_then(Value::as_array);
+            let chats = methods.is_some_and(|methods| {
+                methods
+                    .iter()
+                    .any(|method| method.as_str() == Some("generateContent"))
+            });
+            if !chats {
+                continue;
+            }
+            let id = name.strip_prefix("models/").unwrap_or(name).to_owned();
+            models.push(GoogleModel {
+                label: model
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(&id)
+                    .to_owned(),
+                input_token_limit: model
+                    .get("inputTokenLimit")
+                    .and_then(Value::as_u64)
+                    .filter(|&limit| limit > 0),
+                id,
+            });
+        }
+        token = body
+            .get("nextPageToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(models)
+}
+
+/// A query value with everything but unreserved characters percent-encoded.
+fn url_component(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 /// One model from LM Studio's native `GET /api/v1/models` (beyond Python).
@@ -444,6 +544,16 @@ pub fn fetch_catalog(
                 .as_deref()
                 .unwrap_or("http://localhost:11434"),
         )?,
+        "google" => fetch_google(
+            section
+                .base_url
+                .as_deref()
+                .unwrap_or(super::google::DEFAULT_BASE_URL),
+            api_key,
+        )?
+        .into_iter()
+        .map(|model| (model.id, model.label))
+        .collect(),
         "llamacpp" => {
             return Err(CatalogUnavailable(
                 "llama.cpp exposes no model list -- enter provider:model directly.".to_owned(),
