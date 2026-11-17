@@ -668,6 +668,118 @@ async fn a_reply_the_provider_stops_is_announced_once_and_not_asked_again() {
     assert_eq!(server.requests().len(), 1, "not asked again");
 }
 
+/// A Gemini provider on `server`, as the factory would build it.
+fn gemini(server: &MockServer) -> std::sync::Arc<dyn agent86::provider::Provider> {
+    let config = agent86::provider::google::GoogleConfig {
+        base_url: Some(format!("{}/v1", server.base_url)),
+        max_retries: 0,
+        ..Default::default()
+    };
+    std::sync::Arc::new(
+        agent86::provider::google::GoogleProvider::new(
+            "gemini-3.1-flash-lite",
+            config,
+            Some("gemini-test-key".into()),
+        )
+        .unwrap(),
+    )
+}
+
+async fn run_gemini(server: &MockServer, workspace: &Workspace, goal: &str) -> RunOutput {
+    run_on(
+        gemini(server),
+        workspace,
+        limits(),
+        goal,
+        ApprovalGate::new(ApprovalMode::Ask, None),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_gemini_tool_step_goes_back_with_its_signature_and_googles_id() {
+    let server = MockServer::start(vec![
+        Reply::Sse(support::fixture("google/tool_call.sse")),
+        Reply::Sse(support::fixture("google/text.sse")),
+    ])
+    .await;
+    let workspace = Workspace::new("gemini-tools");
+    let output = run_gemini(&server, &workspace, "What files are here?").await;
+    assert!(output.output.ends_with("Hello there!"), "{}", output.output);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let declarations = request.body["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap();
+        let list_dir = declarations
+            .iter()
+            .find(|declaration| declaration["name"] == "list_dir")
+            .expect("list_dir is declared");
+        assert!(list_dir["parametersJsonSchema"].is_object());
+        assert_eq!(
+            request.body["toolConfig"],
+            json!({"functionCallingConfig": {"mode": "AUTO"}})
+        );
+    }
+    // The second request fails at Google without the first step's signature.
+    let contents = requests[1].body["contents"].as_array().unwrap();
+    let step = &contents[contents.len() - 2];
+    assert_eq!(step["role"], "model");
+    assert_eq!(
+        step["parts"][0],
+        json!({
+            "functionCall": {"id": "fc-list-1", "name": "list_dir", "args": {"path": "."}},
+            "thoughtSignature": "c2lnbmF0dXJlLUE=",
+        })
+    );
+    let answer = &contents[contents.len() - 1];
+    assert_eq!(answer["role"], "user");
+    let response = &answer["parts"][0]["functionResponse"];
+    assert_eq!(
+        (&response["id"], &response["name"]),
+        (&json!("fc-list-1"), &json!("list_dir"))
+    );
+    assert!(response["response"]["result"]
+        .as_str()
+        .unwrap()
+        .contains("README.md"));
+}
+
+#[tokio::test]
+async fn parallel_gemini_calls_keep_the_one_signature_on_the_first_and_answer_in_order() {
+    let server = MockServer::start(vec![
+        Reply::Sse(support::fixture("google/parallel_calls.sse")),
+        Reply::Sse(support::fixture("google/text.sse")),
+    ])
+    .await;
+    let workspace = Workspace::new("gemini-parallel");
+    std::fs::write(workspace.root.join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(workspace.root.join("b.txt"), "beta\n").unwrap();
+    run_gemini(&server, &workspace, "Read a.txt and b.txt").await;
+
+    let contents = server.requests()[1].body["contents"].clone();
+    let contents = contents.as_array().unwrap();
+    let step = &contents[contents.len() - 2]["parts"];
+    assert_eq!(step[0]["thoughtSignature"], "c2lnbmF0dXJlLUI=");
+    assert_eq!(step[0]["functionCall"]["id"], "fc-a");
+    assert!(
+        step[1].get("thoughtSignature").is_none(),
+        "only the first is signed"
+    );
+    assert_eq!(step[1]["functionCall"]["id"], "fc-b");
+    let answers = &contents[contents.len() - 1]["parts"];
+    assert_eq!(answers[0]["functionResponse"]["id"], "fc-a");
+    assert_eq!(answers[1]["functionResponse"]["id"], "fc-b");
+    assert!(answers[0]["functionResponse"]["response"]["result"]
+        .as_str()
+        .unwrap()
+        .contains("alpha"));
+}
+
 #[tokio::test]
 async fn a_model_out_of_steps_is_not_asked_again() {
     let server = MockServer::start(vec![sse_reasoning("Done thinking.", "")]).await;

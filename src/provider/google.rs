@@ -23,6 +23,26 @@
 //!   left to each model's default.
 //! - Retries follow `retry.rs` (429 and 5xx, never once text was shown); a 402
 //!   (prepaid credits used up) is not retried and says so.
+//!
+//! Tools, as checked against the live API on 2026-11-17 (`tests/google_live.rs`,
+//! on `gemini-3.1-flash-lite` and `gemini-4-hydrogen`):
+//!
+//! - Declared through `parametersJsonSchema`, unchanged: every built-in schema and
+//!   MCP-shaped ones (`$ref`/`$defs`, `additionalProperties`, `anyOf` with null,
+//!   type arrays, `oneOf`/`const`/`pattern`, `default`, `$schema`) were accepted.
+//! - A function name must start with a letter or `_`; a tool whose name does not
+//!   (an MCP name such as `1password-get`) is declared as `_<name>`, and the
+//!   model's calls are mapped back ([`gemini_name`]).
+//! - Every call came back with an `id` and its step's first call with a
+//!   `thoughtSignature`. The step sent back without the signature is a 400
+//!   ("Function call is missing a thought_signature"); with it, or with
+//!   [`SKIP_SIGNATURE`], it passes, and the response passes with or without the
+//!   call's id. The adapter keeps each call's signature in memory, keyed by the
+//!   call id, and sends it back on the same part, with the id when Google issued
+//!   it. Signatures are not saved with the session: Google checks only the
+//!   current turn, and a turn never outlives the process yet, so a call with no
+//!   signature kept (another provider's, a resumed session's) gets the
+//!   placeholder.
 
 use super::openai::error_chain;
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy};
@@ -36,6 +56,8 @@ use crate::types::{
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// The stable Gemini API.
@@ -53,6 +75,17 @@ pub const STOPPED_PREFIX: &str = "stopped:";
 
 /// How much of an error body is kept.
 const ERROR_BODY_LIMIT: usize = 2000;
+
+/// Calls remembered before those no longer in the history are dropped.
+const REMEMBERED_CALLS: usize = 4096;
+
+/// What the adapter keeps about a call Gemini made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallMeta {
+    signature: Option<String>,
+    /// The id is Google's, so it goes back with the call and its response.
+    google_id: bool,
+}
 
 /// Settings from `[providers.google]` this adapter uses.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +126,10 @@ pub struct GoogleProvider {
     client: reqwest::Client,
     pricing: PriceTable,
     price_ref: String,
+    /// Each call's signature and id kind, by call id, for sending the step back.
+    calls: Mutex<HashMap<String, CallMeta>>,
+    /// For ids made up for calls Gemini sent without one (Gemini 2.5).
+    next_id: AtomicU64,
 }
 
 impl fmt::Debug for GoogleProvider {
@@ -137,6 +174,8 @@ impl GoogleProvider {
             config,
             client,
             pricing: PriceTable::builtin(),
+            calls: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
         })
     }
 
@@ -154,7 +193,48 @@ impl GoogleProvider {
 
     /// The `generateContent` body for `request`.
     pub fn payload(&self, request: &CompletionRequest) -> Value {
-        let (system, contents) = to_contents(&request.messages);
+        self.prepare(request).0
+    }
+
+    /// The body, and the declared name of each renamed tool to its own name.
+    fn prepare(&self, request: &CompletionRequest) -> (Value, HashMap<String, String>) {
+        let mut declared: HashMap<String, String> = HashMap::new();
+        let mut taken: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
+        let mut rename = |name: &str| -> String {
+            if let Some(known) = declared.get(name) {
+                return known.clone();
+            }
+            let wire = gemini_name(name, &taken);
+            if wire != name {
+                taken.push(wire.clone());
+            }
+            declared.insert(name.to_owned(), wire.clone());
+            wire
+        };
+        let declarations: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": rename(&tool.name),
+                    "description": tool.description,
+                    "parametersJsonSchema": tool.parameters,
+                })
+            })
+            .collect();
+        let calls = {
+            let mut calls = self.calls.lock().unwrap_or_else(|p| p.into_inner());
+            if calls.len() > REMEMBERED_CALLS {
+                let live: std::collections::HashSet<&str> = request
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
+                    .collect();
+                calls.retain(|id, _| live.contains(id.as_str()));
+            }
+            calls.clone()
+        };
+        let (system, contents) = to_contents_with(&request.messages, &calls, &mut rename);
         let mut generation = json!({"thinkingConfig": {"includeThoughts": true}});
         let cap = request
             .max_tokens
@@ -171,7 +251,16 @@ impl GoogleProvider {
         if !system.is_empty() {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
-        body
+        if !declarations.is_empty() {
+            body["tools"] = json!([{"functionDeclarations": declarations}]);
+            body["toolConfig"] = json!({"functionCallingConfig": {"mode": "AUTO"}});
+        }
+        let back = declared
+            .into_iter()
+            .filter(|(own, wire)| own != wire)
+            .map(|(own, wire)| (wire, own))
+            .collect();
+        (body, back)
     }
 
     fn redact(&self, text: &str) -> String {
@@ -185,6 +274,14 @@ impl GoogleProvider {
             .take(ERROR_BODY_LIMIT)
             .collect();
         match status {
+            400 if body.contains("thought_signature") => ProviderError::HttpHint {
+                status,
+                body,
+                hint: "agent86 sent back a tool call without the signature Gemini gave it; \
+                       this is a bug, please report it at \
+                       https://github.com/Maetek-Technologies/agent86/issues"
+                    .to_owned(),
+            },
             402 => ProviderError::HttpHint {
                 status,
                 body,
@@ -251,13 +348,17 @@ impl Provider for GoogleProvider {
             client: build_client(&self.config)?,
             pricing: self.pricing.clone(),
             price_ref: self.price_ref.clone(),
+            calls: Mutex::new(self.calls.lock().unwrap_or_else(|p| p.into_inner()).clone()),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
         }))
     }
 
     fn stream(&self, request: CompletionRequest) -> DeltaStream<'_> {
+        let (body, names) = self.prepare(&request);
         let state = StreamState {
             provider: self,
-            body: self.payload(&request).to_string(),
+            body: body.to_string(),
+            names,
             policy: RetryPolicy::new(self.config.max_retries),
             response: None,
             buffer: Vec::new(),
@@ -283,9 +384,20 @@ impl Provider for GoogleProvider {
 /// parts in one `user` content, in call order, after all of the step's calls, as
 /// Google requires. Consecutive contents of one role are merged by joining their
 /// part lists, never by joining parts, so a signed part stays apart. A model
-/// content's first function call carries [`SKIP_SIGNATURE`] until signatures are
-/// kept per call.
+/// content's first function call carries [`SKIP_SIGNATURE`], as there is no
+/// signature kept for any call here; see [`GoogleProvider`] for the calls it made.
 pub fn to_contents(messages: &[Message]) -> (String, Vec<Value>) {
+    to_contents_with(messages, &HashMap::new(), &mut |name: &str| name.to_owned())
+}
+
+/// [`to_contents`] with the calls Gemini made (their signatures go back on their
+/// own parts, with Google's ids) and the declared name of each tool. A step none
+/// of whose calls has a signature kept gets the placeholder on its first call.
+fn to_contents_with(
+    messages: &[Message],
+    calls: &HashMap<String, CallMeta>,
+    rename: &mut dyn FnMut(&str) -> String,
+) -> (String, Vec<Value>) {
     let mut system: Vec<&str> = Vec::new();
     let mut contents: Vec<(String, Vec<Value>)> = Vec::new();
     let mut names: HashMap<&str, &str> = HashMap::new();
@@ -311,6 +423,11 @@ pub fn to_contents(messages: &[Message]) -> (String, Vec<Value>) {
             }
             Role::Assistant => {
                 let mut parts: Vec<Value> = text_part(&message.content).into_iter().collect();
+                let signed = message.tool_calls.iter().any(|call| {
+                    calls
+                        .get(&call.id)
+                        .is_some_and(|meta| meta.signature.is_some())
+                });
                 for (index, call) in message.tool_calls.iter().enumerate() {
                     names.insert(call.id.as_str(), call.name.as_str());
                     let args = if call.invalid_arguments().is_some() {
@@ -318,9 +435,18 @@ pub fn to_contents(messages: &[Message]) -> (String, Vec<Value>) {
                     } else {
                         call.arguments.clone()
                     };
-                    let mut part = json!({"functionCall": {"name": call.name, "args": args}});
-                    if index == 0 {
-                        part["thoughtSignature"] = json!(SKIP_SIGNATURE);
+                    let meta = calls.get(&call.id);
+                    let mut function = json!({"name": rename(&call.name), "args": args});
+                    if meta.is_some_and(|meta| meta.google_id) {
+                        function["id"] = json!(call.id);
+                    }
+                    let mut part = json!({"functionCall": function});
+                    match meta.and_then(|meta| meta.signature.as_deref()) {
+                        Some(signature) => part["thoughtSignature"] = json!(signature),
+                        None if index == 0 && !signed => {
+                            part["thoughtSignature"] = json!(SKIP_SIGNATURE);
+                        }
+                        None => {}
                     }
                     parts.push(part);
                 }
@@ -337,13 +463,18 @@ pub fn to_contents(messages: &[Message]) -> (String, Vec<Value>) {
                             .and_then(|id| names.get(id).copied())
                     })
                     .unwrap_or("tool");
-                push(
-                    "user",
-                    vec![json!({"functionResponse": {
-                        "name": name,
-                        "response": {"result": message.content},
-                    }})],
-                );
+                let mut response = json!({
+                    "name": rename(name),
+                    "response": {"result": message.content},
+                });
+                if let Some(id) = message
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| calls.get(*id).is_some_and(|meta| meta.google_id))
+                {
+                    response["id"] = json!(id);
+                }
+                push("user", vec![json!({ "functionResponse": response })]);
             }
         }
     }
@@ -356,6 +487,24 @@ pub fn to_contents(messages: &[Message]) -> (String, Vec<Value>) {
 
 fn text_part(text: &str) -> Option<Value> {
     (!text.is_empty()).then(|| json!({"text": text}))
+}
+
+/// The name a tool is declared under: its own when Gemini takes it (a letter or
+/// `_` first, then letters, digits, `_`, `.`, `:`, `-`, at most 128), else with a
+/// `_` in front, more while that is taken by another tool in `taken`.
+pub fn gemini_name(name: &str, taken: &[String]) -> String {
+    let starts_well = name
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+    if starts_well {
+        return name.to_owned();
+    }
+    let mut wire = format!("_{name}");
+    while taken.contains(&wire) {
+        wire.insert(0, '_');
+    }
+    wire
 }
 
 /// What a `finishReason` (or a blocked prompt's `blockReason`) means for the turn.
@@ -392,6 +541,8 @@ struct TurnState {
 struct StreamState<'a> {
     provider: &'a GoogleProvider,
     body: String,
+    /// Declared name to the tool's own, for renamed tools.
+    names: HashMap<String, String>,
     policy: RetryPolicy,
     response: Option<reqwest::Response>,
     buffer: Vec<u8>,
@@ -567,7 +718,8 @@ impl StreamState<'_> {
                 {
                     let mut arguments = Map::new();
                     arguments.insert(INVALID_TOOL_ARGS_KEY.to_owned(), json!(message));
-                    let id = format!("call_{}", self.turn.tool_calls.len());
+                    let n = self.provider.next_id.fetch_add(1, Ordering::Relaxed);
+                    let id = format!("call_g{n}");
                     self.turn.tool_calls.push(ToolCall {
                         id,
                         name: "unknown".to_owned(),
@@ -582,24 +734,37 @@ impl StreamState<'_> {
 
     fn part(&mut self, part: &Value) {
         if let Some(call) = part.get("functionCall") {
-            let name = call
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+            let wire = call.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = self.names.get(wire).map_or(wire, String::as_str).to_owned();
             let arguments = call
                 .get("args")
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            let id = call
+            let google = call
                 .get("id")
                 .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map_or_else(
-                    || format!("call_{}", self.turn.tool_calls.len()),
-                    str::to_owned,
-                );
+                .filter(|id| !id.is_empty());
+            let id = google.map_or_else(
+                || {
+                    let n = self.provider.next_id.fetch_add(1, Ordering::Relaxed);
+                    format!("call_g{n}")
+                },
+                str::to_owned,
+            );
+            let meta = CallMeta {
+                signature: part
+                    .get("thoughtSignature")
+                    .and_then(Value::as_str)
+                    .filter(|signature| !signature.is_empty())
+                    .map(str::to_owned),
+                google_id: google.is_some(),
+            };
+            self.provider
+                .calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.clone(), meta);
             self.turn.tool_calls.push(ToolCall {
                 id,
                 name,
@@ -672,6 +837,16 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    #[test]
+    fn names_gemini_refuses_get_an_underscore_and_stay_unique() {
+        let taken = vec!["_1tool".to_owned()];
+        assert_eq!(gemini_name("read_file", &taken), "read_file");
+        assert_eq!(gemini_name("_private", &taken), "_private");
+        assert_eq!(gemini_name("1password-get", &taken), "_1password-get");
+        assert_eq!(gemini_name("-dash", &taken), "_-dash");
+        assert_eq!(gemini_name("1tool", &taken), "__1tool", "past a taken name");
     }
 
     #[test]
