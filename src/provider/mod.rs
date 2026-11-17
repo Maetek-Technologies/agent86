@@ -27,11 +27,14 @@ use openai::{OpenAiConfig, OpenAiProvider};
 use std::time::Duration;
 use thiserror::Error;
 
-/// llama.cpp's server; LM Studio is `:1234/v1`.
+/// llama.cpp's server (`llama-server --port`).
 const LLAMACPP_DEFAULT_BASE_URL: &str = "http://localhost:8080/v1";
 
 /// vLLM's own default port (`vllm serve --port`).
 pub const VLLM_DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
+
+/// The port LM Studio's docs assume throughout (`lms server start` reuses the last).
+pub const LMSTUDIO_DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// A server agent86 knows beyond the OpenAI-compatible API it speaks (beyond
 /// Python): chosen by a section's `adapter`, or by the built-in section's name.
@@ -41,6 +44,7 @@ pub const VLLM_DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerKind {
     Vllm,
+    LmStudio,
 }
 
 impl ServerKind {
@@ -48,6 +52,7 @@ impl ServerKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Vllm => "vllm",
+            Self::LmStudio => "lmstudio",
         }
     }
 
@@ -55,11 +60,13 @@ impl ServerKind {
     pub fn default_base_url(self) -> &'static str {
         match self {
             Self::Vllm => VLLM_DEFAULT_BASE_URL,
+            Self::LmStudio => LMSTUDIO_DEFAULT_BASE_URL,
         }
     }
 
     /// A key is sent when one resolves, and its absence is not an error: the
-    /// server is open unless it was started with one (vLLM's `--api-key`).
+    /// server is open unless it was started with one (vLLM's `--api-key`, LM
+    /// Studio's "Require Authentication").
     pub fn key_optional(self) -> bool {
         true
     }
@@ -67,6 +74,7 @@ impl ServerKind {
     pub(crate) fn parse(adapter: &str) -> Option<Self> {
         match adapter.trim() {
             "vllm" => Some(Self::Vllm),
+            "lmstudio" => Some(Self::LmStudio),
             _ => None,
         }
     }
@@ -94,8 +102,8 @@ pub fn key_optional(name: &str, section: Option<&ProviderConfig>) -> bool {
 /// Construct the provider that serves `reference`, e.g. `openrouter:openai/gpt-4o-mini`.
 ///
 /// Any provider section with a `base_url` is treated as OpenAI-compatible, so
-/// OpenRouter, Groq, Together, and LM Studio work with only a config block; vLLM
-/// has a section of its own, and `adapter = "vllm"` ([`ServerKind`]) for others.
+/// OpenRouter, Groq, and Together work with only a config block; vLLM and LM
+/// Studio have sections of their own, and `adapter` ([`ServerKind`]) for others.
 /// A key is required for `openai` itself, and for other sections only when they
 /// name an `api_key_env`; a `base_url` without one is a keyless local endpoint.
 ///
@@ -143,8 +151,8 @@ fn build_provider(
             return Err(ProviderError::InvalidSetting {
                 provider: name.to_owned(),
                 detail: format!(
-                    "adapter must be \"vllm\", not {adapter:?}; remove it for a plain \
-                     OpenAI-compatible endpoint"
+                    "adapter must be \"vllm\" or \"lmstudio\", not {adapter:?}; remove it \
+                     for a plain OpenAI-compatible endpoint"
                 ),
             });
         }
@@ -188,8 +196,8 @@ fn build_provider(
         return Ok(Box::new(provider));
     }
 
-    // llama.cpp and LM Studio serve the OpenAI-compatible API locally, so this is
-    // the OpenAI adapter under its own name, with a local default and no key.
+    // llama.cpp serves the OpenAI-compatible API locally, so this is the OpenAI
+    // adapter under its own name, with a local default and no key.
     if name == "llamacpp" {
         let mut section = section;
         section
@@ -215,6 +223,17 @@ fn build_provider(
             .get_or_insert_with(|| kind.default_base_url().to_owned());
         let mut openai_config = openai_config(name, &section, !kind.key_optional())?;
         openai_config.adapter = kind.name();
+        // `[model.context_window]` wins over what the server reports.
+        let overridden = [reference.to_string().as_str(), reference.model.as_str()]
+            .iter()
+            .any(|key| {
+                config
+                    .model
+                    .context_window
+                    .get(*key)
+                    .is_some_and(|&w| w > 0)
+            });
+        openai_config.live_window = kind == ServerKind::LmStudio && !overridden;
         let provider = OpenAiProvider::new(
             reference.model.clone(),
             openai_config,
@@ -258,6 +277,7 @@ fn openai_config(
         read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
         max_retries: section.max_retries,
         routing: section.routing.clone(),
+        live_window: false,
     })
 }
 
@@ -294,6 +314,14 @@ pub trait Provider: Send + Sync {
     /// so a thread must never reuse one another runtime opened. Never reads the
     /// keyring. Building the client can fail, which fails that delegation.
     fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError>;
+
+    /// The context window the server reports now, for a server that sets it at
+    /// runtime (beyond Python): LM Studio's loaded context length, learned once a
+    /// request has loaded the model and then kept for this provider's life. `None`
+    /// leaves the window computed at startup or on `/model`.
+    fn live_context_window(&self) -> Option<u64> {
+        None
+    }
 
     /// Consume [`Provider::stream`] and return the assembled completion.
     fn complete(
@@ -346,7 +374,7 @@ pub async fn collect_completion(
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ProviderError {
     #[error(
-        "Unknown provider '{provider}'. Built-in: anthropic, openai, ollama, llamacpp, vllm. \
+        "Unknown provider '{provider}'. Built-in: anthropic, openai, ollama, llamacpp, vllm, lmstudio. \
          For an OpenAI-compatible endpoint, add a [providers.{provider}] block with a base_url \
          (e.g. OpenRouter, Groq, Together) to your config."
     )]

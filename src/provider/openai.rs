@@ -65,6 +65,10 @@ pub struct OpenAiConfig {
     pub max_retries: u32,
     /// The section's `routing` table, sent as the request's `provider` field.
     pub routing: Option<Map<String, Value>>,
+    /// Learn the window from the server once a request has loaded the model
+    /// (LM Studio's loaded context length, beyond Python); off when
+    /// `[model.context_window]` sets it. See [`Provider::live_context_window`].
+    pub live_window: bool,
 }
 
 impl Default for OpenAiConfig {
@@ -80,6 +84,7 @@ impl Default for OpenAiConfig {
             read_timeout: Duration::from_secs(300),
             max_retries: DEFAULT_MAX_RETRIES,
             routing: None,
+            live_window: false,
         }
     }
 }
@@ -93,6 +98,8 @@ pub struct OpenAiProvider {
     pricing: PriceTable,
     /// The name usage is priced under, normally the `provider:model` ref.
     price_ref: String,
+    /// The window learned from the server ([`OpenAiConfig::live_window`]).
+    learned_window: Mutex<Option<u64>>,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -151,6 +158,7 @@ impl OpenAiProvider {
             config,
             client,
             pricing: PriceTable::builtin(),
+            learned_window: Mutex::new(None),
         })
     }
 
@@ -281,7 +289,45 @@ impl Provider for OpenAiProvider {
                 })?,
             pricing: self.pricing.clone(),
             price_ref: self.price_ref.clone(),
+            learned_window: Mutex::new(
+                *self
+                    .learned_window
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            ),
         }))
+    }
+
+    fn live_context_window(&self) -> Option<u64> {
+        if !self.config.live_window {
+            return None;
+        }
+        let mut learned = self
+            .learned_window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if learned.is_none() {
+            // Until a request has loaded the model there is nothing to learn, and
+            // the window computed at startup stands; once loaded, it is kept.
+            let base = self
+                .config
+                .base_url
+                .as_deref()
+                .unwrap_or(super::LMSTUDIO_DEFAULT_BASE_URL);
+            *learned = super::catalog::fetch_lmstudio_models(
+                base,
+                self.api_key.as_deref(),
+                Duration::from_secs(3),
+            )
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|model| model.key == self.model)?
+                    .loaded_context
+            });
+        }
+        *learned
     }
 
     fn name(&self) -> &str {

@@ -2430,6 +2430,7 @@ async fn models_and_config_list_providers_roles_and_where_config_is_read() {
             "OPENROUTER_API_KEY",
             "GROQ_API_KEY",
             "VLLM_API_KEY",
+            "LM_API_TOKEN",
         ] {
             command.env(variable, "placeholder");
         }

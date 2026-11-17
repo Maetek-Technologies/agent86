@@ -133,6 +133,10 @@ base_url = "http://localhost:8080"
 [providers.vllm]
 base_url = "http://localhost:8000/v1"
 api_key_env = "VLLM_API_KEY"
+
+[providers.lmstudio]
+base_url = "http://localhost:1234/v1"
+api_key_env = "LM_API_TOKEN"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -689,11 +693,11 @@ pub struct ProviderConfig {
     /// that serves it badly.
     #[serde(default)]
     pub routing: Option<serde_json::Map<String, serde_json::Value>>,
-    /// The kind of server a section reaches (beyond Python): `"vllm"` gives any
-    /// section vLLM's behaviour (an optional key, the window its model list
-    /// reports, local pricing, and hints for its errors), so a local server and a
-    /// remote GPU box can sit side by side. Unset is today's rules; the built-in
-    /// `vllm` section needs none. See `provider::ServerKind`.
+    /// The kind of server a section reaches (beyond Python): `"vllm"` or
+    /// `"lmstudio"` gives any section that server's behaviour (an optional key, the
+    /// window and model list it reports, local pricing, and hints for its errors),
+    /// so a local server and a remote box can sit side by side. Unset is today's
+    /// rules; the built-in sections need none. See `provider::ServerKind`.
     #[serde(default)]
     pub adapter: Option<String>,
 }

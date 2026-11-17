@@ -145,7 +145,17 @@ async fn run_with(
     gate: ApprovalGate,
     guardrails: Guardrails,
 ) -> Result<RunOutput, HarnessError> {
-    let provider = provider(server);
+    run_on(provider(server), workspace, limits, goal, gate, guardrails).await
+}
+
+async fn run_on(
+    provider: OpenAiProvider,
+    workspace: &Workspace,
+    limits: LimitsConfig,
+    goal: &str,
+    gate: ApprovalGate,
+    guardrails: Guardrails,
+) -> Result<RunOutput, HarnessError> {
     let harness = Harness {
         provider: std::sync::Arc::new(provider),
         router: Default::default(),
@@ -587,6 +597,37 @@ async fn an_answer_that_never_comes_says_so() {
         format!("{EMPTY_ANSWER_NOTICE}  {NO_ANSWER_NOTICE}")
     );
     assert_eq!(output.steps, 2);
+}
+
+#[tokio::test]
+async fn lm_studio_saying_nothing_twice_gets_the_context_hint() {
+    let server = MockServer::start(vec![sse_text("", "stop"), sse_text("", "stop")]).await;
+    let workspace = Workspace::new("no-answer-lmstudio");
+    let config = OpenAiConfig {
+        base_url: Some(server.base_url.clone()),
+        adapter: "lmstudio",
+        require_key: false,
+        max_retries: 0,
+        ..OpenAiConfig::default()
+    };
+    let provider = OpenAiProvider::new("qwen3-8b", config, None).unwrap();
+    let output = run_on(
+        provider,
+        &workspace,
+        limits(),
+        "hello",
+        ApprovalGate::new(ApprovalMode::Ask, None),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        output.output,
+        format!(
+            "{EMPTY_ANSWER_NOTICE}{NO_ANSWER_NOTICE}{}\n",
+            agent86::provider::hints::LMSTUDIO_EMPTY_ANSWER
+        )
+    );
 }
 
 #[tokio::test]

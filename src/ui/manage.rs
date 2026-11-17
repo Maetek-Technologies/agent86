@@ -40,6 +40,7 @@ const BUILTIN_PROVIDERS: &[&str] = &[
     "ollama",
     "llamacpp",
     "vllm",
+    "lmstudio",
 ];
 
 /// One row of the provider list. `keyless` means the endpoint needs no key at all;
@@ -707,15 +708,13 @@ mod tests {
             &mut app,
             &repl,
             "llamacpp",
-            Err("llama.cpp / LM Studio expose no model list".into()),
+            Err("llama.cpp exposes no model list".into()),
             CatalogPurpose::Manager,
         );
         assert_eq!(
             printed(&mut app),
-            [
-                "catalog unavailable: llama.cpp / LM Studio expose no model list \
-                 (enter a model name directly)"
-            ]
+            ["catalog unavailable: llama.cpp exposes no model list \
+                 (enter a model name directly)"]
         );
         assert!(matches!(app.panel(), Some(Panel::Picker(_))));
         assert!(
@@ -739,6 +738,7 @@ mod tests {
                 "ollama",
                 "llamacpp",
                 "vllm",
+                "lmstudio",
                 "local"
             ]
         );
@@ -752,6 +752,8 @@ mod tests {
         let vllm = &rows[6];
         assert!(vllm.key_optional && !vllm.keyless);
         assert!(matches!(vllm.status(), "key ok" | "key optional"));
+        let lmstudio = &rows[7];
+        assert!(lmstudio.key_optional && !lmstudio.keyless);
     }
 
     #[test]

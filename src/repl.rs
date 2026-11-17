@@ -2482,6 +2482,17 @@ mod tests {
                 ]
             );
         }
+        if std::env::var_os("LM_API_TOKEN").is_none() {
+            assert_eq!(
+                row("lmstudio"),
+                [
+                    "lmstudio",
+                    "http://localhost:1234/v1",
+                    "LM_API_TOKEN",
+                    "optional"
+                ]
+            );
+        }
         assert!(!text.contains("stored"));
     }
 

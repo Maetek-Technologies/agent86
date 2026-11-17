@@ -13,10 +13,10 @@
 //! So is a vLLM server's `max_model_len` ([`vllm_context_window`]), also beyond
 //! Python.
 
-use super::capabilities::DEFAULT_OLLAMA_NUM_CTX_MAX;
+use super::capabilities::{DEFAULT_CONTEXT_WINDOW, DEFAULT_OLLAMA_NUM_CTX_MAX};
 use super::catalog::{
-    fetch_ollama_show, fetch_openai_compatible_context_lengths, fetch_vllm_model_lengths,
-    OllamaShow,
+    fetch_lmstudio_models, fetch_ollama_show, fetch_openai_compatible_context_lengths,
+    fetch_vllm_model_lengths, OllamaShow,
 };
 use crate::config::{Config, ProviderConfig};
 use crate::secrets::{resolve_api_key, SecretStore};
@@ -232,9 +232,46 @@ pub fn vllm_context_window(
     lengths.as_ref()?.get(&model.trim().to_lowercase()).copied()
 }
 
+/// The window an LM Studio model runs at (beyond Python): the context length its
+/// first loaded instance was loaded with, which is often far below the model's
+/// maximum, and which the server enforces. A model that is not loaded yet gets
+/// the smaller of its maximum and [`DEFAULT_CONTEXT_WINDOW`]; once the first
+/// request has loaded it, the provider learns the real length
+/// ([`super::Provider::live_context_window`]). Never cached or memoized here:
+/// reloading the model in LM Studio changes it, and this is asked only at startup
+/// and on `/model`.
+pub fn lmstudio_context_window(
+    provider: &str,
+    model: &str,
+    config: &Config,
+    secrets: &dyn SecretStore,
+) -> Option<u64> {
+    let section = config.providers.get(provider);
+    let kind = super::server_kind(provider, section)?;
+    if kind != super::ServerKind::LmStudio {
+        return None;
+    }
+    let base_url = section
+        .and_then(|section| section.base_url.as_deref())
+        .unwrap_or(kind.default_base_url());
+    let key = resolve_api_key(
+        provider,
+        section.and_then(|section| section.api_key_env.as_deref()),
+        secrets,
+    );
+    let models = fetch_lmstudio_models(base_url, key.as_deref(), FETCH_TIMEOUT).ok()?;
+    let found = models.iter().find(|entry| entry.key == model.trim())?;
+    found.loaded_context.or_else(|| {
+        Some(found.max_context.map_or(DEFAULT_CONTEXT_WINDOW, |max| {
+            max.min(DEFAULT_CONTEXT_WINDOW)
+        }))
+    })
+}
+
 /// What the server behind `provider` reports for `model`'s window: OpenRouter's
-/// figure, an Ollama model's maximum, or a vLLM server's `max_model_len`. The
-/// `discover` of [`super::capabilities::context_window_with`].
+/// figure, an Ollama model's maximum, a vLLM server's `max_model_len`, or an LM
+/// Studio model's loaded length. The `discover` of
+/// [`super::capabilities::context_window_with`].
 pub fn discover_context_window(
     provider: &str,
     model: &str,
@@ -245,6 +282,7 @@ pub fn discover_context_window(
     openrouter_context_window(provider, model, config, cache, secrets)
         .or_else(|| ollama_context_window(provider, model, config))
         .or_else(|| vllm_context_window(provider, model, config, secrets))
+        .or_else(|| lmstudio_context_window(provider, model, config, secrets))
 }
 
 #[cfg(test)]
