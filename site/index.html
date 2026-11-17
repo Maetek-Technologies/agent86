@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agent86: an agentic harness on the command line</title>
+  <meta name="description" content="agent86 connects to remote or local models and lets them use tools and skills, behind your approvals. One native binary for Linux, macOS, and Windows, and an agent for editors that speak ACP.">
+  <meta property="og:title" content="agent86">
+  <meta property="og:description" content="An agentic harness on the command line: remote or local models, tools, skills, sub-agents, and MCP, behind your approvals. One native binary.">
+  <meta property="og:type" content="website">
+  <meta property="og:image" content="https://maetek-technologies.github.io/agent86/images/interface.png">
+  <link rel="icon" type="image/png" href="images/agent86-logo.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <nav class="nav wrap">
+      <a class="brand" href="./"><img src="images/agent86-logo.png" alt="" width="32" height="32"> agent86</a>
+      <ul>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#install">Install</a></li>
+        <li><a href="#editors">Editors</a></li>
+        <li><a href="#docs">Docs</a></li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86">GitHub</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero wrap">
+      <img class="logo" src="images/agent86-logo.png" alt="The agent86 logo: a robot detective in a fedora beside a seven-segment 86, on a retro badge reading AGENT 86" width="200" height="200">
+      <h1>agent 86</h1>
+      <p class="tagline">An agentic harness on the command line. It connects to remote or local models and lets them use tools and skills, and ships as one native binary.</p>
+      <div class="cta">
+        <code class="install-line"><span class="prompt">$</span> npm install -g agent86</code>
+        <a class="button" href="https://github.com/Maetek-Technologies/agent86/releases/latest">Latest release</a>
+        <a class="button ghost" href="https://github.com/Maetek-Technologies/agent86">View on GitHub</a>
+      </div>
+      <p class="platforms">Linux x86_64 and ARM64 · macOS (Apple silicon and Intel) · Windows x86_64 · MIT licensed</p>
+    </section>
+
+    <section class="shot wrap">
+      <img src="images/interface.png" alt="The interactive interface at startup: the AGENT 86 header, the input box with the working directory in its border, and the status line" width="1482" height="765">
+    </section>
+
+    <section id="features" class="wrap">
+      <h2>What it does</h2>
+      <div class="grid">
+        <article>
+          <h3>Any model</h3>
+          <p>OpenAI, Anthropic, OpenRouter, Groq, Ollama, llama.cpp, LM Studio, or any OpenAI-compatible endpoint: <code>--model provider:model</code>. Keys come from the environment or the OS keyring, never a config file.</p>
+        </article>
+        <article>
+          <h3>Tools, behind approvals</h3>
+          <p>The agent reads, searches, writes, and edits files, runs commands and Python snippets, and fetches web pages. Every write and command waits for your approval, unless you say otherwise.</p>
+        </article>
+        <article>
+          <h3>Sandboxed and guarded</h3>
+          <p>Commands run with secrets scrubbed from the environment, a timeout that kills the process tree, and capped output, or in a throwaway Docker container. Guardrails scan for prompt injection, leaked secrets, and personal data; <code>web_fetch</code> refuses private addresses.</p>
+        </article>
+        <article>
+          <h3>An interface you already know</h3>
+          <p>An inline terminal interface: the conversation in your scrollback, a <code>/</code> command menu, <code>@file</code> mentions, Markdown answers, coloured diffs in approvals, and Esc to stop a turn. Or a plain loop, or one-shot <code>run --json</code> for scripts.</p>
+        </article>
+        <article>
+          <h3>Sessions and memory</h3>
+          <p>Every run is a session you can resume. Finished turns are recalled into similar later tasks, and the agent can <code>remember</code> and <code>recall</code> facts, embedded locally on <a href="https://github.com/huggingface/candle">candle</a>. List, pin, and forget them with <code>agent86 memory</code>.</p>
+        </article>
+        <article>
+          <h3>Skills and sub-agents</h3>
+          <p><code>SKILL.md</code> folders work as in Claude Code. The agent can delegate to sub-agents, including specialists with their own instructions, tools, and model, running in parallel or in their own git worktrees.</p>
+        </article>
+        <article>
+          <h3>MCP servers</h3>
+          <p>stdio, streamable HTTP, and SSE servers, started for each run and kept in step with drops, reconnects, and tool list changes. Add, test, and save them from <code>/config mcp</code> without leaving the session.</p>
+        </article>
+        <article>
+          <h3>Secrets stay out of the chat</h3>
+          <p>When the agent needs a key, you type it into a masked prompt. The model only ever sees <code>${secret:NAME}</code>; the value reaches commands as an environment variable and is redacted from history, traces, and memory.</p>
+        </article>
+        <article>
+          <h3>Observable</h3>
+          <p>A redacted flight recorder logs every turn, model call, and tool call, with cost estimates. Export it as JSON or OTLP, or send OpenTelemetry spans to your collector.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="install" class="wrap">
+      <h2>Install</h2>
+      <div class="install">
+        <div>
+          <h3>npm</h3>
+          <pre><code>npm install -g agent86</code></pre>
+          <p>Installs the native binary for your platform. Node.js 18 or newer is needed only to install and launch it.</p>
+        </div>
+        <div>
+          <h3>Release archive</h3>
+          <p>Download the archive for your platform from <a href="https://github.com/Maetek-Technologies/agent86/releases/latest">Releases</a>, extract it, and put <code>agent86</code> on your <code>PATH</code>. Releases carry SLSA build provenance you can check with <code>slsa-verifier</code>.</p>
+        </div>
+        <div>
+          <h3>From source</h3>
+          <pre><code>cargo install --git https://github.com/Maetek-Technologies/agent86</code></pre>
+          <p>Needs Rust 1.94 or newer.</p>
+        </div>
+      </div>
+      <h3>Then</h3>
+<pre><code><span class="prompt">$</span> agent86 auth                                   <span class="comment"># store a provider key in the OS keyring</span>
+<span class="prompt">$</span> agent86 --model openrouter:&lt;model&gt;             <span class="comment"># the interactive interface</span>
+<span class="prompt">$</span> agent86 --model ollama:&lt;model&gt; run "fix the failing test"
+<span class="prompt">$</span> agent86 run --json "summarize this repository"  <span class="comment"># one JSON object on stdout</span></code></pre>
+      <p class="note">Switching from the Python version? Uninstall it first; your <code>~/.agent86</code> config, sessions, memory, traces, history, and keyring keys carry over as they are.</p>
+    </section>
+
+    <section id="editors" class="wrap">
+      <h2>Use it from your editor</h2>
+      <p>agent86 speaks the <a href="https://agentclientprotocol.com">Agent Client Protocol</a>, so Zed, the JetBrains IDEs, many VS Code, Neovim, and Emacs integrations, and terminals such as Microsoft's Intelligent Terminal can use it as their agent. Point the client at the command <code>agent86</code> with the argument <code>acp</code>.</p>
+      <p>Replies, reasoning, and tool calls stream in; approvals show the diff or the command; sub-agents appear as cards; and every thread is an ordinary agent86 session you can continue at a terminal with <code>agent86 --resume &lt;id&gt;</code>.</p>
+    </section>
+
+    <section id="docs" class="wrap">
+      <h2>Documentation</h2>
+      <ul class="docs">
+        <li><a href="https://github.com/Maetek-Technologies/agent86#readme">README</a>: everything agent86 does, configuration, and the roadmap</li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86/blob/main/docs/ACP.md">Editors (ACP)</a>: setup and what differs from the terminal</li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86/blob/main/docs/subagents.md">Sub-agents</a>: specialists, parallel runs, and worktrees</li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86/blob/main/docs/skill-commands.md">Skill commands</a>: running a skill yourself</li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86/blob/main/docs/INTERFACE.md">The interface</a>: the terminal interface's design</li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86/blob/main/docs/PROJECT_PLAN.md">Project plan</a>: status, next steps, and every difference from the Python version</li>
+        <li><a href="https://github.com/Maetek-Technologies/agent86/releases">Release notes</a></li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <p>agent86 is MIT licensed. <a href="https://github.com/Maetek-Technologies/agent86/blob/main/CONTRIBUTING.md">Contributing</a> · <a href="https://github.com/Maetek-Technologies/agent86/blob/main/SECURITY.md">Security</a> · <a href="https://github.com/Maetek-Technologies/agent86/issues">Issues</a></p>
+  </footer>
+</body>
+</html>
