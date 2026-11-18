@@ -15,5 +15,5 @@
 - [ ] `cargo test --all-targets`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] Docs updated (`docs/PROJECT_PLAN.md`, README) if a stage landed
+- [ ] Docs updated (`docs/PROJECT_PLAN.md`, `docs/FEATURES.md`, README) if a stage landed
 - [ ] No secrets in code, tests, or logs

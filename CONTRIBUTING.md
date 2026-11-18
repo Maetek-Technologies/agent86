@@ -6,9 +6,10 @@ Please read the [Code of Conduct](CODE_OF_CONDUCT.md) first. Report security pro
 
 ## Before you start
 
-- Read [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md): it is the source of truth for status, next steps, the roadmap, known differences from Python, and the credential policy.
+- Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), a one-page map of where things live and where to begin for common changes. It is enough for a bug fix or a new test.
 - For anything larger than a small fix, open an issue first so we can agree on the approach.
-- [CLAUDE.md](CLAUDE.md) documents the architecture module by module. It is written for AI assistants but is the best map of the code for humans too.
+- For feature work, read [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) too: it is the source of truth for status, next steps, the roadmap, known differences from Python, and the credential policy.
+- [CLAUDE.md](CLAUDE.md) documents the architecture module by module, with the rules each module must keep. It is written for AI assistants but is the most detailed map of the code for humans too.
 
 ## Setup
 
@@ -31,7 +32,7 @@ All three must pass before a pull request is merged. CI runs them on Linux, macO
 - **MSRV:** avoid newer language or std features, and check a new dependency's `rust-version`. Raising the MSRV is a deliberate change that updates `Cargo.toml`, the CI matrix and branch protection together.
 - **Dependencies and actions:** `cargo deny check advisories` must pass; an exception needs a stated reason in `deny.toml`. Pin every GitHub Action to a commit SHA with its version in a comment.
 - **No performance claims without benchmarks.**
-- **Docs:** when a stage lands, update `docs/PROJECT_PLAN.md` and the README status and roadmap, and keep them honest about what is and is not implemented.
+- **Docs:** when a stage lands, update `docs/PROJECT_PLAN.md`, the feature list and roadmap in `docs/FEATURES.md`, and the README's Status section, and keep them honest about what is and is not implemented.
 
 ## Pull requests
 
