@@ -4,7 +4,8 @@
 parking a job at an approval (see the release roadmap in
 `docs/PROJECT_PLAN.md`)
 **Last updated:** 2026-11-15 (decision 2 and the new decision 7: how the OS
-fires jobs). `docs/PROJECT_PLAN.md` also records the maintainer's decisions of
+fires jobs); 2026-11-18 (the heartbeat and the task list, proposed, not yet
+decided with the maintainer). `docs/PROJECT_PLAN.md` also records the maintainer's decisions of
 2026-10-31 (one release, desktop notifications, per-job approval, results);
 where this document and the plan differ, the plan wins.
 
@@ -183,6 +184,166 @@ the five-target release, a second advisory scanner, two binaries in every npm
 platform package, and a second codebase to security-review, and it would end
 the single native binary. Go's service libraries also default to system
 services, which lose the keyring.
+
+## The heartbeat: the agent checks in with a task list
+
+Proposed 2026-11-18; not yet decided with the maintainer, and nothing is
+implemented.
+
+### Why
+
+A job as designed above is a fixed task at a fixed time. That is a timer, not
+an agent that looks at what it has to do and decides. What makes the agent act
+on its own is three things together: something wakes it, it has durable state
+to look at, and it decides what that state calls for. Decision 2 already gives
+the wake-up (`tick`), without a resident daemon. The heartbeat adds the other
+two: a task list the agent owns, and one recurring job per workspace whose
+whole task is "check your list".
+
+### H1. The task list — a file per workspace, in the home directory
+
+`~/.agent86/tasks/<md5 of the workspace path>.json`, the same workspace key
+the remembered secrets use, written atomically under a `.lock` file beside it
+(the `session_dirs.rs` pattern), since a session and a tick can both write.
+
+It is deliberately *not* in `<workspace>/.agent86/`. The list is a standing
+instruction to unattended runs, and a file inside the workspace arrives with
+a clone or a pull: someone else's commit would become work the agent does
+with nobody watching. Project files are untrusted input everywhere else
+(`trust.rs`), and this keeps it so.
+
+An item:
+
+| Field | Meaning |
+|---|---|
+| `id` | short, stable |
+| `text` | what to do, as the user or the agent wrote it |
+| `status` | `open`, `waiting`, `done`, `stuck`, or `proposed` |
+| `not_before` | optional RFC 3339 time; the item is not due until then |
+| `note` | what the last attempt found or did, written by the agent |
+| `question` | for `waiting`: what the user is asked |
+| `session` | the last run's session id (and the parked session, for `waiting`) |
+| `attempts` | runs that left the item `open` |
+| `created_at`, `created_by` | `user`, `agent` (in a session), or `heartbeat` |
+
+### H2. The tools
+
+- `task_add` (side-effecting): the user approves each item added in a
+  session, as they approve a job definition (decision 6), because it is work
+  that will run unattended.
+- `task_update`: status, `note`, `not_before`, `question`. Free of approval;
+  it changes nothing outside the list and cannot widen what an item asks for
+  (`text` is not editable; a changed task is a new item).
+- `task_list`: read-only.
+
+The tools are registered when `[schedule] enabled` is on, and the store rides
+on `ToolContext` as the `Scheduler` does. The user has the same list through
+`agent86 tasks list|add|done|remove` and, later, `/tasks`.
+
+### H3. The heartbeat job
+
+A job kind in `schedule.json`, at most one per workspace, with the fields of
+any job (workspace, model, approval, an `every` interval, default 15 minutes)
+and no task text of its own: the prompt is fixed, built into agent86, and
+says to work through the due items below, record on each what was done, and
+set `done`, `waiting` with a question, or a `not_before` to come back at. It
+is created by `schedule_create` with `heartbeat = true` (approved once, the
+prompt naming the workspace, model, approval mode, and interval) or by
+`agent86 schedule heartbeat on` in the workspace.
+
+A fire is an ordinary job run (decision 4): a fresh session, the breaker, the
+lock, one run at a time. The due items (at most `[schedule]
+heartbeat_max_items`, oldest first) go into the goal; each item's text passes
+the ingress guardrail, and an item that fails it is marked `stuck` with the
+reason and left out.
+
+### H4. No model call unless something is due
+
+`run_due` fires a heartbeat only when its interval has elapsed *and* the list
+holds an `open` item whose `not_before` is absent or past. Otherwise the tick
+reads two small files and exits, as it does for any job that is not due. An
+idle agent costs nothing, and a skipped check writes no trace event and no
+log line.
+
+This is also how the agent sets its own next wake-up: it puts a `not_before`
+on an item ("the build takes an hour; look again at 14:00"). There is no
+separate wake tool and nothing new to approve, since a `not_before` can only
+delay work the user already approved.
+
+### H5. An item cannot loop
+
+A run that leaves an item `open` with no new `not_before` counts as an
+attempt, and agent86 sets the `not_before` itself: the interval doubled per
+attempt, capped at a day. After `[schedule] heartbeat_max_attempts` (default
+5) the item becomes `stuck` and is reported like `waiting`. Across runs, the
+breaker's per-run limits are not enough, so the heartbeat also has
+`heartbeat_max_runs_per_day` and `heartbeat_daily_cost_usd`; once either is
+spent, the heartbeat does not fire again until the next local day, and the
+run log says so. (An unpriced model costs `0.0`, which is why the run count
+is a limit of its own.)
+
+### H6. What an unattended run may add
+
+An item added during a heartbeat run is `proposed`: listed, never run, until
+the user accepts it (`agent86 tasks accept <id>`, or at the next session's
+note). Otherwise one approved item could grow into work the user never saw,
+which is the standing risk of decision 6 with a longer reach. The agent can
+still break its own item into steps in the item's `note`.
+
+### H7. Blocked on the user
+
+A run that needs an approval, a secret, or an answer marks the item `waiting`
+with the question. With parking (the plan's "Supervision and long-running
+work", item 4) the run's session is parked and its id kept on the item, so
+answering resumes the turn where it stopped; without it, the item waits and
+the next run starts over after the user answers. Either way the interface's
+start-up note (already planned for job runs) lists `waiting`, `stuck`, and
+`proposed` items, and the desktop notification for the run says an item is
+waiting.
+
+### Components and phases
+
+- `src/tasks.rs` (new): the item, the store (load, atomic save, lock), the
+  due rule, and the backoff.
+- `src/tools/tasks.rs` (new): the three tools.
+- `src/schedule.rs`: the heartbeat kind, the pre-check in `run_due`, the
+  goal built from due items, the daily limits, and attempts counted after a
+  run.
+- `src/main.rs`: `agent86 tasks ...` and `schedule heartbeat on|off`.
+- `src/config.rs`: `heartbeat_max_items`, `heartbeat_max_attempts`,
+  `heartbeat_max_runs_per_day`, `heartbeat_daily_cost_usd` under `[schedule]`.
+- `src/observability.rs`: `task_added`, `task_updated`, and `job_run` with
+  the item ids a heartbeat run was given.
+
+It comes after phase 3 below (store, `run_job`, `tick`), which it needs, and
+can come before the service install, since `schedule daemon` or a manual
+`tick` exercises it:
+
+- **H-a.** The task store and `agent86 tasks`. Tests: round trip, lock
+  contention, the due rule and the backoff as pure functions.
+- **H-b.** The tools. Tests: `task_add` refused under `deny` and approved
+  under `auto`; `task_update` cannot change `text`; an item added with the
+  heartbeat as the caller is `proposed`.
+- **H-c.** The heartbeat kind and the pre-check. Tests through the binary
+  against the mock provider: a tick with nothing due makes no request; a due
+  item produces one run whose goal holds it; an item under `not_before` is
+  left alone; an item failing the ingress guardrail is `stuck` and not sent.
+- **H-d.** Backoff, `stuck`, the daily limits, `waiting`, and the start-up
+  note. Tests: an item left open backs off and ends `stuck`; a spent daily
+  limit stops fires until the next day; a run declined at an approval leaves
+  the item `waiting` with the question.
+
+### Open questions
+
+- Whether `proposed` is too strict, and follow-up items from an approved item
+  should run under some bound (a depth, a count per parent) instead.
+- Whether the user should be able to add items from outside a session by
+  other means (a file drop, an ACP method for agent86-web). The ACP method is
+  the likelier one; a file drop reopens the untrusted-input question of H1.
+- Whether one heartbeat run should take all due items or one item per run
+  (cleaner context and accounting, more runs).
+- The release: it fits 1.0.25 after phase 3, but that release already holds
+  parking and checkpointing tier 2.
 
 ## Components to build (mapped to files)
 
