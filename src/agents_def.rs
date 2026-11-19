@@ -272,6 +272,14 @@ impl Specialties {
         }
     }
 
+    /// Read every `<name>.md` in `dir` as the user's own definitions (no approval
+    /// needed), replacing what came before: for a caller that vouches for the
+    /// directory, as the embedding API's (`crate::sdk`) does. Never use it for a
+    /// directory inside a workspace the user did not write.
+    pub fn add_user_dir(&mut self, dir: &Path) {
+        self.add_dir(dir, Source::User);
+    }
+
     /// Read every `<name>.md` in `dir`, in name order, replacing what came before.
     fn add_dir(&mut self, dir: &Path, source: fn(PathBuf) -> Source) {
         let Ok(entries) = std::fs::read_dir(dir) else {

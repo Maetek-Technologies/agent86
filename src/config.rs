@@ -830,6 +830,20 @@ pub enum ConfigError {
 }
 
 /// Resolve configuration from all layers.
+/// The built-in defaults alone, with no file, environment variable, or flag read:
+/// what [`load_config`] starts from. The embedding API (`crate::sdk`) takes its
+/// defaults from here, so they are never kept in two places.
+pub fn builtin_config() -> Config {
+    let mut merged: Table = DEFAULTS.parse().expect("built-in defaults are valid TOML");
+    accept_legacy_status_line(&mut merged);
+    let mut config: Config = Value::Table(merged.clone())
+        .try_into()
+        .expect("built-in defaults deserialize");
+    validate(&mut config).expect("built-in defaults are valid");
+    config.table = merged;
+    config
+}
+
 pub fn load_config(paths: &ConfigPaths, overrides: &Overrides) -> Result<Config, ConfigError> {
     let mut merged: Table = DEFAULTS.parse().expect("built-in defaults are valid TOML");
     let mut sources = Vec::new();

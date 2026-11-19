@@ -28,6 +28,7 @@ pub mod provider;
 pub mod pyjson;
 pub mod repl;
 pub mod router;
+pub mod sdk;
 pub mod secrets;
 pub mod session;
 pub mod session_dirs;

@@ -522,12 +522,20 @@ fn path_order(name: &str) -> String {
 /// Every skill across the search paths, keyed by name, the first root winning a
 /// conflict, as Python's `discover_skills`.
 pub fn discover_skills(config: &Config, workspace: &Path, home: Option<&Path>) -> Skills {
-    let mut found = Skills::new();
     if !config.skills.enabled {
-        return found;
+        return Skills::new();
     }
-    for root in default_skill_paths(config, workspace, home) {
-        let Ok(entries) = std::fs::read_dir(&root) else {
+    discover_in(&default_skill_paths(config, workspace, home))
+}
+
+/// Every skill in `roots` (each a directory of `<name>/SKILL.md` folders),
+/// highest precedence first, the first root winning a conflict: the rule
+/// [`discover_skills`] applies to the default roots, for a caller that names its
+/// own (the embedding API, `crate::sdk`).
+pub fn discover_in(roots: &[PathBuf]) -> Skills {
+    let mut found = Skills::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
         let mut entries: Vec<PathBuf> = entries
