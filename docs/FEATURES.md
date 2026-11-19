@@ -88,6 +88,7 @@ The interface and the plain loop check GitHub for a newer release at most once a
 - [x] 1.0.24: Google (Gemini), vLLM, and LM Studio providers: a native `google` adapter with tool calls and thought signatures, built-in `vllm` and `lmstudio` providers, and "add a server" in `/config model` for remote ones (beyond Python; released 2026-11-17)
 - [ ] 1.0.25: scheduled jobs, which the agent schedules for itself and a per-user OS timer runs with no session open, pausing at an approval instead of failing (beyond Python; planned, see [docs/scheduling.md](scheduling.md))
 - [ ] 1.1.0: vault secrets (`${secret:NAME}`) in MCP server settings (beyond Python; planned; the release roadmap is in the project plan)
+- [ ] A harness tuned for local ~27B models: a verification gate, tool output sized to the window, a stall nudge, a reasoning budget, sampling per specialty, and opt-in orchestration with fresh contexts, each measured against an eval set (beyond Python; proposed, see the project plan)
 - [x] ACP server: `agent86 acp` for editors such as Zed that speak the Agent Client Protocol (beyond Python; checked against the protocol's schema and used by hand in Zed and Microsoft's Intelligent Terminal, not yet tried in the JetBrains IDEs or the other editors; see [docs/ACP.md](ACP.md))
 - [x] The standard agent86: public at `Maetek-Technologies/agent86`, with the Python implementation archived as `agent86-python`
 - [x] A notice when a newer release is out, and `/update` to install it (beyond Python)
