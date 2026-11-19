@@ -2,6 +2,7 @@
 //! harness's `spawn_subagent`: the sub-agent's request, its tools and depth,
 //! its step budget, failures, the trace, and usage flowing into the turn.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::agent::{Harness, ANSWER_PROMPT, CONTINUE_PROMPT};

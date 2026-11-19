@@ -1,6 +1,7 @@
 //! The ReAct loop against the mock provider: tool round trips, error
 //! observations, circuit breakers, and continuations.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::agent::{

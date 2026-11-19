@@ -4,6 +4,8 @@
 
 Accepted — 2026-11-19 (proposed the same day with the prototype; accepted once the fourth slice, the mid-turn callbacks and `Conversation`, completed the API the crate split will publish)
 
+Amended — 2026-11-19: the crate split landed, with a two-tier public surface in place of the `pub(crate)` plan; see "Amendment: the crate split" at the end.
+
 ## Context
 
 agent86 is built as a library with a thin command line on top: `src/lib.rs` exposes every module, and the CLI, the interactive interface, and the ACP server all run one `Harness` through `run_turn_events`. The pieces another program would need to build an agent of its own are already traits (`Provider`, `Tool`, `Embedder`, `SecretStore`, ACP's `Backend`), and the test suite already builds harnesses by hand from injected parts.
@@ -52,3 +54,20 @@ What that means:
 - **The CLI's contracts are untouched.** `run --json`, the session database, the trace format, and the config semantics do not change. `config::builtin_config()` is the only addition outside `sdk`.
 - **Tools still run synchronously inside the turn's runtime**, as they do for the CLI. An embedding program on a multi-threaded runtime is fine. A tool that blocks for long holds the turn, as it always has. An async `Tool` trait is a possible later change, not part of this decision.
 - **It sharpens what agent86 is for.** The pitch becomes "the agent runtime you can safely point at a real machine", which the CLI, the editor integration, and the library all share.
+
+## Amendment: the crate split
+
+**Ruling:** the library is `agent86-core` (`crates/agent86-core/`) and the binary stays at the root as `agent86`. `agent86_core::sdk` is the only surface with a stability promise; every other module stays `pub` for the binary but is `#[doc(hidden)]`, and the binary uses the library by path, so the two always build from the same checkout and ship at one version. ([docs/crate-split.md](../crate-split.md) has the sketch and what was built.)
+
+**Why the decision changed.** The Decision above said that after the split, items not needed by `sdk` would become `pub(crate)` or `#[doc(hidden)]`. Measuring first ruled out `pub(crate)`. The binary's surfaces use 137 distinct library items and call the harness directly 127 times: the ACP server and the interface drive it themselves, and `setup` fills its fields from config. Making those private would mean rebuilding the CLI on `sdk` first. So the binary is treated as an in-repository user of an unstable second tier, and the two always ship at one version, from one checkout.
+
+**What it means:**
+- **Re-exports in both directions.**
+  - `sdk` re-exports every type its own signatures use, and `sdk::providers` holds the `Provider` trait, its types and the built-in adapters. An embedder never names a hidden module, which the SDK's tests and example now show by importing only from `agent86_core::sdk`.
+  - The binary's `lib.rs` re-exports the library's modules under their old names, so its code and tests moved without import changes.
+- **The library never depends on the binary.** The one dependency that pointed that way, the terminal secret prompt reading hidden input through `keys`, moved to the binary with `setup`, its only user.
+- **The heavy parts are optional.**
+  - `os-keyring` gates the keyring stacks for each OS; without it a lookup reads as "no key stored".
+  - `local-embeddings` gates candle and tokenizers; without it a `sentence-transformers:` spec falls back to the hash embedder with Python's `ImportError` note.
+  - Both are on by default. Turned off, the library's dependency tree drops from 367 crates to 172, and CI runs its unit tests that way on every OS.
+- **Narrowing later is still possible.** It can happen one surface at a time, by moving what a surface needs behind `sdk`. Each step shrinks the hidden tier without breaking the stable one.

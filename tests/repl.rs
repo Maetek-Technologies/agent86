@@ -1,6 +1,7 @@
 //! End-to-end tests of the interactive REPL (`agent86` with no subcommand), driven
 //! through piped stdin against the local mock provider.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use regex::Regex;

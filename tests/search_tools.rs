@@ -2,6 +2,7 @@
 //! search with stable, `/`-separated output on every OS, and bounds that say how
 //! to narrow a search they cut.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::tools::search::{LINE_MARKER, MAX_FILES, MAX_LINE_CHARS};

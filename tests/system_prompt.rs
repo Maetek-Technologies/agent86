@@ -1,5 +1,6 @@
 //! The system prompt must match the Python reference exactly.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, ConfigPaths, Overrides};

@@ -2,7 +2,7 @@
 
 ## Publishing a release
 
-Add notes for it in `docs/releases/<tag>.md`, set the version in `Cargo.toml`, merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives, creates the release with those notes and its SLSA provenance, and publishes the npm packages (`npm/build.mjs`).
+Add notes for it in `docs/releases/<tag>.md`, set the version in the root `Cargo.toml`'s `[workspace.package]` (the only place it is written; both crates inherit it), merge both, and push a `v<version>` tag. `.github/workflows/release.yml` then builds the archives, creates the release with those notes and its SLSA provenance, and publishes the npm packages (`npm/build.mjs`).
 
 ## Verifying a release
 

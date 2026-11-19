@@ -227,7 +227,7 @@ pub struct UiConfig {
     /// Render answers as Markdown in the full-screen interface.
     pub markdown: bool,
     /// Check GitHub, at most once a day, for a newer release and say so in the
-    /// interactive surfaces (beyond Python; see `crate::update`).
+    /// interactive surfaces (beyond Python; see the `agent86` binary's `update` module).
     #[serde(default = "default_true")]
     pub update_check: bool,
     /// How much of the model's reasoning the interface shows (beyond Python).

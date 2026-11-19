@@ -16,9 +16,9 @@ Please read the [Code of Conduct](CODE_OF_CONDUCT.md) first. Report security pro
 You need Rust 1.94 or newer (the MSRV, set in `Cargo.toml`). On Windows you also need the Visual Studio Build Tools C++ workload for `link.exe`. Some MCP tests use `python3` or `python` and skip when neither is on `PATH`.
 
 ```bash
-cargo test --all-targets
+cargo test --workspace --all-targets
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 All three must pass before a pull request is merged. CI runs them on Linux, macOS and Windows against stable and the MSRV.

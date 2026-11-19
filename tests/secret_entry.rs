@@ -2,6 +2,7 @@
 //! secret in a masked prompt, tools get it as an environment variable, and the
 //! model, the history, the output, and the trace only ever see its name.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::agent::Harness;

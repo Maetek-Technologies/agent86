@@ -157,10 +157,24 @@ fn sse_body(chunks: &[serde_json::Value]) -> String {
     body
 }
 
+/// The workspace's `tests/fixtures`, from either crate: these helpers live in
+/// `agent86-core`'s tests and are shared with the `agent86` binary's, while the
+/// fixtures stay at the workspace root.
+pub fn fixtures_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    [
+        manifest.join("tests/fixtures"),
+        manifest.join("../../tests/fixtures"),
+    ]
+    .into_iter()
+    .find(|dir| dir.is_dir())
+    .expect("tests/fixtures is at the workspace root")
+}
+
 /// Read a fixture from `tests/fixtures`.
 pub fn fixture(path: &str) -> String {
-    let full = format!("{}/tests/fixtures/{path}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read_to_string(&full).unwrap_or_else(|error| panic!("{full}: {error}"))
+    let full = fixtures_dir().join(path);
+    std::fs::read_to_string(&full).unwrap_or_else(|error| panic!("{}: {error}", full.display()))
 }
 
 async fn serve(mut socket: TcpStream, reply: Reply, recorded: Arc<Mutex<Vec<Recorded>>>) {
@@ -284,7 +298,7 @@ async fn read_request(socket: &mut TcpStream) -> Option<Recorded> {
 /// for the tests of argument repair.
 pub struct ShapesTool;
 
-impl agent86::tools::Tool for ShapesTool {
+impl agent86_core::tools::Tool for ShapesTool {
     fn name(&self) -> &str {
         "shapes"
     }
@@ -307,8 +321,8 @@ impl agent86::tools::Tool for ShapesTool {
     fn execute(
         &self,
         args: &serde_json::Map<String, serde_json::Value>,
-        _ctx: &agent86::tools::ToolContext,
-    ) -> Result<agent86::types::ToolResult, agent86::tools::ToolError> {
+        _ctx: &agent86_core::tools::ToolContext,
+    ) -> Result<agent86_core::types::ToolResult, agent86_core::tools::ToolError> {
         let kinds: Vec<String> = args
             .iter()
             .map(|(key, value)| {
@@ -321,6 +335,6 @@ impl agent86::tools::Tool for ShapesTool {
                 format!("{key}={kind}")
             })
             .collect();
-        Ok(agent86::tools::success("shapes", kinds.join(",")))
+        Ok(agent86_core::tools::success("shapes", kinds.join(",")))
     }
 }

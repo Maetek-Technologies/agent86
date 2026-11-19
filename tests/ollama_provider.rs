@@ -1,6 +1,7 @@
 //! The Ollama provider against the local mock server: NDJSON streaming, tool
 //! calls, usage, retries, and Python's error messages.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, ConfigPaths, Overrides};

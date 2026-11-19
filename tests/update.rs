@@ -1,6 +1,7 @@
 //! The new-version check against the mock server: GitHub's answer, the daily
 //! cache, and the switches that turn it off.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::update::{

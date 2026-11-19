@@ -1,16 +1,30 @@
-[package]
-name = "agent86"
+[workspace]
+members = ["crates/agent86-core"]
+resolver = "2"
+
+# One version, edition, MSRV, and license for both crates. Set the version here
+# only: the binary uses the library by path (no version of its own to bump), so
+# the two always build from the same checkout. The release workflow and
+# `npm/build.mjs` read the first `version = "..."` line of this file, which is
+# this one.
+[workspace.package]
 version = "1.0.24"
 edition = "2021"
 rust-version = "1.94"
-description = "agent86, an agentic harness on the command line"
 repository = "https://github.com/Maetek-Technologies/agent86"
 license = "MIT"
-publish = false
 
-[dependencies]
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+agent86-core = { path = "crates/agent86-core" }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29"
+crossterm_winapi = "0.9"
 encoding_rs = "0.8.42"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 globset = "0.4.21"
@@ -43,25 +57,50 @@ sha2 = "0.11.1"
 candle-core = "=0.11.1"
 candle-nn = "=0.11.1"
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+windows-native-keyring-store = "1.1.0"
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
-[lints.rust]
-unsafe_code = "forbid"
+# The `agent86` binary: the terminal interface, the REPL, `run`, the ACP server,
+# and the CLI's config-driven assembly, on top of `agent86-core`.
+[package]
+name = "agent86"
+description = "agent86, an agentic harness on the command line"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 
-[lints.clippy]
-all = "warn"
-
-[dev-dependencies]
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+[dependencies]
+agent86-core.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+indexmap.workspace = true
+jiff.workspace = true
+pulldown-cmark.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml_edit.workspace = true
+unicode-width.workspace = true
+url.workspace = true
 
 [target."cfg(windows)".dependencies]
-crossterm_winapi = "0.9"
-windows-native-keyring-store = "1.1.0"
+crossterm_winapi.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+[lints]
+workspace = true
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+[dev-dependencies]
+futures-util.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+tokenizers.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 # gemm-common's fp16 NEON helpers (vmulq_f16 and friends) carry no fp16 target
 # feature and only assemble once inlined into gemm-f16's fp16 kernels. Without

@@ -2,6 +2,7 @@
 //! an isolated home and project directory against the local mock provider, with no
 //! network or credentials.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::acp::{

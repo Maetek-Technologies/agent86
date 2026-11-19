@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use support::fixture;
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 struct TempDir(PathBuf);

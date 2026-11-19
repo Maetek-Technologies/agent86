@@ -8,6 +8,7 @@
 //! buckets, same signs), so a `hash:<dim>` vector written by either
 //! implementation is found by the other.
 
+#[cfg(feature = "local-embeddings")]
 use super::sentence_transformers::SentenceTransformerEmbedder;
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
@@ -101,23 +102,45 @@ pub fn build_embedder(spec: &str, hf_offline: bool) -> (Arc<dyn Embedder>, Optio
             } else {
                 name
             };
-            match SentenceTransformerEmbedder::load(name, hf_offline) {
-                Ok(embedder) => (Arc::new(embedder), None),
-                // Python's note names the exception; its install hint does not apply.
-                Err(error) => (
-                    Arc::new(HashingEmbedder::default()),
-                    Some(format!(
-                        "sentence-transformers unavailable ({}); using the offline hash embedder.",
-                        error.python_name()
-                    )),
-                ),
-            }
+            load_sentence_transformer(name, hf_offline)
         }
         _ => (
             Arc::new(HashingEmbedder::default()),
             Some(format!("unknown embedder '{spec}'; using hash embedder.")),
         ),
     }
+}
+
+/// The sentence-transformers model `name`, or the hash embedder and Python's note
+/// naming why it could not load. Python's note names the exception; its install
+/// hint does not apply.
+#[cfg(feature = "local-embeddings")]
+fn load_sentence_transformer(name: &str, hf_offline: bool) -> (Arc<dyn Embedder>, Option<String>) {
+    match SentenceTransformerEmbedder::load(name, hf_offline) {
+        Ok(embedder) => (Arc::new(embedder), None),
+        Err(error) => (
+            Arc::new(HashingEmbedder::default()),
+            Some(unavailable_note(error.python_name())),
+        ),
+    }
+}
+
+/// Built without the `local-embeddings` feature, there is no model to load: the
+/// hash embedder, with the note Python gives when its `sentence-transformers`
+/// package is not installed.
+#[cfg(not(feature = "local-embeddings"))]
+fn load_sentence_transformer(
+    _name: &str,
+    _hf_offline: bool,
+) -> (Arc<dyn Embedder>, Option<String>) {
+    (
+        Arc::new(HashingEmbedder::default()),
+        Some(unavailable_note("ImportError")),
+    )
+}
+
+fn unavailable_note(exception: &str) -> String {
+    format!("sentence-transformers unavailable ({exception}); using the offline hash embedder.")
 }
 
 /// `vector` as the little-endian `float32` BLOB Python's `array("f")` writes.
@@ -168,6 +191,22 @@ pub fn python_sum(values: impl IntoIterator<Item = f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without the model's code compiled in, the request still succeeds, on the
+    /// hash embedder, and says why with the note Python gives when its
+    /// `sentence-transformers` package is missing.
+    #[cfg(not(feature = "local-embeddings"))]
+    #[test]
+    fn without_local_embeddings_a_model_falls_back_with_python_s_note() {
+        let (embedder, note) = build_embedder("sentence-transformers:all-MiniLM-L6-v2", true);
+        assert_eq!(embedder.spec(), "hash:256");
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "sentence-transformers unavailable (ImportError); using the offline hash embedder."
+            )
+        );
+    }
 
     #[test]
     fn specs_pick_the_embedder_and_explain_fallbacks() {

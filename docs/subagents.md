@@ -12,7 +12,7 @@ slice. Text still marked *proposed* below was the plan; where the build differs,
   already named. Slice 0b: sub-agents stop at the main loop's safe points on a
   cancel; over ACP, a cancel or a closed connection stops the turn, and no
   permission request is sent after a cancel.
-- Slices 1 to 6: `src/agents_def.rs` (parsing and discovery, failing closed), the
+- Slices 1 to 6: `crates/agent86-core/src/agents_def.rs` (parsing and discovery, failing closed), the
   `agent`, `skill`, `files`, and `summary` arguments, the filtered system prompt
   and the listing, `tools::ToolScope` (allowlist, approval mode, `confirm`,
   narrowing through nesting from the caller's context), the specialty's own model
@@ -32,7 +32,7 @@ slice. Text still marked *proposed* below was the plan; where the build differs,
   cancel). The siblings share one spend counter (`subagent::FanOut`) and one stop;
   sub-agent events carry a per-spawn `run`.
 - Slice 9: `isolation: worktree` and `delegate`'s `isolate` run a specialty in a
-  `git worktree` of `HEAD` in the temporary directory (`src/worktree.rs`), jailed
+  `git worktree` of `HEAD` in the temporary directory (`crates/agent86-core/src/worktree.rs`), jailed
   there by `SandboxPolicy::rerooted`, with the editor's buffers dropped and MCP
   tools left out unless named. Its answer carries the redacted, size-capped diff
   (untracked files through `git add --intent-to-add`); a worktree with changes is
@@ -60,7 +60,7 @@ slice. Text still marked *proposed* below was the plan; where the build differs,
 - Slice 10: `skills:` preloading, `delegate`'s `skill`, and `use_skill`'s hand-off
   note for a skill with `agent:`.
 - Slice 11: the built-in `researcher`, `reviewer`, and `planner`
-  (`src/agents/*.md`).
+  (`crates/agent86-core/src/agents/*.md`).
 
 Built differently from the design:
 
@@ -177,7 +177,7 @@ A *specialty* is a named, reusable sub-agent definition:
 
 ### 1. Definition format: one Markdown file per specialty
 
-Modelled on `SKILL.md` (`src/skills.rs`), reusing its frontmatter parser and the
+Modelled on `SKILL.md` (`crates/agent86-core/src/skills.rs`), reusing its frontmatter parser and the
 shape of its discovery (home passed explicitly, precedence by root) rather than
 inventing new ones. The roots are its own, and there is no `.claude` root. A
 user-defined specialty looks like this (the built-in `reviewer` is described in
@@ -249,7 +249,7 @@ message; `isolate` and `skill` need `agent`, and without it the call fails sayin
 so.
 
 **System prompt.** Today a sub-agent gets its persona ahead of the parent's
-whole system content (`run_subagent` in `src/subagent.rs`), which would advertise
+whole system content (`run_subagent` in `crates/agent86-core/src/subagent.rs`), which would advertise
 skills and MCP tools a specialty may not use. A specialty gets its instructions,
 then the base identity and environment, then only the tools and skills its
 allowlist permits. *Proposed:* skills are listed only when `use_skill` is permitted,
@@ -417,7 +417,7 @@ stderr, exits 1, and writes nothing to stdout, including with `--json`.
   and an instruction body is prompt text from the repo. The first use of a
   project specialty asks for approval, showing the file; the approval is
   remembered by the file's content hash, so an edited file asks again. This is
-  separate from project-file trust (`src/trust.rs`), which covers only the config
+  separate from project-file trust (`crates/agent86-core/src/trust.rs`), which covers only the config
   file. `--trust-project` or `AGENT86_TRUST_PROJECT` also approves project
   specialties, for CI; otherwise, with nobody to ask (no terminal and no editor),
   an unapproved project specialty is refused, as `ask` mode declines there. An
@@ -501,7 +501,7 @@ purpose and drops its blunt form:
   cached one, is only the source of a copy: what a sub-agent calls on a fan-out
   thread is always a copy made for that thread. The mock server closes every
   connection, so the regression test needs a keep-alive reply in
-  `tests/support/mod.rs`.
+  `crates/agent86-core/tests/support/mod.rs`.
 - *Decided (2026-11-09):* the order the model asked for holds. Reads still go
   first; the calls that remain run in call order, and a run of adjacent specialty
   delegations goes together. So `[write_file, delegate reviewer]` reviews the
@@ -651,7 +651,7 @@ them (section 3):
 - `summary`: text the parent wrote. For `/agent`, `--with-context` produces it by
   running the existing compaction summarizer over the conversation, so its prompt,
   cost, and routing to the cheap model behave as compaction's do. The prompt is in
-  `src/memory/working.rs`, but the call is inside `compact_if_needed`, which also
+  `crates/agent86-core/src/memory/working.rs`, but the call is inside `compact_if_needed`, which also
   rewrites the history, so the request has to be extracted for both to use.
 
 A sub-agent's first message does not pass through `ToolRegistry::dispatch`, so
@@ -1074,7 +1074,7 @@ or set: the built-in specialties' prompts, and the size caps for `files` (start 
    points in `run_subagent`, returning partial usage and the halted-style result of
    section 6), stop the ACP pump forwarding permission requests after a cancel, and
    make EOF or a read error cancel the turn.
-1. Parse and discover definitions (`src/agents_def.rs`, pure, tested with
+1. Parse and discover definitions (`crates/agent86-core/src/agents_def.rs`, pure, tested with
    fixtures; no behavior change), with ASCII names and fail-closed parsing.
 2. `delegate`'s `agent` argument, persona replacement, filtered system prompt (with
    its parts stored and the budget counting it), system-prompt listing. Project files
@@ -1146,7 +1146,7 @@ These still describe today's behaviour and change with the slice that ends it:
   the same tools and approvals, and add a roadmap line, which does not exist yet.
 - `docs/INTERFACE.md`: the `#` menu and the specialty label on approvals.
 - `src/main.rs`: `--trust-project`'s help text.
-- `CLAUDE.md`: the entries for `src/acp/`, `src/trust.rs`, and `src/subagent.rs`
+- `CLAUDE.md`: the entries for `src/acp/`, `crates/agent86-core/src/trust.rs`, and `crates/agent86-core/src/subagent.rs`
   (`ToolContext::fork`). Fan-out also ends two statements that are true today: that
-  approvals are always settled on the loop's thread (`src/approval.rs`) and that
-  `delegate` always runs in the batch's sequential part (`src/subagent.rs`).
+  approvals are always settled on the loop's thread (`crates/agent86-core/src/approval.rs`) and that
+  `delegate` always runs in the batch's sequential part (`crates/agent86-core/src/subagent.rs`).

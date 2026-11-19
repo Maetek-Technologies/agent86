@@ -11,6 +11,7 @@
 //! checked only when `AGENT86_TEST_MINILM=1` and the model is in the local cache.
 //! Downloads are served by the mock server; no test touches the network.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::memory::embeddings::{cosine, pack, unpack, Embedder};

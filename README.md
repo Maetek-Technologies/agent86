@@ -107,9 +107,9 @@ Changes beyond the Python version are deliberate, and each is recorded in the pr
 Install Rust 1.94 or newer, then run:
 
 ```bash
-cargo test --all-targets
+cargo test --workspace --all-targets
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 To try your build, store a key once (or set `OPENROUTER_API_KEY`) and run it:

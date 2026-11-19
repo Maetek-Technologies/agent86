@@ -3,6 +3,7 @@
 //! Google's documented responses (`tests/fixtures/google`), a key made up for the
 //! test, and key variables nothing sets.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, Config, ConfigPaths, Overrides, ProjectTrust};

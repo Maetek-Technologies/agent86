@@ -1,5 +1,6 @@
 //! Sessions: titles, the SQLite store, and compatibility with Python's state_json.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::session::{session_title, typed_prefix, AgentState, SessionStore};

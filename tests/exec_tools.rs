@@ -1,6 +1,7 @@
 //! `run_command` and `python_exec` under the subprocess sandbox, plus the
 //! environment scrubbing and Docker command construction behind them.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::SandboxConfig;

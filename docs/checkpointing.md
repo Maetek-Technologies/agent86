@@ -26,7 +26,7 @@ agent86 resumes from the conversation, not from a verified step.
 - **Saving.** The session is saved to SQLite before and after every turn,
   including failed ones (`src/main.rs`, `persist` around `run_turn_events`; the
   REPL and interface do the same in `Repl::persist`). It is also saved right
-  after a compaction (`src/agent.rs`, in `compact_if_needed`), so a resume never
+  after a compaction (`crates/agent86-core/src/agent.rs`, in `compact_if_needed`), so a resume never
   sees the stale, uncompacted history.
 - **A failed turn keeps its progress.** On a provider error, a tripped circuit
   breaker, or a cancel, the steps that finished stay in `state.messages` and
@@ -36,7 +36,7 @@ agent86 resumes from the conversation, not from a verified step.
 - **Most step failures never fail the turn.**
   - A failed tool call goes back to the model as an `ok = false` observation,
     and the model can correct course on the next step.
-  - Provider errors are retried inside the step (`src/provider/retry.rs`), but
+  - Provider errors are retried inside the step (`crates/agent86-core/src/provider/retry.rs`), but
     never after text has streamed.
   - The `CircuitBreaker` ends runaway turns: too many steps, too much cost, or
     too many errors in a row.
@@ -93,7 +93,7 @@ packages) cannot be checkpointed at all.
 
 The ReAct loop plans as it goes, so there is no predefined "step 14" with
 acceptance criteria. The natural checkpoint is the end of each tool batch,
-where the loop calls `record_step` (`src/agent.rs`). At that point every tool
+where the loop calls `record_step` (`crates/agent86-core/src/agent.rs`). At that point every tool
 call in the history has an answer, which is the invariant a clean resume needs
 and the one the cancel path already keeps.
 
@@ -108,7 +108,7 @@ and the one the cancel path already keeps.
 
 ### Tier 1: save after every step
 
-**Built (2026-11-16, 1.0.21).** `Harness::checkpoint` in `src/agent.rs` saves
+**Built (2026-11-16, 1.0.21).** `Harness::checkpoint` in `crates/agent86-core/src/agent.rs` saves
 at each step boundary and sets the phase to `execute`; every exit from the
 turn sets `done` or `error`. The mid-turn fixture is
 `tests/fixtures/session/mid_turn_state.json`, checked against a local mirror of

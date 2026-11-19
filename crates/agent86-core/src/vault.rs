@@ -668,61 +668,6 @@ impl StreamRedactor {
     }
 }
 
-/// Ask at the terminal, input hidden, for `agent86 run` and the plain REPL: the
-/// reason first (on stderr, so `run --json` keeps stdout to one object), then the
-/// masked prompt, then whether to remember it for the project when a keyring is
-/// there. An empty entry or a failed read declines.
-pub fn terminal_prompt(request: &SecretRequest) -> Option<SecretAnswer> {
-    use std::io::{BufRead, Write};
-    let mut err = std::io::stderr();
-    let _ = writeln!(err);
-    let _ = writeln!(
-        err,
-        "The agent asks for the secret {}{}.",
-        request.name,
-        if request.replacing {
-            " (replacing the one entered before)"
-        } else {
-            ""
-        }
-    );
-    let reason = request.reason.trim();
-    if !reason.is_empty() {
-        let shown: String = reason.chars().filter(|ch| !ch.is_control()).collect();
-        let _ = writeln!(err, "  {shown}");
-    }
-    let _ = writeln!(
-        err,
-        "The value stays out of the chat; the agent only sees its name. Press Enter alone to decline."
-    );
-    let _ = err.flush();
-    let value =
-        crate::keys::prompt_hidden(&format!("{} (input is hidden): ", request.name)).ok()?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        return None;
-    }
-    let mut remember = false;
-    if request.can_remember {
-        let choices = if request.remembered { "[Y/n]" } else { "[y/N]" };
-        let _ = write!(
-            err,
-            "Remember it for this project, in the OS keyring? {choices} "
-        );
-        let _ = err.flush();
-        let mut line = String::new();
-        remember = match std::io::stdin().lock().read_line(&mut line) {
-            Ok(read) if read > 0 => match line.trim().to_lowercase().as_str() {
-                "y" | "yes" => true,
-                "n" | "no" => false,
-                _ => request.remembered,
-            },
-            _ => request.remembered,
-        };
-    }
-    Some(SecretAnswer { value, remember })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
