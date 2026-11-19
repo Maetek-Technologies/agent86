@@ -7,7 +7,8 @@ mod support;
 use agent86::agent::TurnEvent;
 use agent86::provider::{DeltaStream, Provider, ProviderError};
 use agent86::sdk::{
-    Agent, BuildError, Builtins, FnTool, McpServer, Memory, Model, Otel, RunError, SubAgents, Turn,
+    Agent, BuildError, Builtins, Conversation, FnTool, LimitKind, McpServer, Memory, Model, Otel,
+    RunError, SubAgents, Turn,
 };
 use agent86::types::{
     ApprovalMode, Completion, CompletionDelta, CompletionRequest, Role, ToolCall, Usage,
@@ -212,16 +213,32 @@ async fn turns_continue_the_conversation_and_state_round_trips() {
         .collect();
     assert!(contents.contains(&"one".to_owned()) && contents.contains(&"first".to_owned()));
 
-    // The state is the session database's `state_json`, and resumes.
-    let saved = serde_json::to_string(agent.state()).unwrap();
+    // The conversation saves as the session database's `state_json`, and resumes.
+    let conversation = agent.conversation();
+    let saved = conversation.to_json();
+    let state: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(state["session_id"], conversation.id());
+    assert_eq!(state["messages"][0]["role"], "user");
+    let roles: Vec<_> = conversation.messages().iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        [Role::User, Role::Assistant, Role::User, Role::Assistant]
+    );
+    assert_eq!(conversation.messages()[1].text, "first");
+    assert_eq!(conversation.steps(), 2);
+    assert_eq!(conversation.usage().input_tokens, 20);
+    assert_eq!(conversation.last_turn().unwrap().steps, 1);
+
     let mut resumed = Agent::builder()
         .provider(provider.clone())
         .workspace(&workspace.0)
         .build()
         .unwrap()
-        .with_state(serde_json::from_str(&saved).unwrap());
+        .with_conversation(Conversation::from_json(&saved).unwrap());
     assert_eq!(resumed.run("three").await.unwrap().answer, "third");
-    assert_eq!(resumed.state().session_id, agent.state().session_id);
+    assert_eq!(resumed.session_id(), agent.session_id());
+    assert!(Conversation::from_json("not json").is_err());
+    assert_ne!(Conversation::new().id(), Conversation::new().id());
 }
 
 #[tokio::test]
@@ -739,11 +756,8 @@ async fn specialists_run_directly_and_only_narrow_authority() {
         "{refused}"
     );
     // The exchange is kept as an ordinary user and assistant message.
-    let last = agent.state().messages.last().unwrap();
-    assert_eq!(
-        (last.role, last.content.as_str()),
-        (Role::Assistant, "Sunny.")
-    );
+    let last = agent.conversation().messages().pop().unwrap();
+    assert_eq!((last.role, last.text.as_str()), (Role::Assistant, "Sunny."));
 
     let unknown = agent.run(Turn::specialist("nope", "x")).await.unwrap_err();
     assert_eq!(unknown, RunError::UnknownSpecialist("nope".to_owned()));
@@ -845,4 +859,152 @@ async fn spans_reach_the_collector() {
         .collect();
     names.sort_unstable();
     assert_eq!(names, ["model_call", "model_call", "tool_call", "turn"]);
+}
+
+// ---- limits and secrets ---------------------------------------------------
+
+#[tokio::test]
+async fn on_limit_raises_a_reached_step_budget_and_the_turn_goes_on() {
+    let workspace = Workspace::new("on-limit");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "get_weather", json!({"city": "A"}))]),
+        calls(&[("c2", "get_weather", json!({"city": "B"}))]),
+        text("Both sunny."),
+    ]);
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let seen = hits.clone();
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .tool(weather())
+        .max_steps(2)
+        .on_limit(move |hit| {
+            seen.lock()
+                .unwrap()
+                .push((hit.kind, hit.current, hit.offers.clone()));
+            hit.offers.first().copied()
+        })
+        .build()
+        .unwrap();
+    let result = agent.run("Weather in A and B").await.unwrap();
+    assert_eq!(result.answer, "Both sunny.");
+    assert_eq!(provider.requests().len(), 3);
+    let hits = hits.lock().unwrap();
+    assert_eq!(hits.len(), 1);
+    let (kind, current, offers) = &hits[0];
+    assert_eq!((*kind, *current), (LimitKind::Steps, 2));
+    assert!(offers.iter().all(|offer| *offer > 2), "{offers:?}");
+}
+
+/// A command that prints the variable `name`, in the platform's shell.
+fn print_variable(name: &str) -> String {
+    if cfg!(windows) {
+        format!("echo got %{name}%")
+    } else {
+        format!("echo got ${name}")
+    }
+}
+
+const TOKEN: &str = "tok_9f8e7d6c5b4a3921";
+
+#[tokio::test]
+async fn a_given_secret_reaches_commands_but_never_the_model() {
+    let workspace = Workspace::new("secret-given");
+    let provider = Scripted::new(vec![
+        calls(&[(
+            "c1",
+            "run_command",
+            json!({"command": print_variable("API_TOKEN")}),
+        )]),
+        text("done"),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .builtins(Builtins::All)
+        .approval(ApprovalMode::Auto)
+        .secret("API_TOKEN", TOKEN)
+        .build()
+        .unwrap();
+    assert_eq!(agent.secret_names(), ["API_TOKEN"]);
+    // Not offered: nobody answers a request.
+    assert!(!agent.tool_names().contains(&"request_secret".to_owned()));
+    agent.run("use the token").await.unwrap();
+    let seen = observation(&provider, "c1");
+    assert!(seen.contains("got ${secret:API_TOKEN}"), "{seen}");
+    for request in provider.requests() {
+        assert!(!format!("{request:?}").contains(TOKEN));
+    }
+    assert!(!agent.conversation().to_json().contains(TOKEN));
+}
+
+#[test]
+fn a_secret_that_is_not_valid_fails_the_build_without_its_value() {
+    let workspace = Workspace::new("secret-refused");
+    let build = |name: &str, value: &str| {
+        Agent::builder()
+            .provider(Scripted::new(Vec::new()))
+            .workspace(&workspace.0)
+            .secret(name, value)
+            .build()
+            .err()
+            .unwrap()
+    };
+    let short = build("API_TOKEN", "abc");
+    assert!(matches!(&short, BuildError::Secret { name, .. } if name == "API_TOKEN"));
+    assert!(!short.to_string().contains("abc"), "{short}");
+    let named = build("not a name", TOKEN);
+    assert!(named.to_string().contains("not a valid"), "{named}");
+    assert!(!named.to_string().contains(TOKEN));
+}
+
+#[tokio::test]
+async fn on_secret_request_answers_request_secret() {
+    let workspace = Workspace::new("secret-asked");
+    let provider = Scripted::new(vec![
+        calls(&[(
+            "c1",
+            "request_secret",
+            json!({"name": "PATH", "reason": "to change the path"}),
+        )]),
+        calls(&[(
+            "c2",
+            "request_secret",
+            json!({"name": "SERVICE_KEY", "reason": "to call the service"}),
+        )]),
+        calls(&[(
+            "c3",
+            "run_command",
+            json!({"command": print_variable("SERVICE_KEY")}),
+        )]),
+        text("done"),
+    ]);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .builtins(Builtins::All)
+        .approval(ApprovalMode::Auto)
+        .on_secret_request(move |request| {
+            log.lock()
+                .unwrap()
+                .push((request.name.clone(), request.reason.clone()));
+            Some(TOKEN.to_owned())
+        })
+        .build()
+        .unwrap();
+    assert!(agent.tool_names().contains(&"request_secret".to_owned()));
+    agent.run("call the service").await.unwrap();
+    // `PATH` was refused before anyone was asked; `SERVICE_KEY` was answered.
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [("SERVICE_KEY".to_owned(), "to call the service".to_owned())]
+    );
+    assert_eq!(agent.secret_names(), ["SERVICE_KEY"]);
+    let seen = observation(&provider, "c3");
+    assert!(seen.contains("got ${secret:SERVICE_KEY}"), "{seen}");
+    for request in provider.requests() {
+        assert!(!format!("{request:?}").contains(TOKEN));
+    }
 }

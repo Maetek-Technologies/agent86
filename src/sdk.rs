@@ -48,7 +48,15 @@
 //!   caller's authority, and run directly with [`Turn::specialist`];
 //! - named models ([`Model`], [`AgentBuilder::model`]) for specialists' `model:`
 //!   lines and for triage routing ([`AgentBuilder::triage`]);
-//! - OpenTelemetry spans ([`Otel`]), with agent86's span and attribute names.
+//! - OpenTelemetry spans ([`Otel`]), with agent86's span and attribute names;
+//! - questions a turn asks mid-way: whether to raise a limit it reached
+//!   ([`AgentBuilder::on_limit`]) and a secret the model needs
+//!   ([`AgentBuilder::on_secret_request`]), plus secrets the program already holds
+//!   ([`AgentBuilder::secret`]), which tools get as environment variables and the
+//!   model only ever sees as `${secret:NAME}`.
+//!
+//! A conversation is a [`Conversation`], which saves to and loads from the JSON
+//! the session database keeps.
 //!
 //! Nothing is discovered: no `.agent86/` or `~/.agent86/` directory is read, and
 //! no `OTEL_*` variable either. Each part is what the caller passes in.
@@ -73,14 +81,19 @@ use crate::session::{AgentState, SessionStore};
 use crate::specialty_turn::TurnKind;
 use crate::tools::sandbox::Executor;
 use crate::tools::{exec, files, search, web, Tool, ToolContext, ToolError, ToolRegistry};
-use crate::turn::{final_answer, TurnSummary};
-use crate::types::{ApprovalMode, Message, Role, ToolResult, Usage};
+use crate::turn::final_answer;
+use crate::types::{ApprovalMode, Message, ToolResult};
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+pub use crate::limits::{LimitHit, LimitKind};
+pub use crate::turn::TurnSummary;
+pub use crate::types::{Role, ToolCall, Usage};
+pub use crate::vault::SecretRequest;
 
 /// Which of agent86's own tools an [`Agent`] offers, each set including the one
 /// before it. Every one of them is jailed to the workspace.
@@ -121,6 +134,10 @@ pub enum BuildError {
     Memory(String),
     #[error("no model named '{0}'; add it with AgentBuilder::model")]
     UnknownModel(String),
+    /// A secret given to [`AgentBuilder::secret`] was refused. The message names
+    /// the secret and why, never its value.
+    #[error("the secret {name} was refused: {reason}")]
+    Secret { name: String, reason: String },
 }
 
 /// Why [`Agent::run`] failed.
@@ -141,6 +158,9 @@ pub enum RunError {
 /// Decides a side-effecting call: given the tool's name and what the call would
 /// do, `true` lets it run.
 type Approver = Box<dyn Fn(&str, &ApprovalPreview) -> bool + Send + Sync>;
+
+/// Answers [`AgentBuilder::on_secret_request`]: the value, or `None` to decline.
+type SecretAsker = Box<dyn Fn(&SecretRequest) -> Option<String> + Send + Sync>;
 
 /// Builds an [`Agent`]; start from [`Agent::builder`].
 pub struct AgentBuilder {
@@ -165,6 +185,10 @@ pub struct AgentBuilder {
     models: IndexMap<String, Model>,
     triage: Option<(String, String)>,
     otel: Option<Otel>,
+    on_limit: Option<crate::limits::LimitPrompt>,
+    on_secret: Option<SecretAsker>,
+    /// Never printed: the builder has no `Debug`, and errors name only the secret.
+    secrets: Vec<(String, String)>,
 }
 
 impl Default for AgentBuilder {
@@ -192,6 +216,9 @@ impl Default for AgentBuilder {
             models: IndexMap::new(),
             triage: None,
             otel: None,
+            on_limit: None,
+            on_secret: None,
+            secrets: Vec::new(),
         }
     }
 }
@@ -374,6 +401,46 @@ impl AgentBuilder {
         self
     }
 
+    /// Asked when a turn reaches a limit (its step budget, a sub-agent's, or the
+    /// output cap before any text): given what was reached and the values offered,
+    /// return the new limit to go on with, or `None` to stop there as without this
+    /// callback. A raise lasts for the agent's life, or for one specialist's run
+    /// when [`LimitHit::run_only`] says so. Called on the turn's thread, one
+    /// question at a time with approvals.
+    pub fn on_limit(
+        mut self,
+        decide: impl Fn(&LimitHit) -> Option<u32> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_limit = Some(Box::new(decide));
+        self
+    }
+
+    /// Offer the model `request_secret`, and ask `answer` when it is called: given
+    /// the variable's name and the model's reason, return the value (held for the
+    /// agent's life, at least 6 characters) or `None` to decline. Tools that run
+    /// commands get it as that environment variable, and every path back to the
+    /// model, the conversation, and the trace shows only `${secret:NAME}`. Names
+    /// that would change how programs run (`PATH`, `LD_PRELOAD`, ...) are refused
+    /// before `answer` is asked. Nothing is kept in a keyring.
+    pub fn on_secret_request(
+        mut self,
+        answer: impl Fn(&SecretRequest) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_secret = Some(Box::new(answer));
+        self
+    }
+
+    /// Hold a secret the program already has (an API token for a command the
+    /// agent will run), with the same rules as [`AgentBuilder::on_secret_request`]:
+    /// tools get it as the environment variable `name`, the model sees only
+    /// `${secret:NAME}`, and `write_file` and `edit_file` may put it in a file the
+    /// approver sees. `name` must be a valid variable name and the value at least 6
+    /// characters, or [`AgentBuilder::build`] fails.
+    pub fn secret(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.secrets.push((name.into(), value.into()));
+        self
+    }
+
     /// Assemble the agent. Reads nothing but the workspace path, the memory
     /// database, skill and specialist directories when given, and starts the MCP
     /// servers given.
@@ -387,6 +454,25 @@ impl AgentBuilder {
         })?;
         context.policy.timeout = self.tool_timeout;
         context.executor = Executor::Subprocess;
+        for (name, value) in &self.secrets {
+            let refused = |reason: &str| BuildError::Secret {
+                name: name.clone(),
+                reason: reason.to_owned(),
+            };
+            if !crate::vault::valid_name(name) {
+                return Err(refused("not a valid environment variable name"));
+            }
+            let answer = crate::vault::SecretAnswer {
+                value: value.clone(),
+                remember: false,
+            };
+            context.secrets.accept(name, answer).map_err(|_| {
+                refused(&format!(
+                    "shorter than {} characters",
+                    crate::vault::MIN_SECRET_CHARS
+                ))
+            })?;
+        }
 
         let registry = registry_for(self.builtins);
         for tool in self.tools {
@@ -472,6 +558,22 @@ impl AgentBuilder {
             .map(|otel| crate::otel::Tracer::to(otel.destination.clone()))
             .unwrap_or_default();
 
+        if let Some(answer) = self.on_secret {
+            context
+                .secrets
+                .set_prompt(Some(Box::new(move |request: &SecretRequest| {
+                    answer(request).map(|value| crate::vault::SecretAnswer {
+                        value,
+                        remember: false,
+                    })
+                })));
+            registry
+                .register(Box::new(crate::tools::secret::RequestSecretTool))
+                .map_err(BuildError::Tool)?;
+        }
+        let mut session_limits = crate::limits::SessionLimits::default();
+        session_limits.prompt = self.on_limit;
+
         let mcp = start_mcp(&self.mcp_servers, &registry)?;
 
         let recorder = match &self.trace_dir {
@@ -514,7 +616,7 @@ impl AgentBuilder {
                 name: None,
             },
             max_tokens: self.max_output_tokens,
-            session_limits: Default::default(),
+            session_limits,
             context_window: self.context_window,
             gate: ApprovalGate::new(self.approval, self.approver),
             guardrails: Guardrails::new(&self.guardrails),
@@ -532,7 +634,7 @@ impl AgentBuilder {
             .set_queue(harness.gate.queue.clone());
         Ok(Agent {
             harness,
-            state,
+            conversation: Conversation(state),
             notices,
         })
     }
@@ -1057,7 +1159,7 @@ impl From<&String> for Turn {
 /// that continues the conversation.
 pub struct Agent {
     harness: Harness,
-    state: AgentState,
+    conversation: Conversation,
     /// What building found worth saying (a specialist file skipped).
     notices: Vec<String>,
 }
@@ -1108,19 +1210,25 @@ impl Agent {
         };
         let output = self
             .harness
-            .run_kind(&mut self.state, &kind, &prompt, &display, &mut on_event)
+            .run_kind(
+                &mut self.conversation.0,
+                &kind,
+                &prompt,
+                &display,
+                &mut on_event,
+            )
             .await;
         // Saved after a failed turn too, as the CLI does; a failed write loses this
         // save, never the turn (the harness saved after every step already).
         if let Some(store) = &self.harness.memory {
-            let _ = store.persist(&self.state);
+            let _ = store.persist(&self.conversation.0);
         }
         let output = output?;
         Ok(RunResult {
-            answer: final_answer(&self.state.messages).to_owned(),
+            answer: final_answer(&self.conversation.0.messages).to_owned(),
             output,
-            turn: self.state.last_turn.clone(),
-            usage: self.state.usage,
+            turn: self.conversation.0.last_turn.clone(),
+            usage: self.conversation.0.usage,
         })
     }
 
@@ -1130,22 +1238,25 @@ impl Agent {
         self.harness.cancel.clone()
     }
 
-    /// The conversation: messages, steps, usage. It serializes to the session
-    /// database's `state_json`, so it can be stored and given back with
-    /// [`Agent::with_state`].
-    pub fn state(&self) -> &AgentState {
-        &self.state
+    /// The conversation so far, to read or to save with [`Conversation::to_json`].
+    pub fn conversation(&self) -> &Conversation {
+        &self.conversation
     }
 
     /// Continue an earlier conversation instead of starting a new one.
-    pub fn with_state(mut self, state: AgentState) -> Self {
-        self.state = state;
+    pub fn with_conversation(mut self, conversation: Conversation) -> Self {
+        self.conversation = conversation;
         self
     }
 
     /// The session's id, under which [`AgentBuilder::memory`] saves it.
     pub fn session_id(&self) -> &str {
-        &self.state.session_id
+        self.conversation.id()
+    }
+
+    /// The names of the secrets held, never their values.
+    pub fn secret_names(&self) -> Vec<String> {
+        self.harness.context.secrets.names()
     }
 
     /// What is worth telling the user, oldest first: specialist files that were
@@ -1188,6 +1299,77 @@ impl Agent {
     /// makes no stability promise.
     pub fn harness(&self) -> &Harness {
         &self.harness
+    }
+}
+
+/// A conversation: its messages, steps, and usage. It is saved as the JSON the
+/// session database keeps (`state_json`, the format agent86 and Python's agent86
+/// share), so a saved conversation opens in either.
+/// [`Conversation::default`] is a new conversation with a fresh id.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Conversation(AgentState);
+
+/// One message of a [`Conversation`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationMessage {
+    pub role: Role,
+    /// The text: the user's words, the model's reply, or a tool's result.
+    pub text: String,
+    /// The tools an assistant message called.
+    pub tool_calls: Vec<ToolCall>,
+    /// For a tool's result, the id of the call it answers.
+    pub answers: Option<String>,
+}
+
+impl Conversation {
+    /// A new, empty conversation with a fresh id.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Its id, which the session database files it under.
+    pub fn id(&self) -> &str {
+        &self.0.session_id
+    }
+
+    /// Its messages, oldest first (the system prompt is not one of them).
+    pub fn messages(&self) -> Vec<ConversationMessage> {
+        self.0
+            .messages
+            .iter()
+            .map(|message| ConversationMessage {
+                role: message.role,
+                text: message.content.clone(),
+                tool_calls: message.tool_calls.clone(),
+                answers: message.tool_call_id.clone(),
+            })
+            .collect()
+    }
+
+    /// The model calls made so far.
+    pub fn steps(&self) -> usize {
+        self.0.step_count()
+    }
+
+    /// The tokens and cost so far.
+    pub fn usage(&self) -> Usage {
+        self.0.usage
+    }
+
+    /// The last turn's summary, or `None` before the first.
+    pub fn last_turn(&self) -> Option<&TurnSummary> {
+        self.0.last_turn.as_ref()
+    }
+
+    /// The conversation as the session database's JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.0).expect("a conversation always serializes")
+    }
+
+    /// A conversation from [`Conversation::to_json`]'s JSON, or a session
+    /// database's `state_json`.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json).map(Self)
     }
 }
 
