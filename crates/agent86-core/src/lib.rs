@@ -12,6 +12,12 @@
 
 pub mod sdk;
 
+/// Compiles the README's example (shown on crates.io) as a doctest, so it
+/// cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 #[doc(hidden)]
 pub mod agent;
 #[doc(hidden)]

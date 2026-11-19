@@ -57,11 +57,21 @@ npm install -g agent86
 
 npm installs the native binary for your platform (it needs Node.js 18 or newer only to install and launch it). `npm install -g agent86@latest` updates it, and so does `/update now` inside agent86, which also tells you when a newer release is out (`[ui] update_check = false` or `AGENT86_NO_UPDATE_CHECK=1` turns that check off).
 
-You can also download the archive for your platform from [Releases](https://github.com/Maetek-Technologies/agent86/releases), extract it, and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are not code-signed: on macOS, run `xattr -d com.apple.quarantine agent86` once. Releases carry SLSA build provenance, and [docs/RELEASING.md](docs/RELEASING.md#verifying-a-release) shows how to check it. To build from source instead, run `cargo install --git https://github.com/Maetek-Technologies/agent86 --tag v1.0.24` (needs Rust 1.94 or newer).
+You can also download the archive for your platform from [Releases](https://github.com/Maetek-Technologies/agent86/releases), extract it, and put `agent86` on your `PATH`. Builds are available for Linux x86_64 and ARM64 (including 64-bit Raspberry Pi OS; glibc 2.35 or newer, so Ubuntu 22.04, Debian 12, or later), macOS on Apple silicon and Intel, and Windows x86_64. The binaries are not code-signed: on macOS, run `xattr -d com.apple.quarantine agent86` once. Releases carry SLSA build provenance, and [docs/RELEASING.md](docs/RELEASING.md#verifying-a-release) shows how to check it. To build from source instead, run `cargo install --git https://github.com/Maetek-Technologies/agent86 --tag v1.1.0` (needs Rust 1.94 or newer).
 
 ### Switching from the Python version
 
 agent86 replaced the original [Python implementation](https://github.com/Maetek-Technologies/agent86-python), which is archived. Uninstall it first (`pip uninstall agent86`, or `pipx uninstall agent86` if you installed it with pipx): both install a command named `agent86`, and whichever comes first on your `PATH` runs. Your `~/.agent86` config, sessions, memory, traces, prompt history, and keyring keys carry over as they are. [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) lists every way this version behaves differently.
+
+## Use it in your own program
+
+The agent is also a Rust library, [`agent86-core`](https://crates.io/crates/agent86-core): `agent86_core::sdk` builds an agent from your provider, workspace, tools, and approver, with the same jail, approvals, sandbox, guardrails, and secret redaction as the CLI, and reads no config, environment, home directory, or keyring unless you hand it something.
+
+```sh
+cargo add agent86-core
+```
+
+[The crate's README](crates/agent86-core/README.md) has an example, and [ADR 0003](docs/adr/0003-embeddable-agent-api.md) the design. Only `sdk` is covered by semantic versioning.
 
 ## Use it from your editor
 
@@ -81,9 +91,9 @@ It has been used by hand in Zed and in Intelligent Terminal on Windows, and ever
 
 ## Status
 
-Version 1.0.24 (2026-11-17) does everything the Python version did, and more; [docs/FEATURES.md](docs/FEATURES.md) lists what is built. Next:
+Version 1.1.0 (2026-11-19) does everything the Python version did, and more; [docs/FEATURES.md](docs/FEATURES.md) lists what is built. Next:
 
-- [ ] 1.1.0: the embedding framework, `agent86-core`, a library for building your own agents on agent86's harness, with everything 1.0.24 has (in progress; see [ADR 0003](docs/adr/0003-embeddable-agent-api.md))
+- [x] 1.1.0: the embedding framework, `agent86-core`, a library for building your own agents on agent86's harness, with everything 1.0.24 has, on crates.io (see [ADR 0003](docs/adr/0003-embeddable-agent-api.md))
 - [ ] 1.1.1: scheduled jobs, which the agent schedules for itself and a per-user OS timer runs with no session open, pausing at an approval instead of failing (planned, see [docs/scheduling.md](docs/scheduling.md))
 - [ ] 1.1.2: vault secrets (`${secret:NAME}`) in MCP server settings (planned; the release roadmap is in [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md))
 
