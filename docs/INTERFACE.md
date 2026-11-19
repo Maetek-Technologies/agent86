@@ -160,7 +160,7 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 | `src/ui/status.rs` | A port of `ui/status.py` and `fit_status_line`. Shared, so `/cost` and the plain loop could use the same numbers |
 | `src/ui/panels.rs` (part 5) | The key entry, connection test, and save-diff panels (Python's `KeyEntryModal`, `ConnectionTestModal`, `SaveDiffModal`) and the frame every panel is drawn in. The provider list and the catalog picker are pickers (`picker.rs`); the approval panel is in `app.rs`. Part 6 adds the MCP manager, the server form, and the MCP test |
 | `src/ui/manage.rs` (part 5) | The catalog cache and the `/config model` chain, as the catalog and model-manager parts of Python's `tui/app.py`: the bare `/model` picker, the typed `/model <id>` fallback, and the chain from the provider list to the save |
-| `src/ui/limits.rs` | Beyond Python: the offer to raise a limit a turn reached (a panel answered like the approval panel) and `/limits save` through the save-diff panel. The limits themselves are in `src/limits.rs` |
+| `src/ui/limits.rs` | Beyond Python: the offer to raise a limit a turn reached (a panel answered like the approval panel) and `/limits save` through the save-diff panel. The limits themselves are in `crates/agent86-core/src/limits.rs` |
 | `src/repl.rs` | Unchanged role: the command registry, `Repl`, and the plain loop. Command handlers already return `CommandResult`s, which both surfaces draw |
 
 ### Threads and events

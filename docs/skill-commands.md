@@ -20,10 +20,10 @@ and the README and [ACP.md](ACP.md) are updated.
   They live on `ToolContext::skills`.
 - **The model chooses.** `prompt::build_system_prompt` lists each skill's name and
   one-line description. When one applies, the model calls `use_skill`
-  (`src/tools/skills.rs`), which returns the instructions plus the bundled resources
+  (`crates/agent86-core/src/tools/skills.rs`), which returns the instructions plus the bundled resources
   and activates the skill, so its `allowed-tools` restrict the rest of the turn.
   `Harness::run_turn_events` clears the active skill on entry and on every exit
-  (`src/agent.rs`).
+  (`crates/agent86-core/src/agent.rs`).
 - **The user can only look.** The terminal's `/skills` (`src/repl.rs`) lists them.
   Editors have no `/skills`; their eight commands are a fixed table in
   `src/acp/harness.rs`.
@@ -56,7 +56,7 @@ The user cannot say "use this skill now"; they can only hope the model picks it.
 
 ### 1. The harness: `Harness::run_skill_turn`
 
-One method in `src/agent.rs`, next to `run_turn_events`:
+One method in `crates/agent86-core/src/agent.rs`, next to `run_turn_events`:
 
 ```rust
 pub async fn run_skill_turn(
@@ -112,7 +112,7 @@ Unknown names never reach this method; each surface answers them itself.
 
 Skill names are not validated today (they are whatever the frontmatter says), so
 not every name can be a command. *Proposed* rules, in one function in
-`src/skills.rs` (`command_name(&Skill) -> Option<&str>`), used by every surface:
+`crates/agent86-core/src/skills.rs` (`command_name(&Skill) -> Option<&str>`), used by every surface:
 
 - A shortcut exists only when the name is 1 to 64 characters of ASCII letters,
   digits, `-`, and `_`, starting with a letter or digit. Matching is exact

@@ -1,6 +1,6 @@
-# Crate split: `agent86-core` and `agent86` (sketch)
+# Crate split: `agent86-core` and `agent86`
 
-Status: a sketch for review before any code moves (2026-11-19). It follows [ADR 0003](adr/0003-embeddable-agent-api.md), which is accepted and says the library moves into its own crate once the API settles. The measurements below were taken on `main` at `be154eb`.
+Status: done (2026-11-19), as sketched here with the differences listed under "As built". It was first written as a sketch for review before any code moved; It follows [ADR 0003](adr/0003-embeddable-agent-api.md), which is accepted and says the library moves into its own crate once the API settles. The measurements below were taken on `main` at `be154eb`.
 
 ## Goal
 
@@ -135,6 +135,18 @@ An embedder that wants neither would write `agent86-core = { version = "…", de
 6. **Docs.** CLAUDE.md (paths and the two crates), the plan, and an ADR 0003 amendment for the two-tier surface.
 
 Each commit should pass test, fmt and clippy on its own, so a review can follow the steps.
+
+## As built
+
+The four questions below were answered with the recommendations: the binary stays at the root, the API has two tiers, both features are on by default, and the name is `agent86-core` (its availability on crates.io is checked at the publishing step). The work differed from the sketch in these ways:
+
+- **Steps 1 and 2 became one commit.** The library can't compile while `vault` still calls `keys`, so the back-edge was cut in the same commit as the moves.
+- **`sdk` re-exports every type its signatures use.** With the other modules hidden, `ApprovalMode`, `TurnEvent`, `ApprovalPreview`, the `Tool` trait and its types, `GuardrailsConfig`, `Embedder`, `CancelToken` and `HarnessError` are re-exported from `sdk`. A new `sdk::providers` holds the `Provider` trait, the request and response types, and the four built-in adapters. Without this, an embedder couldn't build a provider without reaching into a hidden module.
+- **A path dependency instead of an exact version pin.** `agent86-core = { path = "crates/agent86-core" }`, with no `version`: the binary is never published and always builds the library from the same checkout. A pinned `=1.0.x` would have put the version in a second place that a release could forget to bump. The version is written once, in `[workspace.package]`, and `docs/RELEASING.md` says so.
+- **Two crate-private items became `pub`:** `catalog::get_json` (used by `update`) and `Harness::delegation_offered` (used by `setup`).
+- **The fallback note** for a build without `local-embeddings` is Python's own note for a missing package: `sentence-transformers unavailable (ImportError); using the offline hash embedder.`
+- **The CI step runs the library's unit tests** with `--no-default-features` (171 pass), rather than only `cargo check`.
+- **Measured:** with default features the library's dependency tree is 367 crates; without them it is 172. The same 933 tests pass as before the split.
 
 ## Questions for you
 

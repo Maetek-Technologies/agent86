@@ -305,14 +305,14 @@ waiting.
 
 - `src/tasks.rs` (new): the item, the store (load, atomic save, lock), the
   due rule, and the backoff.
-- `src/tools/tasks.rs` (new): the three tools.
+- `crates/agent86-core/src/tools/tasks.rs` (new): the three tools.
 - `src/schedule.rs`: the heartbeat kind, the pre-check in `run_due`, the
   goal built from due items, the daily limits, and attempts counted after a
   run.
 - `src/main.rs`: `agent86 tasks ...` and `schedule heartbeat on|off`.
-- `src/config.rs`: `heartbeat_max_items`, `heartbeat_max_attempts`,
+- `crates/agent86-core/src/config.rs`: `heartbeat_max_items`, `heartbeat_max_attempts`,
   `heartbeat_max_runs_per_day`, `heartbeat_daily_cost_usd` under `[schedule]`.
-- `src/observability.rs`: `task_added`, `task_updated`, and `job_run` with
+- `crates/agent86-core/src/observability.rs`: `task_added`, `task_updated`, and `job_run` with
   the item ids a heartbeat run was given.
 
 It comes after phase 3 below (store, `run_job`, `tick`), which it needs, and
@@ -353,14 +353,14 @@ can come before the service install, since `schedule daemon` or a manual
   the `Scheduler` store (load/save with atomic write, the lock file); and the
   daemon loop + `run_job` (assemble harness → run turn → record result →
   persist → emit trace/episode).
-- **`src/tools/schedule.rs`** (new): `schedule_create`, `schedule_list`,
+- **`crates/agent86-core/src/tools/schedule.rs`** (new): `schedule_create`, `schedule_list`,
   `schedule_cancel` (and optionally `schedule_run`). `schedule_create` is
   side-effecting; the others are read-only. A `Scheduler` handle rides on
   `ToolContext` (exactly like `memory` does).
 - **`src/setup.rs`**: refactor `assemble` to take an explicit workspace (it
   currently hardcodes `current_dir()`), so the daemon can build a harness jailed
   to the job's workspace. Keep the existing call sites passing `current_dir()`.
-- **`src/tools/mod.rs`**: register the schedule tools in `default_registry`
+- **`crates/agent86-core/src/tools/mod.rs`**: register the schedule tools in `default_registry`
   (gated on the feature being on), and add the `Scheduler` field to
   `ToolContext`.
 - **`src/service.rs`** (new): the three per-user definitions (decision 7) as
@@ -369,10 +369,10 @@ can come before the service install, since `schedule daemon` or a manual
 - **`src/main.rs`**: the `schedule` subcommand — `list`, `show <id>`,
   `cancel <id>`, `run <id>` (run now, for testing), `tick`, `daemon`,
   `install-service`, `uninstall-service`, `status`.
-- **`src/config.rs`**: a `[schedule]` section — `enabled`, `path`,
+- **`crates/agent86-core/src/config.rs`**: a `[schedule]` section — `enabled`, `path`,
   `max_concurrent` (default 1), `grace_s`, `tick_s` (default 60), `log` path,
   `default_model`.
-- **`src/observability.rs`**: new trace events (`job_created`, `job_run` with
+- **`crates/agent86-core/src/observability.rs`**: new trace events (`job_created`, `job_run` with
   status/usage/cost, `job_missed`), redacted like everything else.
 - **`src/repl.rs` / `src/ui/`** (later): a `/schedule` command and, in the
   interface, a schedule panel + the in-process due-job check.

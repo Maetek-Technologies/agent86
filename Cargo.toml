@@ -2,10 +2,11 @@
 members = ["crates/agent86-core"]
 resolver = "2"
 
-# One version, edition, MSRV, and license for both crates: the binary pins the
-# library to exactly this version, so the two always ship together. The release
-# workflow and `npm/build.mjs` read the first `version = "..."` line of this
-# file, which is this one.
+# One version, edition, MSRV, and license for both crates. Set the version here
+# only: the binary uses the library by path (no version of its own to bump), so
+# the two always build from the same checkout. The release workflow and
+# `npm/build.mjs` read the first `version = "..."` line of this file, which is
+# this one.
 [workspace.package]
 version = "1.0.24"
 edition = "2021"
@@ -20,7 +21,7 @@ unsafe_code = "forbid"
 all = "warn"
 
 [workspace.dependencies]
-agent86-core = { path = "crates/agent86-core", version = "=1.0.24" }
+agent86-core = { path = "crates/agent86-core" }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29"
 crossterm_winapi = "0.9"

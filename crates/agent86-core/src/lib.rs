@@ -7,8 +7,8 @@
 //!
 //! Every other module is public because the `agent86` binary (the terminal
 //! interface, the REPL, `run`, and the ACP server) is built on them. They carry no
-//! stability promise and are hidden from these docs; the binary pins this crate to
-//! its exact version.
+//! stability promise and are hidden from these docs; the binary builds this crate
+//! from the same checkout.
 
 pub mod sdk;
 
