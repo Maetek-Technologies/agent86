@@ -384,7 +384,7 @@ pub(crate) struct Spawn {
 
 impl Harness {
     /// Whether `delegate` is offered to `ctx` at `depth`.
-    pub(crate) fn delegation_offered(&self, ctx: &ToolContext, depth: u32) -> bool {
+    pub fn delegation_offered(&self, ctx: &ToolContext, depth: u32) -> bool {
         self.agents.enabled
             && depth < self.agents.max_depth
             && self.registry.get(DELEGATE).is_some()

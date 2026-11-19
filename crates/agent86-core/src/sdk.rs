@@ -6,10 +6,9 @@
 //! environment variable, home directory, keyring, or terminal involved:
 //!
 //! ```no_run
-//! use agent86::sdk::{Agent, Builtins, FnTool};
-//! use agent86::types::ApprovalMode;
+//! use agent86_core::sdk::{Agent, ApprovalMode, Builtins, FnTool};
 //! use serde_json::json;
-//! # fn provider() -> std::sync::Arc<dyn agent86::provider::Provider> { unimplemented!() }
+//! # fn provider() -> std::sync::Arc<dyn agent86_core::sdk::Provider> { unimplemented!() }
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let weather = FnTool::new(
@@ -64,25 +63,21 @@
 //! This module is the intended public surface; the rest of the crate is public
 //! for its own tests and binaries and makes no stability promise.
 
-use crate::agent::{CancelToken, Harness, HarnessError, TurnEvent};
+use crate::agent::Harness;
 use crate::agents_def::Specialties;
-use crate::approval::{ApprovalGate, ApprovalPreview};
-use crate::config::{
-    builtin_config, GuardrailsConfig, LimitsConfig, McpServerConfig, ObservabilityConfig,
-};
+use crate::approval::ApprovalGate;
+use crate::config::{builtin_config, LimitsConfig, McpServerConfig, ObservabilityConfig};
 use crate::guardrails::Guardrails;
 use crate::mcp::{var_ref_names, McpManager};
-use crate::memory::embeddings::Embedder;
 use crate::observability::Recorder;
-use crate::provider::Provider;
 use crate::router::{RoutedModel, Router};
 use crate::secrets::NoSecretStore;
 use crate::session::{AgentState, SessionStore};
 use crate::specialty_turn::TurnKind;
 use crate::tools::sandbox::Executor;
-use crate::tools::{exec, files, search, web, Tool, ToolContext, ToolError, ToolRegistry};
+use crate::tools::{exec, files, search, web, ToolRegistry};
 use crate::turn::final_answer;
-use crate::types::{ApprovalMode, Message, ToolResult};
+use crate::types::Message;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -90,10 +85,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+// Every type this module's signatures use, re-exported here so a user names no
+// other module of the crate: those are public for the `agent86` binary only, are
+// hidden from the docs, and carry no stability promise.
+pub use crate::agent::{CancelToken, HarnessError, TurnEvent};
+pub use crate::approval::ApprovalPreview;
+pub use crate::config::{EgressMode, GuardrailsConfig, IngressMode};
 pub use crate::limits::{LimitHit, LimitKind};
+pub use crate::memory::embeddings::Embedder;
+pub use crate::tools::{Tool, ToolContext, ToolError};
 pub use crate::turn::TurnSummary;
-pub use crate::types::{Role, ToolCall, Usage};
+pub use crate::types::{ApprovalMode, Role, ToolCall, ToolResult, ToolSpec, Usage};
 pub use crate::vault::SecretRequest;
+pub use providers::Provider;
 
 /// Which of agent86's own tools an [`Agent`] offers, each set including the one
 /// before it. Every one of them is jailed to the workspace.
@@ -1454,4 +1458,19 @@ impl Tool for FnTool {
             }),
         }
     }
+}
+
+/// The model layer: the [`Provider`] trait, which only needs `stream`, the types
+/// a provider speaks, and agent86's own adapters, which run any OpenAI-compatible
+/// endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp), Anthropic,
+/// Ollama, and Google Gemini, with agent86's retries, redaction, and pricing.
+pub mod providers {
+    pub use crate::provider::anthropic::{AnthropicConfig, AnthropicProvider};
+    pub use crate::provider::google::{GoogleConfig, GoogleProvider};
+    pub use crate::provider::ollama::{OllamaConfig, OllamaProvider};
+    pub use crate::provider::openai::{OpenAiConfig, OpenAiProvider};
+    pub use crate::provider::{collect_completion, DeltaStream, Provider, ProviderError};
+    pub use crate::types::{
+        Completion, CompletionDelta, CompletionRequest, Message, StopReason, ToolSpec,
+    };
 }

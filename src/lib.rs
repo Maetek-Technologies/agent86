@@ -3,44 +3,26 @@
 //! It began as a compatibility-first rewrite of the Python implementation, and
 //! keeps the formats the two share (config, sessions, memory, traces, keyring)
 //! compatible with it.
+//!
+//! This crate is the binary's surfaces: the terminal interface, the REPL, `run`,
+//! the ACP server, the CLI commands, and the assembly from config (`setup`). The
+//! agent itself is `agent86-core`, whose modules are re-exported here under
+//! their own names, so `crate::agent`, `agent86::tools`, and the rest resolve as
+//! they did before the split.
 
 pub mod acp;
-pub mod agent;
-pub mod agents_def;
-pub mod approval;
 pub mod auth;
-pub mod config;
-pub mod config_writer;
-pub mod difflib;
-pub mod escape;
-pub mod guardrails;
 pub mod history;
 pub mod keys;
-pub mod limits;
-pub mod mcp;
-pub mod memory;
 pub mod mentions;
-pub mod observability;
-pub mod otel;
-pub mod pricing;
-pub mod prompt;
-pub mod provider;
-pub mod pyjson;
 pub mod repl;
-pub mod router;
-pub mod sdk;
-pub mod secrets;
-pub mod session;
 pub mod session_dirs;
 pub mod setup;
-pub mod skills;
-pub mod specialty_turn;
-pub mod subagent;
-pub mod tools;
-pub mod trust;
-pub mod turn;
-pub mod types;
 pub mod ui;
 pub mod update;
-pub mod vault;
-pub mod worktree;
+
+pub use agent86_core::{
+    agent, agents_def, approval, config, config_writer, difflib, escape, guardrails, limits, mcp,
+    memory, observability, otel, pricing, prompt, provider, pyjson, router, sdk, secrets, session,
+    skills, specialty_turn, subagent, tools, trust, turn, types, vault, worktree,
+};

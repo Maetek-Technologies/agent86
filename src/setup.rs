@@ -177,7 +177,7 @@ pub fn assemble_in(
     if interactive {
         context
             .secrets
-            .set_prompt(Some(Box::new(crate::vault::terminal_prompt)));
+            .set_prompt(Some(Box::new(crate::keys::terminal_secret_prompt)));
     }
     // Secrets remembered for this project are loaded now, so the system message
     // lists them and the tools can use them from the first turn.

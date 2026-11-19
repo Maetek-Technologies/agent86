@@ -1,0 +1,53 @@
+# The agent itself: the harness and its loop, the providers, tools, approvals,
+# guardrails, sandbox, secret vault, memory, MCP client, sub-agents, skills, and
+# telemetry. `agent86_core::sdk` is the embedding API, and the only part with a
+# stability promise; every other module is public for the `agent86` binary.
+[package]
+name = "agent86-core"
+description = "The agent behind agent86: a safe agent runtime you can embed"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+encoding_rs.workspace = true
+futures-util.workspace = true
+globset.workspace = true
+ignore.workspace = true
+indexmap.workspace = true
+jiff.workspace = true
+keyring-core.workspace = true
+md5.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1_smol.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+url.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-native-keyring-store.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true

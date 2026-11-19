@@ -9,6 +9,7 @@
 
 use crate::config::Config;
 use crate::secrets::validate_api_key;
+use crate::vault::{SecretAnswer, SecretRequest};
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
@@ -113,6 +114,61 @@ fn prompt_hidden_with_stty(prompt: &str) -> Result<String, String> {
     eprintln!();
     result.map_err(|error| format!("could not read the key: {error}"))?;
     Ok(line)
+}
+
+/// The vault's prompt at a terminal (moved here from `vault` in the crate split,
+/// since it reads input through [`prompt_hidden`]): ask, input hidden, for `agent86 run` and the plain REPL: the
+/// reason first (on stderr, so `run --json` keeps stdout to one object), then the
+/// masked prompt, then whether to remember it for the project when a keyring is
+/// there. An empty entry or a failed read declines.
+pub fn terminal_secret_prompt(request: &SecretRequest) -> Option<SecretAnswer> {
+    use std::io::{BufRead, Write};
+    let mut err = std::io::stderr();
+    let _ = writeln!(err);
+    let _ = writeln!(
+        err,
+        "The agent asks for the secret {}{}.",
+        request.name,
+        if request.replacing {
+            " (replacing the one entered before)"
+        } else {
+            ""
+        }
+    );
+    let reason = request.reason.trim();
+    if !reason.is_empty() {
+        let shown: String = reason.chars().filter(|ch| !ch.is_control()).collect();
+        let _ = writeln!(err, "  {shown}");
+    }
+    let _ = writeln!(
+        err,
+        "The value stays out of the chat; the agent only sees its name. Press Enter alone to decline."
+    );
+    let _ = err.flush();
+    let value = prompt_hidden(&format!("{} (input is hidden): ", request.name)).ok()?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return None;
+    }
+    let mut remember = false;
+    if request.can_remember {
+        let choices = if request.remembered { "[Y/n]" } else { "[y/N]" };
+        let _ = write!(
+            err,
+            "Remember it for this project, in the OS keyring? {choices} "
+        );
+        let _ = err.flush();
+        let mut line = String::new();
+        remember = match std::io::stdin().lock().read_line(&mut line) {
+            Ok(read) if read > 0 => match line.trim().to_lowercase().as_str() {
+                "y" | "yes" => true,
+                "n" | "no" => false,
+                _ => request.remembered,
+            },
+            _ => request.remembered,
+        };
+    }
+    Some(SecretAnswer { value, remember })
 }
 
 #[cfg(test)]
