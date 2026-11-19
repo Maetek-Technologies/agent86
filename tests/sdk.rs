@@ -283,9 +283,12 @@ async fn the_approver_decides_and_sees_the_diff() {
         .build()
         .unwrap();
     agent.run("write both").await.unwrap();
+    // `write_file` writes text as Python's text mode does: `\n` becomes `\r\n` on
+    // Windows.
+    let written = if cfg!(windows) { "hi\r\n" } else { "hi\n" };
     assert_eq!(
         std::fs::read_to_string(workspace.0.join("yes.txt")).unwrap(),
-        "hi\n"
+        written
     );
     assert!(!workspace.0.join("no.txt").exists());
     let asked = asked.lock().unwrap();
