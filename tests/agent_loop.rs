@@ -352,6 +352,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
                     "usage step={} session={}",
                     step.input_tokens, session.input_tokens
                 ),
+                other => format!("other {:?}", other.text()),
             });
         })
         .await

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — 2026-11-19 (a draft for review, written before any binding code; the first slice of 1.2.0 is its prototype, and the open questions at the end are settled before that slice lands)
+Accepted — 2026-11-19 (proposed the same day, before any binding code; the name, the minimum versions, and `TurnEvent`'s `#[non_exhaustive]` were settled at review, and the first slice of 1.2.0 is the prototype that settles the binding crates' lints)
 
 ## Context
 
@@ -56,22 +56,25 @@ What that means:
 
 Binding an API copies its shape into two more languages, so a few things are settled in `sdk` before the first slice, each in a 1.1.x patch release with Rust tests:
 
-- **Events that can grow.** `TurnEvent` is a public enum without `#[non_exhaustive]`, so a new variant is a breaking change for a Rust caller that matches every variant. Marking it `#[non_exhaustive]` is itself a breaking change for those callers. Whether to make it now, while there are few users, or at 2.0, is decided before 1.2.0.
+- **Events that can grow.** `TurnEvent` was a public enum without `#[non_exhaustive]`, so a new variant was a breaking change for a Rust caller that matched every variant. It is now `#[non_exhaustive]` (done 2026-11-19, shipping in 1.1.1; see the settled questions below). That was itself a breaking change for such callers, made while the crate has few users rather than at 2.0.
 - **A blocking entry point or a runtime rule.** The bindings drive `Agent::run` from their own Tokio runtime. Its documentation should say which runtime flavors work (a turn that fans out sub-agents needs a multi-threaded runtime, as the tests do), so the bindings and Rust callers follow one rule.
 - **Async host callbacks in mind.** The callbacks are `Fn` called on the turn's thread, which is what makes the bridging above possible. That stays a documented guarantee of `sdk`, not an accident of its implementation.
 
-### Open questions (settled before the first slice lands)
+### Questions settled (2026-11-19)
 
-1. **The PyPI name.** `agent86-core` (proposed), or `agent86`, giving the archived implementation's users a path forward at the cost of breaking `pip install agent86` for the CLI they have.
-2. **Minimum versions.** Python 3.11 (proposed: 3.10 reached its end of life in October 2026, so 3.11 is the oldest version still receiving security fixes) and Node 22 (proposed: Node 20 reached its end of life in April 2026, so 22 is the oldest LTS line still maintained).
-3. **`TurnEvent`'s `#[non_exhaustive]`.** Now, in a 1.1.x patch release that says so, or at 2.0.
+1. **The PyPI name is `agent86-core`**, imported as `agent86_core`. `agent86` stays the archived Python implementation's, so `pip install agent86` keeps giving its users the CLI they have.
+2. **Python 3.11 and Node 22 are the minimum versions.** Python 3.10 reached its end of life in October 2026 and Node 20 in April 2026, so these are the oldest lines still maintained. The wheels are built for `abi3` from 3.11.
+3. **`TurnEvent` is `#[non_exhaustive]` now**, while the crate is a day old and has few users, rather than at 2.0. It ships in 1.1.1, whose notes say that a Rust `match` on it needs a `_` arm. The binary's own matches got catch-alls in the same change.
+
+Still open, for the first slice's prototype:
+
 4. **Lints.** PyO3's and napi-rs's macros expand to `unsafe` code, which the workspace's `unsafe_code = "forbid"` would reject, and `forbid` cannot be lifted by an `allow`. The binding crates are expected to set their own `unsafe_code = "deny"` with the macros' generated code allowed, keeping hand-written binding code free of `unsafe` and the library at `forbid`; the prototype confirms what the macros need.
 
 ### Slices
 
 1.2.0, Python:
 
-1. **The crate and the core loop.** `bindings/python`, the four built-in providers, `Agent` with the builder's plain options, `run` and `run_sync`, function tools (plain and async), the approver, errors, and the tests above. The open questions are answered here.
+1. **The crate and the core loop.** `bindings/python`, the four built-in providers, `Agent` with the builder's plain options, `run` and `run_sync`, function tools (plain and async), the approver, errors, and the tests above. The lints question is answered here.
 2. **The rest of `sdk`.** Events and `stream`, cancellation, `Conversation`, `Memory` and sessions, MCP servers, skills, sub-agents, named models and triage, OpenTelemetry, `on_limit`, `on_secret_request`, and `secret`.
 3. **Packaging and docs.** The wheel matrix, the sdist, trusted publishing, the install checks, the `.pyi` stubs, a README for PyPI with an example, and the release notes.
 
@@ -84,4 +87,4 @@ Binding an API copies its shape into two more languages, so a few things are set
 - **The release grows.** Two more registries, about twenty more build jobs per release, and more to go wrong on a tag. The jobs follow the npm job's pattern (publish what is missing, skip what is out, so a re-run passes), and PyPI uses trusted publishing, so no new secret is stored for it.
 - **A slow host callback holds the turn**, as a slow Rust tool does today. That is documented, and is the price of keeping the harness's tools synchronous.
 - **The CLI and its contracts are untouched.** Nothing in `run --json`, the session database, the trace, or the config changes, and the `agent86` npm package stays the CLI.
-- **The archived Python implementation is left alone** under its own PyPI name, unless the first open question decides otherwise.
+- **The archived Python implementation is left alone** under its own PyPI name.
