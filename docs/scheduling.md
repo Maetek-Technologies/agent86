@@ -1,6 +1,7 @@
 # Scheduled jobs: the agent schedules work for itself
 
-**Status:** design (not yet implemented); targeted for 1.0.25, together with
+**Status:** design (not yet implemented); targeted for 1.1.1 (planned as 1.0.25 until
+2026-11-19, when 1.1.0 became the embedding framework), together with
 parking a job at an approval (see the release roadmap in
 `docs/PROJECT_PLAN.md`)
 **Last updated:** 2026-11-15 (decision 2 and the new decision 7: how the OS
@@ -342,7 +343,7 @@ can come before the service install, since `schedule daemon` or a manual
   the likelier one; a file drop reopens the untrusted-input question of H1.
 - Whether one heartbeat run should take all due items or one item per run
   (cleaner context and accounting, more runs).
-- The release: it fits 1.0.25 after phase 3, but that release already holds
+- The release: it fits 1.1.1 after phase 3, but that release already holds
   parking and checkpointing tier 2.
 
 ## Components to build (mapped to files)

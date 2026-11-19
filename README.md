@@ -83,8 +83,9 @@ It has been used by hand in Zed and in Intelligent Terminal on Windows, and ever
 
 Version 1.0.24 (2026-11-17) does everything the Python version did, and more; [docs/FEATURES.md](docs/FEATURES.md) lists what is built. Next:
 
-- [ ] 1.0.25: scheduled jobs, which the agent schedules for itself and a per-user OS timer runs with no session open, pausing at an approval instead of failing (planned, see [docs/scheduling.md](docs/scheduling.md))
-- [ ] 1.1.0: vault secrets (`${secret:NAME}`) in MCP server settings (planned; the release roadmap is in [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md))
+- [ ] 1.1.0: the embedding framework, `agent86-core`, a library for building your own agents on agent86's harness, with everything 1.0.24 has (in progress; see [ADR 0003](docs/adr/0003-embeddable-agent-api.md))
+- [ ] 1.1.1: scheduled jobs, which the agent schedules for itself and a per-user OS timer runs with no session open, pausing at an approval instead of failing (planned, see [docs/scheduling.md](docs/scheduling.md))
+- [ ] 1.1.2: vault secrets (`${secret:NAME}`) in MCP server settings (planned; the release roadmap is in [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md))
 
 Notes for every release are in [docs/releases](docs/releases).
 
