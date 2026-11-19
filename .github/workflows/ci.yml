@@ -27,14 +27,21 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Both crates: agent86-core (the library) and agent86 (the binary).
       - name: Test
-        run: cargo test --all-targets --locked
+        run: cargo test --workspace --all-targets --locked
+      # The library with neither optional feature (no OS keyring, no local
+      # embedding model), as an embedder may build it; the keyring stub differs
+      # per platform, so every OS runs it.
+      - name: Test the library without default features
+        if: matrix.toolchain == 'stable'
+        run: cargo test -p agent86-core --no-default-features --lib --locked
       - name: Format
         if: matrix.toolchain == 'stable'
         run: cargo fmt --all -- --check
       - name: Clippy
         if: matrix.toolchain == 'stable'
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   advisories:
     name: advisories
