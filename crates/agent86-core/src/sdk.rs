@@ -1,4 +1,4 @@
-//! Embedding agent86 in another program (beyond Python; a prototype, see
+//! Embedding agent86 in another program (beyond Python; see
 //! `docs/adr/0003-embeddable-agent-api.md`).
 //!
 //! [`Agent::builder`] assembles the same [`Harness`] the CLI, the interface, and
@@ -60,8 +60,9 @@
 //! Nothing is discovered: no `.agent86/` or `~/.agent86/` directory is read, and
 //! no `OTEL_*` variable either. Each part is what the caller passes in.
 //!
-//! This module is the intended public surface; the rest of the crate is public
-//! for its own tests and binaries and makes no stability promise.
+//! This module is the crate's public surface, the one semantic versioning
+//! covers; the rest of the crate is public for the `agent86` binary and makes no
+//! stability promise.
 
 use crate::agent::Harness;
 use crate::agents_def::Specialties;

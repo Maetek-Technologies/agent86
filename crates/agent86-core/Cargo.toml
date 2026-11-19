@@ -5,12 +5,20 @@
 [package]
 name = "agent86-core"
 description = "The agent behind agent86: a safe agent runtime you can embed"
-publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/agent86-core"
+homepage = "https://maetek-technologies.github.io/agent86/"
+keywords = ["agent", "llm", "ai", "mcp", "sandbox"]
+categories = ["artificial-intelligence", "development-tools", "security"]
+# The tests read fixtures from the workspace's `tests/fixtures`, outside this
+# crate, so they are left out of the published package rather than shipped
+# broken; the example and the README's example (a doctest) stay.
+exclude = ["tests/"]
 
 # Both on by default, so `agent86-core` alone behaves as the CLI does; an
 # embedder that wants the lightest build turns them off with
@@ -67,6 +75,10 @@ zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+# docs.rs documents the default features, as `cargo add agent86-core` builds.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lints]
 workspace = true

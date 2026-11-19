@@ -70,4 +70,5 @@ What that means:
   - `os-keyring` gates the keyring stacks for each OS; without it a lookup reads as "no key stored".
   - `local-embeddings` gates candle and tokenizers; without it a `sentence-transformers:` spec falls back to the hash embedder with Python's `ImportError` note.
   - Both are on by default. Turned off, the library's dependency tree drops from 367 crates to 172, and CI runs its unit tests that way on every OS.
+- **Published (1.1.0).** `agent86-core` is on crates.io, published by the release workflow on each tag after the binary archives, at the same version as the CLI. Its documentation on docs.rs shows `sdk` only, and its README says that only `sdk` is covered by semantic versioning: a breaking change there needs a new major version, while the hidden tier may change in any release. The binary is not published.
 - **Narrowing later is still possible.** It can happen one surface at a time, by moving what a surface needs behind `sdk`. Each step shrinks the hidden tier without breaking the stable one.

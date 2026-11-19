@@ -123,7 +123,7 @@ An embedder that wants neither would write `agent86-core = { version = "…", de
   - Both packages take `rust-version`, `edition`, `license` and `repository` from `[workspace.package]`, so the MSRV stays in one place.
 - **Release:** `release.yml`'s `cargo build --release --locked --target …` at the root still builds the `agent86` binary, so the archives, provenance and npm packaging are unchanged.
 - **Versions:** `CARGO_PKG_VERSION` inside the library (the prompt's environment line, the web user agent, OTel `service.version`, the trace) still reads the shared workspace version.
-- **Publishing:** both crates stay `publish = false` in this PR. Publishing is the next step, after checking that the name `agent86-core` is free on crates.io.
+- **Publishing:** both crates stay `publish = false` in this PR. Publishing is the next step, after checking that the name `agent86-core` is free on crates.io. (Done for 1.1.0: the name was free, the library is published by `release.yml`'s `crate` job on a tag, and the binary stays `publish = false`.)
 
 ## Order of commits in the PR
 
