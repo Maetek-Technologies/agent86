@@ -56,7 +56,7 @@ What that means:
 
 Binding an API copies its shape into two more languages, so a few things are settled in `sdk` before the first slice, each in a 1.1.x patch release with Rust tests:
 
-- **Events that can grow.** `TurnEvent` was a public enum without `#[non_exhaustive]`, so a new variant was a breaking change for a Rust caller that matched every variant. It is now `#[non_exhaustive]` (done 2026-11-19, shipping in 1.1.1; see the settled questions below). That was itself a breaking change for such callers, made while the crate has few users rather than at 2.0.
+- **Events that can grow.** `TurnEvent` was a public enum without `#[non_exhaustive]`, so a new variant was a breaking change for a Rust caller that matched every variant. It is now `#[non_exhaustive]` (done 2026-11-19, shipping in 1.1.1; see the settled questions below). That was itself a breaking change for such callers, made while the crate has few users rather than at 2.0. `BuildError`, `RunError`, and `RunResult` got the same marker at the same time, so new error reasons and result fields are additive too.
 - **A blocking entry point or a runtime rule.** The bindings drive `Agent::run` from their own Tokio runtime. Its documentation should say which runtime flavors work (a turn that fans out sub-agents needs a multi-threaded runtime, as the tests do), so the bindings and Rust callers follow one rule.
 - **Async host callbacks in mind.** The callbacks are `Fn` called on the turn's thread, which is what makes the bridging above possible. That stays a documented guarantee of `sdk`, not an accident of its implementation.
 
