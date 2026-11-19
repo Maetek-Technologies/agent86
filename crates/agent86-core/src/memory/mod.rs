@@ -17,7 +17,11 @@
 
 pub mod embeddings;
 pub mod entries;
+// The local sentence-transformers model (candle, tokenizers) and the Hugging Face
+// cache it loads from, behind the `local-embeddings` feature.
+#[cfg(feature = "local-embeddings")]
 pub mod hub;
+#[cfg(feature = "local-embeddings")]
 pub mod sentence_transformers;
 pub mod working;
 

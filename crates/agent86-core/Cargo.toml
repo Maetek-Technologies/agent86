@@ -12,16 +12,35 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+# Both on by default, so `agent86-core` alone behaves as the CLI does; an
+# embedder that wants the lightest build turns them off with
+# `default-features = false`.
+[features]
+default = ["os-keyring", "local-embeddings"]
+# The OS keyring (Windows Credential Manager, the macOS Keychain, the Secret
+# Service), for provider keys and remembered secrets. Without it a lookup reads as
+# "no key stored". The embedding API never reads the keyring either way.
+os-keyring = [
+    "dep:keyring-core",
+    "dep:windows-native-keyring-store",
+    "dep:apple-native-keyring-store",
+    "dep:zbus-secret-service-keyring-store",
+]
+# The local sentence-transformers embedder (candle and tokenizers) for long-term
+# memory. Without it a `sentence-transformers:` spec falls back to the offline
+# hash embedder with a note; the embedding API's `Memory::open` uses that one.
+local-embeddings = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+
 [dependencies]
-candle-core.workspace = true
-candle-nn.workspace = true
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
 encoding_rs.workspace = true
 futures-util.workspace = true
 globset.workspace = true
 ignore.workspace = true
 indexmap.workspace = true
 jiff.workspace = true
-keyring-core.workspace = true
+keyring-core = { workspace = true, optional = true }
 md5.workspace = true
 regex.workspace = true
 reqwest.workspace = true
@@ -31,20 +50,20 @@ serde_json.workspace = true
 sha1_smol.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokenizers.workspace = true
+tokenizers = { workspace = true, optional = true }
 tokio.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 url.workspace = true
 
 [target."cfg(windows)".dependencies]
-windows-native-keyring-store.workspace = true
+windows-native-keyring-store = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store.workspace = true
+apple-native-keyring-store = { workspace = true, optional = true }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-zbus-secret-service-keyring-store.workspace = true
+zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

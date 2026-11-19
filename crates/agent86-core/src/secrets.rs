@@ -186,7 +186,7 @@ fn compound_target(account: &str, service: &str) -> String {
     format!("{account}@{service}")
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "os-keyring", windows))]
 mod os_keyring {
     use super::{
         delete_windows_credential, resolve_windows_credential, store_windows_credential,
@@ -265,7 +265,7 @@ mod os_keyring {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "os-keyring", target_os = "macos"))]
 mod os_keyring {
     use keyring_core::api::CredentialStoreApi;
     use keyring_core::Entry;
@@ -294,7 +294,7 @@ mod os_keyring {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(feature = "os-keyring", unix, not(target_os = "macos")))]
 mod os_keyring {
     use keyring_core::api::CredentialStoreApi;
     use keyring_core::Entry;
@@ -323,9 +323,14 @@ mod os_keyring {
     }
 }
 
-#[cfg(not(any(windows, unix)))]
+/// No keyring: an unsupported platform, or a build without the `os-keyring`
+/// feature. Lookups read as "no key stored", as a headless machine's do.
+#[cfg(any(not(feature = "os-keyring"), not(any(windows, unix))))]
 mod os_keyring {
+    #[cfg(feature = "os-keyring")]
     const UNSUPPORTED: &str = "no OS keyring is supported on this platform";
+    #[cfg(not(feature = "os-keyring"))]
+    const UNSUPPORTED: &str = "agent86-core was built without the os-keyring feature";
 
     pub fn get_password(_service: &str, _account: &str) -> Option<String> {
         None
@@ -341,7 +346,7 @@ mod os_keyring {
 }
 
 /// Delete one keyring entry; a missing entry is `Ok(false)`, not an error.
-#[cfg(unix)]
+#[cfg(all(feature = "os-keyring", unix))]
 fn delete_entry(entry: keyring_core::Entry) -> Result<bool, String> {
     match entry.delete_credential() {
         Ok(()) => Ok(true),
