@@ -1,5 +1,6 @@
 //! The flight recorder: redaction, rotation, reading back, and OTLP export.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{ObservabilityConfig, RedactMode};

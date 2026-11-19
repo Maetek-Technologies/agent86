@@ -3,6 +3,7 @@
 //! task, its `allowed-tools` apply from the first step and end with the turn, and
 //! the turn is otherwise an ordinary one (trace, usage, saved messages, vault).
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::agent::Harness;

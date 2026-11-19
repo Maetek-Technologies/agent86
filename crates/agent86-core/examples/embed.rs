@@ -4,16 +4,14 @@
 //! ```bash
 //! # A local server (Ollama's OpenAI-compatible endpoint, llama.cpp, vLLM, LM Studio):
 //! AGENT86_EXAMPLE_BASE_URL=http://localhost:11434/v1 AGENT86_EXAMPLE_MODEL=llama3.1 \
-//!   cargo run --example embed -- "What is in Cargo.toml, and what's the weather in Oslo?"
+//!   cargo run -p agent86-core --example embed -- "What is in Cargo.toml, and what's the weather in Oslo?"
 //! # OpenAI itself: set OPENAI_API_KEY and AGENT86_EXAMPLE_MODEL.
 //! # Keep sessions and memory in a file, and resume one by its id:
-//! AGENT86_EXAMPLE_MEMORY=./example-memory.db AGENT86_EXAMPLE_SESSION=<id> cargo run --example embed
+//! AGENT86_EXAMPLE_MEMORY=./example-memory.db AGENT86_EXAMPLE_SESSION=<id> cargo run -p agent86-core --example embed
 //! ```
 
-use agent86::agent::TurnEvent;
-use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
-use agent86::sdk::{Agent, Builtins, FnTool, Memory};
-use agent86::types::ApprovalMode;
+use agent86_core::sdk::providers::{OpenAiConfig, OpenAiProvider};
+use agent86_core::sdk::{Agent, ApprovalMode, Builtins, FnTool, Memory, TurnEvent};
 use serde_json::json;
 use std::sync::Arc;
 

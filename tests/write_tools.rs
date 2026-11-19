@@ -1,5 +1,6 @@
 //! `write_file`, `edit_file`, their approval previews, and the approval gate.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::approval::{build_preview, ApprovalGate, ApprovalPreview, ApprovalPrompt};

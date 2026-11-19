@@ -1,3 +1,4 @@
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::pricing::PriceTable;

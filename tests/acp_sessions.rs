@@ -6,6 +6,7 @@
 //! the list shows. The home directory is a temporary one (`with_home`), so nothing
 //! here touches the real `~/.agent86`.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::acp::harness::HarnessBackend;

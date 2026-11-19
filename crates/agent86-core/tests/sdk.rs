@@ -1,17 +1,15 @@
-//! The embedding API (`agent86::sdk`, beyond Python): an agent built from a
+//! The embedding API (`agent86_core::sdk`, beyond Python): an agent built from a
 //! provider and tools the caller writes, with no config file, home directory,
 //! keyring, or network.
 
 mod support;
 
-use agent86::agent::TurnEvent;
-use agent86::provider::{DeltaStream, Provider, ProviderError};
-use agent86::sdk::{
-    Agent, BuildError, Builtins, Conversation, FnTool, LimitKind, McpServer, Memory, Model, Otel,
-    RunError, SubAgents, Turn,
+use agent86_core::sdk::providers::{
+    Completion, CompletionDelta, CompletionRequest, DeltaStream, Provider, ProviderError,
 };
-use agent86::types::{
-    ApprovalMode, Completion, CompletionDelta, CompletionRequest, Role, ToolCall, Usage,
+use agent86_core::sdk::{
+    Agent, ApprovalMode, BuildError, Builtins, Conversation, FnTool, LimitKind, McpServer, Memory,
+    Model, Otel, Role, RunError, SubAgents, ToolCall, Turn, TurnEvent, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -429,8 +427,8 @@ fn python() -> Option<&'static str> {
 
 /// The stdlib-only fixture server in `mode`.
 fn fixture(mode: &str) -> Option<McpServer> {
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mcp/server.py")
+    let script = support::fixtures_dir()
+        .join("mcp/server.py")
         .display()
         .to_string();
     Some(McpServer::stdio(python()?, [script, mode.to_owned()]))

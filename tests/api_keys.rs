@@ -2,6 +2,7 @@
 //!
 //! These tests use an in-memory store; they never read the real OS keyring.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, ConfigPaths, Overrides};

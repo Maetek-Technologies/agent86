@@ -8,6 +8,7 @@
 //! stored as Python `repr` strings: `serde_json`'s float parsing is not always
 //! correctly rounded, and these comparisons are bit-exact.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::memory::embeddings::{build_embedder, pack, Embedder, HashingEmbedder};

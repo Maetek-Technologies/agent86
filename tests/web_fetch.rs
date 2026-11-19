@@ -1,5 +1,6 @@
 //! `web_fetch`: SSRF vetting, redirects, content handling, and HTML reduction.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::tools::web::{block_reason, html_to_text};

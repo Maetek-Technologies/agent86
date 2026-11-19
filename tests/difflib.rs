@@ -1,5 +1,6 @@
 //! The `difflib` port must reproduce CPython's diffs exactly.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::difflib::{splitlines, unified_diff};

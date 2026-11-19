@@ -6,6 +6,7 @@
 //! The keyring is an in-memory fake and the home directory a temporary one, so
 //! nothing here touches the real keyring or the real `~/.agent86`.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::acp::harness::HarnessBackend;

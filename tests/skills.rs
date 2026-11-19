@@ -2,6 +2,7 @@
 //! precedence, `SKILL.md` parsing, the system prompt section, progressive
 //! disclosure, and the `allowed-tools` restriction.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, Config, ConfigPaths, Overrides};

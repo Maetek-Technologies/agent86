@@ -1,6 +1,7 @@
 //! The Anthropic provider against the local mock server: the Messages API event
 //! stream, tool use, cache-aware usage, the SDK's retries, and Python's messages.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, ConfigPaths, Overrides};

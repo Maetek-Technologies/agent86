@@ -1,5 +1,6 @@
 //! The guardrail scanners must match Python's patterns and results exactly.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::guardrails::{

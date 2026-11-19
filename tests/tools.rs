@@ -1,5 +1,6 @@
 //! The read-only workspace tools must behave like Python's `read_file` and `list_dir`.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::tools::{builtin_registry, display_path, ToolContext};

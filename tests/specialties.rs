@@ -3,6 +3,7 @@
 //! nesting, the specialty's own model and budget, project-file approval, attached
 //! context, and skills both ways.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::agent::Harness;

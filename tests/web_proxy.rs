@@ -4,6 +4,7 @@
 //!
 //! In a file of its own: it sets `HTTP_PROXY` for the whole process.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::tools::{builtin_registry, ToolContext};

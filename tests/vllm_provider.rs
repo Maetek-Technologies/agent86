@@ -4,6 +4,7 @@
 //! local mock server with fixtures built from vLLM's source (`tests/fixtures/vllm`),
 //! a fake key store, and key variables nothing sets.
 
+#[path = "../crates/agent86-core/tests/support/mod.rs"]
 mod support;
 
 use agent86::config::{load_config, Config, ConfigPaths, Overrides, ProjectTrust, ProviderConfig};
