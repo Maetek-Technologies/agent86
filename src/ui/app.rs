@@ -173,6 +173,9 @@ impl From<TurnEvent<'_>> for UiEvent {
                 summary: summarize(result),
                 result: observation.to_owned(),
             },
+            // `TurnEvent` is `#[non_exhaustive]`: a kind added later is shown as the
+            // text it adds to the output until it gets an arm of its own here.
+            other => Self::Text(other.text().to_owned()),
         }
     }
 }

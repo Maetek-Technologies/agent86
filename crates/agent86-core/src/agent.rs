@@ -139,7 +139,12 @@ impl CancelToken {
 
 /// One thing a running turn reports. Each event carries the text that `run` and the
 /// plain REPL stream for it, so every surface sees the same output.
+///
+/// `#[non_exhaustive]` (since 1.1.1, ADR 0004): later releases add kinds of event,
+/// so a `match` outside this crate needs a `_` arm. [`TurnEvent::text`] is what any
+/// event adds to the turn's output, whatever its kind.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum TurnEvent<'a> {
     /// The model's text (or the ingress guardrail's refusal, which stands in for it).
     Text(&'a str),
