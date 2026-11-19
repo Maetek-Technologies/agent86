@@ -96,6 +96,7 @@ Version 1.1.0 (2026-11-19) does everything the Python version did, and more; [do
 - [x] 1.1.0: the embedding framework, `agent86-core`, a library for building your own agents on agent86's harness, with everything 1.0.24 has, on crates.io (see [ADR 0003](docs/adr/0003-embeddable-agent-api.md))
 - [ ] 1.1.1: scheduled jobs, which the agent schedules for itself and a per-user OS timer runs with no session open, pausing at an approval instead of failing (planned, see [docs/scheduling.md](docs/scheduling.md))
 - [ ] 1.1.2: vault secrets (`${secret:NAME}`) in MCP server settings (planned; the release roadmap is in [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md))
+- [ ] 1.2.0 and 1.2.1: Python and TypeScript bindings for the library, as `agent86-core` on PyPI and `@maetek/agent86-core` on npm (proposed, see [ADR 0004](docs/adr/0004-python-and-typescript-bindings.md))
 
 Notes for every release are in [docs/releases](docs/releases).
 
