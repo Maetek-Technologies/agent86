@@ -35,8 +35,11 @@
 //! breaker, the workspace jail, the approval gate (side-effecting calls with
 //! nobody to ask are declined), the guardrails, the secret vault's redaction,
 //! parallel read-only tool calls, context fitting and compaction, and the
-//! [`TurnEvent`] stream. What it leaves out for now: MCP servers, long-term
-//! memory, skills, sub-agents, triage routing, and OpenTelemetry, each of which
+//! [`TurnEvent`] stream. On request it adds MCP servers ([`McpServer`], values
+//! taken literally, never expanded from the environment or the keyring) and
+//! long-term memory ([`Memory`]: sessions saved after every step, past turns
+//! recalled into similar later ones, `remember` and `recall`). What it leaves out
+//! for now: skills, sub-agents, triage routing, and OpenTelemetry, each of which
 //! the CLI builds from config in [`crate::setup`].
 //!
 //! This module is the intended public surface; the rest of the crate is public
@@ -44,17 +47,23 @@
 
 use crate::agent::{CancelToken, Harness, HarnessError, TurnEvent};
 use crate::approval::{ApprovalGate, ApprovalPreview};
-use crate::config::{builtin_config, GuardrailsConfig, LimitsConfig, ObservabilityConfig};
+use crate::config::{
+    builtin_config, GuardrailsConfig, LimitsConfig, McpServerConfig, ObservabilityConfig,
+};
 use crate::guardrails::Guardrails;
+use crate::mcp::{var_ref_names, McpManager};
+use crate::memory::embeddings::Embedder;
 use crate::observability::Recorder;
 use crate::provider::Provider;
-use crate::session::AgentState;
+use crate::secrets::NoSecretStore;
+use crate::session::{AgentState, SessionStore};
 use crate::tools::sandbox::Executor;
 use crate::tools::{exec, files, search, web, Tool, ToolContext, ToolError, ToolRegistry};
 use crate::turn::{final_answer, TurnSummary};
 use crate::types::{ApprovalMode, Message, Role, ToolResult, Usage};
-use serde_json::{Map, Value};
-use std::path::PathBuf;
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +96,14 @@ pub enum BuildError {
     Tool(String),
     #[error("could not open the trace directory: {0}")]
     Trace(String),
+    #[error("MCP server '{name}' failed to start: {reason}")]
+    Mcp { name: String, reason: String },
+    #[error("a session to resume needs memory; call AgentBuilder::memory")]
+    SessionWithoutMemory,
+    #[error("no session '{0}' in memory")]
+    SessionNotFound(String),
+    #[error("memory could not be read: {0}")]
+    Memory(String),
 }
 
 /// Decides a side-effecting call: given the tool's name and what the call would
@@ -108,6 +125,9 @@ pub struct AgentBuilder {
     max_output_tokens: u32,
     trace_dir: Option<PathBuf>,
     tool_timeout: Duration,
+    mcp_servers: Vec<(String, McpServer)>,
+    memory: Option<Memory>,
+    session: Option<String>,
 }
 
 impl Default for AgentBuilder {
@@ -127,6 +147,9 @@ impl Default for AgentBuilder {
             guardrails: config.guardrails,
             context_window: DEFAULT_CONTEXT_WINDOW,
             trace_dir: None,
+            mcp_servers: Vec::new(),
+            memory: None,
+            session: None,
         }
     }
 }
@@ -239,7 +262,33 @@ impl AgentBuilder {
         self
     }
 
-    /// Assemble the agent. Reads nothing but the workspace path.
+    /// Start the MCP server `server` with the agent and offer its tools, named
+    /// `mcp__<name>__<tool>` and asked about unless the server marks them
+    /// read-only. A server that fails to start fails [`AgentBuilder::build`]; the
+    /// servers stop when the agent is dropped.
+    pub fn mcp_server(mut self, name: impl Into<String>, server: McpServer) -> Self {
+        self.mcp_servers.push((name.into(), server));
+        self
+    }
+
+    /// Give the agent long-term memory: the session is saved after every step and
+    /// at the end of each turn, finished turns are recalled into similar later
+    /// ones, and the model gets `remember` and `recall`. One [`Memory`] can be
+    /// shared by several agents.
+    pub fn memory(mut self, memory: Memory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Continue the session `id` from [`AgentBuilder::memory`] (any session saved
+    /// there, by this API, `agent86`, or Python's agent86).
+    pub fn session(mut self, id: impl Into<String>) -> Self {
+        self.session = Some(id.into());
+        self
+    }
+
+    /// Assemble the agent. Reads nothing but the workspace path, the memory
+    /// database when one is given, and starts the MCP servers given.
     pub fn build(self) -> Result<Agent, BuildError> {
         let provider = self.provider.ok_or(BuildError::MissingProvider)?;
         let workspace = self.workspace.ok_or(BuildError::MissingWorkspace)?;
@@ -254,6 +303,33 @@ impl AgentBuilder {
         for tool in self.tools {
             registry.register(tool).map_err(BuildError::Tool)?;
         }
+
+        let store = self.memory.as_ref().map(|memory| memory.store.clone());
+        let state = match (&self.session, &store) {
+            (None, _) => AgentState::new(),
+            (Some(_), None) => return Err(BuildError::SessionWithoutMemory),
+            (Some(id), Some(store)) => store
+                .load(id)
+                .map_err(|error| BuildError::Memory(error.0))?
+                .ok_or_else(|| BuildError::SessionNotFound(id.clone()))?,
+        };
+        if let Some(memory) = &self.memory {
+            let (episodes, sessions, days) = memory.retention;
+            store
+                .as_ref()
+                .expect("memory gives a store")
+                .enforce_retention(episodes, sessions, days)
+                .map_err(|error| BuildError::Memory(error.0))?;
+            for tool in [
+                Box::new(crate::tools::memory::RememberTool) as Box<dyn Tool>,
+                Box::new(crate::tools::memory::RecallTool),
+            ] {
+                registry.register(tool).map_err(BuildError::Tool)?;
+            }
+        }
+        context.memory = store.clone();
+
+        let mcp = start_mcp(&self.mcp_servers, &registry)?;
 
         let recorder = match &self.trace_dir {
             None => Recorder::disabled(),
@@ -300,8 +376,8 @@ impl AgentBuilder {
             gate: ApprovalGate::new(self.approval, self.approver),
             guardrails: Guardrails::new(&self.guardrails),
             recorder,
-            mcp: None,
-            memory: None,
+            mcp,
+            memory: store,
             cancel: Default::default(),
             subagents: Default::default(),
         };
@@ -310,10 +386,210 @@ impl AgentBuilder {
             .context
             .secrets
             .set_queue(harness.gate.queue.clone());
-        Ok(Agent {
-            harness,
-            state: AgentState::new(),
+        Ok(Agent { harness, state })
+    }
+}
+
+/// Start `servers` on a manager attached to `registry`, failing on the first that
+/// does not start or whose tools collide; dropping the manager stops the rest.
+fn start_mcp(
+    servers: &[(String, McpServer)],
+    registry: &ToolRegistry,
+) -> Result<Option<Arc<McpManager>>, BuildError> {
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let manager = Arc::new(McpManager::empty(&builtin_config()));
+    manager.attach(registry);
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, server) in servers {
+        let failed = |reason: String| BuildError::Mcp {
+            name: name.clone(),
+            reason,
+        };
+        if seen.contains(&name.as_str()) {
+            return Err(failed("another server was given the same name".to_owned()));
+        }
+        seen.push(name);
+        let mut config = server.config.clone();
+        config.resolve_transport().map_err(failed)?;
+        manager
+            .start_server(
+                name,
+                &config,
+                &server.literal_refs(),
+                &NoSecretStore,
+                config.connect_timeout_s,
+            )
+            .map_err(failed)?;
+        let (_, collisions) = manager.mount(name);
+        if !collisions.is_empty() {
+            return Err(BuildError::Tool(format!(
+                "MCP server '{name}' offers tools already taken: {}",
+                collisions.join(", ")
+            )));
+        }
+    }
+    Ok(Some(manager))
+}
+
+/// An MCP server for [`AgentBuilder::mcp_server`]. Every value (arguments,
+/// environment, URL, headers) is used exactly as given: a `${VAR}` in one is
+/// never expanded from the process's environment or the keyring, as it would be
+/// in a config file, so pass resolved values.
+#[derive(Debug, Clone)]
+pub struct McpServer {
+    config: McpServerConfig,
+}
+
+impl McpServer {
+    fn from(value: Value) -> Self {
+        Self {
+            config: serde_json::from_value(value).expect("a server config always deserializes"),
+        }
+    }
+
+    /// A server agent86 starts as `command` with `args`, speaking MCP on its
+    /// standard streams. It gets agent86's scrubbed environment plus
+    /// [`McpServer::env`], never the whole of this process's.
+    pub fn stdio<S: Into<String>>(
+        command: impl Into<String>,
+        args: impl IntoIterator<Item = S>,
+    ) -> Self {
+        let args: Vec<String> = args.into_iter().map(Into::into).collect();
+        Self::from(json!({"command": command.into(), "args": args, "transport": "stdio"}))
+    }
+
+    /// A server at `url` over streamable HTTP.
+    pub fn http(url: impl Into<String>) -> Self {
+        Self::from(json!({"url": url.into(), "transport": "http"}))
+    }
+
+    /// A server at `url` over the older SSE transport.
+    pub fn sse(url: impl Into<String>) -> Self {
+        Self::from(json!({"url": url.into(), "transport": "sse"}))
+    }
+
+    /// Set an environment variable for a stdio server.
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.env.insert(name.into(), value.into());
+        self
+    }
+
+    /// Send a header with every request to a remote server.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// How long the server has to start and list its tools (30 seconds by default).
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout_s = timeout.as_secs_f64();
+        self
+    }
+
+    /// How long one tool call may take (120 seconds by default).
+    pub fn call_timeout(mut self, timeout: Duration) -> Self {
+        self.config.call_timeout_s = timeout.as_secs_f64();
+        self
+    }
+
+    /// The most characters of a result the model is shown (8000 by default).
+    pub fn max_result_chars(mut self, chars: usize) -> Self {
+        self.config.max_result_chars = chars;
+        self
+    }
+
+    /// Every `${VAR}` in the values mapped to itself, so the manager's expansion
+    /// leaves it as written (overrides win over the environment and the keyring).
+    fn literal_refs(&self) -> HashMap<String, String> {
+        let config = &self.config;
+        config
+            .args
+            .iter()
+            .chain(config.env.values())
+            .chain(config.url.iter())
+            .chain(config.headers.values())
+            .flat_map(|text| var_ref_names(text))
+            .map(|name| (name.clone(), format!("${{{name}}}")))
+            .collect()
+    }
+}
+
+/// Long-term memory for [`AgentBuilder::memory`]: agent86's SQLite memory
+/// database (the same file and schema the CLI uses, so its sessions and facts are
+/// shared), opened once and cheap to clone.
+#[derive(Clone)]
+pub struct Memory {
+    store: SessionStore,
+    retention: (i64, i64, f64),
+}
+
+impl std::fmt::Debug for Memory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Memory")
+            .field("retention", &self.retention)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Memory {
+    /// Open (creating if needed) the database at `path`, embedding with the
+    /// offline hashing embedder (`hash:256`), which needs no model download.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, BuildError> {
+        Self::wrap(SessionStore::open(path.as_ref()))
+    }
+
+    /// [`Memory::open`] with another embedder, such as the sentence-transformers
+    /// model `crate::memory::embeddings::build_embedder` loads. Episodes and facts
+    /// written with one embedder are only found again with the same one.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<Self, BuildError> {
+        Self::wrap(SessionStore::open_with(path.as_ref(), embedder))
+    }
+
+    /// A database that lives only as long as this value and its clones.
+    pub fn in_memory() -> Result<Self, BuildError> {
+        Self::open(":memory:")
+    }
+
+    fn wrap(store: Result<SessionStore, crate::session::StoreError>) -> Result<Self, BuildError> {
+        let memory = builtin_config().memory;
+        Ok(Self {
+            store: store.map_err(|error| BuildError::Memory(error.0))?,
+            retention: (
+                memory.retention_max_episodes,
+                memory.retention_max_sessions,
+                memory.retention_max_age_days,
+            ),
         })
+    }
+
+    /// Keep at most `episodes` episodes and `sessions` sessions, and none older
+    /// than `max_age_days` (`0` for no age limit), pruned when an agent is built
+    /// (1000, 500, and no age limit by default). Pinned entries are kept.
+    pub fn retention(mut self, episodes: i64, sessions: i64, max_age_days: f64) -> Self {
+        self.retention = (episodes, sessions, max_age_days);
+        self
+    }
+
+    /// The sessions saved here, newest first: (id, title).
+    pub fn sessions(&self, limit: usize) -> Result<Vec<(String, Option<String>)>, BuildError> {
+        Ok(self
+            .store
+            .recent_sessions(limit)
+            .map_err(|error| BuildError::Memory(error.0))?
+            .into_iter()
+            .map(|session| (session.session_id, session.title))
+            .collect())
+    }
+
+    /// The store underneath, for what this type does not cover yet (facts,
+    /// episodes, pins). Its API makes no stability promise.
+    pub fn store(&self) -> &SessionStore {
+        &self.store
     }
 }
 
@@ -385,7 +661,13 @@ impl Agent {
         let output = self
             .harness
             .run_turn_events(&mut self.state, goal, goal, &mut on_event)
-            .await?;
+            .await;
+        // Saved after a failed turn too, as the CLI does; a failed write loses this
+        // save, never the turn (the harness saved after every step already).
+        if let Some(store) = &self.harness.memory {
+            let _ = store.persist(&self.state);
+        }
+        let output = output?;
         Ok(RunResult {
             answer: final_answer(&self.state.messages).to_owned(),
             output,
@@ -411,6 +693,21 @@ impl Agent {
     pub fn with_state(mut self, state: AgentState) -> Self {
         self.state = state;
         self
+    }
+
+    /// The session's id, under which [`AgentBuilder::memory`] saves it.
+    pub fn session_id(&self) -> &str {
+        &self.state.session_id
+    }
+
+    /// What the MCP servers reported (a server that dropped, reconnected, or
+    /// changed its tools), oldest first.
+    pub fn notes(&self) -> Vec<String> {
+        self.harness
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.notes())
+            .unwrap_or_default()
     }
 
     /// The names of the tools the model is offered.

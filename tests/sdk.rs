@@ -4,14 +4,15 @@
 
 use agent86::agent::TurnEvent;
 use agent86::provider::{DeltaStream, Provider, ProviderError};
-use agent86::sdk::{Agent, BuildError, Builtins, FnTool};
+use agent86::sdk::{Agent, BuildError, Builtins, FnTool, McpServer, Memory};
 use agent86::types::{
     ApprovalMode, Completion, CompletionDelta, CompletionRequest, Role, ToolCall, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A provider written against the public trait: it answers each request with
 /// the next scripted completion and keeps every request it was sent.
@@ -371,4 +372,187 @@ fn build_refuses_what_is_missing_or_taken() {
         ))
         .build();
     assert!(matches!(taken, Err(BuildError::Tool(_))));
+}
+
+// ---- MCP ------------------------------------------------------------------
+
+/// `python3` or `python`, or `None` (the MCP tests then skip, as `tests/mcp.rs`'s do).
+fn python() -> Option<&'static str> {
+    static FOUND: OnceLock<Option<&'static str>> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        ["python3", "python"].into_iter().find(|candidate| {
+            Command::new(candidate)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+    })
+}
+
+/// The stdlib-only fixture server in `mode`.
+fn fixture(mode: &str) -> Option<McpServer> {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp/server.py")
+        .display()
+        .to_string();
+    Some(McpServer::stdio(python()?, [script, mode.to_owned()]))
+}
+
+#[tokio::test]
+async fn mcp_tools_join_the_agent_and_go_through_the_gate() {
+    let Some(server) = fixture("normal") else {
+        return;
+    };
+    let workspace = Workspace::new("mcp");
+    let provider = Scripted::new(vec![
+        calls(&[
+            ("c1", "mcp__test__add", json!({"a": 2, "b": 3})),
+            ("c2", "mcp__test__echo", json!({"text": "hi"})),
+        ]),
+        text("five"),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .mcp_server("test", server)
+        .build()
+        .unwrap();
+    let names = agent.tool_names();
+    assert!(names.contains(&"mcp__test__add".to_owned()), "{names:?}");
+    agent.run("add").await.unwrap();
+    // `add` is marked read-only by the server; `echo` is not, and nobody can be asked.
+    assert_eq!(observation(&provider, "c1"), "5");
+    assert!(observation(&provider, "c2").starts_with("Not executed"));
+    // The MCP section of the system message names the server.
+    assert!(provider.requests()[0].messages[0].content.contains("test"));
+}
+
+#[tokio::test]
+async fn mcp_values_are_literal() {
+    let Some(server) = fixture("normal") else {
+        return;
+    };
+    let workspace = Workspace::new("mcp-literal");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "mcp__test__secret", json!({}))]),
+        text("ok"),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .approval(ApprovalMode::Auto)
+        .mcp_server("test", server.env("MCP_TEST_TOKEN", "${HOME}"))
+        .build()
+        .unwrap();
+    agent.run("show").await.unwrap();
+    let seen = observation(&provider, "c1");
+    assert!(seen.contains("token=${HOME}"), "{seen}");
+}
+
+#[test]
+fn an_mcp_server_that_fails_to_start_fails_the_build() {
+    let Some(server) = fixture("crash") else {
+        return;
+    };
+    let workspace = Workspace::new("mcp-crash");
+    let error = Agent::builder()
+        .provider(Scripted::new(Vec::new()))
+        .workspace(&workspace.0)
+        .mcp_server("broken", server)
+        .build()
+        .err()
+        .unwrap();
+    let BuildError::Mcp { name, reason } = error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(name, "broken");
+    assert!(reason.contains("imaginary_server"), "{reason}");
+
+    let twice = Agent::builder()
+        .provider(Scripted::new(Vec::new()))
+        .workspace(&workspace.0)
+        .mcp_server("same", fixture("normal").unwrap())
+        .mcp_server("same", fixture("normal").unwrap())
+        .build();
+    assert!(matches!(twice, Err(BuildError::Mcp { .. })));
+}
+
+// ---- memory ---------------------------------------------------------------
+
+#[tokio::test]
+async fn memory_saves_resumes_and_recalls() {
+    let workspace = Workspace::new("memory");
+    let memory = Memory::open(workspace.0.join("memory.db")).unwrap();
+    let provider = Scripted::new(vec![
+        calls(&[(
+            "c1",
+            "remember",
+            json!({"text": "The user prefers metric units."}),
+        )]),
+        text("Noted."),
+        text("You prefer metric."),
+        text("Converted."),
+    ]);
+    let build = || {
+        Agent::builder()
+            .provider(provider.clone())
+            .workspace(&workspace.0)
+            .memory(memory.clone())
+    };
+
+    let mut first = build().build().unwrap();
+    assert!(first.tool_names().contains(&"remember".to_owned()));
+    first
+        .run("Remember that I prefer metric units")
+        .await
+        .unwrap();
+    let id = first.session_id().to_owned();
+    drop(first);
+
+    // The session was saved, and resumes with its history.
+    let sessions = memory.sessions(10).unwrap();
+    assert_eq!(sessions[0].0, id);
+    let mut resumed = build().session(&id).build().unwrap();
+    resumed.run("What units do I prefer?").await.unwrap();
+    let contents: Vec<_> = provider.requests()[2]
+        .messages
+        .iter()
+        .map(|message| message.content.clone())
+        .collect();
+    assert!(contents.contains(&"Noted.".to_owned()), "{contents:?}");
+
+    // A new session gets the finished turn recalled into its system message.
+    let mut fresh = build().build().unwrap();
+    assert_ne!(fresh.session_id(), id);
+    fresh
+        .run("Remember that I prefer metric units")
+        .await
+        .unwrap();
+    let system = &provider.requests()[3].messages[0].content;
+    assert!(system.contains("Relevant past experience"), "{system}");
+}
+
+#[test]
+fn a_session_needs_memory_and_must_exist() {
+    let workspace = Workspace::new("memory-refusals");
+    let provider = Scripted::new(Vec::new());
+    assert_eq!(
+        Agent::builder()
+            .provider(provider.clone())
+            .workspace(&workspace.0)
+            .session("abc")
+            .build()
+            .err(),
+        Some(BuildError::SessionWithoutMemory)
+    );
+    assert_eq!(
+        Agent::builder()
+            .provider(provider)
+            .workspace(&workspace.0)
+            .memory(Memory::in_memory().unwrap())
+            .session("abc")
+            .build()
+            .err(),
+        Some(BuildError::SessionNotFound("abc".to_owned()))
+    );
 }

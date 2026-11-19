@@ -6,11 +6,13 @@
 //! AGENT86_EXAMPLE_BASE_URL=http://localhost:11434/v1 AGENT86_EXAMPLE_MODEL=llama3.1 \
 //!   cargo run --example embed -- "What is in Cargo.toml, and what's the weather in Oslo?"
 //! # OpenAI itself: set OPENAI_API_KEY and AGENT86_EXAMPLE_MODEL.
+//! # Keep sessions and memory in a file, and resume one by its id:
+//! AGENT86_EXAMPLE_MEMORY=./example-memory.db AGENT86_EXAMPLE_SESSION=<id> cargo run --example embed
 //! ```
 
 use agent86::agent::TurnEvent;
 use agent86::provider::openai::{OpenAiConfig, OpenAiProvider};
-use agent86::sdk::{Agent, Builtins, FnTool};
+use agent86::sdk::{Agent, Builtins, FnTool, Memory};
 use agent86::types::ApprovalMode;
 use serde_json::json;
 use std::sync::Arc;
@@ -51,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let mut agent = Agent::builder()
+    let mut builder = Agent::builder()
         .provider(Arc::new(provider))
         .workspace(std::env::current_dir()?)
         .builtins(Builtins::Files)
@@ -62,8 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[refused {tool}] {}", preview.summary);
             false
         })
-        .max_steps(12)
-        .build()?;
+        .max_steps(12);
+    // Optional long-term memory: the session is saved after every step, finished
+    // turns are recalled into similar later ones, and the model can `remember`.
+    if let Ok(path) = std::env::var("AGENT86_EXAMPLE_MEMORY") {
+        builder = builder.memory(Memory::open(path)?);
+        if let Ok(id) = std::env::var("AGENT86_EXAMPLE_SESSION") {
+            builder = builder.session(id);
+        }
+    }
+    let mut agent = builder.build()?;
 
     let result = agent
         .run_with_events(&goal, |event| match event {
@@ -75,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     println!();
+    eprintln!("[session {}]", agent.session_id());
     if let Some(turn) = result.turn {
         eprintln!(
             "[{} steps, {} tool calls, {} tokens in, {} out]",
