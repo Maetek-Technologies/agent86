@@ -35,6 +35,10 @@ Any provider works the same way: `anthropic:`, `openai:`, `google:`, `groq:`, or
 
 By default, every file write, command, and snippet asks for your approval before it runs.
 
+To start a local server and connect without a hosted API key, see the
+[local-model walkthrough](docs/local-models.md), including Ollama context
+settings and vLLM's tool-call requirements.
+
 ## What it does
 
 - **Works on your code.** It lists, reads, searches, writes, and edits files, runs shell commands and Python in a sandbox (or a throwaway Docker container), and fetches web pages, with every side effect behind your approval.
