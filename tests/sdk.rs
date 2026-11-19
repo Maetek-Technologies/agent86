@@ -2,9 +2,13 @@
 //! provider and tools the caller writes, with no config file, home directory,
 //! keyring, or network.
 
+mod support;
+
 use agent86::agent::TurnEvent;
 use agent86::provider::{DeltaStream, Provider, ProviderError};
-use agent86::sdk::{Agent, BuildError, Builtins, FnTool, McpServer, Memory};
+use agent86::sdk::{
+    Agent, BuildError, Builtins, FnTool, McpServer, Memory, Model, Otel, RunError, SubAgents, Turn,
+};
 use agent86::types::{
     ApprovalMode, Completion, CompletionDelta, CompletionRequest, Role, ToolCall, Usage,
 };
@@ -15,9 +19,15 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// A provider written against the public trait: it answers each request with
-/// the next scripted completion and keeps every request it was sent.
-#[derive(Default)]
+/// the next scripted completion and keeps every request it was sent. Copies made
+/// by `fresh` (for sub-agents on threads of their own) share the script.
+#[derive(Default, Clone)]
 struct Scripted {
+    shared: Arc<Script>,
+}
+
+#[derive(Default)]
+struct Script {
     replies: Mutex<VecDeque<Completion>>,
     requests: Mutex<Vec<CompletionRequest>>,
 }
@@ -25,13 +35,15 @@ struct Scripted {
 impl Scripted {
     fn new(replies: Vec<Completion>) -> Arc<Self> {
         Arc::new(Self {
-            replies: Mutex::new(replies.into()),
-            requests: Mutex::default(),
+            shared: Arc::new(Script {
+                replies: Mutex::new(replies.into()),
+                requests: Mutex::default(),
+            }),
         })
     }
 
     fn requests(&self) -> Vec<CompletionRequest> {
-        self.requests.lock().unwrap().clone()
+        self.shared.requests.lock().unwrap().clone()
     }
 }
 
@@ -45,8 +57,9 @@ impl Provider for Scripted {
     }
 
     fn stream(&self, request: CompletionRequest) -> DeltaStream<'_> {
-        self.requests.lock().unwrap().push(request);
+        self.shared.requests.lock().unwrap().push(request);
         let completion = self
+            .shared
             .replies
             .lock()
             .unwrap()
@@ -65,7 +78,7 @@ impl Provider for Scripted {
     }
 
     fn fresh(&self) -> Result<Arc<dyn Provider>, ProviderError> {
-        unreachable!("the embedding API runs no sub-agents")
+        Ok(Arc::new(self.clone()))
     }
 }
 
@@ -129,8 +142,13 @@ fn weather() -> FnTool {
 /// The content of the tool message answering `id` in the last request.
 fn observation(provider: &Scripted, id: &str) -> String {
     let requests = provider.requests();
-    let last = requests.last().unwrap();
-    last.messages
+    answer_in(requests.last().unwrap(), id)
+}
+
+/// The content of the tool message answering `id` in `request`.
+fn answer_in(request: &CompletionRequest, id: &str) -> String {
+    request
+        .messages
         .iter()
         .find(|message| message.role == Role::Tool && message.tool_call_id.as_deref() == Some(id))
         .map(|message| message.content.clone())
@@ -555,4 +573,273 @@ fn a_session_needs_memory_and_must_exist() {
             .err(),
         Some(BuildError::SessionNotFound("abc".to_owned()))
     );
+}
+
+// ---- skills ---------------------------------------------------------------
+
+/// A skills directory holding one skill, `weather-report`, limited to
+/// `get_weather`.
+fn skills_dir(workspace: &Workspace) -> PathBuf {
+    let dir = workspace.0.join("skills");
+    let skill = dir.join("weather-report");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: weather-report\ndescription: Writes a weather report.\nallowed-tools: get_weather\n---\n\nCall get_weather for each city, then write two lines.\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn skills_are_offered_and_run_directly_under_their_allowed_tools() {
+    let workspace = Workspace::new("skills");
+    let provider = Scripted::new(vec![
+        calls(&[
+            ("c1", "get_weather", json!({"city": "Oslo"})),
+            ("c2", "read_file", json!({"path": "x"})),
+        ]),
+        text("Oslo: sunny."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .builtins(Builtins::ReadOnly)
+        .tool(weather())
+        .skills_dir(skills_dir(&workspace))
+        .build()
+        .unwrap();
+    assert_eq!(agent.skills(), ["weather-report"]);
+    assert!(agent.tool_names().contains(&"use_skill".to_owned()));
+
+    let result = agent
+        .run(Turn::skill("weather-report", "Oslo"))
+        .await
+        .unwrap();
+    assert_eq!(result.answer, "Oslo: sunny.");
+    let first = &provider.requests()[0];
+    // The prompt lists the skill; the user's message leads with its instructions.
+    assert!(first.messages[0].content.contains("weather-report"));
+    let user = first
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .unwrap();
+    assert!(
+        user.content.contains("Call get_weather for each city"),
+        "{}",
+        user.content
+    );
+    // Its allowed-tools hold from the first step.
+    assert!(observation(&provider, "c1").contains("Sunny"));
+    let refused = observation(&provider, "c2");
+    assert!(
+        refused.contains("not permitted while the skill"),
+        "{refused}"
+    );
+
+    let unknown = agent.run(Turn::skill("nope", "x")).await.unwrap_err();
+    assert_eq!(unknown, RunError::UnknownSkill("nope".to_owned()));
+}
+
+// ---- sub-agents -----------------------------------------------------------
+
+/// A specialists directory holding `forecaster`, limited to `get_weather` and
+/// running on the model named `cheap`.
+fn specialists_dir(workspace: &Workspace, model: Option<&str>) -> PathBuf {
+    let dir = workspace.0.join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = model.map(|m| format!("model: {m}\n")).unwrap_or_default();
+    std::fs::write(
+        dir.join("forecaster.md"),
+        format!(
+            "---\nname: forecaster\ndescription: Forecasts the weather.\ntools: get_weather\n{model}---\n\nYou forecast the weather, briefly.\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("broken.md"), "---\nname: other\n---\n").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn delegate_runs_a_sub_agent_and_hands_back_its_answer() {
+    let workspace = Workspace::new("delegate");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "delegate", json!({"task": "Weather in Oslo?"}))]),
+        calls(&[("s1", "get_weather", json!({"city": "Oslo"}))]),
+        text("Sunny in Oslo."),
+        text("The sub-agent says it is sunny."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .tool(weather())
+        .subagents(SubAgents::new().without_built_ins())
+        .build()
+        .unwrap();
+    assert!(agent.tool_names().contains(&"delegate".to_owned()));
+    let result = agent.run("Ask a sub-agent about Oslo").await.unwrap();
+    assert_eq!(result.answer, "The sub-agent says it is sunny.");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    // The sub-agent got the task, and the main loop got its answer.
+    assert!(requests[1]
+        .messages
+        .iter()
+        .any(|m| m.role == Role::User && m.content.contains("Weather in Oslo?")));
+    assert!(answer_in(&requests[3], "c1").contains("Sunny in Oslo."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn specialists_run_directly_and_only_narrow_authority() {
+    let workspace = Workspace::new("specialists");
+    let provider = Scripted::new(vec![
+        calls(&[
+            ("s1", "get_weather", json!({"city": "Oslo"})),
+            ("s2", "read_file", json!({"path": "x"})),
+        ]),
+        text("Sunny."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .builtins(Builtins::ReadOnly)
+        .tool(weather())
+        .subagents(SubAgents::new().specialists_dir(specialists_dir(&workspace, None)))
+        .build()
+        .unwrap();
+    let names = agent.specialists();
+    for name in ["researcher", "reviewer", "planner", "forecaster"] {
+        assert!(names.contains(&name.to_owned()), "{names:?}");
+    }
+    // The file that does not parse was skipped, and said so.
+    assert!(
+        agent.notes().iter().any(|n| n.contains("broken.md")),
+        "{:?}",
+        agent.notes()
+    );
+
+    let result = agent
+        .run(Turn::specialist("forecaster", "Oslo tomorrow?"))
+        .await
+        .unwrap();
+    assert_eq!(result.answer, "Sunny.");
+    let first = &provider.requests()[0];
+    assert!(first.messages[0]
+        .content
+        .contains("You forecast the weather"));
+    let offered: Vec<_> = first.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(offered, ["get_weather"]);
+    let refused = observation(&provider, "s2");
+    assert!(
+        refused.contains("not permitted for the 'forecaster' sub-agent"),
+        "{refused}"
+    );
+    // The exchange is kept as an ordinary user and assistant message.
+    let last = agent.state().messages.last().unwrap();
+    assert_eq!(
+        (last.role, last.content.as_str()),
+        (Role::Assistant, "Sunny.")
+    );
+
+    let unknown = agent.run(Turn::specialist("nope", "x")).await.unwrap_err();
+    assert_eq!(unknown, RunError::UnknownSpecialist("nope".to_owned()));
+}
+
+// ---- named models and triage ----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_specialist_runs_on_its_named_model() {
+    let workspace = Workspace::new("named-model");
+    let main = Scripted::new(Vec::new());
+    let cheap = Scripted::new(vec![text("Cheap and sunny.")]);
+    let mut agent = Agent::builder()
+        .provider(main.clone())
+        .workspace(&workspace.0)
+        .tool(weather())
+        .model("cheap", Model::new(cheap.clone()).context_window(8_000))
+        .subagents(
+            SubAgents::new()
+                .without_built_ins()
+                .specialists_dir(specialists_dir(&workspace, Some("cheap"))),
+        )
+        .build()
+        .unwrap();
+    let result = agent
+        .run(Turn::specialist("forecaster", "Oslo?"))
+        .await
+        .unwrap();
+    assert_eq!(result.answer, "Cheap and sunny.");
+    assert_eq!((main.requests().len(), cheap.requests().len()), (0, 1));
+}
+
+#[tokio::test]
+async fn triage_sends_simple_asks_to_cheap_and_the_rest_to_frontier() {
+    let workspace = Workspace::new("triage");
+    let cheap = Scripted::new(vec![text("Paris."), text("Summary.")]);
+    let frontier = Scripted::new(vec![text("Here is the plan.")]);
+    let mut agent = Agent::builder()
+        .provider(Scripted::new(Vec::new()))
+        .workspace(&workspace.0)
+        .model("small", Model::new(cheap.clone()))
+        .model("big", Model::new(frontier.clone()))
+        .triage("small", "big")
+        .build()
+        .unwrap();
+    assert_eq!(
+        agent.run("Capital of France?").await.unwrap().answer,
+        "Paris."
+    );
+    assert_eq!(
+        agent.run("Design a migration plan").await.unwrap().answer,
+        "Here is the plan."
+    );
+    assert_eq!((cheap.requests().len(), frontier.requests().len()), (1, 1));
+
+    let missing = Agent::builder()
+        .provider(Scripted::new(Vec::new()))
+        .workspace(&workspace.0)
+        .model("small", Model::new(cheap.clone()))
+        .triage("small", "huge")
+        .build()
+        .err();
+    assert_eq!(missing, Some(BuildError::UnknownModel("huge".to_owned())));
+}
+
+// ---- OpenTelemetry --------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spans_reach_the_collector() {
+    let workspace = Workspace::new("otel");
+    let collector = support::MockServer::start(vec![support::Reply::Status {
+        status: 200,
+        headers: Vec::new(),
+        body: "{}".into(),
+    }])
+    .await;
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "get_weather", json!({"city": "Oslo"}))]),
+        text("Sunny."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .tool(weather())
+        .otel(Otel::otlp(format!("{}/v1/traces", collector.base_url)).header("x-team", "sdk"))
+        .build()
+        .unwrap();
+    agent.run("Weather?").await.unwrap();
+    drop(agent);
+    let requests = collector.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].request_line.starts_with("POST /v1/traces "));
+    assert_eq!(requests[0].header("x-team"), Some("sdk"));
+    let mut names: Vec<&str> = requests[0].body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|span| span["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["model_call", "model_call", "tool_call", "turn"]);
 }
