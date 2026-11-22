@@ -180,6 +180,11 @@ pub enum TurnEvent<'a> {
         notice: &'a str,
         summary: Option<&'a str>,
     },
+    /// Beyond Python (ADR 0005): one A2UI message a `render_ui` call drew,
+    /// validated, for the surface to draw. Sent after the call's `ToolCall` and
+    /// before its `ToolResult`, in order. Adds nothing to the turn's output.
+    #[cfg(feature = "agent86ui")]
+    Ui(&'a agent86_ui::AgentMessage),
 }
 
 impl<'a> TurnEvent<'a> {
@@ -192,6 +197,8 @@ impl<'a> TurnEvent<'a> {
             | Self::ToolResult { text, .. }
             | Self::Compacted { notice: text, .. } => text,
             Self::Thinking(_) | Self::Usage { .. } => "",
+            #[cfg(feature = "agent86ui")]
+            Self::Ui(_) => "",
         }
     }
 }
@@ -406,6 +413,14 @@ impl Harness {
         }
         if let Some(section) = ctx.secrets.prompt_section() {
             system.content = format!("{}\n\n{section}", system.content);
+        }
+        // Beyond Python: agent86UI's section, only where a renderer is and the
+        // context may draw.
+        #[cfg(feature = "agent86ui")]
+        if let Some(ui) = ctx.ui.as_deref() {
+            if ctx.allowed_tool(crate::agent86ui::RENDER_UI) {
+                system.content = format!("{}\n\n{}", system.content, ui.prompt_section());
+            }
         }
         if let Some(extra) = extra.filter(|extra| !extra.is_empty()) {
             system.content = format!("{}\n\n{extra}", system.content);
@@ -1199,6 +1214,16 @@ impl Harness {
             }
             for (call, (result, delegated)) in tool_calls.iter().zip(results) {
                 summary.tool_calls += 1;
+                // What render_ui drew goes to the surface, never to the session or
+                // the trace (the call's arguments already hold it).
+                #[cfg(feature = "agent86ui")]
+                let result = {
+                    let mut result = result;
+                    for drawn in crate::agent86ui::take_messages(&mut result.metadata) {
+                        emit(TurnEvent::Ui(&drawn));
+                    }
+                    result
+                };
                 // What a sub-agent spent is what this turn spent: in the summary, the
                 // step, and the cost cap, but not as one of this turn's steps.
                 summary.add_usage(&delegated);

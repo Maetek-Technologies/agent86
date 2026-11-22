@@ -20,6 +20,9 @@ pub struct ReadmeDoctests;
 
 #[doc(hidden)]
 pub mod agent;
+#[cfg(feature = "agent86ui")]
+#[doc(hidden)]
+pub mod agent86ui;
 #[doc(hidden)]
 pub mod agents_def;
 #[doc(hidden)]

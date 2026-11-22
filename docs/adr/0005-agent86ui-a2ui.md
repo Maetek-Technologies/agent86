@@ -117,7 +117,7 @@ What that means:
 ### Slices
 
 1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3 (done 2026-11-22; see the second amendment).
-2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment).
+2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth).
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
 4. **The ACP extension and its text fallback** (1.2.1).
 5. **The terminal renderer** (1.2.4).
@@ -192,3 +192,15 @@ Slice 2a ran the A2UI repository's `validator_v1_0` and `message_processor_v1_0`
   - an unknown function nested in a system function's arguments, named, 1.
 
   Left out for good: the reference SDKs' own renderer error code `RECURSION_LIMIT_EXCEEDED` (outside the specification's enum), agent functions (left out of the first version above), and 0.9 data models, 5 cases in all.
+
+## Amendment: the tool, the event, and the builder (2026-11-22)
+
+Slice 2b put `render_ui`, its prompt section, `TurnEvent::Ui`, and `AgentBuilder::ui` in place. Where it differs from the decision above:
+
+- **`agent86ui` is a default Cargo feature of `agent86-core`**, with `agent86-ui` an optional dependency, like `os-keyring` and `local-embeddings`; `--no-default-features` builds without either crate's dependencies (about 20 fewer). `TurnEvent::Ui`, `sdk::Ui`, `AgentBuilder::ui`, `BuildError::Ui`, and the `agent86_ui` re-exports exist only with it, which `#[non_exhaustive]` allows.
+- **`render_ui` is an ordinary registry tool, not intercepted like `delegate`.** The surfaces live on `ToolContext::ui` (a `UiSession`, shared by clones like the vault), so the call gets dispatch's redaction, scopes, and argument repair unchanged. On success the tool leaves the validated messages in its result's metadata; the loop takes them out and emits one `TurnEvent::Ui` each, after the call's `ToolCall` and before its `ToolResult`, so they never reach `state_json` or the trace (the call's arguments already hold them). It is not `parallel_safe`, so surfaces build in call order.
+- **The result** is `Rendered surface <id>.` (or `Deleted surface <id>.`) per surface, then each warning; a failed batch is an error result that says nothing was drawn and lists each problem with its code and path into `messages`.
+- **Sub-agents never draw:** `ToolContext::fork` drops the session and a sub-agent's specs leave the tool out, so a call it makes anyway is answered "No screen that can draw UI is attached here". Only the sdk declares a renderer in 1.2.0, so `run --agent` has none either.
+- **`Ui` is built, not written as a literal:** `Ui::basic()` or `Ui::new(catalogs)`, so `on_wait` (slice 2d) and the remote-media switch can be added without breaking callers. `wait` joins the tool's schema with the blocking path.
+- **The prompt section** is the general rules, then per catalog its `instructions` and a reference generated from its schemas (each component's properties with `?` for optional ones and their types, whether it accepts `@checks`, and each function's arguments and return type), added by `Harness::system_for` wherever the context may call `render_ui`.
+- **Publishing:** the release workflow's `crate` job now dry-runs both crates on pull requests and, on a tag, publishes `agent86-ui` and then `agent86-core`, each skipped if its version is already up. The workspace's `agent86-ui` dependency names a version (a published crate must), which each release sets to the release's version, and the crates.io token must be allowed to publish the new crate.

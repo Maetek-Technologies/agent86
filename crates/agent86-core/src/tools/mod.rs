@@ -10,6 +10,8 @@ pub mod delegate;
 pub mod exec;
 pub mod files;
 pub mod memory;
+#[cfg(feature = "agent86ui")]
+pub mod render_ui;
 pub mod sandbox;
 pub mod search;
 pub mod secret;
@@ -872,6 +874,11 @@ pub struct ToolContext {
     /// The sub-agent run this context belongs to (beyond Python), with its progress,
     /// so a question it asks can say who asks. Set when a sub-agent is spawned.
     pub subagent: Option<Arc<crate::subagent::SubagentRun>>,
+    /// The renderer the embedder declared (beyond Python; ADR 0005), for
+    /// `render_ui`: its catalogs and the surfaces drawn. Shared by clones;
+    /// sub-agent forks have none, since only the main loop draws.
+    #[cfg(feature = "agent86ui")]
+    pub ui: Option<Arc<crate::agent86ui::UiSession>>,
 }
 
 /// What a specialist sub-agent may do (beyond Python): its tools, approval mode,
@@ -977,6 +984,8 @@ impl ToolContext {
             worktree: None,
             card: None,
             subagent: None,
+            #[cfg(feature = "agent86ui")]
+            ui: None,
         })
     }
 
@@ -998,9 +1007,14 @@ impl ToolContext {
 
     /// A copy for a sub-agent: the same tools and jail, and its own active skill,
     /// starting as this context's, so what it activates restricts only itself.
+    /// It draws no UI: only the main loop has the renderer.
     pub fn fork(&self) -> Self {
         let mut forked = self.clone();
         forked.active_skill = Arc::new(std::sync::Mutex::new(self.active_skill()));
+        #[cfg(feature = "agent86ui")]
+        {
+            forked.ui = None;
+        }
         forked
     }
 

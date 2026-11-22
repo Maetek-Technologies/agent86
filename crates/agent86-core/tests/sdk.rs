@@ -1006,3 +1006,201 @@ async fn on_secret_request_answers_request_secret() {
         assert!(!format!("{request:?}").contains(TOKEN));
     }
 }
+
+// agent86UI (ADR 0005): the model draws through `render_ui` where the embedder
+// declared a renderer.
+
+#[cfg(feature = "agent86ui")]
+fn form_surface(components: Value) -> Value {
+    json!({"messages": [{"version": "1.0", "createSurface": {
+        "surfaceId": "form",
+        "catalogId": agent86_core::sdk::agent86_ui::BASIC_CATALOG_ID,
+        "components": components,
+        "dataModel": {"name": ""}
+    }}]})
+}
+
+#[cfg(feature = "agent86ui")]
+fn name_form() -> Value {
+    form_surface(json!([
+        {"id": "root", "component": "Column", "children": ["name", "ok"]},
+        {"id": "name", "component": "TextField", "label": "Name", "value": {"@path": "/name"}},
+        {"id": "ok", "component": "Button", "child": "ok_label",
+         "action": {"event": {"name": "submit", "context": {"name": {"@path": "/name"}}}}},
+        {"id": "ok_label", "component": "Text", "text": "OK"}
+    ]))
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn render_ui_draws_and_each_message_reaches_the_surface() {
+    use agent86_core::sdk::{AgentMessageKind, Ui};
+    let workspace = Workspace::new("ui-draw");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "render_ui", name_form())]),
+        text("I put up a form for your name."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    assert_eq!(agent.tool_names(), ["render_ui"]);
+
+    let mut seen = Vec::new();
+    let result = agent
+        .run_with_events("Ask me my name", |event| match event {
+            TurnEvent::ToolCall { call, .. } => seen.push(format!("call {}", call.name)),
+            TurnEvent::Ui(message) => {
+                let kind = match &message.kind {
+                    AgentMessageKind::CreateSurface(create) => {
+                        format!(
+                            "create {} ({} components)",
+                            create.surface_id,
+                            create.components.as_ref().map_or(0, Vec::len)
+                        )
+                    }
+                    other => format!("{other:?}"),
+                };
+                seen.push(format!("ui {kind}"));
+            }
+            TurnEvent::ToolResult { result, .. } => seen.push(format!("result {}", result.ok)),
+            _ => {}
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.answer, "I put up a form for your name.");
+    assert_eq!(
+        seen,
+        [
+            "call render_ui",
+            "ui create form (4 components)",
+            "result true"
+        ]
+    );
+    assert_eq!(observation(&provider, "c1"), "Rendered surface form.");
+
+    // The prompt teaches the catalog on every request; the drawn messages stay
+    // out of the conversation, whose tool call already holds them.
+    let requests = provider.requests();
+    let system = &requests[0].messages[0].content;
+    assert!(system.contains("## agent86UI: drawing UI with render_ui"));
+    assert!(system.contains("- TextField {"));
+    assert!(!agent
+        .conversation()
+        .to_json()
+        .contains("agent86ui_messages"));
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn an_invalid_batch_draws_nothing_and_tells_the_model_what_to_fix() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-invalid");
+    let broken = form_surface(json!([
+        {"id": "root", "component": "Column", "children": ["name"]},
+        {"id": "extra", "component": "Txt", "text": "hi"}
+    ]));
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "render_ui", broken)]),
+        calls(&[("c2", "render_ui", name_form())]),
+        text("Done."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    let mut drawn = 0;
+    let mut results = Vec::new();
+    agent
+        .run_with_events("Ask me my name", |event| match event {
+            TurnEvent::Ui(_) => drawn += 1,
+            TurnEvent::ToolResult { result, .. } => results.push(result.ok),
+            _ => {}
+        })
+        .await
+        .unwrap();
+    assert_eq!(results, [false, true]);
+    assert_eq!(drawn, 1, "only the corrected batch is drawn");
+    let requests = provider.requests();
+    let verdict = answer_in(&requests[1], "c1");
+    assert!(verdict.contains("nothing was drawn"), "{verdict}");
+    assert!(
+        verdict.contains("Unknown component type 'Txt'"),
+        "{verdict}"
+    );
+    // The batch failed as a whole, so the surface was never created and the
+    // corrected call could create it.
+    assert_eq!(answer_in(&requests[2], "c2"), "Rendered surface form.");
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn without_a_renderer_render_ui_is_not_offered() {
+    let workspace = Workspace::new("ui-none");
+    let provider = Scripted::new(vec![text("Hello.")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .build()
+        .unwrap();
+    agent.run("Hi").await.unwrap();
+    assert!(!agent.tool_names().contains(&"render_ui".to_owned()));
+    let requests = provider.requests();
+    assert!(!requests[0].messages[0].content.contains("agent86UI"));
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn sub_agents_never_draw() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-subagent");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "delegate", json!({"task": "Draw a form"}))]),
+        calls(&[("s1", "render_ui", name_form())]),
+        text("I could not draw."),
+        text("The sub-agent could not draw."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .subagents(SubAgents::new().without_built_ins())
+        .build()
+        .unwrap();
+    let mut drawn = 0;
+    agent
+        .run_with_events("Delegate a form", |event| {
+            if let TurnEvent::Ui(_) = event {
+                drawn += 1;
+            }
+        })
+        .await
+        .unwrap();
+    let requests = provider.requests();
+    // The main loop is offered the tool and its section; the sub-agent neither.
+    assert!(requests[0].tools.iter().any(|t| t.name == "render_ui"));
+    assert!(requests[1].tools.iter().all(|t| t.name != "render_ui"));
+    assert!(!requests[1].messages[0].content.contains("agent86UI"));
+    // A call it makes anyway draws nothing.
+    assert_eq!(drawn, 0);
+    assert!(answer_in(&requests[2], "s1").contains("No screen that can draw UI"));
+}
+
+#[cfg(feature = "agent86ui")]
+#[test]
+fn a_renderer_needs_a_catalog() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-empty");
+    let error = Agent::builder()
+        .provider(Scripted::new(vec![]))
+        .workspace(&workspace.0)
+        .ui(Ui::new([]))
+        .build()
+        .err()
+        .unwrap();
+    assert!(matches!(error, BuildError::Ui(_)), "{error}");
+}

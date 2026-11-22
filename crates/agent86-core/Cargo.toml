@@ -20,11 +20,11 @@ categories = ["artificial-intelligence", "development-tools", "security"]
 # broken; the example and the README's example (a doctest) stay.
 exclude = ["tests/"]
 
-# Both on by default, so `agent86-core` alone behaves as the CLI does; an
+# All on by default, so `agent86-core` alone behaves as the CLI does; an
 # embedder that wants the lightest build turns them off with
 # `default-features = false`.
 [features]
-default = ["os-keyring", "local-embeddings"]
+default = ["os-keyring", "local-embeddings", "agent86ui"]
 # The OS keyring (Windows Credential Manager, the macOS Keychain, the Secret
 # Service), for provider keys and remembered secrets. Without it a lookup reads as
 # "no key stored". The embedding API never reads the keyring either way.
@@ -38,8 +38,14 @@ os-keyring = [
 # memory. Without it a `sentence-transformers:` spec falls back to the offline
 # hash embedder with a note; the embedding API's `Memory::open` uses that one.
 local-embeddings = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+# agent86UI (ADR 0005): the `render_ui` tool, through which the model draws
+# A2UI 1.0 surfaces that a renderer the embedder declares draws natively,
+# validated by the `agent86-ui` crate. Without it neither the tool nor the
+# `ui` event exists.
+agent86ui = ["dep:agent86-ui"]
 
 [dependencies]
+agent86-ui = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 encoding_rs.workspace = true

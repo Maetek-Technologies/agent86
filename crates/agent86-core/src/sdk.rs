@@ -98,6 +98,12 @@ pub use crate::tools::{Tool, ToolContext, ToolError};
 pub use crate::turn::TurnSummary;
 pub use crate::types::{ApprovalMode, Role, ToolCall, ToolResult, ToolSpec, Usage};
 pub use crate::vault::SecretRequest;
+/// agent86UI's protocol layer (ADR 0005): A2UI 1.0 messages, catalogs, the
+/// validator, and the headless surface runtime a renderer can build on.
+#[cfg(feature = "agent86ui")]
+pub use agent86_ui;
+#[cfg(feature = "agent86ui")]
+pub use agent86_ui::{AgentMessage, AgentMessageKind, Catalog};
 pub use providers::Provider;
 
 /// Which of agent86's own tools an [`Agent`] offers, each set including the one
@@ -147,6 +153,10 @@ pub enum BuildError {
     /// the secret and why, never its value.
     #[error("the secret {name} was refused: {reason}")]
     Secret { name: String, reason: String },
+    /// [`AgentBuilder::ui`] was given no catalogs, or one that does not compile.
+    #[cfg(feature = "agent86ui")]
+    #[error("agent86UI could not be set up: {0}")]
+    Ui(String),
 }
 
 /// Why [`Agent::run`] failed.
@@ -200,6 +210,8 @@ pub struct AgentBuilder {
     otel: Option<Otel>,
     on_limit: Option<crate::limits::LimitPrompt>,
     on_secret: Option<SecretAsker>,
+    #[cfg(feature = "agent86ui")]
+    ui: Option<Ui>,
     /// Never printed: the builder has no `Debug`, and errors name only the secret.
     secrets: Vec<(String, String)>,
 }
@@ -231,6 +243,8 @@ impl Default for AgentBuilder {
             otel: None,
             on_limit: None,
             on_secret: None,
+            #[cfg(feature = "agent86ui")]
+            ui: None,
             secrets: Vec::new(),
         }
     }
@@ -443,6 +457,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Declare a renderer (ADR 0005): offer the model `render_ui`, through which
+    /// it draws interactive UI as A2UI 1.0 messages in the renderer's catalogs.
+    /// Each validated message reaches [`Agent::run`]'s callback as
+    /// [`TurnEvent::Ui`], for the program to draw with its own widgets (Google's
+    /// React and Lit renderers take them as they are). The system prompt gains a
+    /// section with the catalogs' instructions and components on every request;
+    /// sub-agents never draw.
+    #[cfg(feature = "agent86ui")]
+    pub fn ui(mut self, ui: Ui) -> Self {
+        self.ui = Some(ui);
+        self
+    }
+
     /// Hold a secret the program already has (an API token for a command the
     /// agent will run), with the same rules as [`AgentBuilder::on_secret_request`]:
     /// tools get it as the environment variable `name`, the model sees only
@@ -582,6 +609,20 @@ impl AgentBuilder {
                 })));
             registry
                 .register(Box::new(crate::tools::secret::RequestSecretTool))
+                .map_err(BuildError::Tool)?;
+        }
+        #[cfg(feature = "agent86ui")]
+        if let Some(ui) = self.ui {
+            if ui.catalogs.is_empty() {
+                return Err(BuildError::Ui(
+                    "a renderer needs at least one catalog".into(),
+                ));
+            }
+            let session = crate::agent86ui::UiSession::new(ui.catalogs)
+                .map_err(|error| BuildError::Ui(error.to_string()))?;
+            context.ui = Some(Arc::new(session));
+            registry
+                .register(Box::new(crate::tools::render_ui::RenderUiTool))
                 .map_err(BuildError::Tool)?;
         }
         let mut session_limits = crate::limits::SessionLimits::default();
@@ -816,6 +857,36 @@ impl Model {
     pub fn max_output_tokens(mut self, tokens: u32) -> Self {
         self.max_output_tokens = Some(tokens);
         self
+    }
+}
+
+/// A renderer for agent86UI ([`AgentBuilder::ui`]): the A2UI catalogs it
+/// draws, in order of preference.
+#[cfg(feature = "agent86ui")]
+#[derive(Debug, Clone)]
+pub struct Ui {
+    catalogs: Vec<Catalog>,
+}
+
+#[cfg(feature = "agent86ui")]
+impl Ui {
+    /// A renderer for the specification's basic catalog, which Google's
+    /// renderers implement.
+    pub fn basic() -> Self {
+        Self::new([Catalog::basic().clone()])
+    }
+
+    /// A renderer for `catalogs` (load one with [`Catalog::from_value`]), in
+    /// order of preference.
+    pub fn new(catalogs: impl IntoIterator<Item = Catalog>) -> Self {
+        Self {
+            catalogs: catalogs.into_iter().collect(),
+        }
+    }
+
+    /// The catalogs, in order of preference.
+    pub fn catalogs(&self) -> &[Catalog] {
+        &self.catalogs
     }
 }
 
