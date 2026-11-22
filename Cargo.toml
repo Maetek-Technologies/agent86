@@ -22,6 +22,9 @@ all = "warn"
 
 [workspace.dependencies]
 agent86-core = { path = "crates/agent86-core" }
+# agent86-core's agent86UI feature. A published crate names its dependencies'
+# versions, so this one is set to the workspace version at each release.
+agent86-ui = { path = "crates/agent86-ui", version = "1.1.0" }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29"
 crossterm_winapi = "0.9"

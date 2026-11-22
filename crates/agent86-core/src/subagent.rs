@@ -1271,6 +1271,9 @@ impl Harness {
             if !offered {
                 specs.retain(|spec| spec.name != DELEGATE);
             }
+            // Only the main loop draws UI (ADR 0005).
+            #[cfg(feature = "agent86ui")]
+            specs.retain(|spec| spec.name != crate::agent86ui::RENDER_UI);
             // The same window discipline as the main loop, with the system message
             // held out of the trim so it is never the part dropped, on the window
             // and cap of the model it runs on.

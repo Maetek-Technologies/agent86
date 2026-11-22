@@ -734,6 +734,10 @@ impl<'a> RunPrinter<'a> {
     fn event(&mut self, event: TurnEvent<'_>) {
         match (self.mode, event) {
             (None, _) | (_, TurnEvent::Thinking(_) | TurnEvent::Usage { .. }) => {}
+            // `run` declares no renderer, so `render_ui` is never offered and
+            // this never comes; were it to, it adds nothing to the output and is
+            // not a sign that tools follow.
+            (_, TurnEvent::Ui(_)) => {}
             (Some(RunOutputMode::Full), event) => {
                 // Raw write + flush streams partial lines reliably across terminals.
                 let mut stdout = std::io::stdout().lock();

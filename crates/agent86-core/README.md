@@ -55,10 +55,11 @@ A fuller example, with memory and resumable sessions, is [`examples/embed.rs`](h
 
 ## Features
 
-Both are on by default, so the library behaves as the CLI does. Turn them off with `default-features = false` for a lighter build (about 170 dependencies instead of 370).
+All three are on by default, so the library behaves as the CLI does. Turn them off with `default-features = false` for a lighter build (about 170 dependencies instead of 350).
 
 - `os-keyring`: the OS keyring (Windows Credential Manager, the macOS Keychain, the Secret Service), used by the CLI's config-driven assembly. The `sdk` never reads the keyring either way.
 - `local-embeddings`: the local sentence-transformers embedder for memory, on candle. Without it a `sentence-transformers:` embedder falls back to the offline hash embedder, which is what `sdk::Memory::open` uses anyway.
+- `agent86ui`: agent86UI, agent86's implementation of Google's A2UI 1.0 protocol (the `agent86-ui` crate): with `sdk::AgentBuilder::ui`, the model draws interactive UI (forms, choices, confirmations) through a `render_ui` tool, and each validated message reaches the program as `TurnEvent::Ui`, for it to draw with its own widgets.
 
 The minimum supported Rust version is 1.94.
 

@@ -12,7 +12,7 @@ on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml", "npm/**", "crates/agent86-core/Cargo.toml"]
+    paths: [".github/workflows/release.yml", "npm/**", "crates/agent86-core/Cargo.toml", "crates/agent86-ui/Cargo.toml"]
 
 permissions:
   contents: read
@@ -131,12 +131,13 @@ jobs:
       upload-assets: true
       provenance-name: agent86-${{ github.ref_name }}.intoto.jsonl
 
-  # The library on crates.io, once the release with the binary archives is out
+  # The libraries on crates.io, once the release with the binary archives is out
   # (on a pull request, where there is no release, a dry run after the builds).
-  # `cargo publish` packages the crate and builds it from the package alone
+  # `cargo publish` packages each crate and builds it from the package alone
   # before uploading. The token is a crates.io API token scoped to publishing
-  # `agent86-core`, kept as the repository secret `CARGO_REGISTRY_TOKEN`; the
-  # dry run needs none.
+  # `agent86-core` and `agent86-ui` (the first release of `agent86-ui` needs one
+  # that may publish a new crate), kept as the repository secret
+  # `CARGO_REGISTRY_TOKEN`; the dry run needs none.
   crate:
     needs: [build, release]
     if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'pull_request' || needs.release.result == 'success') }}
@@ -148,35 +149,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - name: Publish agent86-core
+      - name: Publish agent86-ui and agent86-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "${GITHUB_REF_TYPE}" != tag ]; then
-            # Packages and builds the crate as a publish would, without uploading;
-            # cargo only warns when this version is already on crates.io.
-            cargo publish -p agent86-core --locked --dry-run
+            # Packages and builds both crates as a publish would, without
+            # uploading; agent86-core's dependency on agent86-ui resolves to the
+            # one packaged beside it. Cargo only warns when a version is already
+            # on crates.io.
+            cargo publish -p agent86-ui -p agent86-core --locked --dry-run
             exit 0
           fi
           # A tag must name the version Cargo.toml has.
           if [ "${GITHUB_REF_NAME}" != "v$version" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml's $version"; exit 1
           fi
-          # A re-run after a publish that went through skips it: crates.io never
-          # takes the same version twice.
-          status=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -A 'agent86-release (https://github.com/Maetek-Technologies/agent86)' \
-            "https://crates.io/api/v1/crates/agent86-core/$version")
-          if [ "$status" = 200 ]; then
-            echo "agent86-core@$version is already published"
-            exit 0
-          fi
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
             echo "::error::the repository secret CARGO_REGISTRY_TOKEN is not set"; exit 1
           fi
-          cargo publish -p agent86-core --locked
+          # agent86-ui first, since agent86-core depends on it; cargo waits until
+          # the registry serves it before going on. A re-run after a publish that
+          # went through skips that crate: crates.io never takes the same version
+          # twice.
+          for crate in agent86-ui agent86-core; do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A 'agent86-release (https://github.com/Maetek-Technologies/agent86)' \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            if [ "$status" = 200 ]; then
+              echo "$crate@$version is already published"
+              continue
+            fi
+            cargo publish -p "$crate" --locked
+          done
 
   npm:
     needs: build
