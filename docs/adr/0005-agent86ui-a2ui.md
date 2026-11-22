@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — 2026-11-22 (drafted before any code; the release was settled the same day, and the first slice's crate and conformance tests are the prototype that settles the other open questions below)
+Accepted — 2026-11-22 (proposed the same day, before any code; the release was settled at review, and the first slice's crate and conformance tests settle the other open questions below)
 
 ## Context
 
