@@ -169,6 +169,71 @@ impl UiSession {
         self.runtime().apply(messages)
     }
 
+    /// Every surface up now as the one `createSurface` that draws it as it is,
+    /// for a program that reopens a session (or draws late) to bring its screen
+    /// up to date.
+    pub fn snapshot(&self) -> Vec<AgentMessage> {
+        self.runtime()
+            .snapshot()
+            .into_iter()
+            .filter_map(|message| serde_json::from_value(message).ok())
+            .collect()
+    }
+
+    /// Rebuild the surfaces from a session's history (ADR 0005: resume replays,
+    /// nothing is stored): every `render_ui` call that drew, in order, through
+    /// the same redaction, policy, and validation as when it ran. A call that
+    /// drew is one whose result is ok or opens with what the tool writes when it
+    /// draws (a waiting call the user dismissed reports a failure, yet drew).
+    /// Steps keep calls the history's compaction summarized away. Returns how
+    /// many calls were replayed.
+    pub fn replay(
+        &self,
+        state: &crate::session::AgentState,
+        ctx: &crate::tools::ToolContext,
+    ) -> usize {
+        let mut runtime = match Runtime::new(self.catalogs.clone()) {
+            Ok(runtime) => runtime,
+            Err(_) => return 0,
+        };
+        runtime.set_rules(RULES);
+        let mut replayed = 0;
+        for step in &state.steps {
+            for call in step.tool_calls.iter().filter(|call| call.name == RENDER_UI) {
+                let drew = step
+                    .results
+                    .iter()
+                    .find(|result| result.call_id == call.id)
+                    .is_some_and(drew);
+                if !drew {
+                    continue;
+                }
+                // The history keeps the call as the model sent it, before the
+                // registry repaired an array sent as a JSON string.
+                let messages = match call.arguments.get("messages") {
+                    Some(Value::Array(messages)) => messages.clone(),
+                    Some(Value::String(text)) => match serde_json::from_str(text) {
+                        Ok(Value::Array(messages)) => messages,
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                let messages: Vec<Value> = messages
+                    .iter()
+                    .map(|message| sanitize(message, &ctx.secrets, self.egress))
+                    .collect();
+                if !policy(&messages, &ctx.policy, self.remote_media).is_empty() {
+                    continue;
+                }
+                if runtime.apply(&messages).is_ok() {
+                    replayed += 1;
+                }
+            }
+        }
+        *self.runtime() = runtime;
+        replayed
+    }
+
     /// The ids of the surfaces up now.
     pub fn surface_ids(&self) -> Vec<String> {
         self.runtime().surface_ids().map(String::from).collect()
@@ -389,6 +454,19 @@ pub fn take_drawn(metadata: &mut Map<String, Value>) -> (Vec<AgentMessage>, Opti
         _ => Vec::new(),
     };
     (messages, metadata.remove(TRACE_KEY))
+}
+
+/// What `render_ui`'s result opens with when the call drew.
+const DREW: &[&str] = &["Rendered surface ", "Deleted surface ", "Applied."];
+
+/// Whether a `render_ui` result says the call drew.
+fn drew(result: &crate::types::ToolResult) -> bool {
+    let text = if result.ok {
+        result.content.as_str()
+    } else {
+        result.error.as_deref().unwrap_or_default()
+    };
+    result.ok || DREW.iter().any(|opening| text.starts_with(opening))
 }
 
 /// The surfaces a waiting call waits on, taken out of its result's metadata.

@@ -205,3 +205,28 @@ fn null_deletes_and_send_data_model_is_reported() {
     );
     agent86_ui::check_renderer_data_model(&runtime.renderer_data_model().unwrap()).unwrap();
 }
+
+#[test]
+fn a_snapshot_redraws_every_surface_as_it_is() {
+    let mut runtime = form();
+    // Change it after creating it: a component replaced, the data written.
+    let report = runtime.apply(&[
+        json!({"version": "1.0", "updateComponents": {"surfaceId": "s", "components": [
+            {"id": "send_label", "component": "Text", "text": "Send it"}
+        ]}}),
+        json!({"version": "1.0", "updateDataModel": {"surfaceId": "s", "path": "/form/name", "value": "Ada"}}),
+    ]);
+    assert!(report.is_ok(), "{:#?}", report.errors);
+
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    let mut fresh = Runtime::basic();
+    let report = fresh.apply(&snapshot);
+    assert!(report.is_ok(), "{:#?}", report.errors);
+    assert_eq!(fresh.tree("s"), runtime.tree("s"));
+    assert_eq!(fresh.data_model("s"), runtime.data_model("s"));
+    assert_eq!(
+        snapshot[0]["createSurface"]["catalogId"],
+        json!(BASIC_CATALOG_ID)
+    );
+}

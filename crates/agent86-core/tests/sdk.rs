@@ -1666,3 +1666,82 @@ async fn an_action_goes_through_the_vault_and_the_ingress_guardrail() {
         .await;
     assert_eq!(provider.requests().len(), before);
 }
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_resumed_session_gets_its_surfaces_back_from_the_history() {
+    use agent86_core::sdk::{AgentMessageKind, Ui};
+    let workspace = Workspace::new("ui-resume");
+    let memory = Memory::open(workspace.0.join("memory.db")).unwrap();
+    let mut other = waiting(name_form());
+    other["messages"][0]["createSurface"]["surfaceId"] = json!("dismissed");
+    let mut gone = name_form();
+    gone["messages"][0]["createSurface"]["surfaceId"] = json!("gone");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "render_ui", name_form())]),
+        calls(&[(
+            "c2",
+            "render_ui",
+            json!({"messages": [{"version": "1.0", "updateDataModel": {"surfaceId": "form", "path": "/name", "value": "Ada"}}]}),
+        )]),
+        // Refused, so never drawn.
+        calls(&[(
+            "c3",
+            "render_ui",
+            form_surface(json!([{"id": "root", "component": "Txt"}])),
+        )]),
+        // Drawn, then dismissed: a failed result that still drew.
+        calls(&[("c4", "render_ui", other)]),
+        // Drawn, then deleted.
+        calls(&[("c5", "render_ui", gone)]),
+        calls(&[(
+            "c6",
+            "render_ui",
+            json!({"messages": [{"version": "1.0", "deleteSurface": {"surfaceId": "gone"}}]}),
+        )]),
+        text("Done."),
+    ]);
+    let build = || {
+        Agent::builder()
+            .provider(provider.clone())
+            .workspace(&workspace.0)
+            .memory(memory.clone())
+            .ui(Ui::basic().on_wait(|_| None))
+    };
+    let mut first = build().build().unwrap();
+    first.run("Draw some forms").await.unwrap();
+    let id = first.session_id().to_owned();
+    let before = first.surfaces();
+    let conversation = first.conversation().to_json();
+    drop(first);
+
+    let ids = |surfaces: &[agent86_core::sdk::AgentMessage]| -> Vec<String> {
+        surfaces
+            .iter()
+            .filter_map(|m| m.surface_id().map(String::from))
+            .collect()
+    };
+    assert_eq!(ids(&before), ["dismissed", "form"]);
+
+    let resumed = build().session(&id).build().unwrap();
+    let after = resumed.surfaces();
+    assert_eq!(ids(&after), ["dismissed", "form"]);
+    assert_eq!(after, before);
+    let AgentMessageKind::CreateSurface(form) = &after[1].kind else {
+        panic!("a createSurface");
+    };
+    assert_eq!(form.data_model, json!({"name": "Ada"}).as_object().cloned());
+
+    // The same from a conversation handed back.
+    let conversation = Conversation::from_json(&conversation).unwrap();
+    let handed = build().build().unwrap().with_conversation(conversation);
+    assert_eq!(handed.surfaces(), before);
+
+    // No renderer, no surfaces.
+    let plain = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .build()
+        .unwrap();
+    assert!(plain.surfaces().is_empty());
+}

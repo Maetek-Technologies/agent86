@@ -697,11 +697,15 @@ impl AgentBuilder {
             .context
             .secrets
             .set_queue(harness.gate.queue.clone());
-        Ok(Agent {
+        let agent = Agent {
             harness,
             conversation: Conversation(state),
             notices,
-        })
+        };
+        // A resumed session's surfaces come back from its history.
+        #[cfg(feature = "agent86ui")]
+        agent.replay_surfaces();
+        Ok(agent)
     }
 
     /// The router for the named models: it builds nothing, it looks names up, so a
@@ -1428,9 +1432,38 @@ impl Agent {
     }
 
     /// Continue an earlier conversation instead of starting a new one.
+    /// With agent86UI, the surfaces are rebuilt from its `render_ui` calls, as
+    /// on resuming a session; [`Agent::surfaces`] gives them to draw.
     pub fn with_conversation(mut self, conversation: Conversation) -> Self {
         self.conversation = conversation;
+        #[cfg(feature = "agent86ui")]
+        self.replay_surfaces();
         self
+    }
+
+    /// Rebuild the renderer's surfaces from the conversation's history.
+    #[cfg(feature = "agent86ui")]
+    fn replay_surfaces(&self) {
+        if let Some(ui) = &self.harness.context.ui {
+            ui.replay(&self.conversation.0, &self.harness.context);
+        }
+    }
+
+    /// Every surface up now, each as the one `createSurface` message that draws
+    /// it as it is (its components and data model), in surface id order. After
+    /// resuming a session ([`AgentBuilder::session`] or
+    /// [`Agent::with_conversation`]) the surfaces are rebuilt from the
+    /// history's `render_ui` calls, so a program that reopens draws these to
+    /// show the user where they were. What the user typed but never submitted is
+    /// the renderer's alone, so it is not here. Empty without a renderer.
+    #[cfg(feature = "agent86ui")]
+    pub fn surfaces(&self) -> Vec<AgentMessage> {
+        self.harness
+            .context
+            .ui
+            .as_ref()
+            .map(|ui| ui.snapshot())
+            .unwrap_or_default()
     }
 
     /// The session's id, under which [`AgentBuilder::memory`] saves it.
