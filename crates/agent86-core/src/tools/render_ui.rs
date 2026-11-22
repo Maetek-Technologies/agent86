@@ -8,7 +8,7 @@
 //! the validator's job, since providers' strict modes cap a schema's size.
 
 use super::{failure, success, Tool, ToolContext, ToolError};
-use crate::agent86ui::{MESSAGES_KEY, RENDER_UI};
+use crate::agent86ui::{policy, sanitize, MESSAGES_KEY, RENDER_UI, TRACE_KEY};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
 
@@ -92,21 +92,47 @@ impl Tool for RenderUiTool {
             ));
         }
 
-        let report = ui.apply(messages);
+        // What a surface shows reaches the user as the model's text does: through
+        // the vault's redaction and the egress guardrail first. Then agent86's
+        // policy, then the protocol's rules.
+        let messages: Vec<Value> = messages
+            .iter()
+            .map(|message| sanitize(message, &ctx.secrets, ui.egress()))
+            .collect();
+        let components = component_count(&messages);
+        let refusals = policy(&messages, &ctx.policy, ui.remote_media());
+        if !refusals.is_empty() {
+            let codes = vec!["REFUSED"; refusals.len()];
+            let mut result = failure(
+                self.name(),
+                format!(
+                    "agent86 does not allow some of these messages, so nothing was drawn. Change \
+                     these and send the messages again (paths point into `messages`):\n{}",
+                    bullets(&refusals)
+                ),
+            );
+            result.metadata.insert(
+                TRACE_KEY.into(),
+                trace(&messages, components, "refused", &codes),
+            );
+            return Ok(result);
+        }
+        let report = ui.apply(&messages);
         if !report.is_ok() {
-            let problems: Vec<String> = report
-                .errors
-                .iter()
-                .map(|problem| format!("- {problem}"))
-                .collect();
-            return Ok(failure(
+            let codes: Vec<&str> = report.errors.iter().map(|p| p.code.as_str()).collect();
+            let mut result = failure(
                 self.name(),
                 format!(
                     "The messages are not valid A2UI, so nothing was drawn. Fix these and \
                      send the corrected messages again (paths point into `messages`):\n{}",
-                    problems.join("\n")
+                    bullets(&report.errors)
                 ),
-            ));
+            );
+            result.metadata.insert(
+                TRACE_KEY.into(),
+                trace(&messages, components, "invalid", &codes),
+            );
+            return Ok(result);
         }
 
         let mut lines = Vec::new();
@@ -133,14 +159,63 @@ impl Tool for RenderUiTool {
             lines.push(format!("Warning: {warning}"));
         }
         let mut result = success(self.name(), lines.join("\n"));
-        let messages: Vec<Value> = report
+        let typed: Vec<Value> = report
             .messages
             .iter()
             .filter_map(|message| serde_json::to_value(message).ok())
             .collect();
         result
             .metadata
-            .insert(MESSAGES_KEY.into(), Value::Array(messages));
+            .insert(MESSAGES_KEY.into(), Value::Array(typed));
+        result.metadata.insert(
+            TRACE_KEY.into(),
+            trace(&messages, components, "rendered", &[]),
+        );
         Ok(result)
     }
+}
+
+fn bullets<T: std::fmt::Display>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many components a batch sends.
+fn component_count(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| {
+            ["createSurface", "updateComponents"]
+                .into_iter()
+                .filter_map(move |kind| message.get(kind)?.get("components")?.as_array())
+        })
+        .map(Vec::len)
+        .sum()
+}
+
+/// The `ui_render` trace fields: the surfaces a batch names, its component
+/// count, the verdict, and the codes of what was wrong. Never the components.
+fn trace(messages: &[Value], components: usize, verdict: &str, codes: &[&str]) -> Value {
+    let mut surfaces: Vec<&str> = Vec::new();
+    for message in messages {
+        let id = message
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.values())
+            .find_map(|body| body.get("surfaceId").and_then(Value::as_str));
+        if let Some(id) = id {
+            if !surfaces.contains(&id) {
+                surfaces.push(id);
+            }
+        }
+    }
+    json!({
+        "surfaces": surfaces,
+        "components": components,
+        "verdict": verdict,
+        "problems": codes,
+    })
 }

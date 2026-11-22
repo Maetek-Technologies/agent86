@@ -619,7 +619,9 @@ impl AgentBuilder {
                 ));
             }
             let session = crate::agent86ui::UiSession::new(ui.catalogs)
-                .map_err(|error| BuildError::Ui(error.to_string()))?;
+                .map_err(|error| BuildError::Ui(error.to_string()))?
+                .with_egress(self.guardrails.egress)
+                .with_remote_media(ui.remote_media);
             context.ui = Some(Arc::new(session));
             registry
                 .register(Box::new(crate::tools::render_ui::RenderUiTool))
@@ -866,6 +868,7 @@ impl Model {
 #[derive(Debug, Clone)]
 pub struct Ui {
     catalogs: Vec<Catalog>,
+    remote_media: bool,
 }
 
 #[cfg(feature = "agent86ui")]
@@ -881,7 +884,17 @@ impl Ui {
     pub fn new(catalogs: impl IntoIterator<Item = Catalog>) -> Self {
         Self {
             catalogs: catalogs.into_iter().collect(),
+            remote_media: false,
         }
+    }
+
+    /// Let `Image`, `Video`, and `AudioPlayer` load `https` URLs. Off by
+    /// default: a surface's media is then a `data:` URL or a file in the
+    /// workspace (a path relative to it, which the program serves), since a
+    /// fetch can track the user or carry data out in its URL.
+    pub fn allow_remote_media(mut self) -> Self {
+        self.remote_media = true;
+        self
     }
 
     /// The catalogs, in order of preference.

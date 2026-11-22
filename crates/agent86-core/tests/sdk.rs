@@ -1204,3 +1204,116 @@ fn a_renderer_needs_a_catalog() {
         .unwrap();
     assert!(matches!(error, BuildError::Ui(_)), "{error}");
 }
+
+#[cfg(feature = "agent86ui")]
+fn shown_text(message: &agent86_core::sdk::AgentMessage) -> String {
+    serde_json::to_string(message).unwrap()
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_surface_shows_secrets_and_what_egress_redacts_only_redacted() {
+    use agent86_core::sdk::{EgressMode, GuardrailsConfig, IngressMode, Ui};
+    let workspace = Workspace::new("ui-redact");
+    let trace = workspace.0.join("trace");
+    let surface = form_surface(json!([
+        {"id": "root", "component": "Column", "children": ["token", "key"]},
+        {"id": "token", "component": "Text", "text": "Your token is tok-abcdef-123456"},
+        {"id": "key", "component": "Text", "text": "AWS key AKIAABCDEFGHIJKLMNOP"}
+    ]));
+    let provider = Scripted::new(vec![calls(&[("c1", "render_ui", surface)]), text("Shown.")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .secret("API_TOKEN", "tok-abcdef-123456")
+        .guardrails(GuardrailsConfig {
+            approval: ApprovalMode::Ask,
+            ingress: IngressMode::Warn,
+            egress: EgressMode::Redact,
+            scan_observations: true,
+        })
+        .trace_dir(&trace)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    let mut shown = Vec::new();
+    agent
+        .run_with_events("Show it", |event| {
+            if let TurnEvent::Ui(message) = event {
+                shown.push(shown_text(message));
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(shown.len(), 1);
+    assert!(
+        shown[0].contains("Your token is ${secret:API_TOKEN}"),
+        "{}",
+        shown[0]
+    );
+    assert!(!shown[0].contains("tok-abcdef-123456"));
+    assert!(!shown[0].contains("AKIAABCDEFGHIJKLMNOP"), "{}", shown[0]);
+
+    // The trace records which surface, how many components, and the verdict,
+    // never the components themselves.
+    let log = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
+    let event: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "ui_render")
+        .expect("a ui_render event");
+    assert_eq!(event["surfaces"], json!(["form"]));
+    assert_eq!(event["components"], 3);
+    assert_eq!(event["verdict"], "rendered");
+    let line = log.lines().find(|line| line.contains("ui_render")).unwrap();
+    assert!(!line.contains("Your token"), "{line}");
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_password_field_is_refused_and_the_model_pointed_at_request_secret() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-obscured");
+    let trace = workspace.0.join("trace");
+    let surface = form_surface(json!([
+        {"id": "root", "component": "TextField", "label": "Password", "value": {"@path": "/name"}, "variant": "obscured"}
+    ]));
+    let provider = Scripted::new(vec![calls(&[("c1", "render_ui", surface)]), text("OK.")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .trace_dir(&trace)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    let mut drawn = 0;
+    agent
+        .run_with_events("Ask for my password", |event| {
+            if let TurnEvent::Ui(_) = event {
+                drawn += 1;
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(drawn, 0);
+    let verdict = observation(&provider, "c1");
+    assert!(verdict.contains("nothing was drawn"), "{verdict}");
+    assert!(
+        verdict.contains("REFUSED at /0/createSurface/components/0/variant"),
+        "{verdict}"
+    );
+    assert!(verdict.contains("request_secret"), "{verdict}");
+    let log = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
+    let event: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "ui_render")
+        .expect("a ui_render event");
+    assert_eq!(event["verdict"], "refused");
+    assert_eq!(event["problems"], json!(["REFUSED"]));
+    // A refused batch never reached the surfaces, so a corrected one can create
+    // the same surface.
+    assert!(provider.requests()[0].messages[0]
+        .content
+        .contains("Never ask for a password"));
+}
