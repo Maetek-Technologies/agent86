@@ -253,6 +253,32 @@ impl Runtime {
             .is_some_and(|surface| surface.send_data_model)
     }
 
+    /// Each surface as the one `createSurface` message that draws it as it is
+    /// now: its catalog, `sendDataModel` when set, its components (the latest of
+    /// each id, by id), and its data model. A renderer that reopens, or joins
+    /// late, can be brought up to date with these alone, in surface id order.
+    pub fn snapshot(&self) -> Vec<Value> {
+        self.surfaces
+            .iter()
+            .map(|(id, surface)| {
+                let mut body = Map::new();
+                body.insert("surfaceId".into(), Value::from(id.as_str()));
+                if let Some(catalog) = &surface.catalog_id {
+                    body.insert("catalogId".into(), Value::from(catalog.as_str()));
+                }
+                if surface.send_data_model {
+                    body.insert("sendDataModel".into(), Value::Bool(true));
+                }
+                body.insert(
+                    "components".into(),
+                    surface.components.values().cloned().collect(),
+                );
+                body.insert("dataModel".into(), surface.data.root().clone());
+                serde_json::json!({"version": crate::PROTOCOL_VERSION, "createSurface": body})
+            })
+            .collect()
+    }
+
     /// The renderer's capabilities (`renderer_capabilities.json`): the ids of
     /// its catalogs and, with `inline`, the catalog documents themselves.
     pub fn capabilities(&self, inline: bool) -> Value {
