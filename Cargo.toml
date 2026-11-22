@@ -52,7 +52,7 @@ tokio = { version = "1.54.1", features = ["macros", "rt", "signal", "sync", "tim
 toml_edit = "0.25"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "preserve_order", "serde"] }
 unicode-width = "0.2"
-url = "2.5.8"
+url = "2.5.9"
 md5 = "0.8.1"
 sha2 = "0.11.1"
 # candle 0.11 sets the MSRV: on x86_64 it calls `__cpuid_count` outside an
