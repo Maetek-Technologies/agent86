@@ -10,7 +10,7 @@
 
 use crate::config::EgressMode;
 use agent86_ui::runtime::Runtime;
-use agent86_ui::{AgentMessage, Catalog, CompileError, Report, Rules};
+use agent86_ui::{Action, AgentMessage, Catalog, CompileError, Report, Rules};
 use serde_json::{Map, Value};
 use std::sync::{Mutex, PoisonError};
 
@@ -25,6 +25,24 @@ pub const MESSAGES_KEY: &str = "agent86ui_messages";
 /// Where it leaves what the trace's `ui_render` event records (the surfaces,
 /// the component count, the verdict), taken out the same way.
 pub const TRACE_KEY: &str = "agent86ui_trace";
+
+/// Where it names the surfaces a `wait: true` call waits on, for the loop,
+/// which asks once it has emitted the call's messages (so the program has
+/// them to draw before it is asked for an answer).
+pub const WAIT_KEY: &str = "agent86ui_wait";
+
+/// What a waiting `render_ui` call asks the program (`sdk::Ui::on_wait`): the
+/// first action the user takes on one of these surfaces, which the call has
+/// just drawn (its `TurnEvent::Ui` messages came first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UiWait {
+    /// The surfaces the call drew that are up, in the order it named them.
+    pub surface_ids: Vec<String>,
+}
+
+/// Answers a [`UiWait`]: the action, or `None` when the user dismissed it.
+pub type UiWaiter = std::sync::Arc<dyn Fn(&UiWait) -> Option<Action> + Send + Sync>;
 
 /// The completeness rules a `render_ui` batch is checked under: strict, but an
 /// orphan is a warning, because A2UI 1.0 has no message that removes a
@@ -42,6 +60,8 @@ pub struct UiSession {
     /// Media may load from `https` URLs, not only `data:` URLs and workspace
     /// files.
     remote_media: bool,
+    /// Answers a waiting call, when the program can.
+    waiter: Option<UiWaiter>,
 }
 
 impl std::fmt::Debug for UiSession {
@@ -65,6 +85,7 @@ impl UiSession {
             runtime: Mutex::new(runtime),
             egress: EgressMode::Off,
             remote_media: false,
+            waiter: None,
         })
     }
 
@@ -80,6 +101,51 @@ impl UiSession {
     pub fn with_remote_media(mut self, allow: bool) -> Self {
         self.remote_media = allow;
         self
+    }
+
+    /// Let a call wait for the user's answer, asking `waiter`.
+    pub fn with_waiter(mut self, waiter: Option<UiWaiter>) -> Self {
+        self.waiter = waiter;
+        self
+    }
+
+    /// Whether a call may wait: someone answers.
+    pub fn can_wait(&self) -> bool {
+        self.waiter.is_some()
+    }
+
+    /// Ask the program for the user's answer (`None`: dismissed, or nobody
+    /// answers).
+    pub fn wait(&self, request: &UiWait) -> Option<Action> {
+        self.waiter.as_ref().and_then(|waiter| waiter(request))
+    }
+
+    /// Whether `action` could have come from a surface up now: its surface
+    /// exists (and is one of `among`, when given) and holds the component it
+    /// names. What it carries is the user's and is checked as their input is.
+    pub fn check_action(&self, action: &Action, among: Option<&[String]>) -> Result<(), String> {
+        if action.name.is_empty() {
+            return Err("the action has no name".into());
+        }
+        if among.is_some_and(|ids| !ids.contains(&action.surface_id)) {
+            return Err(format!(
+                "the action is for surface {:?}, which this call did not draw",
+                action.surface_id
+            ));
+        }
+        let runtime = self.runtime();
+        let Some(mut components) = runtime.components(&action.surface_id) else {
+            return Err(format!("there is no surface {:?}", action.surface_id));
+        };
+        if !components
+            .any(|c| c.get("id").and_then(Value::as_str) == Some(&action.source_component_id))
+        {
+            return Err(format!(
+                "surface {:?} has no component {:?}",
+                action.surface_id, action.source_component_id
+            ));
+        }
+        Ok(())
     }
 
     pub fn egress(&self) -> EgressMode {
@@ -118,6 +184,14 @@ impl UiSession {
         } else {
             "a data: URL or the path of a file in the workspace (remote URLs are not loaded)"
         };
+        if self.can_wait() {
+            section.push_str(
+                "\n- With `\"wait\": true` the call waits for the user's first action on \
+                 the surface and returns it as its result (`[ui action] ...`). Use it for a \
+                 form you need answered before you can go on; otherwise leave it out and \
+                 carry on.",
+            );
+        }
         section.push_str(&format!(
             "\n- Never ask for a password, key, or token in a surface (no TextField with \
              variant \"obscured\"): call request_secret, which asks through a masked prompt \
@@ -315,6 +389,130 @@ pub fn take_drawn(metadata: &mut Map<String, Value>) -> (Vec<AgentMessage>, Opti
         _ => Vec::new(),
     };
     (messages, metadata.remove(TRACE_KEY))
+}
+
+/// The surfaces a waiting call waits on, taken out of its result's metadata.
+pub fn take_wait(metadata: &mut Map<String, Value>) -> Option<Vec<String>> {
+    match metadata.remove(WAIT_KEY)? {
+        Value::Array(ids) => Some(
+            ids.into_iter()
+                .filter_map(|id| id.as_str().map(String::from))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// An action as the model reads it, a waiting call's result or the next user
+/// message: `[ui action] <name> on <surfaceId>: <context as JSON>`, then the
+/// event's `userMessage` on a line of its own when it has one.
+pub fn action_text(action: &Action) -> String {
+    let context = crate::pyjson::python_json_dumps(&Value::Object(action.context.clone()), false);
+    let mut text = format!(
+        "[ui action] {} on {}: {context}",
+        action.name, action.surface_id
+    );
+    if let Some(message) = action.user_message.as_deref().filter(|m| !m.is_empty()) {
+        text.push('\n');
+        text.push_str(message);
+    }
+    text
+}
+
+impl crate::agent::Harness {
+    /// Wait for the user's answer to a `wait: true` call, through the prompt
+    /// queue like a secret prompt (one question at a time, declined once the
+    /// turn is cancelled), and make it the call's result. The answer goes
+    /// through the vault and the ingress guardrail, as typed input does, and is
+    /// recorded as `ui_action`, without its values.
+    pub(crate) fn ui_wait(
+        &self,
+        call: &crate::types::ToolCall,
+        drawn: crate::types::ToolResult,
+        surfaces: Vec<String>,
+        sid: &str,
+    ) -> crate::types::ToolResult {
+        use crate::tools::{failure, success};
+        let Some(ui) = self.context.ui.as_deref() else {
+            return drawn;
+        };
+        if surfaces.is_empty() {
+            return drawn;
+        }
+        let request = UiWait {
+            surface_ids: surfaces.clone(),
+        };
+        let question = crate::approval::Question {
+            tool: Some(RENDER_UI.into()),
+            call: Some(call.id.clone()),
+            ..crate::approval::Question::new(crate::approval::QuestionKind::Ui)
+        };
+        let shown = drawn.content.clone();
+        let answered = |result: crate::types::ToolResult| crate::types::ToolResult {
+            call_id: drawn.call_id.clone(),
+            ..result
+        };
+        let action = match self.gate.queue.ask(question, || ui.wait(&request)) {
+            None => {
+                return answered(failure(
+                    RENDER_UI,
+                    format!(
+                        "{shown}\nThe turn was cancelled before the user answered. The surface \
+                         stays up; an action on it later comes as a user message."
+                    ),
+                ))
+            }
+            Some(None) => {
+                return answered(failure(
+                    RENDER_UI,
+                    format!(
+                        "{shown}\nThe user did not answer (they dismissed it). The surface stays \
+                         up; an action on it later comes as a user message."
+                    ),
+                ))
+            }
+            Some(Some(action)) => action,
+        };
+        if let Err(why) = ui.check_action(&action, Some(&surfaces)) {
+            return answered(failure(
+                RENDER_UI,
+                format!("{shown}\nThe screen's answer could not be used: {why}."),
+            ));
+        }
+        let text = self.context.secrets.redact(&action_text(&action));
+        let report = self.guardrails.inspect_ingress(&text);
+        if report.flagged() {
+            self.recorder.event(
+                sid,
+                "guardrail",
+                vec![
+                    ("stage", serde_json::json!("ingress")),
+                    ("source", serde_json::json!("ui_action")),
+                    ("findings", serde_json::json!(report.summary())),
+                ],
+            );
+        }
+        self.recorder.event(
+            sid,
+            "ui_action",
+            vec![
+                ("surface", serde_json::json!(action.surface_id)),
+                ("name", serde_json::json!(action.name)),
+                ("component", serde_json::json!(action.source_component_id)),
+                ("waited", serde_json::json!(true)),
+            ],
+        );
+        if self.guardrails.should_block(&report) {
+            return answered(failure(
+                RENDER_UI,
+                format!(
+                    "{shown}\nThe user's answer was refused by the input guardrail ({}).",
+                    report.summary()
+                ),
+            ));
+        }
+        answered(success(RENDER_UI, format!("{shown}\n{text}")))
+    }
 }
 
 /// Every string in `value`, through the secret vault's redaction and, with the

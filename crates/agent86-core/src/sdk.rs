@@ -90,6 +90,8 @@ use std::time::Duration;
 // other module of the crate: those are public for the `agent86` binary only, are
 // hidden from the docs, and carry no stability promise.
 pub use crate::agent::{CancelToken, HarnessError, TurnEvent};
+#[cfg(feature = "agent86ui")]
+pub use crate::agent86ui::UiWait;
 pub use crate::approval::ApprovalPreview;
 pub use crate::config::{EgressMode, GuardrailsConfig, IngressMode};
 pub use crate::limits::{LimitHit, LimitKind};
@@ -103,7 +105,7 @@ pub use crate::vault::SecretRequest;
 #[cfg(feature = "agent86ui")]
 pub use agent86_ui;
 #[cfg(feature = "agent86ui")]
-pub use agent86_ui::{AgentMessage, AgentMessageKind, Catalog};
+pub use agent86_ui::{Action, AgentMessage, AgentMessageKind, Catalog};
 pub use providers::Provider;
 
 /// Which of agent86's own tools an [`Agent`] offers, each set including the one
@@ -621,7 +623,8 @@ impl AgentBuilder {
             let session = crate::agent86ui::UiSession::new(ui.catalogs)
                 .map_err(|error| BuildError::Ui(error.to_string()))?
                 .with_egress(self.guardrails.egress)
-                .with_remote_media(ui.remote_media);
+                .with_remote_media(ui.remote_media)
+                .with_waiter(ui.on_wait);
             context.ui = Some(Arc::new(session));
             registry
                 .register(Box::new(crate::tools::render_ui::RenderUiTool))
@@ -865,10 +868,25 @@ impl Model {
 /// A renderer for agent86UI ([`AgentBuilder::ui`]): the A2UI catalogs it
 /// draws, in order of preference.
 #[cfg(feature = "agent86ui")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Ui {
     catalogs: Vec<Catalog>,
     remote_media: bool,
+    on_wait: Option<crate::agent86ui::UiWaiter>,
+}
+
+#[cfg(feature = "agent86ui")]
+impl std::fmt::Debug for Ui {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ui")
+            .field(
+                "catalogs",
+                &self.catalogs.iter().map(Catalog::id).collect::<Vec<_>>(),
+            )
+            .field("remote_media", &self.remote_media)
+            .field("on_wait", &self.on_wait.is_some())
+            .finish()
+    }
 }
 
 #[cfg(feature = "agent86ui")]
@@ -885,7 +903,24 @@ impl Ui {
         Self {
             catalogs: catalogs.into_iter().collect(),
             remote_media: false,
+            on_wait: None,
         }
+    }
+
+    /// Let the model wait for the user's answer (`render_ui` with `wait`), for
+    /// a form in the middle of a task: once the call's [`TurnEvent::Ui`]
+    /// messages are out, `answer` is asked for the first [`Action`] the user
+    /// takes on one of [`UiWait::surface_ids`], or `None` when they dismiss it.
+    /// Called on the turn's thread, one question at a time with approvals, and
+    /// never once the turn is cancelled. The action's context becomes the call's
+    /// result, through the vault and the ingress guardrail as typed input does.
+    /// Without it, a waiting call is refused and the model asks without waiting.
+    pub fn on_wait(
+        mut self,
+        answer: impl Fn(&UiWait) -> Option<Action> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_wait = Some(std::sync::Arc::new(answer));
+        self
     }
 
     /// Let `Image`, `Video`, and `AudioPlayer` load `https` URLs. Off by

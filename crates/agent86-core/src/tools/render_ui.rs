@@ -8,7 +8,7 @@
 //! the validator's job, since providers' strict modes cap a schema's size.
 
 use super::{failure, success, Tool, ToolContext, ToolError};
-use crate::agent86ui::{policy, sanitize, MESSAGES_KEY, RENDER_UI, TRACE_KEY};
+use crate::agent86ui::{policy, sanitize, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
 
@@ -43,6 +43,12 @@ impl Tool for RenderUiTool {
                     "title": "Messages",
                     "type": "array",
                 },
+                "wait": {
+                    "default": false,
+                    "description": "Wait for the user's first action on the surface and get it as this call's result, for a form in the middle of a task. Without it the turn goes on, and an action comes later as a user message.",
+                    "title": "Wait",
+                    "type": "boolean",
+                },
             },
             "required": ["messages"],
             "type": "object",
@@ -72,7 +78,16 @@ impl Tool for RenderUiTool {
                 ]))
             }
         };
-        if let Some(extra) = args.keys().find(|key| *key != "messages") {
+        let wait = match args.get("wait") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(wait)) => *wait,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(vec![
+                    "wait: Input should be a valid boolean".into(),
+                ]))
+            }
+        };
+        if let Some(extra) = args.keys().find(|key| *key != "messages" && *key != "wait") {
             return Err(ToolError::InvalidArguments(vec![format!(
                 "{extra}: Extra inputs are not permitted"
             )]));
@@ -85,6 +100,15 @@ impl Tool for RenderUiTool {
                     .into(),
             ));
         };
+        if wait && !ui.can_wait() {
+            return Ok(failure(
+                self.name(),
+                "This screen cannot answer while the turn waits, so nothing was drawn. Send \
+                 the messages again without wait; an action on the surface comes as a later \
+                 user message."
+                    .into(),
+            ));
+        }
         if messages.is_empty() {
             return Ok(failure(
                 self.name(),
@@ -171,6 +195,16 @@ impl Tool for RenderUiTool {
             TRACE_KEY.into(),
             trace(&messages, components, "rendered", &[]),
         );
+        if wait {
+            let waited: Vec<Value> = surfaces
+                .iter()
+                .filter(|id| live.iter().any(|s| s == *id))
+                .map(|id| Value::from(*id))
+                .collect();
+            result
+                .metadata
+                .insert(WAIT_KEY.into(), Value::Array(waited));
+        }
         Ok(result)
     }
 }

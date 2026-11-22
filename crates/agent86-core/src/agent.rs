@@ -1232,7 +1232,12 @@ impl Harness {
                             .collect();
                         self.recorder.event(&sid, "ui_render", fields);
                     }
-                    result
+                    // A waiting call asks now that its messages are out, so the
+                    // program has them to draw before it is asked for an answer.
+                    match crate::agent86ui::take_wait(&mut result.metadata) {
+                        Some(surfaces) => self.ui_wait(call, result, surfaces, &sid),
+                        None => result,
+                    }
                 };
                 // What a sub-agent spent is what this turn spent: in the summary, the
                 // step, and the cost cap, but not as one of this turn's steps.
