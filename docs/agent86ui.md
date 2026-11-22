@@ -93,5 +93,4 @@ Neither holds what a surface showed or what the user entered. As for every tool,
 ## What it does not do yet
 
 - A2UI over A2A or AG-UI, A2UI in MCP servers' output, renderer and agent functions, and A2UI 0.9 are left out.
-- Some of the A2UI validator's rules are not built yet: the recursion and depth limits, full JSON Pointer syntax in paths, surfaces with no default catalog, calls and components that name their own catalog, and component metadata. They will be in place before `agent86-ui` is first published.
 - Config: `[ui] agent86ui = "auto" | "off"` and `[ui] agent86ui_remote_media` arrive with the first surface that reads the config file, ACP in 1.2.1. In 1.2.0 an embedder turns agent86UI on with `AgentBuilder::ui`.

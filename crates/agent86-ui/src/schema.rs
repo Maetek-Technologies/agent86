@@ -299,7 +299,23 @@ fn describe(error: &jsonschema::ValidationError<'_>, out: &mut Vec<SchemaError>)
                 .filter(|branch| !branch.iter().any(|inner| rules_out(inner, &path)))
                 .collect();
             if let [branch] = meant.as_slice() {
+                // As at the top level: the branch's "unevaluated" complaint stands
+                // only when nothing else in it failed at or inside that place.
+                let unevaluated = |e: &jsonschema::ValidationError<'_>| {
+                    matches!(e.kind(), ValidationErrorKind::UnevaluatedProperties { .. })
+                };
                 for inner in branch.iter() {
+                    if unevaluated(inner) {
+                        let at = inner.instance_path().to_string();
+                        let shadowed = branch.iter().any(|other| {
+                            let path = other.instance_path().to_string();
+                            !unevaluated(other)
+                                && (path == at || path.starts_with(&format!("{at}/")))
+                        });
+                        if shadowed {
+                            continue;
+                        }
+                    }
                     describe(inner, out);
                 }
                 return;
@@ -374,6 +390,8 @@ pub struct SchemaSet {
     /// `oneOf` chooses between, so a message checked against its own kind's
     /// gets that kind's errors rather than "matches none of the kinds".
     kinds: Vec<(&'static str, jsonschema::Validator)>,
+    /// A function call against the catalog's `anyFunction`.
+    function_call: jsonschema::Validator,
 }
 
 impl std::fmt::Debug for SchemaSet {
@@ -404,10 +422,14 @@ impl SchemaSet {
                 Ok((*kind, compile(&schema, Some(&catalog))?))
             })
             .collect::<Result<_, CompileError>>()?;
+        let any_function = serde_json::json!({
+            "$ref": format!("{}#/$defs/anyFunction", uri("catalog.json"))
+        });
         Ok(Self {
             agent_to_renderer: compile(&d.agent_to_renderer, Some(&catalog))?,
             renderer_to_agent: compile(&d.renderer_to_agent, Some(&catalog))?,
             kinds,
+            function_call: compile(&any_function, Some(&catalog))?,
         })
     }
 
@@ -431,6 +453,12 @@ impl SchemaSet {
     /// [`crate::Validator`].
     pub fn check_agent_message(&self, message: &Value) -> Result<(), Vec<SchemaError>> {
         errors(&self.agent_to_renderer, message)
+    }
+
+    /// Check one function call (`{"@call": ..., "args": ...}`) against this
+    /// catalog's functions: that it names one, and its arguments.
+    pub fn check_function_call(&self, call: &Value) -> Result<(), Vec<SchemaError>> {
+        errors(&self.function_call, call)
     }
 
     /// Check one renderer-to-agent message (an action, a function call or
