@@ -701,7 +701,7 @@ fn run_turn(
         scope.spawn(move || {
             let on_event = |event: crate::agent::TurnEvent<'_>| {
                 // The status line reads usage from the session when the turn ends;
-                // a surface has no renderer here yet (ADR 0005, 1.2.4).
+                // a surface has no renderer here yet (ADR 0005, 1.2.2).
                 if !matches!(
                     event,
                     crate::agent::TurnEvent::Usage { .. } | crate::agent::TurnEvent::Ui(_)

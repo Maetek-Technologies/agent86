@@ -10,7 +10,7 @@ A2UI is Google's protocol, and agent86 is not affiliated with or endorsed by Goo
 |---|---|
 | Programs embedding `agent86-core` (`sdk`), such as agent86-desktop | From 1.2.0 |
 | ACP clients (agent86-web, editors) | Planned for 1.2.1: the `com.maetek.agent86/a2ui` extension, and a text version for other clients |
-| The terminal interface | Planned for 1.2.4 |
+| The terminal interface | Planned for 1.2.2 |
 | `agent86 run`, the plain loop, piped input, CI | Never: the tool is not offered, so their output is unchanged |
 
 The model can only draw where a surface has declared a renderer, so `render_ui` and its part of the system prompt (which costs a few thousand tokens per request) are absent everywhere else.
