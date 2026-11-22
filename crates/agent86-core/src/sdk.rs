@@ -178,6 +178,12 @@ pub enum RunError {
     /// agent has no [`SubAgents`].
     #[error("no specialist named '{0}'")]
     UnknownSpecialist(String),
+    /// [`Agent::ui_action`] was given an action no surface up could have sent
+    /// (no renderer, no such surface or component, or no name). The message
+    /// says which, never the action's values.
+    #[cfg(feature = "agent86ui")]
+    #[error("the UI action was refused: {0}")]
+    UiAction(String),
 }
 
 /// Decides a side-effecting call: given the tool's name and what the call would
@@ -1367,6 +1373,47 @@ impl Agent {
             turn: self.conversation.0.last_turn.clone(),
             usage: self.conversation.0.usage,
         })
+    }
+
+    /// Hand the model what the user did on a surface (a button pressed), when no
+    /// `render_ui` call was waiting for it: it becomes the next user message,
+    /// `[ui action] <name> on <surfaceId>: <context as JSON>` (plus the event's
+    /// `userMessage` on its own line), and runs a turn as [`Agent::run`] does,
+    /// through the vault and the ingress guardrail like typed input. Recorded as
+    /// `ui_action`, without its values. Call it after the turn that drew the
+    /// surface has ended; actions taken during a turn wait for it, as typed
+    /// input does.
+    #[cfg(feature = "agent86ui")]
+    pub async fn ui_action(&mut self, action: Action) -> Result<RunResult, RunError> {
+        self.ui_action_with_events(action, |_| {}).await
+    }
+
+    /// [`Agent::ui_action`], reporting each [`TurnEvent`] as it happens.
+    #[cfg(feature = "agent86ui")]
+    pub async fn ui_action_with_events(
+        &mut self,
+        action: Action,
+        on_event: impl FnMut(TurnEvent<'_>),
+    ) -> Result<RunResult, RunError> {
+        let ui = self
+            .harness
+            .context
+            .ui
+            .clone()
+            .ok_or_else(|| RunError::UiAction("this agent has no renderer".into()))?;
+        ui.check_action(&action, None).map_err(RunError::UiAction)?;
+        self.harness.recorder.event(
+            &self.conversation.0.session_id,
+            "ui_action",
+            vec![
+                ("surface", json!(action.surface_id)),
+                ("name", json!(action.name)),
+                ("component", json!(action.source_component_id)),
+                ("waited", json!(false)),
+            ],
+        );
+        let text = crate::agent86ui::action_text(&action);
+        self.run_with_events(Turn::Goal(text), on_event).await
     }
 
     /// A handle that stops the running turn at its next safe point (before a model
