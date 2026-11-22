@@ -319,18 +319,23 @@ fn describe(error: &jsonschema::ValidationError<'_>, out: &mut Vec<SchemaError>)
                 }
                 meant = context.iter().collect();
             }
-            let forms: Vec<String> = meant
-                .iter()
-                .filter_map(|branch| branch.first())
-                .map(|inner| inner.masked().to_string())
-                .collect();
-            out.push(SchemaError {
-                path,
-                message: format!(
+            let mut forms: Vec<String> = Vec::new();
+            for inner in meant.iter().filter_map(|branch| branch.first()) {
+                let form = inner.masked().to_string();
+                if !forms.contains(&form) {
+                    forms.push(form);
+                }
+            }
+            // Every branch failing the same way (a component with no
+            // `component`) is one problem, said once.
+            let message = match forms.as_slice() {
+                [only] => only.clone(),
+                _ => format!(
                     "matches none of the forms allowed here ({})",
                     forms.join("; ")
                 ),
-            });
+            };
+            out.push(SchemaError { path, message });
         }
         _ => out.push(SchemaError {
             path,
