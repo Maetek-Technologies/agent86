@@ -101,6 +101,8 @@ pub enum QuestionKind {
     Limit,
     /// Enter a secret.
     Secret,
+    /// Answer a surface a `render_ui` call waits on (beyond Python; ADR 0005).
+    Ui,
 }
 
 impl QuestionKind {
@@ -110,6 +112,7 @@ impl QuestionKind {
             Self::Specialty => "specialty",
             Self::Limit => "limit",
             Self::Secret => "secret",
+            Self::Ui => "ui",
         }
     }
 }
