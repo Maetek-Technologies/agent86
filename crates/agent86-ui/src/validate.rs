@@ -34,6 +34,14 @@ pub enum Code {
     IntegrityError,
     /// A `callRendererFunction` the renderer would refuse.
     InvalidFunctionCall,
+    /// A dynamic value cannot be evaluated: a template that does not parse,
+    /// `@index` outside a list template, a function that cannot be resolved
+    /// (found by [`crate::runtime::Runtime`], which evaluates the surface).
+    ExpressionError,
+    /// An `updateDataModel` write the path does not allow (through a string,
+    /// a non-numeric segment on an array). Sent on the wire as
+    /// `VALIDATION_FAILED`, the code for a message field that fails.
+    DataError,
 }
 
 impl Code {
@@ -45,6 +53,8 @@ impl Code {
             Code::UnallowedChild => "UNALLOWED_CHILD",
             Code::IntegrityError => "INTEGRITY_ERROR",
             Code::InvalidFunctionCall => "INVALID_FUNCTION_CALL",
+            Code::ExpressionError => "EXPRESSION_ERROR",
+            Code::DataError => "VALIDATION_FAILED",
         }
     }
 }
@@ -136,7 +146,12 @@ const KINDS: &[&str] = &[
     "agentFunctionResponse",
 ];
 
-fn problem(code: Code, surface: Option<&str>, path: String, message: impl Into<String>) -> Problem {
+pub(crate) fn problem(
+    code: Code,
+    surface: Option<&str>,
+    path: String,
+    message: impl Into<String>,
+) -> Problem {
     Problem {
         code,
         surface_id: surface.map(String::from),
@@ -842,6 +857,14 @@ fn child_ids(component: &Value, def: &ComponentDef) -> Vec<String> {
                 if let Some(id) = template.get("componentId").and_then(Value::as_str) {
                     ids.push(id.to_string());
                 }
+            }
+            (ChildRef::Items(field), Value::Array(items)) => {
+                ids.extend(
+                    items
+                        .iter()
+                        .filter_map(|item| item.get(field).and_then(Value::as_str))
+                        .map(String::from),
+                );
             }
             _ => {}
         }

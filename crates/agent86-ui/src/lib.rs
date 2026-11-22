@@ -11,13 +11,20 @@
 //!   the schemas and the rules they cannot express (surfaces, `root`, child
 //!   references, composition, function boundaries), with the specification's
 //!   error codes and paths, so the problems can go back to the model;
+//! - [`runtime`]: the headless surface runtime a renderer builds on: surfaces'
+//!   components and data models, every binding, call, template, and check
+//!   resolved for drawing ([`runtime::Runtime::tree`]), user input written back,
+//!   and actions dispatched, with the basic catalog's functions (formatting in
+//!   `en-US`, the regex dialect and its safety rules) implemented;
 //! - [`SchemaSet`]: the envelope schemas compiled against a catalog, for the
 //!   schema half of validation alone;
 //! - [`is_identifier`]: the specification's naming rule.
 //!
 //! The JSON Schemas and the basic catalog are vendored from the specification
 //! (`spec/`, Apache-2.0, upstream commit recorded in `spec/UPSTREAM.md`) and
-//! served from memory: nothing is ever fetched.
+//! served from memory: nothing is ever fetched. The tests replay the
+//! specification's schema cases and its shared conformance suites for the
+//! runtime (`conformance/core/` upstream).
 //!
 //! agent86UI is agent86's implementation of A2UI; A2UI is Google's protocol, and
 //! this crate is not affiliated with or endorsed by Google.
@@ -25,6 +32,7 @@
 mod catalog;
 mod ident;
 mod message;
+pub mod runtime;
 mod schema;
 mod validate;
 

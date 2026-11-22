@@ -16,6 +16,8 @@ keywords = ["a2ui", "agent", "ui", "llm", "json-schema"]
 categories = ["gui", "parser-implementations", "development-tools"]
 
 [dependencies]
+fancy-regex.workspace = true
+jiff.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -24,3 +26,7 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+jiff.workspace = true
+regex.workspace = true

@@ -12,7 +12,13 @@ under the Apache License 2.0 (`LICENSE-APACHE` here):
 
 The crate's tests carry the specification's test cases the same way, under
 `tests/fixtures/v1_0/` (from `specification/v1_0/test/` and
-`catalogs/basic/v1/examples/`).
+`catalogs/basic/v1/examples/`), and the shared SDK conformance suites under
+`tests/fixtures/conformance/`:
+
+| Here | Upstream |
+|---|---|
+| `conformance/core/*.json` | `conformance/core/*.yaml`, converted to JSON unchanged (PyYAML `safe_load`, then `json.dump`), so the tests need no YAML parser |
+| `conformance/test_data/catalogs/*.json` | `conformance/test_data/catalogs/` (the two catalogs the function cases use) |
 
 To refresh: copy the same files from a newer upstream commit, update the commit
 above, and run `cargo test -p agent86-ui`. The conformance test replays every
