@@ -31,6 +31,8 @@ pub const MAX_TREE_DEPTH: usize = 64;
 struct SurfaceState {
     catalog_id: Option<String>,
     send_data_model: bool,
+    /// `createSurface`'s `metadata` (its `extensions`), as sent.
+    metadata: Option<Value>,
     components: BTreeMap<String, Value>,
     data: DataModel,
 }
@@ -246,6 +248,13 @@ impl Runtime {
             .map(|surface| surface.components.values())
     }
 
+    /// A surface's `metadata` from `createSurface` (its `extensions`).
+    pub fn surface_metadata(&self, surface_id: &str) -> Option<&Value> {
+        self.surfaces
+            .get(surface_id)
+            .and_then(|surface| surface.metadata.as_ref())
+    }
+
     /// Whether the surface asked for its data model with every message.
     pub fn sends_data_model(&self, surface_id: &str) -> bool {
         self.surfaces
@@ -268,6 +277,9 @@ impl Runtime {
                 }
                 if surface.send_data_model {
                     body.insert("sendDataModel".into(), Value::Bool(true));
+                }
+                if let Some(metadata) = &surface.metadata {
+                    body.insert("metadata".into(), metadata.clone());
                 }
                 body.insert(
                     "components".into(),
@@ -311,10 +323,13 @@ impl Runtime {
 
     /// Validate and apply a batch, all or nothing. See the module docs.
     pub fn apply(&mut self, messages: &[Value]) -> Report {
-        let mut report = self.validator.check(messages);
+        // The batch as checked: legacy envelope keys moved to their `@`
+        // spellings, so what is stored is what was validated.
+        let (mut report, messages) = self.validator.check_normalized(messages);
         if !report.is_ok() {
             return report;
         }
+        let messages = &messages[..];
         let mut surfaces = self.surfaces.clone();
         let mut touched = BTreeSet::new();
         for (index, message) in messages.iter().enumerate() {
@@ -802,6 +817,7 @@ fn apply_one(
                 .get("sendDataModel")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            metadata: body.get("metadata").cloned(),
             components: BTreeMap::new(),
             data: DataModel::new(
                 body.get("dataModel")

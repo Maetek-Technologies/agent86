@@ -331,8 +331,79 @@ fn a_cycle_is_an_error() {
         ]),
     )]);
     let error = only_error(&report);
-    assert_eq!(error.code, Code::ValidationFailed);
+    // The reference SDKs' code for it, which the specification leaves open.
+    assert_eq!(error.code, Code::RecursionLimitExceeded);
+    assert_eq!(error.code.as_str(), "RECURSION_LIMIT_EXCEEDED");
     assert!(error.message.contains("a -> b -> a"), "{}", error.message);
+}
+
+#[test]
+fn the_reference_limits_and_path_syntax_hold() {
+    use agent86_ui::{MAX_CALL_DEPTH, MAX_DEPTH};
+    // Components nested exactly MAX_DEPTH below root pass; one more does not.
+    let chain = |levels: usize| {
+        let mut components = vec![json!({"id": "root", "component": "Card", "child": "c0"})];
+        for n in 0..levels {
+            if n + 1 == levels {
+                components.push(text(&format!("c{n}"), "leaf"));
+            } else {
+                components.push(json!({"id": format!("c{n}"), "component": "Card", "child": format!("c{}", n + 1)}));
+            }
+        }
+        create("s", Value::Array(components))
+    };
+    assert!(Validator::basic().check(&[chain(MAX_DEPTH)]).is_ok());
+    let error = only_error(&Validator::basic().check(&[chain(MAX_DEPTH + 1)])).clone();
+    assert_eq!(error.code, Code::RecursionLimitExceeded);
+    assert!(error
+        .message
+        .starts_with("Global recursion limit exceeded: logical depth > 50"));
+
+    // Function calls nested MAX_CALL_DEPTH deep pass; one more does not.
+    let calls = |depth: usize| {
+        let mut value = json!("hi");
+        for _ in 0..depth {
+            value = json!({"@call": "formatString", "args": {"value": value}});
+        }
+        create(
+            "s",
+            json!([{"id": "root", "component": "Text", "text": value}]),
+        )
+    };
+    assert!(Validator::basic().check(&[calls(MAX_CALL_DEPTH)]).is_ok());
+    let error = only_error(&Validator::basic().check(&[calls(MAX_CALL_DEPTH + 1)])).clone();
+    assert!(error
+        .message
+        .starts_with("Recursion limit exceeded: functionCall depth > 5"));
+
+    // A value nested too deep anywhere, before any schema check.
+    let mut deep = json!("x");
+    for _ in 0..MAX_DEPTH {
+        deep = json!({"k": deep});
+    }
+    let report = Validator::basic().check(&[create(
+        "s",
+        json!([{"id": "root", "component": "Text", "text": "x", "deep": deep}]),
+    )]);
+    assert!(only_error(&report)
+        .message
+        .starts_with("Global recursion limit exceeded: Depth > 50"));
+
+    // A pointer whose ~ escapes nothing.
+    let report = Validator::basic().check(&[create(
+        "s",
+        json!([{"id": "root", "component": "Text", "text": {"@path": "/a/~2"}}]),
+    )]);
+    let error = only_error(&report);
+    assert_eq!(error.path, "/0/createSurface/components/0/text/@path");
+    assert!(error.message.starts_with("Invalid path syntax: '/a/~2'"));
+    // Relative paths and escaped keys are fine.
+    assert!(Validator::basic()
+        .check(&[create(
+            "s",
+            json!([{"id": "root", "component": "Text", "text": {"@path": "a~1b/~0c"}}])
+        )])
+        .is_ok());
 }
 
 #[test]
@@ -550,4 +621,110 @@ fn a_component_with_no_type_is_said_once() {
         Validator::basic().check(&[create("s", json!([{"id": "root", "text": "no type"}]))]);
     let error = only_error(&report);
     assert_eq!(error.message, "\"component\" is a required property");
+}
+
+#[test]
+fn legacy_envelope_keys_are_moved_to_their_at_spellings() {
+    let mut validator = Validator::basic();
+    let report = validator.apply(&[create(
+        "s",
+        json!([{"id": "root", "component": "TextField", "label": "Name",
+                "value": {"@path": "/name"},
+                "catalogId": BASIC_CATALOG_ID,
+                "checks": [{"condition": {"@call": "required", "args": {"value": {"@path": "/name"}}}, "message": "Name, please."}]}]),
+    )]);
+    assert!(report.is_ok(), "{:#?}", report.errors);
+    // The typed message carries the @ keys a 1.0 renderer reads.
+    let AgentMessageKind::CreateSurface(created) = &report.messages[0].kind else {
+        panic!("createSurface");
+    };
+    let component = serde_json::to_value(&created.components.as_ref().unwrap()[0]).unwrap();
+    assert_eq!(component["@catalogId"], json!(BASIC_CATALOG_ID));
+    assert!(component.get("@checks").is_some(), "{component}");
+    assert!(component.get("checks").is_none(), "{component}");
+
+    // Both spellings at once is refused.
+    let report = Validator::basic().check(&[create(
+        "t",
+        json!([{"id": "root", "component": "Text", "text": "x",
+                "metadata": {"extensions": {}}, "@metadata": {"extensions": {}}}]),
+    )]);
+    assert!(only_error(&report)
+        .message
+        .contains("both metadata and @metadata"));
+}
+
+#[test]
+fn a_catalog_that_cannot_be_found_is_catalog_not_found() {
+    // No default and none named.
+    let report = Validator::basic().check(&[
+        json!({"version": "1.0", "createSurface": {"surfaceId": "s"}}),
+        json!({"version": "1.0", "updateComponents": {"surfaceId": "s", "components": [
+            {"id": "root", "component": "Text", "text": "x"}
+        ]}}),
+    ]);
+    let error = only_error(&report);
+    assert_eq!(error.code, Code::CatalogNotFound);
+    assert_eq!(error.code.as_str(), "CATALOG_NOT_FOUND");
+    assert!(
+        error.message.contains("has no default catalogId"),
+        "{}",
+        error.message
+    );
+
+    // A call naming a catalog this renderer does not have.
+    let report = Validator::basic().check(&[create(
+        "s",
+        json!([{"id": "root", "component": "Text",
+                "text": {"@call": "formatString", "catalogId": "elsewhere", "args": {"value": "x"}}}]),
+    )]);
+    let error = only_error(&report);
+    assert_eq!(error.code, Code::CatalogNotFound);
+    assert_eq!(error.path, "/0/createSurface/components/0/text/catalogId");
+    assert!(error.message.starts_with("Catalog not found: elsewhere"));
+}
+
+#[test]
+fn a_call_is_checked_against_the_catalog_it_resolves_to() {
+    // A second catalog with one function, `shout(phrase: string)`.
+    let mut document = Catalog::basic().document().clone();
+    document["catalogId"] = json!("extra");
+    document["functions"] = json!({"shout": {
+        "type": "object", "returnType": "string",
+        "properties": {"@call": {"const": "shout"},
+                       "args": {"type": "object", "properties": {"phrase": {"type": "string"}},
+                                "required": ["phrase"], "additionalProperties": false}},
+        "required": ["@call", "args"]
+    }});
+    document["$defs"]["anyFunction"] = json!({"oneOf": [{"$ref": "#/functions/shout"}]});
+    let extra = Catalog::from_value(document).unwrap();
+    let validator = Validator::new([Catalog::basic().clone(), extra]).unwrap();
+    let text = |call: Value| {
+        create(
+            "s",
+            json!([{"id": "root", "component": "Text", "text": call}]),
+        )
+    };
+
+    // Named, with good arguments, inside a basic component: accepted.
+    let ok = validator.check(&[text(
+        json!({"@call": "shout", "catalogId": "extra", "args": {"phrase": "hi"}}),
+    )]);
+    assert!(ok.is_ok(), "{:#?}", ok.errors);
+    // Bad arguments are found against that catalog's schema.
+    let bad = validator.check(&[text(
+        json!({"@call": "shout", "catalogId": "extra", "args": {"phrase": 2}}),
+    )]);
+    let error = only_error(&bad);
+    assert!(
+        error
+            .path
+            .starts_with("/0/createSurface/components/0/text/args"),
+        "{error:?}"
+    );
+    // Not named, it resolves to the surface's default, which has no shout.
+    let unnamed = validator.check(&[text(json!({"@call": "shout", "args": {"phrase": "hi"}}))]);
+    assert!(only_error(&unnamed)
+        .message
+        .starts_with("Unrecognized function 'shout'"));
 }

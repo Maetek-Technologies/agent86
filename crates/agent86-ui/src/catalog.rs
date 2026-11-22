@@ -269,6 +269,38 @@ impl Catalog {
     pub fn function(&self, name: &str) -> Option<&FunctionDef> {
         self.functions.get(name)
     }
+
+    /// Whether this catalog's schema for component `type_name` declares a
+    /// property `name`: in its own `properties`, or those of any `allOf`,
+    /// `oneOf`, or `anyOf` branch, or of a `$defs` entry it refers to. A
+    /// component may declare `catalogId`, `metadata`, `accessibility`, or
+    /// `checks` as ordinary properties, which then are not the legacy spellings
+    /// of the `@` envelope keys.
+    pub fn declares(&self, type_name: &str, name: &str) -> bool {
+        let Some(schema) = self.document.pointer(&format!(
+            "/components/{}",
+            type_name.replace('~', "~0").replace('/', "~1")
+        )) else {
+            return false;
+        };
+        declared(schema, name, &self.document, 0)
+    }
+
+    /// Whether `name` is component `type_name`'s own property here, not the
+    /// envelope's: [`Catalog::declares`], except that a `catalogId` or
+    /// `metadata` declared in a `properties` block that also declares `id`, in
+    /// the standard shape (a string `catalogId`, or a `metadata` object whose
+    /// only property is `extensions`), is the envelope's, as early 1.0 drafts
+    /// inlined it.
+    pub fn declares_own(&self, type_name: &str, name: &str) -> bool {
+        let Some(schema) = self.document.pointer(&format!(
+            "/components/{}",
+            type_name.replace('~', "~0").replace('/', "~1")
+        )) else {
+            return false;
+        };
+        own(schema, name, &self.document, 0)
+    }
 }
 
 /// A component schema's `properties.component.const`, at its root or in one of
@@ -463,6 +495,91 @@ fn fragment_key(segment: &str) -> String {
     String::from_utf8_lossy(&decoded)
         .replace("~1", "/")
         .replace("~0", "~")
+}
+
+/// [`declared`], with an inline envelope mixin not counted (see
+/// [`Catalog::declares_own`]).
+fn own(schema: &Value, name: &str, document: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        if let Some(property) = properties.get(name) {
+            let standard = match name {
+                "catalogId" => property.get("type").and_then(Value::as_str) == Some("string"),
+                "metadata" => {
+                    property.get("type").and_then(Value::as_str) == Some("object")
+                        && property
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|inner| {
+                                inner.len() == 1 && inner.contains_key("extensions")
+                            })
+                }
+                _ => false,
+            };
+            if !(standard && properties.contains_key("id")) {
+                return true;
+            }
+        }
+    }
+    if let Some(local) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|target| target.strip_prefix('#'))
+    {
+        if let Some(target) = document.pointer(local) {
+            if own(target, name, document, depth + 1) {
+                return true;
+            }
+        }
+    }
+    ["allOf", "oneOf", "anyOf"].iter().any(|key| {
+        schema
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| own(part, name, document, depth + 1))
+            })
+    })
+}
+
+/// Whether `schema` (or a part of it) declares property `name`; `depth` stops
+/// a `$ref` loop.
+fn declared(schema: &Value, name: &str, document: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(name))
+    {
+        return true;
+    }
+    if let Some(local) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|target| target.strip_prefix('#'))
+    {
+        if let Some(target) = document.pointer(local) {
+            if declared(target, name, document, depth + 1) {
+                return true;
+            }
+        }
+    }
+    ["allOf", "oneOf", "anyOf"].iter().any(|key| {
+        schema
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| declared(part, name, document, depth + 1))
+            })
+    })
 }
 
 fn ref_problem(

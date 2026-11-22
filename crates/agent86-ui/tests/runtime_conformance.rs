@@ -1284,6 +1284,8 @@ fn category_of(problem: &agent86_ui::Problem) -> &'static str {
     match problem.code {
         agent86_ui::Code::IntegrityError => "IntegrityError",
         agent86_ui::Code::DataError => "DataError",
+        agent86_ui::Code::RecursionLimitExceeded => "RecursionError",
+        agent86_ui::Code::CatalogNotFound => "CatalogError",
         _ => "ValidationError",
     }
 }
@@ -1319,8 +1321,13 @@ fn suite_error_matches(expected: &Value, report: &agent86_ui::Report) -> Result<
     let category_ok = |problem: &agent86_ui::Problem| match category {
         None => true,
         Some(want) => {
+            // As the reference harness maps categories: an integrity or
+            // recursion error is a validation error too, and a recursion error
+            // an integrity error.
             let got = category_of(problem);
-            got == want || (want == "ValidationError" && got == "IntegrityError")
+            got == want
+                || (want == "ValidationError" && matches!(got, "IntegrityError" | "RecursionError"))
+                || (want == "IntegrityError" && got == "RecursionError")
         }
     };
     let found = report.errors.iter().any(|problem| {
@@ -1469,6 +1476,14 @@ fn check_suite_surfaces(
                 return Err(format!("surface {id} exists is {got}, expected {exists}"));
             }
         }
+        if let Some(metadata) = object.remove("metadata") {
+            let got = runtime.surface_metadata(id);
+            if got != Some(&metadata) {
+                return Err(format!(
+                    "surface {id} metadata is {got:?}, expected {metadata}"
+                ));
+            }
+        }
         if let Some(send) = object.remove("sendDataModel") {
             let got = runtime.sends_data_model(id);
             if Some(got) != send.as_bool() {
@@ -1556,16 +1571,9 @@ fn processor_suite_case(case: &Value) -> Result<(), String> {
 // Why the cases left out of the processor suites are left out. Each is
 // recorded in the plan as work before the crate is first published; an entry
 // that stops matching a case fails the run.
-const LIMITS: &str = "the recursion and depth limits (component nesting 50, functionCall depth 5, data model depth) are not enforced yet";
-const PATH_SYNTAX: &str =
-    "binding and updateDataModel paths are not checked against RFC 6901 beyond the leading '/' yet";
-const NO_DEFAULT: &str = "a surface with no default catalogId, its components and calls naming their own catalogs, is not supported yet (CatalogError 'has no default catalogId')";
-const CALL_CATALOG: &str = "a function call naming its own catalogId is resolved by the runtime but not yet schema-checked against that catalog, and an unknown one is not a CatalogError";
-const LEGACY_CATALOG_ID: &str = "a component's bare catalogId (beside @catalogId) is not read yet";
-const METADATA: &str = "component metadata (metadata, @metadata) is not stored yet";
-const SDK_CODE: &str = "expects the reference SDKs' own renderer error code (RECURSION_LIMIT_EXCEEDED), outside the specification's enum";
+const STUB_CATALOGS: &str = "the case's catalogs are stubs (an id alone) holding a component the basic catalog lacks; it needs a permissive stand-in catalog, which this harness does not build";
+const CLOSED_SCHEMA: &str = "a catalog component schema with additionalProperties: false rejects the envelope's own keys (id, @catalogId) under the specification's schemas as composed; the reference SDKs check a component's properties apart from its envelope";
 const AGENT_FUNCTIONS: &str = "agent functions (schema-only functions, routing an undeclared call to the agent) are left out of agent86UI's first version (ADR 0005)";
-const NESTED_NAME: &str = "an unknown function nested in a system function's args is reported as a shape mismatch, not by name, yet";
 const V0_9: &str = "asks for a 0.9 renderer data model; this renderer reads 1.0 only";
 
 #[test]
@@ -1574,30 +1582,7 @@ fn validator_v1_0() {
         "validator_v1_0",
         Versions::From1_0,
         PROCESSOR,
-        &[
-            ("test_v10_invalid_binding_path_error", PATH_SYNTAX),
-            ("test_v10_update_data_model_invalid_path_error", PATH_SYNTAX),
-            (
-                "test_v10_component_nesting_depth_limit_exceeded_error",
-                LIMITS,
-            ),
-            (
-                "test_v10_component_nesting_depth_one_past_limit_error",
-                LIMITS,
-            ),
-            (
-                "test_v10_recursion_limit_function_call_depth_exceeded_error",
-                LIMITS,
-            ),
-            (
-                "test_v10_recursion_limit_function_call_depth_one_past_limit_error",
-                LIMITS,
-            ),
-            (
-                "test_v10_data_model_nesting_depth_limit_exceeded_error",
-                LIMITS,
-            ),
-        ],
+        &[],
         processor_suite_case,
     );
 }
@@ -1614,46 +1599,39 @@ fn message_processor_v1_0() {
             "get_renderer_data_model",
         ],
         &[
-            ("test_global_recursion_depth_limit_exceeded_error", LIMITS),
-            ("test_batch_atomic_rollback_on_candidate_topology_cycle", SDK_CODE),
-            ("test_v10_component_without_catalog_id_on_surface_without_default_errors", NO_DEFAULT),
-            ("test_v10_components_naming_catalogs_on_surface_without_default", NO_DEFAULT),
-            ("test_v10_component_from_named_catalog_with_closed_schema_accepted", NO_DEFAULT),
-            ("test_v10_function_call_without_catalog_id_on_surface_without_default_errors", NO_DEFAULT),
-            ("test_v10_index_function_on_surface_without_default", NO_DEFAULT),
-            ("test_v10_component_update_without_catalog_id_on_surface_without_default_errors", NO_DEFAULT),
-            ("test_v10_nested_call_in_args_on_surface_without_default_errors", NO_DEFAULT),
-            ("test_v10_call_in_index_args_on_surface_without_default_errors", NO_DEFAULT),
-            ("test_v10_call_without_catalog_id_on_surface_without_default_errors_without_strict_mode", NO_DEFAULT),
-            ("test_v10_component_without_catalog_id_errors_with_a_single_catalog", NO_DEFAULT),
-            ("test_v10_function_call_naming_catalog_without_that_function_errors", CALL_CATALOG),
-            ("test_v10_function_call_naming_catalog_with_invalid_args_errors", CALL_CATALOG),
-            ("test_v10_function_call_naming_catalog_with_valid_args", CALL_CATALOG),
-            ("test_v10_function_call_naming_unknown_catalog_errors", CALL_CATALOG),
-            ("test_v10_function_call_with_empty_catalog_id_errors", CALL_CATALOG),
-            ("test_v10_nested_call_in_args_resolves_its_own_catalog", CALL_CATALOG),
-            ("test_v10_nested_call_in_args_naming_its_catalog", CALL_CATALOG),
-            ("test_v10_calls_in_lists_naming_their_catalog", CALL_CATALOG),
-            ("test_v10_call_naming_unknown_catalog_errors_without_strict_mode", CALL_CATALOG),
-            ("test_v10_call_naming_catalog_of_other_protocol_version_errors", CALL_CATALOG),
-            ("test_v10_component_catalog_override", LEGACY_CATALOG_ID),
-            ("test_v10_update_components_mismatched_catalog_protocol_version_error", LEGACY_CATALOG_ID),
-            ("test_v10_function_call_without_catalog_id_uses_surface_default", LEGACY_CATALOG_ID),
-            ("test_v10_component_update_without_catalog_id_uses_surface_default", LEGACY_CATALOG_ID),
-            ("test_v10_call_in_list_without_catalog_id_uses_surface_default", LEGACY_CATALOG_ID),
-            ("test_v10_call_in_list_with_invalid_args_errors", LEGACY_CATALOG_ID),
-            ("test_v10_component_naming_catalog_is_checked_against_that_catalog", LEGACY_CATALOG_ID),
-            ("test_v10_legacy_catalog_id_routes_by_default_catalog_schema", LEGACY_CATALOG_ID),
-            ("test_v10_legacy_catalog_id_routes_when_target_declares_non_string_catalog_id", LEGACY_CATALOG_ID),
-            ("test_v10_inline_catalog_id_and_metadata_standard_only_beside_inline_id", LEGACY_CATALOG_ID),
-            ("test_v10_update_components_stores_component_metadata", METADATA),
-            ("test_v10_update_components_replaces_component_metadata", METADATA),
-            ("test_v10_update_components_omitted_metadata_clears_component_metadata", METADATA),
-            ("test_v10_strict_function_call_to_schema_only_function_of_surface_catalog", AGENT_FUNCTIONS),
-            ("test_v10_call_to_undeclared_function_without_strict_mode_accepted", AGENT_FUNCTIONS),
-            ("test_v10_call_in_index_args_is_checked", NESTED_NAME),
-            ("test_v10_get_renderer_data_model_excludes_surface_without_default_from_v09", V0_9),
-            ("test_v10_get_renderer_data_model_filters_by_surface_protocol_version", V0_9),
+            (
+                "test_v10_strict_function_call_to_schema_only_function_of_surface_catalog",
+                AGENT_FUNCTIONS,
+            ),
+            (
+                "test_v10_function_call_naming_catalog_with_valid_args",
+                AGENT_FUNCTIONS,
+            ),
+            (
+                "test_v10_nested_call_in_args_naming_its_catalog",
+                AGENT_FUNCTIONS,
+            ),
+            (
+                "test_v10_calls_in_lists_naming_their_catalog",
+                AGENT_FUNCTIONS,
+            ),
+            ("test_v10_component_catalog_override", STUB_CATALOGS),
+            (
+                "test_v10_component_from_named_catalog_with_closed_schema_accepted",
+                CLOSED_SCHEMA,
+            ),
+            (
+                "test_v10_call_to_undeclared_function_without_strict_mode_accepted",
+                AGENT_FUNCTIONS,
+            ),
+            (
+                "test_v10_get_renderer_data_model_excludes_surface_without_default_from_v09",
+                V0_9,
+            ),
+            (
+                "test_v10_get_renderer_data_model_filters_by_surface_protocol_version",
+                V0_9,
+            ),
         ],
         processor_suite_case,
     );
