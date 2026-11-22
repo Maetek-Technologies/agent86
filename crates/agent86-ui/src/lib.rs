@@ -50,7 +50,7 @@ pub use schema::{
     check_agent_capabilities, check_catalog_definition, check_renderer_capabilities,
     check_renderer_data_model, CompileError, SchemaError, SchemaSet, SPEC_BASE,
 };
-pub use validate::{Code, Problem, Report, Validator};
+pub use validate::{Code, Problem, Report, Rules, Validator};
 
 /// The A2UI protocol version this crate implements, as messages carry it in
 /// their `version` field.

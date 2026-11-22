@@ -216,6 +216,12 @@ impl Runtime {
         Self::new([Catalog::basic().clone()]).expect("the basic catalog compiles")
     }
 
+    /// The completeness rules batches are applied under from now on (see
+    /// [`crate::Rules`]; strict by default).
+    pub fn set_rules(&mut self, rules: crate::Rules) {
+        self.validator.set_rules(rules);
+    }
+
     /// Implement a function on the renderer (see [`Evaluator::register`]).
     pub fn register(&mut self, name: impl Into<String>, def: FunctionDef, function: LocalFunction) {
         self.evaluator.register(name, def, function);
@@ -245,6 +251,23 @@ impl Runtime {
         self.surfaces
             .get(surface_id)
             .is_some_and(|surface| surface.send_data_model)
+    }
+
+    /// The renderer's capabilities (`renderer_capabilities.json`): the ids of
+    /// its catalogs and, with `inline`, the catalog documents themselves.
+    pub fn capabilities(&self, inline: bool) -> Value {
+        let mut caps = Map::new();
+        caps.insert(
+            "supportedCatalogIds".into(),
+            self.catalogs.iter().map(|c| Value::from(c.id())).collect(),
+        );
+        if inline {
+            caps.insert(
+                "inlineCatalogs".into(),
+                self.catalogs.iter().map(|c| c.document().clone()).collect(),
+            );
+        }
+        serde_json::json!({ crate::PROTOCOL_VERSION: caps })
     }
 
     /// The renderer data model to send with a message (`renderer_data_model.json`):

@@ -1,5 +1,5 @@
-//! The A2UI specification's shared conformance suites for the runtime, run
-//! against `agent86_ui::runtime`.
+//! The A2UI specification's shared conformance suites for the runtime, the
+//! validator, and the message processor, run against `agent86_ui::runtime`.
 //!
 //! `tests/fixtures/conformance/core/*.json` are the upstream YAML suites
 //! (`conformance/core/` at the commit in `spec/UPSTREAM.md`), converted to JSON
@@ -496,6 +496,18 @@ fn inline_catalog(spec: &Value) -> Catalog {
         document["catalogId"] = json!(id);
         return Catalog::from_value(document).unwrap();
     };
+    // A fragment is a URI part, so a non-ASCII name is percent-encoded.
+    let encode = |name: &str| -> String {
+        name.bytes()
+            .map(|b| {
+                if b.is_ascii() {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
     let mut defs = Vec::new();
     let mut filled = serde_json::Map::new();
     for (name, schema) in components {
@@ -508,14 +520,30 @@ fn inline_catalog(spec: &Value) -> Catalog {
             required.push(json!("component"));
             schema["required"] = Value::Array(required);
         }
-        defs.push(json!({"$ref": format!("#/components/{name}")}));
+        defs.push(json!({"$ref": format!("#/components/{}", encode(name))}));
         filled.insert(name.clone(), schema);
     }
+    // Functions keep their schemas; `anyFunction` lists them.
+    let functions = spec
+        .get("functions")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let any_function = if functions.is_empty() {
+        json!(false)
+    } else {
+        let refs: Vec<Value> = functions
+            .keys()
+            .map(|name| json!({"$ref": format!("#/functions/{}", encode(name))}))
+            .collect();
+        json!({ "oneOf": refs })
+    };
     Catalog::from_value(json!({
         "protocolVersion": "1.0",
         "catalogId": id,
         "components": filled,
-        "$defs": {"anyComponent": {"oneOf": defs}, "anyFunction": false}
+        "functions": functions,
+        "$defs": {"anyComponent": {"oneOf": defs}, "anyFunction": any_function}
     }))
     .unwrap()
 }
@@ -613,12 +641,28 @@ fn nodes_by_name(
     map
 }
 
-fn check_node(node: &agent86_ui::runtime::Node, expected: &Value, at: &str) -> Result<(), String> {
+fn check_node(
+    node: &agent86_ui::runtime::Node,
+    raw: Option<&Value>,
+    expected: &Value,
+    at: &str,
+) -> Result<(), String> {
     for (key, want) in expected.as_object().into_iter().flatten() {
         let got = match key.as_str() {
             "id" => Some(json!(node.id)),
             "component" => Some(json!(node.component)),
-            _ => node.properties.get(key).cloned(),
+            // Envelope keys stay on the component as sent.
+            "@metadata" => raw.and_then(|r| r.get(key)).cloned(),
+            // A property holding only children is in the node's children.
+            _ => node.properties.get(key).cloned().or_else(|| {
+                let (_, nodes) = node.children.iter().find(|(name, _)| name == key)?;
+                let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+                Some(if want.is_array() {
+                    json!(ids)
+                } else {
+                    json!(ids.first())
+                })
+            }),
         };
         if !property_matches(got.as_ref(), want) {
             return Err(format!("{at}.{key} is {got:?}, expected {want}"));
@@ -649,7 +693,12 @@ fn check_surfaces(runtime: &agent86_ui::runtime::Runtime, expected: &Value) -> R
                     let node = nodes
                         .get(id)
                         .ok_or_else(|| format!("{surface}: no component {id}"))?;
-                    check_node(node, component, &format!("{surface}.{id}"))?;
+                    let raw = runtime
+                        .components(surface)
+                        .into_iter()
+                        .flatten()
+                        .find(|c| c["id"] == json!(id));
+                    check_node(node, raw, component, &format!("{surface}.{id}"))?;
                 }
             }
             Some(Value::Array(components)) => {
@@ -665,7 +714,12 @@ fn check_surfaces(runtime: &agent86_ui::runtime::Runtime, expected: &Value) -> R
                     let node = nodes
                         .get(id)
                         .ok_or_else(|| format!("{surface}: no component {id}"))?;
-                    check_node(node, component, &format!("{surface}.{id}"))?;
+                    let raw = runtime
+                        .components(surface)
+                        .into_iter()
+                        .flatten()
+                        .find(|c| c["id"] == json!(id));
+                    check_node(node, raw, component, &format!("{surface}.{id}"))?;
                 }
             }
             _ => {}
@@ -1031,5 +1085,576 @@ fn actions() {
         &["dispatch_action"],
         &[],
         dispatch_case,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The validator and message processor suites (`validator_v1_0`,
+// `message_processor_v1_0`): batches through a strict `Runtime`, as the
+// harness guide says (`strictMode: false` relaxes it; a step's
+// `validationConfig` replaces the rules for that step, a rule it leaves out
+// being strict).
+//
+// Error messages are matched as the Python reference harness matches them: a
+// case writes one SDK's wording, so the expected text is looked for without
+// case, with the same few alternations for the other SDKs' phrasing, or as a
+// regular expression. `details` lists each SDK's own model errors
+// (`messages.0.version`, `missing_field`) and is not compared; the verdict,
+// the category, the message, and the renderer error are.
+
+/// The catalogs a case declares, each made a 1.0 catalog this crate loads;
+/// a catalog for another protocol version is left out, since a 1.0 renderer
+/// cannot use it.
+fn declared_catalogs(case: &Value) -> Vec<Catalog> {
+    let mut catalogs = Vec::new();
+    for path in case
+        .get("catalogPaths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(catalog) = catalog_at(path.as_str().unwrap()) {
+            catalogs.push(catalog);
+        }
+    }
+    if let Some(spec) = case
+        .get("catalog")
+        .filter(|s| s.get("components").is_some())
+    {
+        catalogs.push(inline_catalog(spec));
+    }
+    for spec in case
+        .get("catalogs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let version = spec
+            .get("protocolVersion")
+            .or_else(|| case.get("protocolVersion"))
+            .and_then(Value::as_str);
+        if version.is_some_and(|v| v != "1.0") {
+            continue;
+        }
+        let catalog = if spec.get("components").is_none() {
+            // A stub, the id and version alone: an empty catalog where the
+            // case is about capabilities, else (as Python's harness does) the
+            // basic catalog under that id.
+            let id = spec["catalogId"].as_str().unwrap();
+            if case["action"] == "get_renderer_capabilities" {
+                Catalog::from_value(json!({
+                    "protocolVersion": "1.0",
+                    "catalogId": id,
+                    "components": {},
+                    "$defs": {"anyComponent": false, "anyFunction": false}
+                }))
+                .unwrap()
+            } else {
+                let mut document = Catalog::basic().document().clone();
+                document["catalogId"] = json!(id);
+                Catalog::from_value(document).unwrap()
+            }
+        } else {
+            Catalog::from_value(spec.clone()).unwrap_or_else(|_| inline_catalog(spec))
+        };
+        catalogs.push(catalog);
+    }
+    catalogs
+}
+
+/// Every `createSurface.catalogId` a case's messages name.
+fn surface_catalog_ids(case: &Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let mut batches = vec![case.get("messages").or_else(|| case.get("payload"))];
+    for step in case
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        batches.push(step.get("messages").or_else(|| step.get("payload")));
+    }
+    for batch in batches.into_iter().flatten() {
+        for message in messages_of(batch) {
+            if let Some(id) = message
+                .get("createSurface")
+                .and_then(|c| c.get("catalogId"))
+                .and_then(Value::as_str)
+            {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn expects_catalog_error(case: &Value) -> bool {
+    let mut all = vec![expect_error(case)];
+    for step in case
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        all.push(expect_error(step));
+    }
+    all.into_iter()
+        .flatten()
+        .any(|e| e.get("category").and_then(Value::as_str) == Some("CatalogError"))
+}
+
+/// The case's runtime: its declared catalogs, plus (the harness guide's
+/// advice for a stricter runner) the first of them, or the basic catalog, under
+/// each surface catalog id the case uses without defining it, unless the case
+/// is about a catalog that cannot be found.
+fn suite_runtime(case: &Value) -> agent86_ui::runtime::Runtime {
+    let mut catalogs = declared_catalogs(case);
+    if !expects_catalog_error(case) {
+        let excluded: BTreeSet<&str> = case
+            .get("catalogs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("catalogId").and_then(Value::as_str))
+            .collect();
+        let base = catalogs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Catalog::basic().clone());
+        for id in surface_catalog_ids(case) {
+            if catalogs.iter().any(|c| c.id() == id) || excluded.contains(id.as_str()) {
+                continue;
+            }
+            if id.contains("v0_9") {
+                continue;
+            }
+            let mut document = base.document().clone();
+            document["catalogId"] = json!(id);
+            catalogs.push(Catalog::from_value(document).unwrap());
+        }
+    }
+    let mut runtime = agent86_ui::runtime::Runtime::new(catalogs).unwrap();
+    runtime.set_rules(case_rules(case));
+    runtime
+}
+
+fn case_rules(case: &Value) -> agent86_ui::Rules {
+    if case.get("strictMode") == Some(&json!(false)) {
+        agent86_ui::Rules::RELAXED
+    } else {
+        agent86_ui::Rules::STRICT
+    }
+}
+
+/// A step's `validationConfig` as rules; a flag left out is strict.
+fn step_rules(config: &Value) -> Result<agent86_ui::Rules, String> {
+    known_keys(
+        config,
+        &[
+            "allowOrphanComponents",
+            "allowDanglingReferences",
+            "allowMissingRoot",
+        ],
+        "validationConfig",
+    )?;
+    let flag = |name: &str| config.get(name).and_then(Value::as_bool).unwrap_or(false);
+    Ok(agent86_ui::Rules::STRICT
+        .allowing_orphans(flag("allowOrphanComponents"))
+        .allowing_dangling_references(flag("allowDanglingReferences"))
+        .allowing_missing_root(flag("allowMissingRoot")))
+}
+
+/// The Python reference harness's message match (`_error_message_matches`).
+fn message_matches(expected: &str, actual: &str) -> bool {
+    let norm = |s: &str| s.to_lowercase().replace('"', "'");
+    let (want, got) = (norm(expected), norm(actual));
+    if got.contains(&want) {
+        return true;
+    }
+    if (want.contains("orphan") && got.contains("not reachable"))
+        || (want.contains("circular")
+            && (got.contains("circular") || got.contains("self-reference")))
+    {
+        return true;
+    }
+    regex::Regex::new(expected).is_ok_and(|re| re.is_match(actual))
+}
+
+fn category_of(problem: &agent86_ui::Problem) -> &'static str {
+    match problem.code {
+        agent86_ui::Code::IntegrityError => "IntegrityError",
+        agent86_ui::Code::DataError => "DataError",
+        _ => "ValidationError",
+    }
+}
+
+/// Whether a report holds the error a case expects.
+fn suite_error_matches(expected: &Value, report: &agent86_ui::Report) -> Result<(), String> {
+    let (category, message) = match expected {
+        Value::String(text) => (None, Some(text.as_str())),
+        _ => {
+            known_keys(
+                expected,
+                &[
+                    "category",
+                    "message",
+                    "surfaceId",
+                    "path",
+                    "details",
+                    "rendererError",
+                ],
+                "expectError",
+            )?;
+            (
+                expected.get("category").and_then(Value::as_str),
+                expected.get("message").and_then(Value::as_str),
+            )
+        }
+    };
+    if report.is_ok() {
+        return Err(format!(
+            "expected an error {expected}, the batch was accepted"
+        ));
+    }
+    let category_ok = |problem: &agent86_ui::Problem| match category {
+        None => true,
+        Some(want) => {
+            let got = category_of(problem);
+            got == want || (want == "ValidationError" && got == "IntegrityError")
+        }
+    };
+    let found = report.errors.iter().any(|problem| {
+        category_ok(problem)
+            && message.is_none_or(|m| message_matches(m, &problem.message))
+            && expected
+                .get("surfaceId")
+                .and_then(Value::as_str)
+                .is_none_or(|s| problem.surface_id.as_deref() == Some(s))
+    });
+    if !found {
+        return Err(format!(
+            "expected {expected}, got {:?}",
+            report
+                .errors
+                .iter()
+                .map(|p| format!("{} {}: {}", category_of(p), p.code, p.message))
+                .collect::<Vec<_>>()
+        ));
+    }
+    if let Some(wire) = expected.get("rendererError") {
+        let error = &wire["error"];
+        let ok = report.errors.iter().any(|problem| {
+            error["code"].as_str() == Some(problem.code.as_str())
+                && error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_none_or(|m| message_matches(m, &problem.message))
+                && error
+                    .get("surfaceId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| problem.surface_id.as_deref() == Some(s))
+        });
+        if !ok {
+            return Err(format!(
+                "expected renderer error {error}, got {:?}",
+                report
+                    .errors
+                    .iter()
+                    .map(|p| format!("{} at {:?}: {}", p.code, p.path, p.message))
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn suite_process_case(case: &Value) -> Result<(), String> {
+    known_keys(
+        case,
+        &[
+            "action",
+            "protocolVersion",
+            "catalog",
+            "catalogPaths",
+            "catalogs",
+            "strictMode",
+            "steps",
+            "messages",
+            "payload",
+            "expect",
+            "expectError",
+            "args",
+        ],
+        "case",
+    )?;
+    let mut runtime = suite_runtime(case);
+    let steps: Vec<Value> = match case.get("steps").and_then(Value::as_array) {
+        Some(steps) => steps.clone(),
+        None => vec![json!({
+            "messages": case.get("messages").or_else(|| case.get("payload")).cloned().unwrap_or(json!([])),
+        })],
+    };
+    let last = steps.len().saturating_sub(1);
+    for (number, step) in steps.iter().enumerate() {
+        known_keys(
+            step,
+            &[
+                "messages",
+                "payload",
+                "expect",
+                "expectError",
+                "validationConfig",
+            ],
+            "step",
+        )?;
+        let messages = messages_of(
+            step.get("messages")
+                .or_else(|| step.get("payload"))
+                .unwrap_or(&json!([])),
+        );
+        if let Some(config) = step.get("validationConfig") {
+            runtime.set_rules(step_rules(config)?);
+        }
+        let report = runtime.apply(&messages);
+        runtime.set_rules(case_rules(case));
+        let expected = expect_error(step).or(if number == last {
+            expect_error(case)
+        } else {
+            None
+        });
+        match expected {
+            Some(expected) => {
+                suite_error_matches(expected, &report).map_err(|e| format!("step {number}: {e}"))?
+            }
+            None => {
+                if !report.is_ok() {
+                    return Err(format!(
+                        "step {number}: unexpected errors {:?}",
+                        report
+                            .errors
+                            .iter()
+                            .map(|p| format!("{} at {:?}: {}", p.code, p.path, p.message))
+                            .collect::<Vec<_>>()
+                    ));
+                }
+                let expect = step.get("expect").or(if number == last {
+                    case.get("expect")
+                } else {
+                    None
+                });
+                if let Some(expect) = expect.filter(|e| !e.is_null()) {
+                    check_suite_surfaces(&runtime, expect)
+                        .map_err(|e| format!("step {number}: {e}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `expect.surfaces` for the processor suites: `exists` and `sendDataModel`
+/// here, the rest through [`check_surfaces`].
+fn check_suite_surfaces(
+    runtime: &agent86_ui::runtime::Runtime,
+    expect: &Value,
+) -> Result<(), String> {
+    known_keys(expect, &["surfaces"], "expect")?;
+    let mut rest = serde_json::Map::new();
+    for (id, want) in expect["surfaces"].as_object().into_iter().flatten() {
+        let mut want = want.clone();
+        let object = want.as_object_mut().unwrap();
+        if let Some(exists) = object.remove("exists") {
+            let got = runtime.surface_ids().any(|s| s == id);
+            if Some(got) != exists.as_bool() {
+                return Err(format!("surface {id} exists is {got}, expected {exists}"));
+            }
+        }
+        if let Some(send) = object.remove("sendDataModel") {
+            let got = runtime.sends_data_model(id);
+            if Some(got) != send.as_bool() {
+                return Err(format!(
+                    "surface {id} sendDataModel is {got}, expected {send}"
+                ));
+            }
+        }
+        rest.insert(id.clone(), want);
+    }
+    check_surfaces(runtime, &json!({ "surfaces": rest }))
+}
+
+fn capabilities_case(case: &Value) -> Result<(), String> {
+    known_keys(
+        case,
+        &["action", "protocolVersion", "catalogs", "args", "expect"],
+        "case",
+    )?;
+    known_keys(&case["args"], &["version", "includeInlineCatalogs"], "args")?;
+    let runtime = agent86_ui::runtime::Runtime::new(declared_catalogs(case)).unwrap();
+    let inline = case["args"]["includeInlineCatalogs"]
+        .as_bool()
+        .unwrap_or(false);
+    let got = runtime.capabilities(inline);
+    agent86_ui::check_renderer_capabilities(&got).map_err(|e| format!("{e:?}"))?;
+    if got != case["expect"] {
+        return Err(format!("capabilities {got}, expected {}", case["expect"]));
+    }
+    Ok(())
+}
+
+fn renderer_data_model_case(case: &Value) -> Result<(), String> {
+    known_keys(
+        case,
+        &[
+            "action",
+            "protocolVersion",
+            "catalogPaths",
+            "steps",
+            "messages",
+            "args",
+            "expect",
+        ],
+        "case",
+    )?;
+    if let Some(args) = case.get("args") {
+        known_keys(args, &["version"], "args")?;
+    }
+    let mut runtime = suite_runtime(case);
+    let steps: Vec<Value> = match case.get("steps").and_then(Value::as_array) {
+        Some(steps) => steps.clone(),
+        None => vec![json!({"messages": case["messages"]})],
+    };
+    for step in &steps {
+        known_keys(step, &["messages"], "step")?;
+        // A message for another version is not this renderer's to apply.
+        let messages: Vec<Value> = messages_of(&step["messages"])
+            .into_iter()
+            .filter(|m| m["version"] == "1.0")
+            .collect();
+        let report = runtime.apply(&messages);
+        if !report.is_ok() {
+            return Err(format!("unexpected errors {:?}", report.errors));
+        }
+    }
+    let got = runtime.renderer_data_model().unwrap_or(Value::Null);
+    if got != case["expect"] {
+        return Err(format!(
+            "renderer data model {got}, expected {}",
+            case["expect"]
+        ));
+    }
+    Ok(())
+}
+
+fn processor_suite_case(case: &Value) -> Result<(), String> {
+    match case["action"].as_str().unwrap() {
+        "get_renderer_capabilities" => capabilities_case(case),
+        "get_renderer_data_model" => renderer_data_model_case(case),
+        _ => suite_process_case(case),
+    }
+}
+
+// Why the cases left out of the processor suites are left out. Each is
+// recorded in the plan as work before the crate is first published; an entry
+// that stops matching a case fails the run.
+const LIMITS: &str = "the recursion and depth limits (component nesting 50, functionCall depth 5, data model depth) are not enforced yet";
+const PATH_SYNTAX: &str =
+    "binding and updateDataModel paths are not checked against RFC 6901 beyond the leading '/' yet";
+const NO_DEFAULT: &str = "a surface with no default catalogId, its components and calls naming their own catalogs, is not supported yet (CatalogError 'has no default catalogId')";
+const CALL_CATALOG: &str = "a function call naming its own catalogId is resolved by the runtime but not yet schema-checked against that catalog, and an unknown one is not a CatalogError";
+const LEGACY_CATALOG_ID: &str = "a component's bare catalogId (beside @catalogId) is not read yet";
+const METADATA: &str = "component metadata (metadata, @metadata) is not stored yet";
+const SDK_CODE: &str = "expects the reference SDKs' own renderer error code (RECURSION_LIMIT_EXCEEDED), outside the specification's enum";
+const AGENT_FUNCTIONS: &str = "agent functions (schema-only functions, routing an undeclared call to the agent) are left out of agent86UI's first version (ADR 0005)";
+const NESTED_NAME: &str = "an unknown function nested in a system function's args is reported as a shape mismatch, not by name, yet";
+const V0_9: &str = "asks for a 0.9 renderer data model; this renderer reads 1.0 only";
+
+#[test]
+fn validator_v1_0() {
+    run(
+        "validator_v1_0",
+        Versions::From1_0,
+        PROCESSOR,
+        &[
+            ("test_v10_invalid_binding_path_error", PATH_SYNTAX),
+            ("test_v10_update_data_model_invalid_path_error", PATH_SYNTAX),
+            (
+                "test_v10_component_nesting_depth_limit_exceeded_error",
+                LIMITS,
+            ),
+            (
+                "test_v10_component_nesting_depth_one_past_limit_error",
+                LIMITS,
+            ),
+            (
+                "test_v10_recursion_limit_function_call_depth_exceeded_error",
+                LIMITS,
+            ),
+            (
+                "test_v10_recursion_limit_function_call_depth_one_past_limit_error",
+                LIMITS,
+            ),
+            (
+                "test_v10_data_model_nesting_depth_limit_exceeded_error",
+                LIMITS,
+            ),
+        ],
+        processor_suite_case,
+    );
+}
+
+#[test]
+fn message_processor_v1_0() {
+    run(
+        "message_processor_v1_0",
+        Versions::From1_0,
+        &[
+            "validate",
+            "process_messages",
+            "get_renderer_capabilities",
+            "get_renderer_data_model",
+        ],
+        &[
+            ("test_global_recursion_depth_limit_exceeded_error", LIMITS),
+            ("test_batch_atomic_rollback_on_candidate_topology_cycle", SDK_CODE),
+            ("test_v10_component_without_catalog_id_on_surface_without_default_errors", NO_DEFAULT),
+            ("test_v10_components_naming_catalogs_on_surface_without_default", NO_DEFAULT),
+            ("test_v10_component_from_named_catalog_with_closed_schema_accepted", NO_DEFAULT),
+            ("test_v10_function_call_without_catalog_id_on_surface_without_default_errors", NO_DEFAULT),
+            ("test_v10_index_function_on_surface_without_default", NO_DEFAULT),
+            ("test_v10_component_update_without_catalog_id_on_surface_without_default_errors", NO_DEFAULT),
+            ("test_v10_nested_call_in_args_on_surface_without_default_errors", NO_DEFAULT),
+            ("test_v10_call_in_index_args_on_surface_without_default_errors", NO_DEFAULT),
+            ("test_v10_call_without_catalog_id_on_surface_without_default_errors_without_strict_mode", NO_DEFAULT),
+            ("test_v10_component_without_catalog_id_errors_with_a_single_catalog", NO_DEFAULT),
+            ("test_v10_function_call_naming_catalog_without_that_function_errors", CALL_CATALOG),
+            ("test_v10_function_call_naming_catalog_with_invalid_args_errors", CALL_CATALOG),
+            ("test_v10_function_call_naming_catalog_with_valid_args", CALL_CATALOG),
+            ("test_v10_function_call_naming_unknown_catalog_errors", CALL_CATALOG),
+            ("test_v10_function_call_with_empty_catalog_id_errors", CALL_CATALOG),
+            ("test_v10_nested_call_in_args_resolves_its_own_catalog", CALL_CATALOG),
+            ("test_v10_nested_call_in_args_naming_its_catalog", CALL_CATALOG),
+            ("test_v10_calls_in_lists_naming_their_catalog", CALL_CATALOG),
+            ("test_v10_call_naming_unknown_catalog_errors_without_strict_mode", CALL_CATALOG),
+            ("test_v10_call_naming_catalog_of_other_protocol_version_errors", CALL_CATALOG),
+            ("test_v10_component_catalog_override", LEGACY_CATALOG_ID),
+            ("test_v10_update_components_mismatched_catalog_protocol_version_error", LEGACY_CATALOG_ID),
+            ("test_v10_function_call_without_catalog_id_uses_surface_default", LEGACY_CATALOG_ID),
+            ("test_v10_component_update_without_catalog_id_uses_surface_default", LEGACY_CATALOG_ID),
+            ("test_v10_call_in_list_without_catalog_id_uses_surface_default", LEGACY_CATALOG_ID),
+            ("test_v10_call_in_list_with_invalid_args_errors", LEGACY_CATALOG_ID),
+            ("test_v10_component_naming_catalog_is_checked_against_that_catalog", LEGACY_CATALOG_ID),
+            ("test_v10_legacy_catalog_id_routes_by_default_catalog_schema", LEGACY_CATALOG_ID),
+            ("test_v10_legacy_catalog_id_routes_when_target_declares_non_string_catalog_id", LEGACY_CATALOG_ID),
+            ("test_v10_inline_catalog_id_and_metadata_standard_only_beside_inline_id", LEGACY_CATALOG_ID),
+            ("test_v10_update_components_stores_component_metadata", METADATA),
+            ("test_v10_update_components_replaces_component_metadata", METADATA),
+            ("test_v10_update_components_omitted_metadata_clears_component_metadata", METADATA),
+            ("test_v10_strict_function_call_to_schema_only_function_of_surface_catalog", AGENT_FUNCTIONS),
+            ("test_v10_call_to_undeclared_function_without_strict_mode_accepted", AGENT_FUNCTIONS),
+            ("test_v10_call_in_index_args_is_checked", NESTED_NAME),
+            ("test_v10_get_renderer_data_model_excludes_surface_without_default_from_v09", V0_9),
+            ("test_v10_get_renderer_data_model_filters_by_surface_protocol_version", V0_9),
+        ],
+        processor_suite_case,
     );
 }
