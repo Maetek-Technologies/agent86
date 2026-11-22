@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — 2026-11-19 (proposed the same day, before any binding code; the name, the minimum versions, and `TurnEvent`'s `#[non_exhaustive]` were settled at review, and the first slice of 1.2.0 is the prototype that settles the binding crates' lints)
+Accepted — 2026-11-19 (proposed the same day, before any binding code; the name, the minimum versions, and `TurnEvent`'s `#[non_exhaustive]` were settled at review, and the first slice of 1.2.0 is the prototype that settles the binding crates' lints); amended 2026-11-22: renumbered 1.3.0 and 1.3.1, see the amendment below
 
 ## Context
 
@@ -56,7 +56,7 @@ What that means:
 
 Binding an API copies its shape into two more languages, so a few things are settled in `sdk` before the first slice, each in a 1.1.x patch release with Rust tests:
 
-- **Events that can grow.** `TurnEvent` was a public enum without `#[non_exhaustive]`, so a new variant was a breaking change for a Rust caller that matched every variant. It is now `#[non_exhaustive]` (done 2026-11-19, shipping in 1.1.1; see the settled questions below). That was itself a breaking change for such callers, made while the crate has few users rather than at 2.0. `BuildError`, `RunError`, and `RunResult` got the same marker at the same time, so new error reasons and result fields are additive too.
+- **Events that can grow.** `TurnEvent` was a public enum without `#[non_exhaustive]`, so a new variant was a breaking change for a Rust caller that matched every variant. It is now `#[non_exhaustive]` (done 2026-11-19, shipping in 1.2.0 since the 2026-11-22 amendment; see the settled questions below). That was itself a breaking change for such callers, made while the crate has few users rather than at 2.0. `BuildError`, `RunError`, and `RunResult` got the same marker at the same time, so new error reasons and result fields are additive too.
 - **A blocking entry point or a runtime rule.** The bindings drive `Agent::run` from their own Tokio runtime. Its documentation should say which runtime flavors work (a turn that fans out sub-agents needs a multi-threaded runtime, as the tests do), so the bindings and Rust callers follow one rule.
 - **Async host callbacks in mind.** The callbacks are `Fn` called on the turn's thread, which is what makes the bridging above possible. That stays a documented guarantee of `sdk`, not an accident of its implementation.
 
@@ -64,7 +64,7 @@ Binding an API copies its shape into two more languages, so a few things are set
 
 1. **The PyPI name is `agent86-core`**, imported as `agent86_core`. `agent86` stays the archived Python implementation's, so `pip install agent86` keeps giving its users the CLI they have.
 2. **Python 3.11 and Node 22 are the minimum versions.** Python 3.10 reached its end of life in October 2026 and Node 20 in April 2026, so these are the oldest lines still maintained. The wheels are built for `abi3` from 3.11.
-3. **`TurnEvent` is `#[non_exhaustive]` now**, while the crate is a day old and has few users, rather than at 2.0. It ships in 1.1.1, whose notes say that a Rust `match` on it needs a `_` arm. The binary's own matches got catch-alls in the same change.
+3. **`TurnEvent` is `#[non_exhaustive]` now**, while the crate is a day old and has few users, rather than at 2.0. It ships in 1.2.0 (1.1.1 before the 2026-11-22 amendment), whose notes say that a Rust `match` on it needs a `_` arm. The binary's own matches got catch-alls in the same change.
 
 Still open, for the first slice's prototype:
 
@@ -88,3 +88,10 @@ Still open, for the first slice's prototype:
 - **A slow host callback holds the turn**, as a slow Rust tool does today. That is documented, and is the price of keeping the harness's tools synchronous.
 - **The CLI and its contracts are untouched.** Nothing in `run --json`, the session database, the trace, or the config changes, and the `agent86` npm package stays the CLI.
 - **The archived Python implementation is left alone** under its own PyPI name.
+
+## Amendment: renumbered 1.3.0 and 1.3.1 (2026-11-22)
+
+agent86UI ([ADR 0005](0005-agent86ui-a2ui.md)) was moved ahead of the 1.1.x patches because agent86-desktop now comes first. It adds to `sdk`, so it takes 1.2.0, and the releases after it move along. The Python bindings are now 1.3.0 and the TypeScript bindings 1.3.1. Nothing else in this decision changes. Where the text above says 1.2.0 or 1.2.1 for the bindings, read 1.3.0 or 1.3.1. Two things follow:
+
+- **The bindings bind agent86UI from their first release.** `AgentBuilder::ui`, `Agent::ui_action`, and a `ui` event kind join slice 2's list, and the blocking `on_wait` callback is bridged the same way as `on_secret_request`.
+- **The `#[non_exhaustive]` change ships in 1.2.0, not 1.1.1.** It was already on `main`, and is now released in a minor version, which suits a change that breaks exhaustive matches.
