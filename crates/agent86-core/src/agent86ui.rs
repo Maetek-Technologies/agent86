@@ -8,6 +8,7 @@
 //! the tool context like the secret vault. It exists only when the embedder
 //! declared a renderer; sub-agents never get it.
 
+use crate::config::EgressMode;
 use agent86_ui::runtime::Runtime;
 use agent86_ui::{AgentMessage, Catalog, CompileError, Report, Rules};
 use serde_json::{Map, Value};
@@ -21,6 +22,10 @@ pub const RENDER_UI: &str = "render_ui";
 /// recorded (so nothing new reaches the session or the trace).
 pub const MESSAGES_KEY: &str = "agent86ui_messages";
 
+/// Where it leaves what the trace's `ui_render` event records (the surfaces,
+/// the component count, the verdict), taken out the same way.
+pub const TRACE_KEY: &str = "agent86ui_trace";
+
 /// The completeness rules a `render_ui` batch is checked under: strict, but an
 /// orphan is a warning, because A2UI 1.0 has no message that removes a
 /// component, so one replaced as a child stays behind and the model could not
@@ -31,6 +36,12 @@ pub const RULES: Rules = Rules::STRICT.allowing_orphans(true);
 pub struct UiSession {
     catalogs: Vec<Catalog>,
     runtime: Mutex<Runtime>,
+    /// The egress guardrail's mode: in `redact`, every string a surface shows
+    /// is redacted first.
+    egress: EgressMode,
+    /// Media may load from `https` URLs, not only `data:` URLs and workspace
+    /// files.
+    remote_media: bool,
 }
 
 impl std::fmt::Debug for UiSession {
@@ -52,7 +63,31 @@ impl UiSession {
         Ok(Self {
             catalogs,
             runtime: Mutex::new(runtime),
+            egress: EgressMode::Off,
+            remote_media: false,
         })
+    }
+
+    /// Redact what surfaces show as the egress guardrail in `mode` redacts the
+    /// model's text.
+    pub fn with_egress(mut self, mode: EgressMode) -> Self {
+        self.egress = mode;
+        self
+    }
+
+    /// Let media load from `https` URLs too (ADR 0005: off by default, since a
+    /// fetch can track the user or carry data out in its URL).
+    pub fn with_remote_media(mut self, allow: bool) -> Self {
+        self.remote_media = allow;
+        self
+    }
+
+    pub fn egress(&self) -> EgressMode {
+        self.egress
+    }
+
+    pub fn remote_media(&self) -> bool {
+        self.remote_media
     }
 
     pub fn catalogs(&self) -> &[Catalog] {
@@ -78,6 +113,18 @@ impl UiSession {
     /// functions. Rebuilt per request, like the MCP section.
     pub fn prompt_section(&self) -> String {
         let mut section = String::from(PROMPT);
+        let media = if self.remote_media {
+            "a data: URL, an https URL, or the path of a file in the workspace"
+        } else {
+            "a data: URL or the path of a file in the workspace (remote URLs are not loaded)"
+        };
+        section.push_str(&format!(
+            "\n- Never ask for a password, key, or token in a surface (no TextField with \
+             variant \"obscured\"): call request_secret, which asks through a masked prompt \
+             and never shows you the value.\n- The url (and a Video's posterUrl) of Image, \
+             Video, and AudioPlayer must be a literal string: {media}.\n- openUrl opens only \
+             http and https URLs."
+        ));
         for catalog in &self.catalogs {
             section.push_str(&format!("\n\n### Catalog `{}`\n", catalog.id()));
             if let Some(instructions) = catalog.instructions() {
@@ -256,21 +303,361 @@ fn type_of(property: &Value) -> String {
     }
 }
 
-/// The messages a `render_ui` result carries for the loop, taken out of its
-/// metadata, so they are emitted and never recorded.
-pub fn take_messages(metadata: &mut Map<String, Value>) -> Vec<AgentMessage> {
-    match metadata.remove(MESSAGES_KEY) {
+/// What a `render_ui` result carries for the loop, taken out of its metadata,
+/// so it is emitted and recorded as agent86UI's own and never kept in the
+/// session: the validated messages, and the `ui_render` trace fields.
+pub fn take_drawn(metadata: &mut Map<String, Value>) -> (Vec<AgentMessage>, Option<Value>) {
+    let messages = match metadata.remove(MESSAGES_KEY) {
         Some(Value::Array(items)) => items
             .into_iter()
             .filter_map(|item| serde_json::from_value(item).ok())
             .collect(),
         _ => Vec::new(),
+    };
+    (messages, metadata.remove(TRACE_KEY))
+}
+
+/// Every string in `value`, through the secret vault's redaction and, with the
+/// egress guardrail in `redact` mode, its redaction too: what a surface shows
+/// reaches the user as the model's text does. Object keys are left alone.
+pub fn sanitize(value: &Value, vault: &crate::vault::SecretVault, egress: EgressMode) -> Value {
+    match value {
+        Value::String(text) => {
+            let text = vault.redact(text);
+            Value::String(if egress == EgressMode::Redact {
+                crate::guardrails::redact(&text).0
+            } else {
+                text
+            })
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize(item, vault, egress))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), sanitize(item, vault, egress)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Something agent86's policy refuses in a batch (ADR 0005), where the
+/// protocol would allow it: a JSON Pointer into the batch and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub path: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "REFUSED at {}: {}", self.path, self.message)
+    }
+}
+
+/// The media components of the basic catalog and the properties that load a
+/// URL. A custom catalog's component of the same name is held to the same rule.
+const MEDIA: &[(&str, &[&str])] = &[
+    ("Image", &["url"]),
+    ("Video", &["url", "posterUrl"]),
+    ("AudioPlayer", &["url"]),
+];
+
+/// What agent86 refuses in a batch the protocol allows (ADR 0005):
+/// - a `TextField` with `"variant": "obscured"`: secrets are never collected
+///   through a surface, so the value never reaches the model;
+/// - media from anywhere but a `data:` URL or a file in the workspace (or an
+///   `https` URL, with `remote_media`), and from a binding or a call, whose
+///   value is not known until the renderer resolves it;
+/// - `openUrl` with a literal URL that is not `http` or `https` (a dynamic one
+///   is the renderer's to check before it opens it, after showing it);
+/// - `callRendererFunction` and agent functions, left out of the first version.
+pub fn policy(
+    messages: &[Value],
+    jail: &crate::tools::SandboxPolicy,
+    remote_media: bool,
+) -> Vec<Refusal> {
+    let mut refusals = Vec::new();
+    let mut refuse = |path: String, message: String| refusals.push(Refusal { path, message });
+    for (index, message) in messages.iter().enumerate() {
+        if message.get("callRendererFunction").is_some() {
+            refuse(
+                format!("/{index}/callRendererFunction"),
+                "renderer functions are not available here; draw with components and change \
+                 them with updateComponents and updateDataModel instead"
+                    .into(),
+            );
+        }
+        if message.get("agentFunctionResponse").is_some() {
+            refuse(
+                format!("/{index}/agentFunctionResponse"),
+                "agent functions are not available here".into(),
+            );
+        }
+        for kind in ["createSurface", "updateComponents"] {
+            let Some(components) = message
+                .get(kind)
+                .and_then(|body| body.get("components"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for (number, component) in components.iter().enumerate() {
+                let at = format!("/{index}/{kind}/components/{number}");
+                let type_name = component.get("component").and_then(Value::as_str);
+                let id = component
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("this component");
+                if type_name == Some("TextField")
+                    && component.get("variant").and_then(Value::as_str) == Some("obscured")
+                {
+                    refuse(
+                        format!("{at}/variant"),
+                        format!(
+                            "TextField {id} is \"obscured\", a password field, but a surface never \
+                             collects secrets: call request_secret instead, which asks the user \
+                             through a masked prompt and never shows you the value"
+                        ),
+                    );
+                }
+                if let Some((_, properties)) =
+                    MEDIA.iter().find(|(name, _)| Some(*name) == type_name)
+                {
+                    for property in *properties {
+                        let Some(value) = component.get(*property) else {
+                            continue;
+                        };
+                        let path = format!("{at}/{property}");
+                        match value.as_str() {
+                            Some(url) => {
+                                if let Some(why) = media_problem(url, jail, remote_media) {
+                                    refuse(path, format!("{id}'s {property} {why}"));
+                                }
+                            }
+                            None => refuse(
+                                path,
+                                format!(
+                                    "{id}'s {property} must be a literal string: what a surface \
+                                     loads is checked before it is drawn, so it cannot come from a \
+                                     binding or a function call"
+                                ),
+                            ),
+                        }
+                    }
+                }
+                open_urls(component, &at, &mut refuse);
+            }
+        }
+    }
+    refusals
+}
+
+/// Why a media URL may not load, or `None` when it may.
+fn media_problem(
+    url: &str,
+    jail: &crate::tools::SandboxPolicy,
+    remote_media: bool,
+) -> Option<String> {
+    match scheme(url) {
+        Some(scheme) if scheme == "data" => None,
+        Some(scheme) if scheme == "https" && remote_media => None,
+        Some(scheme) if scheme == "https" || scheme == "http" => Some(format!(
+            "{url:?} is a remote URL, and remote media is off here (a fetch can track the user \
+             or carry data out in its URL): use a data: URL or a file in the workspace"
+        )),
+        Some(scheme) => Some(format!(
+            "{url:?} uses {scheme}:, which a surface may not load: use a data: URL or a file in \
+             the workspace"
+        )),
+        None => match jail.resolve_within(url) {
+            Err(_) => Some(format!("{url:?} is outside the workspace")),
+            Ok(path) if !path.is_file() => Some(format!("{url:?} is not a file in the workspace")),
+            Ok(_) => None,
+        },
+    }
+}
+
+/// A URL's scheme, lowercased, when it has one. A single letter before the
+/// colon is a Windows drive, not a scheme.
+fn scheme(url: &str) -> Option<String> {
+    let (scheme, _) = url.split_once(':')?;
+    let valid = scheme.len() > 1
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then(|| scheme.to_ascii_lowercase())
+}
+
+/// Refuse each `openUrl` call in `value` whose literal URL is not `http` or
+/// `https`.
+fn open_urls(value: &Value, at: &str, refuse: &mut impl FnMut(String, String)) {
+    match value {
+        Value::Object(map) => {
+            if map.get("@call").and_then(Value::as_str) == Some("openUrl") {
+                if let Some(url) = value.pointer("/args/url").and_then(Value::as_str) {
+                    let scheme = scheme(url);
+                    if !matches!(scheme.as_deref(), Some("http" | "https")) {
+                        refuse(
+                            format!("{at}/args/url"),
+                            format!("openUrl only opens http and https URLs, not {url:?}"),
+                        );
+                    }
+                }
+            }
+            for (key, item) in map {
+                let segment = key.replace('~', "~0").replace('/', "~1");
+                open_urls(item, &format!("{at}/{segment}"), refuse);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                open_urls(item, &format!("{at}/{index}"), refuse);
+            }
+        }
+        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::tools::SandboxPolicy;
+    use serde_json::json;
+
+    struct Jail(std::path::PathBuf, SandboxPolicy);
+
+    fn jail(name: &str) -> Jail {
+        let root = std::env::temp_dir().join(format!("agent86-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("img")).unwrap();
+        std::fs::write(root.join("img/cat.png"), b"png").unwrap();
+        let policy = SandboxPolicy::new(&root).unwrap();
+        Jail(root, policy)
+    }
+
+    impl Drop for Jail {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn with_components(components: Value) -> Vec<Value> {
+        vec![json!({"version": "1.0", "createSurface": {
+            "surfaceId": "s", "catalogId": "c", "components": components
+        }})]
+    }
+
+    fn refused(messages: &[Value], jail: &Jail, remote: bool) -> Vec<String> {
+        policy(messages, &jail.1, remote)
+            .into_iter()
+            .map(|r| format!("{} {}", r.path, r.message))
+            .collect()
+    }
+
+    #[test]
+    fn a_password_field_is_refused_with_request_secret_named() {
+        let jail = jail("obscured");
+        let got = refused(
+            &with_components(json!([
+                {"id": "root", "component": "TextField", "label": "Password", "variant": "obscured"},
+                {"id": "note", "component": "TextField", "label": "Note", "variant": "longText"}
+            ])),
+            &jail,
+            false,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].starts_with("/0/createSurface/components/0/variant TextField root"));
+        assert!(got[0].contains("request_secret"));
+    }
+
+    #[test]
+    fn media_loads_only_data_urls_and_workspace_files_unless_remote_is_on() {
+        let jail = jail("media");
+        let image =
+            |url: Value| with_components(json!([{"id": "root", "component": "Image", "url": url}]));
+        let ok = |url: Value, remote| refused(&image(url), &jail, remote).is_empty();
+        assert!(ok(json!("data:image/png;base64,iVBORw0KGgo="), false));
+        assert!(ok(json!("img/cat.png"), false));
+        assert!(!ok(json!("img/dog.png"), false), "missing file");
+        assert!(!ok(json!("../outside.png"), false), "outside the jail");
+        assert!(!ok(json!("https://example.com/cat.png"), false));
+        assert!(ok(json!("https://example.com/cat.png"), true));
+        assert!(!ok(json!("http://example.com/cat.png"), true), "only https");
+        assert!(!ok(json!("file:///etc/passwd"), true));
+        let bound = refused(&image(json!({"@path": "/url"})), &jail, true);
+        assert!(bound[0].contains("must be a literal string"), "{bound:?}");
+        // A Video's poster is held to the same rule.
+        let video = with_components(json!([{"id": "root", "component": "Video",
+            "url": "data:video/mp4;base64,AAAA", "posterUrl": "https://example.com/p.png"}]));
+        let got = refused(&video, &jail, false);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].starts_with("/0/createSurface/components/0/posterUrl"));
+    }
+
+    #[test]
+    fn open_url_takes_only_http_and_https_literals() {
+        let jail = jail("open");
+        let button = |url: Value| {
+            with_components(json!([
+                {"id": "root", "component": "Button", "child": "t",
+                 "action": {"functionCall": {"@call": "openUrl", "args": {"url": url}}}},
+                {"id": "t", "component": "Text", "text": "Go"}
+            ]))
+        };
+        assert!(refused(&button(json!("https://example.com")), &jail, false).is_empty());
+        assert!(refused(&button(json!("http://example.com")), &jail, false).is_empty());
+        // A dynamic URL is the renderer's to check, after showing it.
+        assert!(refused(&button(json!({"@path": "/link"})), &jail, false).is_empty());
+        let got = refused(&button(json!("javascript:alert(1)")), &jail, false);
+        assert_eq!(
+            got,
+            ["/0/createSurface/components/0/action/functionCall/args/url openUrl only opens http and https URLs, not \"javascript:alert(1)\""]
+        );
+    }
+
+    #[test]
+    fn renderer_and_agent_functions_are_refused() {
+        let jail = jail("functions");
+        let got = refused(
+            &[
+                json!({"version": "1.0", "callRendererFunction": {"surfaceId": "s", "functionCallId": "f", "call": {"@call": "x"}}}),
+                json!({"version": "1.0", "agentFunctionResponse": {"functionCallId": "f", "value": 1}}),
+            ],
+            &jail,
+            false,
+        );
+        assert!(got[0].starts_with("/0/callRendererFunction renderer functions are not available"));
+        assert!(got[1].starts_with("/1/agentFunctionResponse agent functions are not available"));
+    }
+
+    #[test]
+    fn a_drive_letter_is_not_a_scheme() {
+        assert_eq!(scheme("C:\\img\\cat.png"), None);
+        assert_eq!(scheme("HTTPS://x"), Some("https".into()));
+        assert_eq!(scheme("img/cat.png"), None);
+    }
+
+    #[test]
+    fn sanitize_redacts_secrets_and_with_egress_redact_what_the_guardrail_finds() {
+        let vault = crate::vault::SecretVault::default();
+        vault.set("API_TOKEN", "tok-abcdef-123456".into());
+        let message =
+            json!({"text": "use tok-abcdef-123456", "aws": "AKIAABCDEFGHIJKLMNOP", "n": 3});
+        let kept = sanitize(&message, &vault, EgressMode::Warn);
+        assert_eq!(kept["text"], "use ${secret:API_TOKEN}");
+        assert_eq!(kept["aws"], "AKIAABCDEFGHIJKLMNOP");
+        assert_eq!(kept["n"], 3);
+        let redacted = sanitize(&message, &vault, EgressMode::Redact);
+        assert_ne!(redacted["aws"], "AKIAABCDEFGHIJKLMNOP");
+        assert!(!redacted.to_string().contains("AKIA"), "{redacted}");
+    }
 
     #[test]
     fn the_basic_catalog_reference_names_components_and_functions() {

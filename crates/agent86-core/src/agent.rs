@@ -1219,8 +1219,18 @@ impl Harness {
                 #[cfg(feature = "agent86ui")]
                 let result = {
                     let mut result = result;
-                    for drawn in crate::agent86ui::take_messages(&mut result.metadata) {
-                        emit(TurnEvent::Ui(&drawn));
+                    let (drawn, trace) = crate::agent86ui::take_drawn(&mut result.metadata);
+                    for message in &drawn {
+                        emit(TurnEvent::Ui(message));
+                    }
+                    if let Some(Value::Object(fields)) = trace {
+                        // agent86's own kind (Python has none): which surfaces, how
+                        // many components, and the verdict, never the tree.
+                        let fields: Vec<(&str, Value)> = fields
+                            .iter()
+                            .map(|(key, value)| (key.as_str(), value.clone()))
+                            .collect();
+                        self.recorder.event(&sid, "ui_render", fields);
                     }
                     result
                 };
