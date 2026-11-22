@@ -108,6 +108,8 @@ What that means:
 
    The terminal renderer and the bindings do not depend on each other and can swap places.
 
+   Revised 2026-11-22, after 1.2.0 shipped: the terminal renderer moves up to **1.2.2**, right after the ACP extension, so agent86UI reaches the CLI's interactive interface sooner. Scheduled jobs become 1.2.3 and MCP vault secrets 1.2.4.
+
 ### Questions still open, for the first slice
 
 2. **The password-style field** (answered 2026-11-22). It is `TextField` with `"variant": "obscured"` (the basic catalog's `variant` enum is `longText`, `number`, `shortText`, `obscured`). The core refuses it in slice 2; the protocol crate stays policy-free.
@@ -120,7 +122,7 @@ What that means:
 2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth); 2c the redaction, guardrails, policy, and the `ui_render` trace kind (done 2026-11-22; see the fifth); 2d the blocking wait (done 2026-11-22; see the sixth); 2e actions after the turn (done 2026-11-22; see the seventh); 2f replay on resume and `Agent::surfaces` (done 2026-11-22; see the eighth); 2g the docs and the first measurement of question 4 (done 2026-11-22; see the ninth); 2h the validator's remaining rules (done 2026-11-22; see the tenth).
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
 4. **The ACP extension and its text fallback** (1.2.1).
-5. **The terminal renderer** (1.2.4).
+5. **The terminal renderer** (1.2.2; planned as 1.2.4 until 2026-11-22).
 6. **Docs** (1.2.0, extended by each later release): `docs/agent86ui.md`, the README's and the site's claims, and the plan's differences.
 
 ## Consequences
