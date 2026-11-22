@@ -118,7 +118,7 @@ pub enum Builtins {
 
 /// Why [`AgentBuilder::build`] failed.
 ///
-/// `#[non_exhaustive]` (since 1.1.1): later releases may add reasons, so a
+/// `#[non_exhaustive]` (since 1.2.0): later releases may add reasons, so a
 /// `match` outside this crate needs a `_` arm; the `Display` text describes any.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -151,7 +151,7 @@ pub enum BuildError {
 
 /// Why [`Agent::run`] failed.
 ///
-/// `#[non_exhaustive]` (since 1.1.1): later releases may add reasons, so a
+/// `#[non_exhaustive]` (since 1.2.0): later releases may add reasons, so a
 /// `match` outside this crate needs a `_` arm; the `Display` text describes any.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -1093,7 +1093,7 @@ fn registry_for(builtins: Builtins) -> ToolRegistry {
 
 /// What one [`Agent::run`] produced.
 ///
-/// `#[non_exhaustive]` (since 1.1.1): later releases may add fields, so code
+/// `#[non_exhaustive]` (since 1.2.0): later releases may add fields, so code
 /// outside this crate reads the fields it needs and cannot build one or
 /// destructure it without `..`.
 #[derive(Debug, Clone, PartialEq)]
