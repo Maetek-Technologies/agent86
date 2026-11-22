@@ -301,7 +301,8 @@ bound to. A `ChildList` is an array of ids, or a template over a list in the dat
 model (`{\"path\": \"/items\", \"componentId\": \"row\"}`) whose bindings are \
 relative to each item.
 - A button's action is `{\"event\": {\"name\": \"submit\", \"context\": {\"name\": \
-{\"@path\": \"/form/name\"}}}}`. When the user presses it, a later user message \
+{\"@path\": \"/form/name\"}}}}`: `context` goes inside `event`, beside `name`, never \
+beside `event`. When the user presses it, a later user message \
 reads `[ui action] submit on <surfaceId>: <context as JSON>`; the surface stays \
 up meanwhile.
 - render_ui's result is the validator's verdict. If it lists problems, nothing \
@@ -331,7 +332,7 @@ pub fn reference(catalog: &Catalog) -> String {
                 } else {
                     "?"
                 };
-                format!("{key}{optional}: {}", type_of(property))
+                format!("{key}{optional}: {}", type_of(property, document))
             })
             .collect();
         let checks = if checkable { " (accepts @checks)" } else { "" };
@@ -367,7 +368,7 @@ pub fn reference(catalog: &Catalog) -> String {
                     } else {
                         "?"
                     };
-                    format!("{key}{optional}: {}", type_of(property))
+                    format!("{key}{optional}: {}", type_of(property, document))
                 })
                 .collect();
             let returns = schema
@@ -419,10 +420,18 @@ fn gather(schema: &Value) -> (Map<String, Value>, Vec<String>, bool) {
     (properties, required, checkable)
 }
 
-/// A property's type, briefly: a common type by name, an enum's values, or the
-/// JSON type.
-fn type_of(property: &Value) -> String {
+/// A property's type, briefly: a common type by name, a catalog's own
+/// definition by what it is (its `Weight` is a number, not a name to guess
+/// at), an enum's values, or the JSON type.
+fn type_of(property: &Value, document: &Value) -> String {
     if let Some(target) = property.get("$ref").and_then(Value::as_str) {
+        if let Some(local) = target.strip_prefix("#/$defs/") {
+            if let Some(def) = document.pointer(&format!("/$defs/{local}")) {
+                if def.get("$ref").is_none() {
+                    return type_of(def, document);
+                }
+            }
+        }
         return target.rsplit('/').next().unwrap_or(target).to_string();
     }
     if let Some(values) = property.get("enum").and_then(Value::as_array) {
@@ -434,7 +443,7 @@ fn type_of(property: &Value) -> String {
     }
     match property.get("type").and_then(Value::as_str) {
         Some("array") => match property.get("items") {
-            Some(items) => format!("array of {}", type_of(items)),
+            Some(items) => format!("array of {}", type_of(items, document)),
             None => "array".into(),
         },
         Some(kind) => kind.to_string(),
@@ -940,7 +949,7 @@ mod tests {
         let reference = reference(Catalog::basic());
         assert!(
             reference.contains(
-                "- Button { child: Child, variant?: \"default\"|\"primary\"|\"borderless\", action: Action, weight?: Weight } (accepts @checks)"
+                "- Button { child: Child, variant?: \"default\"|\"primary\"|\"borderless\", action: Action, weight?: number } (accepts @checks)"
             ),
             "{reference}"
         );

@@ -543,3 +543,11 @@ fn a_surface_can_mix_catalogs_and_errors_keep_their_indices() {
         report.errors
     );
 }
+
+#[test]
+fn a_component_with_no_type_is_said_once() {
+    let report =
+        Validator::basic().check(&[create("s", json!([{"id": "root", "text": "no type"}]))]);
+    let error = only_error(&report);
+    assert_eq!(error.message, "\"component\" is a required property");
+}

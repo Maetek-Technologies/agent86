@@ -112,12 +112,12 @@ What that means:
 
 2. **The password-style field** (answered 2026-11-22). It is `TextField` with `"variant": "obscured"` (the basic catalog's `variant` enum is `longText`, `number`, `shortText`, `obscured`). The core refuses it in slice 2; the protocol crate stays policy-free.
 3. **The spec's finer points** (partly answered 2026-11-22 from the specification's text). The `action` fields are `name`, `surfaceId`, `sourceComponentId`, `timestamp` (an RFC 3339 date-time), and `context`, all required, plus `userMessage` and `metadata`. The agent-side error codes are `VALIDATION_FAILED`, `UNALLOWED_PARENT`, `UNALLOWED_CHILD`, `INTEGRITY_ERROR`, and `INVALID_FUNCTION_CALL`; `EXPRESSION_ERROR` and `EXECUTION_ERROR` are the renderer's. Still to read for the headless runtime: the `DynamicBoolean` coercion table and the regex dialect's limits.
-4. **The model's quality.** Measure, on the providers people use (including a local ~27B model), how often `render_ui` validates on the first try and after one correction. If smaller models fail often, `auto` may need to mean "on for models known to manage it", as the reasoning and sampling tables already single out models.
+4. **The model's quality** (first measured 2026-11-22 on a local 27B model, see the ninth amendment; still open for hosted models). Measure, on the providers people use (including a local ~27B model), how often `render_ui` validates on the first try and after one correction. If smaller models fail often, `auto` may need to mean "on for models known to manage it", as the reasoning and sampling tables already single out models.
 
 ### Slices
 
 1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3 (done 2026-11-22; see the second amendment).
-2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth); 2c the redaction, guardrails, policy, and the `ui_render` trace kind (done 2026-11-22; see the fifth); 2d the blocking wait (done 2026-11-22; see the sixth); 2e actions after the turn (done 2026-11-22; see the seventh); 2f replay on resume and `Agent::surfaces` (done 2026-11-22; see the eighth).
+2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth); 2c the redaction, guardrails, policy, and the `ui_render` trace kind (done 2026-11-22; see the fifth); 2d the blocking wait (done 2026-11-22; see the sixth); 2e actions after the turn (done 2026-11-22; see the seventh); 2f replay on resume and `Agent::surfaces` (done 2026-11-22; see the eighth); 2g the docs and the first measurement of question 4 (done 2026-11-22; see the ninth).
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
 4. **The ACP extension and its text fallback** (1.2.1).
 5. **The terminal renderer** (1.2.4).
@@ -244,3 +244,23 @@ Slice 2f built resume. Where it differs from the decision above:
 
 - **Replay reads the steps, not the messages.** `state_json`'s steps keep every call with its result, including those compaction summarized out of the messages, so those surfaces come back too; only a session whose steps were trimmed loses them. A call counts as drawn when its result is ok or opens with what the tool writes when it draws (`Rendered surface`, `Deleted surface`, `Applied.`), since a waiting call the user dismissed reports a failure yet drew. Each drawn call is replayed in order through the same redaction, policy, and validation as when it ran (an array the model sent as a JSON string is parsed, as the registry repaired it), into a fresh runtime. So a workspace file a surface showed that has since gone, or a vault that no longer holds a value, can leave a surface out or show it differently; that is accepted with the rest of what replay loses.
 - **The program gets the result as `Agent::surfaces()`** (agreed when slice 2 was planned): each surface up now as the one `createSurface` that draws it as it is (its catalog, `sendDataModel`, its components, and its data model), in surface id order, from the new `agent86_ui::runtime::Runtime::snapshot`. Replay runs when `AgentBuilder::session` resumes a session and in `Agent::with_conversation`; a program that reopens draws `surfaces()`. Nothing new is stored, and `state_json` is unchanged.
+
+## Amendment: docs, and the first measurement of question 4 (2026-11-22)
+
+Slice 2g wrote `docs/agent86ui.md` (with the renderer's obligations: a distinct frame, showing and checking an `openUrl` URL before opening it, workspace media kept inside the workspace) and the opt-in live check, `tests/agent86ui_live.rs`: five tasks a model would plausibly answer with a surface (a choice, a form with a date and a check box, a confirmation, a slider, a list template), each in a fresh workspace with only `render_ui` offered and four steps, counting how often the first call validates and how often one of the first two does.
+
+**First measurement, `ollama:qwen3.8:27b-mlx` (local, about 27B), one run of five tasks:**
+
+| | drew a surface | valid first try | valid within one correction |
+|---|---|---|---|
+| Before the fixes below | 5/5 | 0/5 | 2/5 |
+| After them | 5/5 | 2/5 | 4/5 |
+
+After the fixes every task had a valid surface within three calls. What the first run's failures showed, and what changed:
+
+- **A component with no `component`** was reported once per branch of the catalog's `oneOf` (18 identical lines). Identical branch complaints are now said once (`agent86-ui`'s error narrowing).
+- **`weight?: Weight`** in the prompt's reference left the model to guess (it wrote `"bold"`). The reference now resolves a catalog's own `$defs` (`weight?: number`).
+- **`context` beside `event`** in a button's action, twice. The prompt now says `context` goes inside `event`.
+- Still seen after the fixes: `createSurface` without `surfaceId`, and an enum value the component does not take; both are fixed on the first correction.
+
+Five tasks and one run are too few to settle question 4, and the results vary between runs. They are enough to keep `auto` as it is for now: a local 27B model gets there with the validator's feedback, at the cost of a correction or two. The question stays open until the hosted models embedders use are measured too (`AGENT86_TEST_UI_MODELS` takes a list), before agent86UI is turned on by default anywhere a user did not ask for it (the ACP extension, 1.2.1).
