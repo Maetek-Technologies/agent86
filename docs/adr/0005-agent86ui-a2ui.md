@@ -117,7 +117,7 @@ What that means:
 ### Slices
 
 1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3 (done 2026-11-22; see the second amendment).
-2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in.
+2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment).
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
 4. **The ACP extension and its text fallback** (1.2.1).
 5. **The terminal renderer** (1.2.4).
@@ -173,3 +173,22 @@ What building it settled:
 - **Left for the slices that use it:** agent function routing (`callAgentFunction` from a binding), the rest of the upstream suites (the validator's `validator_v1_0` and `message_processor_v1_0`, node resolution, RPC), and a locale.
   - The reference SDKs treat a missing root, dangling references, and orphans as errors in strict mode, where this validator warns.
   - Which of the two `render_ui` should follow is decided in slice 2, with those suites run then.
+
+## Amendment: completeness, and the validator suites (2026-11-22)
+
+Slice 2a ran the A2UI repository's `validator_v1_0` and `message_processor_v1_0` suites (`conformance/core/`, converted to JSON like the others) through a strict `Runtime`, which settles the question the second amendment left open.
+
+- **Completeness is strict by default, as in the reference SDKs.** `agent86_ui::Rules` is their `ValidationConfig` without its version and message filters: `allow_missing_root`, `allow_dangling_references`, and `allow_orphans`. `Rules::STRICT` is the default, so a missing `root`, a dangling child reference, or a component nothing shows is an error; `Rules::RELAXED` makes each a warning, for a renderer drawing a stream that is completed later. A cycle or a broken composition rule is an error either way. `Validator::set_rules` and `Runtime::set_rules` choose them; a suite step's `validationConfig` maps onto them, a rule it leaves out being strict.
+- **`render_ui` uses strict rules with orphans allowed.** A2UI 1.0 has no message that removes a component, so a component replaced as a child (a loading placeholder swapped for content, as the specification's own `incremental-dashboard` example does) stays on the surface with nothing showing it, and only `deleteSurface` clears it. Under strict orphans a model that updates a surface across two calls would get an error it cannot fix. So a missing `root` and a dangling reference are errors the model must fix, and an orphan comes back as a warning in the tool result.
+- **Messages use the reference SDKs' phrases**, still worded for a model: "Missing root component", "Dangling reference: … references non-existent component 'x' in field 'children[1]'", "is not reachable from 'root'", "Self-reference detected", "Circular reference detected", "Duplicate component ID", "Unknown component type 'X' … use one of: …", "Unrecognized function 'f' … use one of: …", "must be a valid UAX #31 identifier", "Unsupported protocol version", "Missing required version field", "action 'beginRendering' is not supported in protocol version 1.0", and type errors as "surfaceId must be a string, not 12345". A missing property names the component type ("\"text\" is a required property of Text").
+- **Fixes the suites found:** an array of `ComponentId`s in a catalog is a child list; a catalog's `$ref` fragments are percent-decoded (a non-ASCII component name); the version is checked without a catalog (`"v99.0"` was accepted when no catalog's schema ran); `deleteSurface` of a surface that does not exist changes nothing (a warning, where it was an integrity error), as in the reference SDKs; a duplicate id in one message is an `INTEGRITY_ERROR`; a function name must be an identifier (system functions such as `@index` aside); an unknown function in an action's `functionCall` is named rather than reported as "matches none of the forms". `Runtime::capabilities` gives `renderer_capabilities.json`.
+- **Results:** `validator_v1_0` runs 43 of its 50 cases and `message_processor_v1_0` 43 of its 84 (one case for 0.9.1 is outside the 1.0 filter), all passing. The rest are listed as unsupported with their reasons, to be built before the crate is first published:
+  - the recursion and depth limits (component nesting 50, `functionCall` depth 5, data model depth), 6 cases;
+  - RFC 6901 syntax of binding and `updateDataModel` paths beyond the leading `/`, 2;
+  - a surface with no default `catalogId`, its components and calls naming their own catalogs (`CatalogError`), 10;
+  - a function call naming its own `catalogId`, schema-checked against that catalog, 10;
+  - a component's bare `catalogId` beside `@catalogId`, 10;
+  - component `metadata` and `@metadata`, 3;
+  - an unknown function nested in a system function's arguments, named, 1.
+
+  Left out for good: the reference SDKs' own renderer error code `RECURSION_LIMIT_EXCEEDED` (outside the specification's enum), agent functions (left out of the first version above), and 0.9 data models, 5 cases in all.

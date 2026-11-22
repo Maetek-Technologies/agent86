@@ -16,7 +16,10 @@ it is the protocol layer of agent86UI
   Schemas and the rules they cannot express (surfaces, `root`, child references,
   composition constraints, function boundaries), and reports problems with the
   specification's error codes and JSON Pointer paths, worded so a model can fix
-  them.
+  them. `Rules` says how complete a surface must be after a batch: strict by
+  default, as in the reference SDKs (a missing `root`, a dangling child
+  reference, or a component nothing shows is an error), or relaxed (each a
+  warning), for a renderer drawing a stream that is completed later.
 - `runtime::Runtime`: the headless surface runtime a renderer builds on. It
   applies batches (validated, then applied, all or nothing), resolves a surface
   for drawing (`tree`: every binding, function call, list template, and check
@@ -41,13 +44,14 @@ let report = validator.apply(&[json!({
 })]);
 assert!(!report.is_ok());
 assert_eq!(report.errors[0].path, "/0/createSurface/components/0");
-assert_eq!(report.errors[0].message, "\"text\" is a required property");
+assert_eq!(report.errors[0].message, "\"text\" is a required property of Text");
 ```
 
 The specification's JSON Schemas and basic catalog are vendored (see
 `spec/UPSTREAM.md`) and served from memory: validation never fetches anything.
 The crate's tests replay the specification's schema test cases and the shared
-conformance suites every A2UI SDK runs for its runtime.
+conformance suites every A2UI SDK runs for its runtime, validator, and message
+processor.
 
 agent86UI is agent86's implementation of A2UI. A2UI is Google's protocol; this
 crate is not affiliated with or endorsed by Google.

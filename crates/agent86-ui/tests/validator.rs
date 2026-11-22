@@ -1,7 +1,9 @@
 //! `Validator`: the schema check plus the rules a schema cannot express, over
 //! batches of messages and the surfaces they build.
 
-use agent86_ui::{AgentMessageKind, Catalog, Code, Problem, Report, Validator, BASIC_CATALOG_ID};
+use agent86_ui::{
+    AgentMessageKind, Catalog, Code, Problem, Report, Rules, Validator, BASIC_CATALOG_ID,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -36,7 +38,9 @@ fn only_error(report: &Report) -> &Problem {
 #[test]
 fn every_basic_catalog_example_passes_the_rules_too() {
     // Each upstream example is one batch to a fresh renderer. They are the
-    // specification's own idea of valid UI, so none may fail a rule here.
+    // specification's own idea of valid UI, so none may fail a rule here,
+    // strict but for orphans: 1.0 has no message that removes a component, so
+    // replacing a placeholder (`incremental-dashboard`) leaves it orphaned.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_0/examples");
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
@@ -49,6 +53,7 @@ fn every_basic_catalog_example_passes_the_rules_too() {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let messages = example["messages"].as_array().unwrap();
         let mut validator = Validator::basic();
+        validator.set_rules(Rules::STRICT.allowing_orphans(true));
         let report = validator.apply(messages);
         if !report.is_ok() {
             failures.push(format!("{}: {:#?}", path.display(), report.errors));
@@ -170,12 +175,20 @@ fn component_ids_must_be_identifiers_and_unique_in_a_message() {
                 Code::ValidationFailed,
                 "/0/createSurface/components/1/id".to_string()
             ),
+            // A duplicate id is an integrity error, as the reference SDKs
+            // report it.
             (
-                Code::ValidationFailed,
+                Code::IntegrityError,
                 "/0/createSurface/components/3/id".to_string()
             ),
         ]
     );
+    assert!(report.errors[0]
+        .message
+        .starts_with("Component id 'user-card' must be a valid UAX #31 identifier"));
+    assert!(report.errors[1]
+        .message
+        .starts_with("Duplicate component ID 'a'"));
 }
 
 #[test]
@@ -192,7 +205,7 @@ fn a_schema_error_points_into_the_batch() {
     // the model hears what Text is missing, not that nothing matched.
     let error = only_error(&report);
     assert_eq!(error.path, "/1/createSurface/components/1");
-    assert_eq!(error.message, "\"text\" is a required property");
+    assert_eq!(error.message, "\"text\" is a required property of Text");
 
     // The same for a function call: the catalog's oneOf over functions is
     // narrowed to `required`'s schema.
@@ -236,8 +249,41 @@ fn a_schema_error_points_into_the_batch() {
 }
 
 #[test]
-fn missing_children_a_missing_root_and_hidden_components_are_warnings() {
+fn missing_children_a_missing_root_and_hidden_components_are_errors_when_strict() {
+    let batch = [create(
+        "s",
+        json!([
+            {"id": "root", "component": "Column", "children": ["later"]},
+            text("orphan", "nobody shows me")
+        ]),
+    )];
+    let report = Validator::basic().check(&batch);
+    assert_eq!(Validator::basic().rules(), Rules::STRICT);
+    let messages: Vec<&str> = report.errors.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(report.errors.len(), 2, "{messages:#?}");
+    assert!(messages[0]
+        .starts_with("Dangling reference: root references non-existent component 'later'"));
+    assert_eq!(report.errors[0].path, "/0/createSurface/components/0");
+    assert!(messages[1].starts_with("Component 'orphan' is not reachable from 'root'"));
+    assert_eq!(report.errors[1].path, "/0/createSurface/components/1");
+
+    let report = Validator::basic().check(&[create("t", json!([text("title", "no root")]))]);
+    let error = only_error(&report);
+    assert!(
+        error.message.starts_with("Missing root component"),
+        "{}",
+        error.message
+    );
+
+    // A surface created with no components yet is fine either way.
+    let report = Validator::basic().check(&[create("u", json!([]))]);
+    assert!(report.is_ok() && report.warnings.is_empty(), "{report:#?}");
+}
+
+#[test]
+fn relaxed_rules_make_them_warnings() {
     let mut validator = Validator::basic();
+    validator.set_rules(Rules::RELAXED);
     let report = validator.apply(&[create(
         "s",
         json!([
@@ -250,15 +296,28 @@ fn missing_children_a_missing_root_and_hidden_components_are_warnings() {
     assert_eq!(report.warnings.len(), 2, "{messages:#?}");
     assert!(messages
         .iter()
-        .any(|m| m.contains("\"later\"") && m.contains("placeholder")));
+        .any(|m| m.contains("'later'") && m.contains("placeholder")));
     assert!(messages.iter().any(|m| m.contains("orphan")));
     assert_eq!(report.warnings[0].path, "/0/createSurface/components/0");
 
-    let report = Validator::basic().check(&[create("t", json!([text("title", "no root")]))]);
+    let report = validator.check(&[create("t", json!([text("title", "no root")]))]);
     assert!(report.is_ok());
-    assert!(report.warnings[0]
+    assert!(report.warnings[0].message.contains("none with id \"root\""));
+
+    // Each rule on its own: only orphans allowed leaves the others errors.
+    let mut validator = Validator::basic();
+    validator.set_rules(Rules::STRICT.allowing_orphans(true));
+    let report = validator.check(&[create(
+        "s",
+        json!([
+            {"id": "root", "component": "Column", "children": ["later"]},
+            text("orphan", "nobody shows me")
+        ]),
+    )]);
+    assert!(only_error(&report)
         .message
-        .contains("no component with id \"root\""));
+        .starts_with("Dangling reference"));
+    assert_eq!(report.warnings.len(), 1);
 }
 
 #[test]

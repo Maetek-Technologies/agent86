@@ -109,6 +109,64 @@ impl Report {
     }
 }
 
+/// How strictly a surface's component tree must be complete once a batch is
+/// applied: the reference SDKs' `ValidationConfig`, without its version and
+/// message filters.
+///
+/// [`Rules::STRICT`] (the default, as in the reference SDKs) makes each problem
+/// an error, which suits a batch that is meant to be whole (one tool call).
+/// [`Rules::RELAXED`] makes each a warning, for a renderer drawing a stream that
+/// is completed later. A cycle or a broken composition rule is an error either
+/// way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Rules {
+    /// A surface with components but none with id `root` is accepted.
+    pub allow_missing_root: bool,
+    /// A component may refer to a child that is not defined.
+    pub allow_dangling_references: bool,
+    /// A component nothing reachable from `root` shows is accepted.
+    pub allow_orphans: bool,
+}
+
+impl Rules {
+    /// Every problem is an error.
+    pub const STRICT: Rules = Rules {
+        allow_missing_root: false,
+        allow_dangling_references: false,
+        allow_orphans: false,
+    };
+    /// Every problem is a warning.
+    pub const RELAXED: Rules = Rules {
+        allow_missing_root: true,
+        allow_dangling_references: true,
+        allow_orphans: true,
+    };
+    /// These rules with a missing root allowed or not.
+    pub const fn allowing_missing_root(mut self, allow: bool) -> Self {
+        self.allow_missing_root = allow;
+        self
+    }
+
+    /// These rules with dangling references allowed or not.
+    pub const fn allowing_dangling_references(mut self, allow: bool) -> Self {
+        self.allow_dangling_references = allow;
+        self
+    }
+
+    /// These rules with orphans allowed or not.
+    pub const fn allowing_orphans(mut self, allow: bool) -> Self {
+        self.allow_orphans = allow;
+        self
+    }
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Rules::STRICT
+    }
+}
+
 /// What the validator remembers about a surface.
 #[derive(Debug, Clone, Default)]
 struct Surface {
@@ -126,6 +184,7 @@ struct Entry {
 pub struct Validator {
     catalogs: Vec<Entry>,
     surfaces: BTreeMap<String, Surface>,
+    rules: Rules,
 }
 
 impl std::fmt::Debug for Validator {
@@ -136,6 +195,15 @@ impl std::fmt::Debug for Validator {
             .finish()
     }
 }
+
+/// Message kinds of A2UI 0.8 and 0.9 that 1.0 renamed or dropped, named in
+/// the error so a model trained on them sees why.
+const LEGACY_KINDS: &[&str] = &[
+    "beginRendering",
+    "surfaceUpdate",
+    "dataModelUpdate",
+    "updateSurface",
+];
 
 const KINDS: &[&str] = &[
     "createSurface",
@@ -179,7 +247,18 @@ impl Validator {
         Ok(Self {
             catalogs,
             surfaces: BTreeMap::new(),
+            rules: Rules::default(),
         })
+    }
+
+    /// The completeness rules batches are checked under from now on.
+    pub fn set_rules(&mut self, rules: Rules) {
+        self.rules = rules;
+    }
+
+    /// The completeness rules in force.
+    pub fn rules(&self) -> Rules {
+        self.rules
     }
 
     /// A validator for a renderer that supports the basic catalog only.
@@ -282,25 +361,58 @@ impl Validator {
         origins: &mut BTreeMap<(String, String), String>,
         touched: &mut BTreeSet<String>,
     ) {
+        // The version first: a message for another protocol version is not
+        // worth reading further, and this check needs no catalog.
+        match raw.get("version") {
+            Some(Value::String(version)) if version == crate::PROTOCOL_VERSION => {}
+            None => {
+                report.errors.push(problem(
+                    Code::ValidationFailed,
+                    None,
+                    prefix.to_string(),
+                    "Missing required version field: every message needs \"version\": \"1.0\"",
+                ));
+                return;
+            }
+            Some(version) => {
+                let shown = version
+                    .as_str()
+                    .map_or_else(|| version.to_string(), String::from);
+                report.errors.push(problem(
+                    Code::ValidationFailed,
+                    None,
+                    format!("{prefix}/version"),
+                    format!(
+                        "Unsupported protocol version '{shown}': this renderer speaks A2UI 1.0, so set \"version\": \"1.0\""
+                    ),
+                ));
+                return;
+            }
+        }
         let present: Vec<&str> = KINDS
             .iter()
             .copied()
             .filter(|kind| raw.get(*kind).is_some())
             .collect();
         let [kind] = present.as_slice() else {
-            let found = if present.is_empty() {
-                "none".to_string()
+            let message = if let Some(old) = LEGACY_KINDS.iter().find(|k| raw.get(**k).is_some()) {
+                format!(
+                    "action '{old}' is not supported in protocol version 1.0 (it is from A2UI 0.8 or 0.9); use one of {}",
+                    KINDS.join(", ")
+                )
+            } else if present.is_empty() {
+                format!("a message must hold exactly one of {}", KINDS.join(", "))
             } else {
-                present.join(" and ")
+                format!(
+                    "Message contains multiple conflicting update actions ({}); send each in a message of its own",
+                    present.join(" and ")
+                )
             };
             report.errors.push(problem(
                 Code::ValidationFailed,
                 None,
                 prefix.to_string(),
-                format!(
-                    "a message must hold exactly one of {} (found {found})",
-                    KINDS.join(", ")
-                ),
+                message,
             ));
             return;
         };
@@ -348,6 +460,20 @@ impl Validator {
                         touched.insert(id.to_string());
                     }
                 }
+            }
+            // Deleting a surface that does not exist changes nothing, as in the
+            // reference SDKs; the model hears about it as a warning.
+            "deleteSurface"
+                if surface_id.is_some_and(|id| !state.contains_key(id))
+                    && body.as_object().is_some_and(|b| b.len() == 1) =>
+            {
+                let id = surface_id.unwrap_or_default();
+                report.warnings.push(problem(
+                    Code::IntegrityError,
+                    Some(id),
+                    format!("{prefix}/deleteSurface/surfaceId"),
+                    format!("surface {id:?} does not exist, so there was nothing to delete"),
+                ));
             }
             "updateComponents" | "updateDataModel" | "deleteSurface" => {
                 let known = surface_id.and_then(|id| state.get(id));
@@ -496,16 +622,16 @@ impl Validator {
                         surface,
                         format!("{at}/id"),
                         format!(
-                            "component id {id:?} is not an identifier: start with a letter or _, then letters, digits, or _"
+                            "Component id '{id}' must be a valid UAX #31 identifier: start with a letter or _, then letters, digits, or _"
                         ),
                     ));
                 }
                 if let Some(first) = ids.insert(id.to_string(), index) {
                     report.errors.push(problem(
-                        Code::ValidationFailed,
+                        Code::IntegrityError,
                         surface,
                         format!("{at}/id"),
-                        format!("component id {id:?} is used twice in this message (also at index {first})"),
+                        format!("Duplicate component ID '{id}': it is used twice in this message (also at index {first}); give each component its own id"),
                     ));
                 }
             }
@@ -558,6 +684,18 @@ impl Validator {
                 .get("@call")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            // System functions (`@index`) are named by the specification.
+            if !name.starts_with('@') && !is_identifier(name) {
+                report.errors.push(problem(
+                    Code::ValidationFailed,
+                    surface,
+                    format!("{path}/@call"),
+                    format!(
+                        "Function name '{name}' must be a valid UAX #31 identifier: start with a letter or _, then letters, digits, or _"
+                    ),
+                ));
+                continue;
+            }
             let catalog_id = call.get("catalogId").and_then(Value::as_str).or(catalog);
             let Some(def) = catalog_id
                 .and_then(|id| self.entry(id))
@@ -647,8 +785,9 @@ impl Validator {
     }
 
     /// The rules over a surface's whole component tree, after the batch:
-    /// composition constraints, cycles, and (as warnings) missing children, a
-    /// missing root, and components nothing shows.
+    /// composition constraints, cycles, and, as errors or warnings by
+    /// [`Rules`], missing children, a missing root, and components nothing
+    /// shows.
     fn check_tree(
         &self,
         surface_id: &str,
@@ -677,14 +816,22 @@ impl Validator {
                 continue;
             };
             let children = child_ids(component, def);
-            for child in &children {
+            for (child, field) in &children {
                 match surface.components.get(child) {
-                    None => report.warnings.push(problem(
+                    None if self.rules.allow_dangling_references => report.warnings.push(problem(
                         Code::ValidationFailed,
                         Some(surface_id),
                         at(id),
                         format!(
-                            "{id} refers to {child:?}, which is not defined yet; it shows as a placeholder until it is"
+                            "Dangling reference: {id} references component '{child}' in field '{field}', which is not defined yet; it shows as a placeholder until it is"
+                        ),
+                    )),
+                    None => report.errors.push(problem(
+                        Code::ValidationFailed,
+                        Some(surface_id),
+                        at(id),
+                        format!(
+                            "Dangling reference: {id} references non-existent component '{child}' in field '{field}'; define it in the same call or remove the reference"
                         ),
                     )),
                     Some(child_component) => {
@@ -721,59 +868,80 @@ impl Validator {
                     }
                 }
             }
-            edges.insert(id.as_str(), children);
+            edges.insert(
+                id.as_str(),
+                children.into_iter().map(|(child, _)| child).collect(),
+            );
         }
 
-        match surface.components.get("root") {
-            None if !surface.components.is_empty() => report.warnings.push(problem(
+        if let Some(cycle) = find_cycle(&edges) {
+            let message = if cycle.len() == 2 {
+                format!("Self-reference detected: {} references itself", cycle[0])
+            } else {
+                format!("Circular reference detected: {}", cycle.join(" -> "))
+            };
+            report.errors.push(problem(
                 Code::ValidationFailed,
                 Some(surface_id),
-                String::new(),
-                format!("surface {surface_id:?} has no component with id \"root\", so nothing is shown yet"),
-            )),
-            None => {}
-            Some(root) => {
-                if let Some(allowed) = def_of(root).and_then(|d| d.allowed_parents.as_ref()) {
-                    if !allowed.iter().any(|t| t == "Surface") {
-                        report.errors.push(problem(
-                            Code::UnallowedParent,
-                            Some(surface_id),
-                            at("root"),
-                            format!(
-                                "{} cannot be the root: it may only be placed under {}",
-                                type_of(root),
-                                allowed.join(", ")
-                            ),
-                        ));
-                    }
-                }
-                if let Some(cycle) = find_cycle(&edges) {
-                    report.errors.push(problem(
-                        Code::ValidationFailed,
-                        Some(surface_id),
-                        at(&cycle[0]),
-                        format!("components form a cycle: {}", cycle.join(" -> ")),
-                    ));
+                at(&cycle[0]),
+                message,
+            ));
+            return;
+        }
+        let Some(root) = surface.components.get("root") else {
+            if !surface.components.is_empty() {
+                let (list, verdict) = if self.rules.allow_missing_root {
+                    (&mut report.warnings, "so nothing is shown yet")
                 } else {
-                    let reachable = reach(&edges, "root");
-                    let unseen: Vec<&str> = surface
-                        .components
-                        .keys()
-                        .map(String::as_str)
-                        .filter(|id| !reachable.contains(id))
-                        .collect();
-                    if !unseen.is_empty() {
-                        report.warnings.push(problem(
-                            Code::ValidationFailed,
-                            Some(surface_id),
-                            String::new(),
-                            format!(
-                                "not reachable from root, so not shown: {}",
-                                unseen.join(", ")
-                            ),
-                        ));
-                    }
-                }
+                    (&mut report.errors, "so nothing can be shown; add one")
+                };
+                list.push(problem(
+                    Code::ValidationFailed,
+                    Some(surface_id),
+                    String::new(),
+                    format!(
+                        "Missing root component: surface {surface_id:?} has components but none with id \"root\", {verdict}"
+                    ),
+                ));
+            }
+            return;
+        };
+        if let Some(allowed) = def_of(root).and_then(|d| d.allowed_parents.as_ref()) {
+            if !allowed.iter().any(|t| t == "Surface") {
+                report.errors.push(problem(
+                    Code::UnallowedParent,
+                    Some(surface_id),
+                    at("root"),
+                    format!(
+                        "{} cannot be the root: it may only be placed under {}",
+                        type_of(root),
+                        allowed.join(", ")
+                    ),
+                ));
+            }
+        }
+        let reachable = reach(&edges, "root");
+        for id in surface
+            .components
+            .keys()
+            .filter(|id| !reachable.contains(id.as_str()))
+        {
+            if self.rules.allow_orphans {
+                report.warnings.push(problem(
+                    Code::ValidationFailed,
+                    Some(surface_id),
+                    at(id),
+                    format!("Component '{id}' is not reachable from 'root', so it is not shown"),
+                ));
+            } else {
+                report.errors.push(problem(
+                    Code::ValidationFailed,
+                    Some(surface_id),
+                    at(id),
+                    format!(
+                        "Component '{id}' is not reachable from 'root', so it would never be shown; make it a child of a shown component or remove it"
+                    ),
+                ));
             }
         }
     }
@@ -842,29 +1010,35 @@ fn remap(path: &str, kind: &str, indices: &[usize]) -> String {
 
 /// The ids a component refers to through its child-reference properties.
 /// A template's `componentId` counts as a child.
-fn child_ids(component: &Value, def: &ComponentDef) -> Vec<String> {
+/// A component's child references, each with the field it is in, written
+/// as the reference SDKs write it (`children[1]`, `tabs[0].child`,
+/// `children.componentId` for a template).
+fn child_ids(component: &Value, def: &ComponentDef) -> Vec<(String, String)> {
     let mut ids = Vec::new();
     for (property, kind) in &def.children {
         let Some(value) = component.get(property) else {
             continue;
         };
         match (kind, value) {
-            (ChildRef::Single, Value::String(id)) => ids.push(id.clone()),
+            (ChildRef::Single, Value::String(id)) => ids.push((id.clone(), property.clone())),
             (ChildRef::List, Value::Array(items)) => {
-                ids.extend(items.iter().filter_map(Value::as_str).map(String::from));
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(id) = item.as_str() {
+                        ids.push((id.to_string(), format!("{property}[{index}]")));
+                    }
+                }
             }
             (ChildRef::List, Value::Object(template)) => {
                 if let Some(id) = template.get("componentId").and_then(Value::as_str) {
-                    ids.push(id.to_string());
+                    ids.push((id.to_string(), format!("{property}.componentId")));
                 }
             }
             (ChildRef::Items(field), Value::Array(items)) => {
-                ids.extend(
-                    items
-                        .iter()
-                        .filter_map(|item| item.get(field).and_then(Value::as_str))
-                        .map(String::from),
-                );
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(id) = item.get(field).and_then(Value::as_str) {
+                        ids.push((id.to_string(), format!("{property}[{index}].{field}")));
+                    }
+                }
             }
             _ => {}
         }

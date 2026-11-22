@@ -316,9 +316,14 @@ fn strings(value: Option<&Value>) -> Option<Vec<String>> {
     )
 }
 
-/// An array property whose items are objects with a child-reference field.
+/// An array property of child references: its items each one id (read as a
+/// [`ChildRef::List`] of ids), or objects with a child-reference field.
 fn items_ref(property: &Value) -> Option<ChildRef> {
-    let fields = property.get("items")?.get("properties")?.as_object()?;
+    let items = property.get("items")?;
+    if child_ref(items) == Some(ChildRef::Single) {
+        return Some(ChildRef::List);
+    }
+    let fields = items.get("properties")?.as_object()?;
     fields
         .iter()
         .find(|(_, field)| child_ref(field) == Some(ChildRef::Single))
@@ -432,6 +437,34 @@ fn collect_refs(schema: &Value, refs: &mut Vec<String>) {
     }
 }
 
+/// A `$ref` fragment's last segment as a key: percent-decoded (a fragment is a
+/// URI part, so a non-ASCII name arrives encoded) and JSON Pointer unescaped.
+fn fragment_key(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied(),
+            bytes.get(i + 2).copied(),
+        ) {
+            (b'%', Some(h), Some(l)) if hex(h).is_some() && hex(l).is_some() => {
+                decoded.push((hex(h).unwrap() * 16 + hex(l).unwrap()) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                decoded.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded)
+        .replace("~1", "/")
+        .replace("~0", "~")
+}
+
 fn ref_problem(
     target: &str,
     components: &serde_json::Map<String, Value>,
@@ -439,11 +472,11 @@ fn ref_problem(
     defs: &serde_json::Map<String, Value>,
 ) -> Option<String> {
     if let Some(name) = target.strip_prefix("#/components/") {
-        return (!components.contains_key(name))
+        return (!components.contains_key(&fragment_key(name)))
             .then(|| format!("$ref {target:?} names no component of this catalog"));
     }
     if let Some(name) = target.strip_prefix("#/functions/") {
-        return (!functions.contains_key(name))
+        return (!functions.contains_key(&fragment_key(name)))
             .then(|| format!("$ref {target:?} names no function of this catalog"));
     }
     if let Some(name) = target.strip_prefix("#/$defs/") {
@@ -452,7 +485,7 @@ fn ref_problem(
                 "$ref {target:?} may not be referenced from inside the catalog"
             ));
         }
-        return (!defs.contains_key(name))
+        return (!defs.contains_key(&fragment_key(name)))
             .then(|| format!("$ref {target:?} names no $defs entry of this catalog"));
     }
     if let Some(name) = target.strip_prefix("common_types.json#/$defs/") {
@@ -468,6 +501,35 @@ fn ref_problem(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_ref_fragment_is_percent_decoded_and_unescaped() {
+        assert_eq!(fragment_key("%F0%9D%91%A5Label"), "𝑥Label");
+        assert_eq!(fragment_key("a~1b~0c"), "a/b~c");
+        assert_eq!(fragment_key("100%"), "100%");
+    }
+
+    #[test]
+    fn an_array_of_component_ids_is_a_child_list() {
+        let catalog = Catalog::from_value(json!({
+            "protocolVersion": "1.0",
+            "catalogId": "slots",
+            "components": {"Slots": {
+                "type": "object",
+                "properties": {
+                    "component": {"const": "Slots"},
+                    "slots": {"type": "array", "items": {"$ref": "common_types.json#/$defs/ComponentId"}}
+                },
+                "required": ["component"]
+            }},
+            "$defs": {"anyComponent": {"oneOf": [{"$ref": "#/components/Slots"}]}, "anyFunction": false}
+        }))
+        .unwrap();
+        assert_eq!(
+            catalog.component("Slots").unwrap().children.get("slots"),
+            Some(&ChildRef::List)
+        );
+    }
 
     #[test]
     fn the_basic_catalog_loads_with_its_structure() {

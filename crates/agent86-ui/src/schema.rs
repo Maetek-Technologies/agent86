@@ -14,7 +14,7 @@
 
 use crate::catalog::Catalog;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 /// The base URI the 1.0 schemas' `$id`s share.
@@ -182,10 +182,44 @@ fn errors(validator: &jsonschema::Validator, value: &Value) -> Result<(), Vec<Sc
 const QUOTE_LIMIT: usize = 60;
 
 fn render(error: &jsonschema::ValidationError<'_>) -> String {
-    if error.instance().to_string().chars().count() <= QUOTE_LIMIT {
+    use jsonschema::error::ValidationErrorKind;
+    let short = error.instance().to_string().chars().count() <= QUOTE_LIMIT;
+    let text = if short {
         error.to_string()
     } else {
         error.masked().to_string()
+    };
+    // The field a value sits in, when the path ends in a property name, so
+    // the message says which one is wrong.
+    let path = error.instance_path().to_string();
+    let field = path
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty() && segment.parse::<usize>().is_err());
+    match (error.kind(), field) {
+        (ValidationErrorKind::Type { .. }, Some(field)) => {
+            match text.split_once(" is not of type ") {
+                Some((value, expected)) => {
+                    let expected = expected.trim_matches('"');
+                    let article = if expected.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                        "an"
+                    } else {
+                        "a"
+                    };
+                    format!("{field} must be {article} {expected}, not {value}")
+                }
+                None => format!("{field}: {text}"),
+            }
+        }
+        (ValidationErrorKind::Enum { .. }, Some(field)) => format!("{field}: {text}"),
+        // A component missing a property: name its type.
+        (ValidationErrorKind::Required { .. }, _) => {
+            match error.instance().get("component").and_then(Value::as_str) {
+                Some(component) => format!("{text} of {component}"),
+                None => text,
+            }
+        }
+        _ => text,
     }
 }
 
@@ -194,8 +228,9 @@ fn render(error: &jsonschema::ValidationError<'_>) -> String {
 ///   function call's `@call` (how a `oneOf` over a catalog's components or
 ///   functions rules out the other types);
 /// - at the `oneOf`'s own location, a type mismatch (an object is not the
-///   literal-string branch) or a missing `@` key (a `{"@call": ...}` is not the
-///   `{"@path": ...}` branch).
+///   literal-string branch), a missing `@` key (a `{"@call": ...}` is not the
+///   `{"@path": ...}` branch), or a missing `event` or `functionCall` (an
+///   action's two forms).
 fn rules_out(error: &jsonschema::ValidationError<'_>, at: &str) -> bool {
     use jsonschema::error::ValidationErrorKind;
     let path = error.instance_path().to_string();
@@ -205,9 +240,45 @@ fn rules_out(error: &jsonschema::ValidationError<'_>, at: &str) -> bool {
         }
         ValidationErrorKind::Type { .. } => path == at,
         ValidationErrorKind::Required { property } => {
-            path == at && property.as_str().is_some_and(|name| name.starts_with('@'))
+            path == at
+                && property
+                    .as_str()
+                    .is_some_and(|name| name.starts_with('@') || ACTION_FORMS.contains(&name))
         }
         _ => false,
+    }
+}
+
+/// The keys that tell an action's two forms apart.
+const ACTION_FORMS: &[&str] = &["event", "functionCall"];
+
+/// A value whose discriminator (`component`, `@call`) names no branch of a
+/// `oneOf`: the name it gave, and the names the catalog defines, so the model
+/// can pick one.
+fn unknown_type(context: &[Vec<jsonschema::ValidationError<'static>>]) -> String {
+    use jsonschema::error::ValidationErrorKind;
+    let mut given = None;
+    let mut key = "component";
+    let mut known = BTreeSet::new();
+    for inner in context.iter().flatten() {
+        if let ValidationErrorKind::Constant { expected_value } = inner.kind() {
+            let path = inner.instance_path().to_string();
+            if path.ends_with("/@call") {
+                key = "@call";
+            }
+            given.get_or_insert_with(|| inner.instance().to_string());
+            if let Some(name) = expected_value.as_str() {
+                known.insert(name.to_string());
+            }
+        }
+    }
+    let given = given.unwrap_or_default();
+    let given = given.trim_matches('"');
+    let known = known.into_iter().collect::<Vec<_>>().join(", ");
+    if key == "@call" {
+        format!("Unrecognized function '{given}': the catalog defines no such function; use one of: {known}")
+    } else {
+        format!("Unknown component type '{given}': the catalog defines no such component; use one of: {known}")
     }
 }
 
@@ -242,7 +313,7 @@ fn describe(error: &jsonschema::ValidationError<'_>, out: &mut Vec<SchemaError>)
                 }) {
                     out.push(SchemaError {
                         path,
-                        message: "is not one of the types the catalog defines".into(),
+                        message: unknown_type(context),
                     });
                     return;
                 }
