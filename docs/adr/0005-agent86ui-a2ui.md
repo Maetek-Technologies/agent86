@@ -110,13 +110,13 @@ What that means:
 
 ### Questions still open, for the first slice
 
-2. **The password-style field.** The basic catalog's exact `TextField` variant names are checked against `specification/v1_0/` before the validator refuses one.
-3. **The spec's finer points.** These come from a summary and are confirmed against the spec text before the types are written: the `action` fields beyond the examples, the `DynamicBoolean` coercion rules, the regex dialect's limits, and the full error-code list.
+2. **The password-style field** (answered 2026-11-22). It is `TextField` with `"variant": "obscured"` (the basic catalog's `variant` enum is `longText`, `number`, `shortText`, `obscured`). The core refuses it in slice 2; the protocol crate stays policy-free.
+3. **The spec's finer points** (partly answered 2026-11-22 from the specification's text). The `action` fields are `name`, `surfaceId`, `sourceComponentId`, `timestamp` (an RFC 3339 date-time), and `context`, all required, plus `userMessage` and `metadata`. The agent-side error codes are `VALIDATION_FAILED`, `UNALLOWED_PARENT`, `UNALLOWED_CHILD`, `INTEGRITY_ERROR`, and `INVALID_FUNCTION_CALL`; `EXPRESSION_ERROR` and `EXECUTION_ERROR` are the renderer's. Still to read for the headless runtime: the `DynamicBoolean` coercion table and the regex dialect's limits.
 4. **The model's quality.** Measure, on the providers people use (including a local ~27B model), how often `render_ui` validates on the first try and after one correction. If smaller models fail often, `auto` may need to mean "on for models known to manage it", as the reasoning and sampling tables already single out models.
 
 ### Slices
 
-1. **`agent86-ui`** (1.2.0): types, validator, headless runtime, and the conformance fixtures. Questions 2 and 3 are answered here.
+1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3.
 2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in.
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
 4. **The ACP extension and its text fallback** (1.2.1).
@@ -131,3 +131,23 @@ What that means:
 - **A larger attack surface at the renderer.** Model-written UI on a trusted surface can be made to look like agent86's own approval panel. Surfaces must draw agent86UI distinctly (a frame naming the agent, never the approval styling), and the media and `openUrl` rules above are part of the decision, not polish.
 - **Python compatibility is untouched.** No change to `run --json`, `state_json`, the database schema, the trace format, or the config Python reads. Python sees only an unknown tool's calls in a shared session.
 - **agent86-desktop and agent86-web gain the most**, since React renderers already exist, while the terminal renderer is the largest piece of new UI code.
+
+## Amendment: what the first slice found (2026-11-22)
+
+Building slice 1a against the specification changed three points of the decision above. Where the text above disagrees, this section wins.
+
+- **The validator runs JSON Schema at runtime.** A catalog is itself a JSON Schema document: each component is a schema that refers into `common_types.json`, and the envelope checks a component against `catalog.json#/$defs/anyComponent`. Checking a component against its catalog therefore needs a real JSON Schema engine, not hand-written rules.
+  - `agent86-ui` depends on the `jsonschema` crate (0.63, `rust-version` 1.85) with its default features off, so it can fetch nothing.
+  - Every document a reference can reach is served from memory: the vendored schemas, plus the catalog in use under the `catalog.json` placeholder. A reference to anything else fails to compile.
+  - Hand-written code covers what a schema cannot express:
+    - surfaces (a surface created twice, or updated before it exists);
+    - unique, UAX #31 component ids;
+    - composition (`allowedParents`, `allowedChildren`, `Surface` as the root's parent);
+    - cycles;
+    - function boundaries (`requiresUserActivation` only in an action's `functionCall`, no `agentOnly` function in a component, no agent call to a `rendererOnly` one);
+    - warnings for children not defined yet, a missing `root`, and components nothing shows.
+  - A model needs better errors than "matches none of the oneOf branches", so two things narrow a failure to the form the value meant: each message is checked against its own kind's definition, and inside a `oneOf` the branches the value plainly is not are set aside. Verdicts are unchanged: the conformance test checks them against the specification's.
+- **Fixtures live in the crate.** The specification's schemas and basic catalog are in `crates/agent86-ui/spec/` (with the Apache-2.0 license and `UPSTREAM.md` recording the commit), and its test cases and examples are in `crates/agent86-ui/tests/fixtures/v1_0/`, not the workspace's `tests/fixtures/agent86ui/`. That way the published crate carries tests that run, which `agent86-core`'s cannot. The crate's license is `MIT AND Apache-2.0`.
+  - The specification's 178 schema test cases, its example stream, and the basic catalog's 43 examples all pass. The 43 examples pass the extra rules as well.
+  - The repository's top-level `conformance/` directory is a harness for renderer and agent SDKs, not schema cases, and is not used yet.
+- **Surfaces may mix catalogs.** The decision implied one catalog per surface. A component is checked against the catalog it resolves to (its `@catalogId`, else the surface's default), one schema check per catalog, with error paths mapped back to the original indices. That makes mixing as cheap as not mixing.

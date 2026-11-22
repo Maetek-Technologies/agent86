@@ -1,0 +1,50 @@
+# agent86-ui
+
+[A2UI](https://a2ui.org) 1.0 for Rust: the message types, catalogs, and
+validation an agent needs to let its model draw interactive UI.
+
+A2UI is Google's open protocol for agent-generated UI: the agent streams
+declarative JSON describing surfaces of components, and the renderer draws
+them with its own widgets, from a catalog it trusts. No code crosses the wire.
+This crate is the agent's side, with no dependency on the rest of agent86, where
+it is the protocol layer of agent86UI
+([ADR 0005](https://github.com/Maetek-Technologies/agent86/blob/main/docs/adr/0005-agent86ui-a2ui.md)).
+
+- `Catalog`: a catalog loaded and checked against the specification's rules
+  (`Catalog::basic()` is the specification's basic catalog).
+- `Validator`: checks what a model wrote, a batch at a time, against the JSON
+  Schemas and the rules they cannot express (surfaces, `root`, child references,
+  composition constraints, function boundaries), and reports problems with the
+  specification's error codes and JSON Pointer paths, worded so a model can fix
+  them.
+- `AgentMessage` and `RendererMessage`: the messages as typed values.
+
+```rust
+use agent86_ui::{Validator, BASIC_CATALOG_ID};
+use serde_json::json;
+
+let mut validator = Validator::basic();
+let report = validator.apply(&[json!({
+    "version": "1.0",
+    "createSurface": {
+        "surfaceId": "greeting",
+        "catalogId": BASIC_CATALOG_ID,
+        "components": [{"id": "root", "component": "Text"}]
+    }
+})]);
+assert!(!report.is_ok());
+assert_eq!(report.errors[0].path, "/0/createSurface/components/0");
+assert_eq!(report.errors[0].message, "\"text\" is a required property");
+```
+
+The specification's JSON Schemas and basic catalog are vendored (see
+`spec/UPSTREAM.md`) and served from memory: validation never fetches anything.
+The crate's tests replay every test case the specification ships.
+
+agent86UI is agent86's implementation of A2UI. A2UI is Google's protocol; this
+crate is not affiliated with or endorsed by Google.
+
+## License
+
+MIT, except the vendored A2UI specification files under `spec/`, which are
+Apache-2.0 (`spec/LICENSE-APACHE`).
