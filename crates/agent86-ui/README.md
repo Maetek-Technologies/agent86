@@ -17,6 +17,13 @@ it is the protocol layer of agent86UI
   composition constraints, function boundaries), and reports problems with the
   specification's error codes and JSON Pointer paths, worded so a model can fix
   them.
+- `runtime::Runtime`: the headless surface runtime a renderer builds on. It
+  applies batches (validated, then applied, all or nothing), resolves a surface
+  for drawing (`tree`: every binding, function call, list template, and check
+  evaluated), writes what the user enters back to the data model, and
+  dispatches actions on a gesture (the `action` to send the agent, or a local
+  function's effects). The basic catalog's functions are implemented, with
+  `en-US` formatting and the A2UI regex dialect's safety rules.
 - `AgentMessage` and `RendererMessage`: the messages as typed values.
 
 ```rust
@@ -39,7 +46,8 @@ assert_eq!(report.errors[0].message, "\"text\" is a required property");
 
 The specification's JSON Schemas and basic catalog are vendored (see
 `spec/UPSTREAM.md`) and served from memory: validation never fetches anything.
-The crate's tests replay every test case the specification ships.
+The crate's tests replay the specification's schema test cases and the shared
+conformance suites every A2UI SDK runs for its runtime.
 
 agent86UI is agent86's implementation of A2UI. A2UI is Google's protocol; this
 crate is not affiliated with or endorsed by Google.

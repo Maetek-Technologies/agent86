@@ -38,12 +38,16 @@ pub const ALLOWED_EXTERNAL_REF_TARGETS: &[&str] = &[
 /// How a component property refers to other components, read from its schema's
 /// `$ref`, which is how the specification says validators find structural links
 /// ("Validator compliance when defining catalogs").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChildRef {
     /// One component id (`ComponentId` or `Child`).
     Single,
     /// A `ChildList`: an array of ids, or a template (`componentId` and `path`).
     List,
+    /// An array of objects each holding one component id in this field (the
+    /// basic catalog's `Tabs.tabs[].child`).
+    Items(String),
 }
 
 /// What validation needs to know about one component type.
@@ -55,6 +59,9 @@ pub struct ComponentDef {
     pub allowed_parents: Option<Vec<String>>,
     /// The child types this component may contain (`None`: any).
     pub allowed_children: Option<Vec<String>>,
+    /// The properties that hold an `Action`, which a renderer runs on a user
+    /// gesture rather than resolving with the other properties.
+    pub actions: std::collections::BTreeSet<String>,
 }
 
 /// Who may call a function (`allowedCallers`).
@@ -309,12 +316,27 @@ fn strings(value: Option<&Value>) -> Option<Vec<String>> {
     )
 }
 
+/// An array property whose items are objects with a child-reference field.
+fn items_ref(property: &Value) -> Option<ChildRef> {
+    let fields = property.get("items")?.get("properties")?.as_object()?;
+    fields
+        .iter()
+        .find(|(_, field)| child_ref(field) == Some(ChildRef::Single))
+        .map(|(name, _)| ChildRef::Items(name.clone()))
+}
+
 fn component_def(schema: &Value) -> ComponentDef {
     let mut children = BTreeMap::new();
+    let mut actions = std::collections::BTreeSet::new();
     for properties in property_maps(schema) {
         for (name, property) in properties {
-            if let Some(kind) = child_ref(property) {
+            if let Some(kind) = child_ref(property).or_else(|| items_ref(property)) {
                 children.insert(name.clone(), kind);
+            }
+            if property.get("$ref").and_then(Value::as_str)
+                == Some("common_types.json#/$defs/Action")
+            {
+                actions.insert(name.clone());
             }
         }
     }
@@ -322,6 +344,7 @@ fn component_def(schema: &Value) -> ComponentDef {
         children,
         allowed_parents: strings(schema.get("allowedParents")),
         allowed_children: strings(schema.get("allowedChildren")),
+        actions,
     }
 }
 
@@ -460,6 +483,15 @@ mod tests {
             Some(&ChildRef::Single)
         );
         assert!(basic.component("Text").unwrap().children.is_empty());
+        assert_eq!(
+            basic.component("Tabs").unwrap().children.get("tabs"),
+            Some(&ChildRef::Items("child".into()))
+        );
+        assert!(basic
+            .component("Button")
+            .unwrap()
+            .actions
+            .contains("action"));
         let open = basic.function("openUrl").unwrap();
         assert!(open.requires_user_activation);
         assert_eq!(open.callers, Callers::RendererOnly);

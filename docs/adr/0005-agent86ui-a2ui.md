@@ -116,7 +116,7 @@ What that means:
 
 ### Slices
 
-1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3.
+1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3 (done 2026-11-22; see the second amendment).
 2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in.
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
 4. **The ACP extension and its text fallback** (1.2.1).
@@ -151,3 +151,25 @@ Building slice 1a against the specification changed three points of the decision
   - The specification's 178 schema test cases, its example stream, and the basic catalog's 43 examples all pass. The 43 examples pass the extra rules as well.
   - The repository's top-level `conformance/` directory is a harness for renderer and agent SDKs, not schema cases, and is not used yet.
 - **Surfaces may mix catalogs.** The decision implied one catalog per surface. A component is checked against the catalog it resolves to (its `@catalogId`, else the surface's default), one schema check per catalog, with error paths mapped back to the original indices. That makes mixing as cheap as not mixing.
+
+## Amendment: the headless runtime (2026-11-22)
+
+Slice 1b, the headless runtime (`agent86_ui::runtime`), is checked against the A2UI repository's shared conformance suites, `conformance/core/`, which every reference SDK (TypeScript, Python, Dart, Swift) runs. They are converted from YAML to JSON unchanged and replayed under the upstream harness guide's strict rules: an unknown action, op, or key fails the case. 316 of the 329 cases in the ten suites that cover the runtime run, and all pass:
+- `data_model` (52), `data_context` (11), `expressions` (98), `functions` (110), `index_function` (4), `validation_result` (6), `data_deletion` (7), `data_model_pointers` (7), `reserved_keys` (10), and `actions` (11).
+- The 13 left out are written for 0.9: six function cases marked `v0.9`, and seven action cases with no version that use 0.9's binding syntax (`{"path": ...}`, a literal in 1.0).
+- The reference harness runs every version-less case as 0.9. Here the version-less function cases run against 1.0, and a validation result is compared with an expected boolean by its `valid`, since 1.0's validators return results where 0.9's returned booleans.
+
+What building it settled:
+
+- **Question 3, the rest.** The `DynamicBoolean` coercion table and the regex dialect are implemented as the specification states them, and pinned by the suites:
+  - the dialect is parsed in full; refused outright are backreferences, lookbehind, named groups, `\p{}`, `\cX`, legacy octal, inline flags, and the identity escapes Unicode mode forbids;
+  - the four safety rules are applied (`PATTERN_TOO_LONG`, `NESTED_QUANTIFIER`, `OVERLAPPING_ALTERNATION`, `ADJACENT_OVERLAP`);
+  - a pattern that passes is translated into `fancy-regex` syntax with the dialect's meanings spelled out (ASCII `\d`, `\w`, and `\b`; `^` and `$` only at the ends), with a backtracking limit as a last defense.
+- **Formatting is `en-US`, written to match `Intl`.** Numbers and currency round half away from zero on the shortest decimal form, with grouping and currency symbols. Dates use TR35 tokens on the wall-clock time as written; a date that does not exist (`2026-02-30`) gives `""`. Plurals check the explicit `zero`, `one`, and `two` forms first, as every reference SDK does. A locale option is left for later.
+- **New dependencies:** `fancy-regex` (0.20, `rust-version` 1.66, already in the tree through `jsonschema`) and `jiff` (already a workspace dependency).
+- **The runtime applies what the validator accepts, and evaluates it.** A batch that passes validation is applied to a copy of the surfaces and every touched surface is resolved. An evaluation error that does not depend on data (a template that does not parse, `@index` outside a list, a function no catalog defines) rejects the batch with `EXPRESSION_ERROR`, so the model hears about it in the tool result. A data model write the path does not allow rejects it too. The validator's `Code` gained `ExpressionError` and `DataError`.
+- **Embedders can implement functions.** `Runtime::register` adds a local function (its `allowedCallers` and gesture rule as a catalog would declare them). It may read the data model and ask for writes, which apply when the action that ran it finishes and are dropped when it ran from a binding. A failure is an `EXECUTION_ERROR`. The suites rely on this, and custom catalogs will need it.
+- **Nested child references.** The basic catalog's `Tabs` holds its children inside an array of objects (`tabs[].child`). `ChildRef::Items` covers that, in the validator's reachability and composition checks and in the runtime's tree. The property stays among the resolved properties, since it also carries each tab's title.
+- **Left for the slices that use it:** agent function routing (`callAgentFunction` from a binding), the rest of the upstream suites (the validator's `validator_v1_0` and `message_processor_v1_0`, node resolution, RPC), and a locale.
+  - The reference SDKs treat a missing root, dangling references, and orphans as errors in strict mode, where this validator warns.
+  - Which of the two `render_ui` should follow is decided in slice 2, with those suites run then.

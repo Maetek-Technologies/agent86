@@ -33,6 +33,9 @@ indexmap = { version = "2.14.2", features = ["serde"] }
 # Local time and its offset for the prompt's time line and `memory`/`trace`
 # listings. Replaced chrono (unmaintained, RUSTSEC-2026-0543) in 1.0.24.
 jiff = "1.0.0"
+# The A2UI regex dialect for agent86-ui: lookahead, with a backtracking limit
+# on top of the dialect's static safety rules. rust-version 1.66.
+fancy-regex = "0.20.2"
 # JSON Schema 2020-12, for agent86-ui: A2UI catalogs are JSON Schema documents, so
 # checking a component against its catalog needs a real validator. Without the
 # default features it resolves no reference over the network or from files; the
