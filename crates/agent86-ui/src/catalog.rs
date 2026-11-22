@@ -1,0 +1,580 @@
+//! Catalogs: the components and functions a renderer draws and runs, which are
+//! the only ones an agent may use. A catalog is a JSON Schema document
+//! (`catalog_definition.json`); [`Catalog`] holds it with what validation needs
+//! read out of it: each component's child-reference properties and composition
+//! constraints, and each function's return type and allowed callers.
+
+use crate::ident::is_identifier;
+use crate::schema::{check_catalog_definition, CompileError, SchemaError, SchemaSet};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+/// The basic catalog's id, as the specification publishes it.
+pub const BASIC_CATALOG_ID: &str =
+    "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json";
+
+const BASIC_CATALOG: &str = include_str!("../spec/v1_0/catalogs/basic/catalog.json");
+
+/// The schemas in `common_types.json` a catalog's external `$ref` may target
+/// (the specification's catalog schema rule 3, "Restricted `$ref` Targets").
+pub const ALLOWED_EXTERNAL_REF_TARGETS: &[&str] = &[
+    "ComponentId",
+    "Child",
+    "ChildList",
+    "DynamicString",
+    "DynamicNumber",
+    "DynamicBoolean",
+    "DynamicStringList",
+    "DynamicValue",
+    "AccessibilityAttributes",
+    "CheckRule",
+    "Checkable",
+    "Action",
+    "DataBinding",
+    "FunctionCall",
+];
+
+/// How a component property refers to other components, read from its schema's
+/// `$ref`, which is how the specification says validators find structural links
+/// ("Validator compliance when defining catalogs").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRef {
+    /// One component id (`ComponentId` or `Child`).
+    Single,
+    /// A `ChildList`: an array of ids, or a template (`componentId` and `path`).
+    List,
+}
+
+/// What validation needs to know about one component type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComponentDef {
+    /// The properties that hold child references, by name.
+    pub children: BTreeMap<String, ChildRef>,
+    /// The parent types this component may appear under (`None`: any).
+    pub allowed_parents: Option<Vec<String>>,
+    /// The child types this component may contain (`None`: any).
+    pub allowed_children: Option<Vec<String>>,
+}
+
+/// Who may call a function (`allowedCallers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Callers {
+    /// Only the renderer, from bindings, checks, and actions (the default).
+    RendererOnly,
+    /// Only the agent, through `callRendererFunction`.
+    AgentOnly,
+    /// Either.
+    RendererOrAgent,
+}
+
+/// What validation needs to know about one function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDef {
+    /// The declared `returnType` (`string`, `validationResult`, `void`, ...).
+    pub return_type: String,
+    /// The declared `allowedCallers`.
+    pub callers: Callers,
+    /// Whether it may only run from a user gesture (`requiresUserActivation`).
+    pub requires_user_activation: bool,
+}
+
+/// Why a catalog was refused when loaded.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum CatalogError {
+    /// The document does not match `catalog_definition.json`.
+    #[error("catalog does not match catalog_definition.json: {}", join(.0))]
+    Schema(Vec<SchemaError>),
+    /// A rule the schema cannot express: the protocol version, a name, a
+    /// `$ref` target, a component's discriminator.
+    #[error("invalid catalog: {0}")]
+    Rule(String),
+    /// The catalog does not compile as the envelope schema's `catalog.json`.
+    #[error(transparent)]
+    Compile(#[from] CompileError),
+}
+
+fn join(errors: &[SchemaError]) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// A loaded, checked catalog.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    id: String,
+    document: Value,
+    components: BTreeMap<String, ComponentDef>,
+    functions: BTreeMap<String, FunctionDef>,
+}
+
+impl Catalog {
+    /// The specification's basic catalog (`catalogs/basic/v1`), vendored.
+    pub fn basic() -> &'static Catalog {
+        static BASIC: OnceLock<Catalog> = OnceLock::new();
+        BASIC.get_or_init(|| {
+            let document = serde_json::from_str(BASIC_CATALOG).expect("basic catalog is JSON");
+            Catalog::from_value(document).expect("the vendored basic catalog is valid")
+        })
+    }
+
+    /// Load a catalog document, checking it against `catalog_definition.json`
+    /// and the rules the schema cannot express: `protocolVersion` must be
+    /// `1.0`; component, function, property, and `$defs` names must be UAX #31
+    /// identifiers; every `$ref` must target this catalog's own components,
+    /// functions, or leaf `$defs`, or one of [`ALLOWED_EXTERNAL_REF_TARGETS`];
+    /// and each component must declare `component` as the constant of its own
+    /// name. Nothing the document refers to is fetched.
+    pub fn from_value(document: Value) -> Result<Catalog, CatalogError> {
+        check_catalog_definition(&document).map_err(CatalogError::Schema)?;
+        let object = document
+            .as_object()
+            .ok_or_else(|| CatalogError::Rule("a catalog is a JSON object".into()))?;
+        match object.get("protocolVersion").and_then(Value::as_str) {
+            Some("1.0") => {}
+            Some(other) => {
+                return Err(CatalogError::Rule(format!(
+                    "protocolVersion is {other:?}; this implementation reads 1.0 catalogs only"
+                )))
+            }
+            None => {
+                return Err(CatalogError::Rule(
+                    "protocolVersion is missing, which means 0.9; this implementation reads 1.0 catalogs only".into(),
+                ))
+            }
+        }
+        let id = object
+            .get("catalogId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let empty = serde_json::Map::new();
+        let component_docs = object
+            .get("components")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let function_docs = object
+            .get("functions")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let defs = object
+            .get("$defs")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+
+        let mut problems = Vec::new();
+        for (name, schema) in component_docs {
+            if !is_identifier(name) {
+                problems.push(format!("component name {name:?} is not an identifier"));
+            }
+            if discriminator(schema) != Some(name.as_str()) {
+                problems.push(format!(
+                    "component {name:?} must declare \"component\": {{\"const\": {name:?}}}"
+                ));
+            }
+            check_names(schema, &mut problems);
+        }
+        for (name, schema) in function_docs {
+            let bare = name.strip_prefix('@').unwrap_or(name);
+            if !is_identifier(bare) {
+                problems.push(format!("function name {name:?} is not an identifier"));
+            }
+            check_names(schema, &mut problems);
+        }
+        for (name, schema) in defs {
+            if name == "anyComponent" || name == "anyFunction" {
+                continue;
+            }
+            if !is_identifier(name) {
+                problems.push(format!("$defs name {name:?} is not an identifier"));
+            }
+            check_names(schema, &mut problems);
+        }
+        let mut refs = Vec::new();
+        for section in [component_docs, function_docs, defs] {
+            for schema in section.values() {
+                collect_refs(schema, &mut refs);
+            }
+        }
+        for target in refs {
+            if let Some(problem) = ref_problem(&target, component_docs, function_docs, defs) {
+                problems.push(problem);
+            }
+        }
+        if !problems.is_empty() {
+            return Err(CatalogError::Rule(problems.join("; ")));
+        }
+
+        let components = component_docs
+            .iter()
+            .map(|(name, schema)| (name.clone(), component_def(schema)))
+            .collect();
+        let functions = function_docs
+            .iter()
+            .map(|(name, schema)| (name.clone(), function_def(schema)))
+            .collect();
+        let catalog = Catalog {
+            id,
+            document,
+            components,
+            functions,
+        };
+        // Compiling proves every reference resolves within the served documents.
+        SchemaSet::for_catalog(&catalog)?;
+        Ok(catalog)
+    }
+
+    /// The catalog's id (`catalogId`).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The catalog's JSON Schema document, as loaded.
+    pub fn document(&self) -> &Value {
+        &self.document
+    }
+
+    /// The catalog's `instructions` for the model, if it has any.
+    pub fn instructions(&self) -> Option<&str> {
+        self.document.get("instructions").and_then(Value::as_str)
+    }
+
+    /// The component types, by name.
+    pub fn components(&self) -> &BTreeMap<String, ComponentDef> {
+        &self.components
+    }
+
+    /// The functions, by name.
+    pub fn functions(&self) -> &BTreeMap<String, FunctionDef> {
+        &self.functions
+    }
+
+    /// One component type, if the catalog has it.
+    pub fn component(&self, name: &str) -> Option<&ComponentDef> {
+        self.components.get(name)
+    }
+
+    /// One function, if the catalog has it.
+    pub fn function(&self, name: &str) -> Option<&FunctionDef> {
+        self.functions.get(name)
+    }
+}
+
+/// A component schema's `properties.component.const`, at its root or in one of
+/// its `allOf` entries.
+fn discriminator(schema: &Value) -> Option<&str> {
+    property_maps(schema)
+        .into_iter()
+        .find_map(|properties| properties.get("component")?.get("const")?.as_str())
+}
+
+/// The `properties` objects of a component schema: its own and those of its
+/// `allOf` entries (where catalogs put local properties beside a `Checkable`).
+fn property_maps(schema: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    let mut maps = Vec::new();
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        maps.push(properties);
+    }
+    if let Some(all) = schema.get("allOf").and_then(Value::as_array) {
+        for entry in all {
+            if let Some(properties) = entry.get("properties").and_then(Value::as_object) {
+                maps.push(properties);
+            }
+        }
+    }
+    maps
+}
+
+fn child_ref(property: &Value) -> Option<ChildRef> {
+    match property.get("$ref")?.as_str()? {
+        "common_types.json#/$defs/ComponentId" | "common_types.json#/$defs/Child" => {
+            Some(ChildRef::Single)
+        }
+        "common_types.json#/$defs/ChildList" => Some(ChildRef::List),
+        _ => None,
+    }
+}
+
+fn strings(value: Option<&Value>) -> Option<Vec<String>> {
+    Some(
+        value?
+            .as_array()?
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+fn component_def(schema: &Value) -> ComponentDef {
+    let mut children = BTreeMap::new();
+    for properties in property_maps(schema) {
+        for (name, property) in properties {
+            if let Some(kind) = child_ref(property) {
+                children.insert(name.clone(), kind);
+            }
+        }
+    }
+    ComponentDef {
+        children,
+        allowed_parents: strings(schema.get("allowedParents")),
+        allowed_children: strings(schema.get("allowedChildren")),
+    }
+}
+
+fn function_def(schema: &Value) -> FunctionDef {
+    let callers = match schema.get("allowedCallers").and_then(Value::as_str) {
+        Some("agentOnly") => Callers::AgentOnly,
+        Some("rendererOrAgent") => Callers::RendererOrAgent,
+        _ => Callers::RendererOnly,
+    };
+    FunctionDef {
+        return_type: schema
+            .get("returnType")
+            .and_then(Value::as_str)
+            .unwrap_or("any")
+            .to_string(),
+        callers,
+        requires_user_activation: schema
+            .get("requiresUserActivation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// Keys whose values are annotations or literal data, not subschemas.
+const NON_SCHEMA_KEYS: &[&str] = &[
+    "metadata",
+    "examples",
+    "const",
+    "default",
+    "enum",
+    "description",
+];
+
+/// Property names inside a schema must be identifiers too (except the
+/// protocol's own `@path` and `@call`).
+fn check_names(schema: &Value, problems: &mut Vec<String>) {
+    match schema {
+        Value::Object(object) => {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                for (name, property) in properties {
+                    if name != "@path" && name != "@call" && !is_identifier(name) {
+                        problems.push(format!("property name {name:?} is not an identifier"));
+                    }
+                    check_names(property, problems);
+                }
+            }
+            for (key, value) in object {
+                if key != "properties" && !NON_SCHEMA_KEYS.contains(&key.as_str()) {
+                    check_names(value, problems);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                check_names(item, problems);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_refs(schema: &Value, refs: &mut Vec<String>) {
+    match schema {
+        Value::Object(object) => {
+            if let Some(target) = object.get("$ref").and_then(Value::as_str) {
+                refs.push(target.to_string());
+            }
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                for property in properties.values() {
+                    collect_refs(property, refs);
+                }
+            }
+            for (key, value) in object {
+                if key != "properties" && !NON_SCHEMA_KEYS.contains(&key.as_str()) {
+                    collect_refs(value, refs);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_refs(item, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ref_problem(
+    target: &str,
+    components: &serde_json::Map<String, Value>,
+    functions: &serde_json::Map<String, Value>,
+    defs: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    if let Some(name) = target.strip_prefix("#/components/") {
+        return (!components.contains_key(name))
+            .then(|| format!("$ref {target:?} names no component of this catalog"));
+    }
+    if let Some(name) = target.strip_prefix("#/functions/") {
+        return (!functions.contains_key(name))
+            .then(|| format!("$ref {target:?} names no function of this catalog"));
+    }
+    if let Some(name) = target.strip_prefix("#/$defs/") {
+        if name == "anyComponent" || name == "anyFunction" {
+            return Some(format!(
+                "$ref {target:?} may not be referenced from inside the catalog"
+            ));
+        }
+        return (!defs.contains_key(name))
+            .then(|| format!("$ref {target:?} names no $defs entry of this catalog"));
+    }
+    if let Some(name) = target.strip_prefix("common_types.json#/$defs/") {
+        return (!ALLOWED_EXTERNAL_REF_TARGETS.contains(&name))
+            .then(|| format!("$ref {target:?} is not one of the common types a catalog may use"));
+    }
+    Some(format!(
+        "$ref {target:?} points outside the catalog and the common types, which is not allowed"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_basic_catalog_loads_with_its_structure() {
+        let basic = Catalog::basic();
+        assert_eq!(basic.id(), BASIC_CATALOG_ID);
+        assert_eq!(basic.components().len(), 18);
+        assert_eq!(
+            basic.component("Column").unwrap().children.get("children"),
+            Some(&ChildRef::List)
+        );
+        assert_eq!(
+            basic.component("Button").unwrap().children.get("child"),
+            Some(&ChildRef::Single)
+        );
+        assert!(basic.component("Text").unwrap().children.is_empty());
+        let open = basic.function("openUrl").unwrap();
+        assert!(open.requires_user_activation);
+        assert_eq!(open.callers, Callers::RendererOnly);
+        assert_eq!(
+            basic.function("required").unwrap().return_type,
+            "validationResult"
+        );
+        assert!(basic.instructions().unwrap().contains("formatString"));
+    }
+
+    fn minimal(extra: Value) -> Value {
+        let mut catalog = json!({
+            "protocolVersion": "1.0",
+            "catalogId": "example.com:test",
+            "components": {
+                "Label": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "Label"},
+                        "text": {"$ref": "common_types.json#/$defs/DynamicString"}
+                    },
+                    "required": ["component", "text"]
+                }
+            },
+            "functions": {},
+            "$defs": {
+                "anyComponent": {"oneOf": [{"$ref": "#/components/Label"}]},
+                "anyFunction": false
+            }
+        });
+        if let (Some(base), Some(extra)) = (catalog.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        catalog
+    }
+
+    #[test]
+    fn a_minimal_catalog_loads() {
+        let catalog = Catalog::from_value(minimal(json!({}))).unwrap();
+        assert_eq!(catalog.id(), "example.com:test");
+    }
+
+    #[test]
+    fn refuses_a_catalog_for_another_protocol_version() {
+        let error = Catalog::from_value(minimal(json!({"protocolVersion": "0.9"}))).unwrap_err();
+        assert!(error.to_string().contains("1.0 catalogs only"), "{error}");
+        let mut no_version = minimal(json!({}));
+        no_version
+            .as_object_mut()
+            .unwrap()
+            .remove("protocolVersion");
+        assert!(Catalog::from_value(no_version).is_err());
+    }
+
+    #[test]
+    fn refuses_a_reference_outside_the_catalog() {
+        let catalog = minimal(json!({
+            "$defs": {
+                "anyComponent": {"oneOf": [{"$ref": "#/components/Label"}]},
+                "anyFunction": false,
+                "Remote": {"$ref": "https://example.com/elsewhere.json"}
+            }
+        }));
+        let error = Catalog::from_value(catalog).unwrap_err();
+        assert!(error.to_string().contains("points outside"), "{error}");
+    }
+
+    #[test]
+    fn refuses_a_common_type_not_on_the_list() {
+        let catalog = minimal(json!({
+            "$defs": {
+                "anyComponent": {"oneOf": [{"$ref": "#/components/Label"}]},
+                "anyFunction": false,
+                "Sneaky": {"$ref": "common_types.json#/$defs/FunctionResponse"}
+            }
+        }));
+        let error = Catalog::from_value(catalog).unwrap_err();
+        assert!(
+            error.to_string().contains("not one of the common types"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_component_whose_discriminator_does_not_match() {
+        let catalog = minimal(json!({
+            "components": {
+                "Label": {
+                    "type": "object",
+                    "properties": {"component": {"const": "Other"}},
+                    "required": ["component"]
+                }
+            }
+        }));
+        let error = Catalog::from_value(catalog).unwrap_err();
+        assert!(error.to_string().contains("must declare"), "{error}");
+    }
+
+    #[test]
+    fn refuses_a_name_that_is_not_an_identifier() {
+        let catalog = minimal(json!({
+            "components": {
+                "Label": {
+                    "type": "object",
+                    "properties": {
+                        "component": {"const": "Label"},
+                        "font-size": {"type": "number"}
+                    },
+                    "required": ["component"]
+                }
+            }
+        }));
+        let error = Catalog::from_value(catalog).unwrap_err();
+        assert!(error.to_string().contains("\"font-size\""), "{error}");
+    }
+}

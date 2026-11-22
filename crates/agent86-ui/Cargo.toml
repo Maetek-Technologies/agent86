@@ -1,0 +1,26 @@
+# agent86UI's protocol layer: Google's A2UI 1.0 (https://a2ui.org) for Rust, with
+# no dependency on the rest of agent86: the message types, catalogs, and the
+# validator an agent runs on what its model wrote. ADR 0005.
+[package]
+name = "agent86-ui"
+description = "A2UI 1.0 for Rust: message types, catalogs, and validation of agent-generated UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license = "MIT AND Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/agent86-ui"
+homepage = "https://maetek-technologies.github.io/agent86/"
+keywords = ["a2ui", "agent", "ui", "llm", "json-schema"]
+categories = ["gui", "parser-implementations", "development-tools"]
+
+[dependencies]
+jsonschema.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
