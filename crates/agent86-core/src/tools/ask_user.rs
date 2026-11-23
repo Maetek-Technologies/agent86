@@ -55,7 +55,7 @@ impl Tool for AskUserTool {
                                 "type": "string",
                             },
                             "options": {
-                                "description": format!("For choice and multi only: 2 to {MAX_OPTIONS} short answers. \"Other\" is added for you."),
+                                "description": format!("For choice and multi only: up to {MAX_OPTIONS} short answers. \"Other\" is added for you."),
                                 "items": {"type": "string"},
                                 "type": "array",
                             },

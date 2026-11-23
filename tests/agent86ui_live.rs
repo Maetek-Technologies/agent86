@@ -15,8 +15,11 @@
 //! seven to nine questions; `session`, the session that failed, replayed (a
 //! prose turn over a home folder with the read-only tools, then a request for a
 //! form), which a clean context does not reproduce; or `ask`, six requests that
-//! need clarifying questions without naming a form. The results print as a
-//! table:
+//! need clarifying questions without naming a form. `AGENT86_TEST_UI_STEPS`
+//! (default 4) is the step budget per turn: over a folder a model may look
+//! around before it asks, so the `session` and `ask` sets are fairer at 12.
+//! `AGENT86_TEST_UI_SHOW=1` prints the arguments of each first failing call.
+//! The results print as a table:
 //!
 //! ```text
 //! AGENT86_TEST_UI_LIVE=1 cargo test --test agent86ui_live -- --nocapture
@@ -115,6 +118,15 @@ async fn models_write_valid_render_ui_batches() {
         .iter()
         .flat_map(|task| std::iter::repeat_n(*task, runs))
         .collect();
+    // Steps per turn (`AGENT86_TEST_UI_STEPS`, default 4). Over a folder a
+    // model may look around before it asks; a real session allows far more.
+    let steps: u32 = std::env::var("AGENT86_TEST_UI_STEPS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4);
+    // With `AGENT86_TEST_UI_SHOW=1`, the arguments of each first failing call.
+    let show = std::env::var("AGENT86_TEST_UI_SHOW").as_deref() == Ok("1");
 
     let mut rows = Vec::new();
     for reference in models.split(',').map(str::trim).filter(|r| !r.is_empty()) {
@@ -143,7 +155,7 @@ async fn models_write_valid_render_ui_batches() {
                 .workspace(&workspace)
                 .approval(ApprovalMode::Deny)
                 .context_window(context_window_for(reference, &config))
-                .max_steps(4)
+                .max_steps(steps)
                 // Dismisses every wait, as a user closing the form would, so
                 // `wait: true` is measured as the interface takes it.
                 .ui(Ui::basic().on_wait(|_| None))
@@ -183,6 +195,16 @@ async fn models_write_valid_render_ui_batches() {
                                     let text = result.error.as_deref().unwrap_or_default();
                                     let problem = text.lines().nth(1).unwrap_or(text);
                                     outcome.error = Some(problem.chars().take(200).collect());
+                                    if show {
+                                        let sent =
+                                            serde_json::Value::Object(call.arguments.clone())
+                                                .to_string();
+                                        eprintln!(
+                                            "  {} sent: {}",
+                                            call.name,
+                                            sent.chars().take(600).collect::<String>()
+                                        );
+                                    }
                                 }
                             }
                         }
