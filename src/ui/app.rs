@@ -155,7 +155,7 @@ impl From<TurnEvent<'_>> for UiEvent {
             // Never sent (the worker drops it); it adds no text.
             TurnEvent::Usage { .. } => Self::Text(String::new()),
             // The interface declares no renderer until its own lands (ADR 0005,
-            // 1.2.2), so `render_ui` is not offered; dropped by the worker too.
+            // 1.2.1), so `render_ui` is not offered; dropped by the worker too.
             TurnEvent::Ui(_) => Self::Text(String::new()),
             TurnEvent::Thinking(text) => Self::Thinking(text.to_owned()),
             TurnEvent::ToolCall { call, .. } => Self::ToolCall {

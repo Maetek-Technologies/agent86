@@ -379,7 +379,7 @@ impl Presenter {
                 sink.update(Update::Message(chunk.to_owned()))
             }
             // An ACP session declares no renderer until the a2ui extension lands
-            // (ADR 0005, 1.2.1), so `render_ui` is not offered there yet.
+            // (ADR 0005, 1.2.2), so `render_ui` is not offered there yet.
             TurnEvent::Ui(_) => {}
             TurnEvent::Thinking(chunk) if !chunk.is_empty() => match self.thinking {
                 DisplayLevel::Full => sink.update(Update::Thought(chunk.to_owned())),

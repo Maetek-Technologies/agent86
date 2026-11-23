@@ -110,6 +110,8 @@ What that means:
 
    Revised 2026-11-22, after 1.2.0 shipped: the terminal renderer moves up to **1.2.2**, right after the ACP extension, so agent86UI reaches the CLI's interactive interface sooner. Scheduled jobs become 1.2.3 and MCP vault secrets 1.2.4.
 
+   Revised again 2026-11-22: the terminal renderer goes first, as **1.2.1**, and the ACP extension with its text fallback becomes **1.2.2**. Scheduled jobs (1.2.3) and MCP vault secrets (1.2.4) stay put.
+
 ### Questions still open, for the first slice
 
 2. **The password-style field** (answered 2026-11-22). It is `TextField` with `"variant": "obscured"` (the basic catalog's `variant` enum is `longText`, `number`, `shortText`, `obscured`). The core refuses it in slice 2; the protocol crate stays policy-free.
@@ -120,9 +122,9 @@ What that means:
 
 1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3 (done 2026-11-22; see the second amendment).
 2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth); 2c the redaction, guardrails, policy, and the `ui_render` trace kind (done 2026-11-22; see the fifth); 2d the blocking wait (done 2026-11-22; see the sixth); 2e actions after the turn (done 2026-11-22; see the seventh); 2f replay on resume and `Agent::surfaces` (done 2026-11-22; see the eighth); 2g the docs and the first measurement of question 4 (done 2026-11-22; see the ninth); 2h the validator's remaining rules (done 2026-11-22; see the tenth).
-3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.1.
-4. **The ACP extension and its text fallback** (1.2.1).
-5. **The terminal renderer** (1.2.2; planned as 1.2.4 until 2026-11-22).
+3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.2.
+4. **The ACP extension and its text fallback** (1.2.2; planned as 1.2.1 until 2026-11-22).
+5. **The terminal renderer** (1.2.1; planned as 1.2.4, then 1.2.2, until 2026-11-22).
 6. **Docs** (1.2.0, extended by each later release): `docs/agent86ui.md`, the README's and the site's claims, and the plan's differences.
 
 ## Consequences
@@ -237,7 +239,7 @@ Slice 2e built the non-blocking path:
 
 - **`Agent::ui_action(action)` and `ui_action_with_events`** run a turn whose user message is the action's text (`[ui action] <name> on <surfaceId>: <context as JSON>`, plus the event's `userMessage`), the same text a waiting call returns. That text is the only mark that a message was an action, so `state_json` is unchanged, and a surface (or Python) shows it as the text it is. As a user message it goes through the vault's redaction and the ingress guardrail like typed input; in `block` mode an injection refuses the turn before any model call.
 - **Checked first** (`UiSession::check_action`): the agent has a renderer, the surface is up, and it holds the component the action names; otherwise `RunError::UiAction` (a new `#[non_exhaustive]` variant, behind the feature), which names what was wrong and never the values, and no turn runs. It is recorded as `ui_action` with `waited: false`.
-- **`callAgentFunction` cannot arrive:** the sdk takes only an `Action`, so a renderer's agent-function call has no way in, which is how the first version leaves agent functions out. ACP's `_com.maetek.agent86/a2ui/action` (1.2.1) will refuse one explicitly.
+- **`callAgentFunction` cannot arrive:** the sdk takes only an `Action`, so a renderer's agent-function call has no way in, which is how the first version leaves agent functions out. ACP's `_com.maetek.agent86/a2ui/action` (1.2.2) will refuse one explicitly.
 - **Actions during a turn** are the program's to hold until the turn ends, as typed input is; `Agent` takes `&mut self` per turn, so it cannot interleave them.
 
 ## Amendment: replay on resume, and the snapshot (2026-11-22)
@@ -265,7 +267,7 @@ After the fixes every task had a valid surface within three calls. What the firs
 - **`context` beside `event`** in a button's action, twice. The prompt now says `context` goes inside `event`.
 - Still seen after the fixes: `createSurface` without `surfaceId`, and an enum value the component does not take; both are fixed on the first correction.
 
-Five tasks and one run are too few to settle question 4, and the results vary between runs. They are enough to keep `auto` as it is for now: a local 27B model gets there with the validator's feedback, at the cost of a correction or two. The question stays open until the hosted models embedders use are measured too (`AGENT86_TEST_UI_MODELS` takes a list), before agent86UI is turned on by default anywhere a user did not ask for it (the ACP extension, 1.2.1).
+Five tasks and one run are too few to settle question 4, and the results vary between runs. They are enough to keep `auto` as it is for now: a local 27B model gets there with the validator's feedback, at the cost of a correction or two. The question stays open until the hosted models embedders use are measured too (`AGENT86_TEST_UI_MODELS` takes a list), before agent86UI is turned on by default anywhere a user did not ask for it (the terminal interface, 1.2.1, then the ACP extension, 1.2.2).
 
 ## Amendment: the validator's remaining rules (2026-11-22)
 
