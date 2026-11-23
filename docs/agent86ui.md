@@ -9,7 +9,7 @@ A2UI is Google's protocol, and agent86 is not affiliated with or endorsed by Goo
 | Surface | agent86UI |
 |---|---|
 | Programs embedding `agent86-core` (`sdk`), such as agent86-desktop | From 1.2.0 |
-| The terminal interface | Planned for 1.2.1 |
+| The terminal interface | 1.2.1, built on `main` and not yet released: see [In the terminal](#in-the-terminal) |
 | ACP clients (agent86-web, editors) | Planned for 1.2.2: the `com.maetek.agent86/a2ui` extension, and a text version for other clients |
 | `agent86 run`, the plain loop, piped input, CI | Never: the tool is not offered, so their output is unchanged |
 
@@ -30,6 +30,22 @@ A field the model puts beside a message's kind (`"surfaceId"` next to `"createSu
 
 - **Later, as a message (the default).** A button's action, such as `{"event": {"name": "submit", "context": {"name": {"@path": "/form/name"}}}}`, comes back as the next user message: `[ui action] submit on form: {"name": "Ada"}`. It goes through the same redaction and input guardrail as typed text, and starts a turn.
 - **At once, mid-turn (`wait`).** With `"wait": true` the turn waits for the user's first action on the surface, and that action is the call's result. Use it for a form the task cannot go on without. Only a Button whose action is an event sends an answer (choosing or typing only changes the data model), so a waiting call whose surface has none is refused before it is drawn. A waiting question is asked one at a time with approvals and secrets, and never once the turn is cancelled. If the program cannot answer, a waiting call is refused and the model asks without waiting.
+
+## In the terminal
+
+From 1.2.1 the interactive interface (`agent86` with no subcommand, at a terminal) declares a renderer, so the model can draw there. `run`, the plain loop (`--plain`, `AGENT86_PLAIN`, piped input), and ACP never offer `render_ui`, and their output is unchanged.
+
+- **What it draws:** the basic catalog's interactive subset: Text, Row, Column, Card, List, Divider, Button, TextField, CheckBox, ChoicePicker, Slider (as a number), DateTimeInput (as text), and Image, Video, and AudioPlayer as a link. Tabs and Modal say they are not drawn in the terminal yet.
+- **How it looks:** inside a magenta frame with heavy lines titled `agent86UI · drawn by the agent · <surfaceId>`, which nothing else in agent86 uses, so a surface never looks like an approval. The newest surface sits above the input box, cut to about 40% of the screen; the others are counted on one line. When a surface is answered, deleted, or replaced by a newer one, a copy of its last state goes into scrollback. The display levels (`/thinking`, `/toolview`) never hide a surface, since it is a question to you.
+- **Keys:** a waiting surface takes the keys at once; otherwise Alt+Up (Option+Up) opens the live surface while no turn runs, and again goes to the next older one. Inside a surface:
+  - Tab and Shift+Tab, or Up and Down, move between inputs (Up and Down go through a choice's options first);
+  - Space toggles a check box or picks a choice, and Left and Right move a slider;
+  - typing, Backspace, Ctrl+U, and paste edit a text field;
+  - Enter presses a button, which sends its answer;
+  - Escape dismisses a waiting surface, or goes back to the input box. Ctrl+C dismisses and cancels the turn.
+- **Links:** a button that opens a URL shows it and asks y/n, then opens it with your system's opener, `http` and `https` only.
+- **Resuming:** starting with a session, `/resume`, and `/clear` redraw the surfaces the session has up. Ctrl+O's transcript view ends with the live surface in full.
+- **Settings** (`[ui]`): `agent86ui = "auto"` (the default: on for every model) or `"off"`, which a project file may set without being trusted; `agent86ui_remote_media = true` lets media load `https` URLs, and needs trust.
 
 ## Embedding it
 
@@ -93,4 +109,4 @@ Neither holds what a surface showed or what the user entered. As for every tool,
 ## What it does not do yet
 
 - A2UI over A2A or AG-UI, A2UI in MCP servers' output, renderer and agent functions, and A2UI 0.9 are left out.
-- Config: `[ui] agent86ui = "auto" | "off"` and `[ui] agent86ui_remote_media` arrive with the first surface that reads the config file, the terminal interface in 1.2.1. In 1.2.0 an embedder turns agent86UI on with `AgentBuilder::ui`.
+- ACP clients get agent86UI in 1.2.2. An embedder turns it on with `AgentBuilder::ui`; the `[ui]` settings are the interface's.

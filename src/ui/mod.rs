@@ -367,6 +367,8 @@ fn run(repl: &mut Repl) -> io::Result<()> {
     for note in &repl.startup_notes {
         app.note(Style::Dim, note);
     }
+    // A resumed session's surfaces, which `attach_renderer` replayed, are drawn.
+    sync_surfaces(&mut app, repl);
     let notices = events.clone();
     crate::update::start(repl.config.ui.update_check, move |text| {
         let _ = notices.send(UiEvent::Note(Style::Dim, text));
@@ -596,6 +598,8 @@ fn dispatch(
                 app.clear_transcript();
                 screen.clear_all()?;
                 commit_header(app);
+                // A fresh conversation has no surfaces.
+                sync_surfaces(app, repl);
             } else if let Some(render) = &result.render {
                 app.commit_text(render);
             }
@@ -697,6 +701,7 @@ fn resume_picked(
             screen.clear_all()?;
             commit_header(app);
             app.replay(&repl.state.messages);
+            sync_surfaces(app, repl);
             app.note(Style::Dim, &note);
         }
     }
@@ -877,6 +882,16 @@ fn pump(
             }
         }
         app.tick();
+    }
+}
+
+/// Rebuild the surfaces of the session now live (ADR 0005: resume replays,
+/// nothing is stored) in the agent's renderer, then draw them: on starting
+/// with a session, `/resume`, and `/clear`. Without a renderer, nothing.
+fn sync_surfaces(app: &mut App, repl: &Repl) {
+    if let Some(ui) = &repl.harness.context.ui {
+        ui.replay(&repl.state, &repl.harness.context);
+        app.restore_surfaces(&ui.snapshot());
     }
 }
 

@@ -432,6 +432,19 @@ impl App {
     }
 
     /// Forget what was printed, as the screen is about to be cleared.
+    /// Put back the surfaces a session has up (`UiSession::snapshot`, each one
+    /// `createSurface`), replacing whatever was up: on starting with a session,
+    /// `/resume`, and `/clear`. Nothing reaches scrollback; the newest in the
+    /// snapshot's order is drawn live.
+    pub fn restore_surfaces(&mut self, messages: &[crate::sdk::AgentMessage]) {
+        self.surfaces = Surfaces::new();
+        self.surface_focus = None;
+        for message in messages {
+            let _ = self.surfaces.apply(message, self.width);
+        }
+        self.dirty = true;
+    }
+
     pub fn clear_transcript(&mut self) {
         self.committed.clear();
         self.entries.clear();
@@ -1073,7 +1086,13 @@ impl App {
         let Some(view) = &mut self.view else {
             return Vec::new();
         };
-        let lines = view_lines(&self.entries, width, view.expanded);
+        let mut lines = view_lines(&self.entries, width, view.expanded);
+        // The surface drawn live is not in the entries until it leaves the live
+        // slot, so the view ends with it, in full.
+        if let Some(id) = self.surfaces.current() {
+            lines.push(Line::default());
+            lines.extend(self.surfaces.draw(id, width, None).lines);
+        }
         let bottom = lines.len().saturating_sub(rows);
         if view.follow || view.top >= bottom {
             view.top = bottom;
@@ -2170,6 +2189,65 @@ mod tests {
         assert_eq!(app.take_request(), None);
         app.on_key(key(KeyCode::Char('z')), &[]);
         assert!(!app.editor.is_empty());
+    }
+
+    #[test]
+    fn restored_surfaces_replace_the_old_ones_without_reaching_scrollback() {
+        let mut app = app();
+        app.on_turn_event(create_surface("old", "Old"));
+        let snapshot: Vec<crate::sdk::AgentMessage> = ["a", "b"]
+            .iter()
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({"version": "1.0", "createSurface": {
+                    "surfaceId": id,
+                    "catalogId": crate::sdk::Catalog::basic().id(),
+                    "components": [{"id": "root", "component": "Text", "text": format!("surface {id}")}]
+                }}))
+                .unwrap()
+            })
+            .collect();
+        app.take_committed();
+        app.restore_surfaces(&snapshot);
+        assert!(committed_text(&mut app).is_empty());
+        let live = live_text(&mut app);
+        assert!(
+            live.iter().any(|row| row.contains("surface b")),
+            "{live:#?}"
+        );
+        assert!(live.iter().any(|row| row.contains("1 more surface up")));
+        assert!(!live.iter().any(|row| row.contains("Old")));
+
+        app.restore_surfaces(&[]);
+        assert!(!live_text(&mut app)
+            .iter()
+            .any(|row| row.contains("agent86UI")));
+    }
+
+    #[test]
+    fn the_transcript_view_ends_with_the_live_surface_in_full() {
+        let mut app = app();
+        let components: Vec<Value> = std::iter::once(serde_json::json!({
+            "id": "root", "component": "Column",
+            "children": (0..20).map(|i| format!("t{i}")).collect::<Vec<_>>()
+        }))
+        .chain((0..20).map(|i| {
+            serde_json::json!({
+                "id": format!("t{i}"), "component": "Text", "text": format!("row {i}")
+            })
+        }))
+        .collect();
+        app.on_turn_event(ui(serde_json::json!({"version": "1.0", "createSurface": {
+            "surfaceId": "tall",
+            "catalogId": crate::sdk::Catalog::basic().id(),
+            "components": components
+        }})));
+        app.on_key(ctrl('o'), &[]);
+        let page: Vec<String> = app.view_page().iter().map(Line::plain_text).collect();
+        assert!(page.iter().any(|row| row.contains("row 19")), "{page:#?}");
+        assert!(
+            !page.iter().any(|row| row.contains("more rows")),
+            "uncut: {page:#?}"
+        );
     }
 
     #[test]
