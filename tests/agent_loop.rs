@@ -2364,7 +2364,7 @@ async fn a_dismissed_form_is_not_an_error_and_says_not_to_ask_again() {
 
 #[tokio::test]
 async fn questions_with_problems_are_not_asked_and_the_model_is_told_each() {
-    let broken = r#"{"questions": [{"id": "scope", "question": "Which?", "kind": "choice", "options": ["Only"]}]}"#;
+    let broken = r#"{"questions": [{"id": "scope", "question": "Which?", "kind": "text"}, {"id": "scope", "question": "Again?", "kind": "text"}]}"#;
     let server = MockServer::start(vec![
         sse_tool_calls(&[("q", "ask_user", broken)]),
         sse_text("Sorry.", "stop"),
@@ -2388,7 +2388,7 @@ async fn questions_with_problems_are_not_asked_and_the_model_is_told_each() {
     assert_eq!(*calls.lock().unwrap(), 0);
     assert_eq!(
         server.requests()[1].body["messages"][3]["content"],
-        "The questions were not asked. Fix these and call ask_user again:\n- questions/0 (scope): a choice question needs 2 to 12 options, not 1 (\"Other\" is added for you)"
+        "The questions were not asked. Fix these and call ask_user again:\n- questions/1 (scope): id \"scope\" is used by an earlier question; ids must differ"
     );
 }
 

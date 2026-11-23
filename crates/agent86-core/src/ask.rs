@@ -24,7 +24,7 @@ pub const ASK_KEY: &str = "agent86_ask";
 /// At most this many questions in one call.
 pub const MAX_QUESTIONS: usize = 10;
 /// A choice question's options, at least and at most.
-pub const MIN_OPTIONS: usize = 2;
+pub const MIN_OPTIONS: usize = 1;
 pub const MAX_OPTIONS: usize = 12;
 /// The longest question text, title, and option, in characters.
 pub const MAX_QUESTION_CHARS: usize = 300;
@@ -115,11 +115,8 @@ impl Form {
     /// every field.
     pub fn parse(args: &Map<String, Value>) -> Result<Form, Vec<String>> {
         let mut problems = Vec::new();
-        for key in args.keys() {
-            if key != "title" && key != "questions" {
-                problems.push(format!("{key}: not a field of ask_user (title, questions)"));
-            }
-        }
+        // Fields beyond title and questions are ignored, not refused (ADR 0006,
+        // slice 8): what the questions say is all that is asked.
         let title = match args.get("title") {
             None | Some(Value::Null) => None,
             Some(Value::String(title)) if title.trim().is_empty() => None,
@@ -218,13 +215,14 @@ fn parse_question(
         format!("questions/{index} ({id})")
     };
     let before = problems.len();
-    for key in fields.keys() {
-        if !["id", "question", "kind", "options", "optional"].contains(&key.as_str()) {
-            problems.push(format!(
-                "{at}: {key} is not a field of a question (id, question, kind, options, optional)"
-            ));
-        }
-    }
+    // Unknown fields are ignored and a few names models use instead are taken
+    // (ADR 0006, slice 8): a refusal costs a round trip, and the question is
+    // plain either way.
+    let field = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| fields.get(*name).filter(|value| !value.is_null()))
+    };
     if id.is_empty() {
         problems.push(format!(
             "{at}: id is required, an identifier such as \"scope\""
@@ -240,7 +238,7 @@ fn parse_question(
     } else {
         seen.push(id.to_owned());
     }
-    let question = match fields.get("question") {
+    let question = match field(&["question", "label", "text", "prompt"]) {
         Some(Value::String(text)) if !text.trim().is_empty() => {
             if text.chars().count() > MAX_QUESTION_CHARS {
                 problems.push(format!(
@@ -254,7 +252,7 @@ fn parse_question(
             String::new()
         }
     };
-    let kind = match fields.get("kind").and_then(Value::as_str) {
+    let kind = match field(&["kind", "type"]).and_then(Value::as_str) {
         Some(name) => AnswerKind::parse(name).or_else(|| {
             problems.push(format!("{at}: kind {name:?} is not one of {}", kind_list()));
             None
@@ -264,7 +262,7 @@ fn parse_question(
             None
         }
     };
-    let options: Vec<String> = match fields.get("options") {
+    let mut options: Vec<String> = match field(&["options", "choices"]) {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(options)) => options
             .iter()
@@ -283,37 +281,42 @@ fn parse_question(
     };
     if let Some(kind) = kind {
         if kind.has_options() {
-            if options.len() < MIN_OPTIONS || options.len() > MAX_OPTIONS {
+            // One option is a fair question, since "Other" is added; none makes
+            // it a text question (below). Only too many is refused.
+            if options.len() > MAX_OPTIONS {
                 problems.push(format!(
-                    "{at}: a {} question needs {MIN_OPTIONS} to {MAX_OPTIONS} options, not {} \
+                    "{at}: a {} question takes at most {MAX_OPTIONS} options, not {} \
                      (\"Other\" is added for you)",
                     kind.as_str(),
                     options.len()
                 ));
             }
-            let mut unique: Vec<&String> = Vec::new();
-            for option in &options {
-                if option.chars().count() > MAX_OPTION_CHARS {
-                    problems.push(format!(
-                        "{at}: an option is longer than {MAX_OPTION_CHARS} characters; shorten it"
-                    ));
-                }
-                if unique.contains(&option) {
-                    problems.push(format!("{at}: the option {option:?} is listed twice"));
-                }
-                unique.push(option);
+            if options
+                .iter()
+                .any(|option| option.chars().count() > MAX_OPTION_CHARS)
+            {
+                problems.push(format!(
+                    "{at}: an option is longer than {MAX_OPTION_CHARS} characters; shorten it"
+                ));
             }
-        } else if !options.is_empty() {
-            problems.push(format!(
-                "{at}: options are only for choice and multi questions, not {}",
-                kind.as_str()
-            ));
+            // An option listed twice is listed once.
+            let mut unique: Vec<String> = Vec::new();
+            for option in options.drain(..) {
+                if !unique.contains(&option) {
+                    unique.push(option);
+                }
+            }
+            options = unique;
         }
+        // Options on a question without them (a model listing examples for a
+        // text answer) are ignored, not refused: the question still stands,
+        // and a refusal would cost a round trip (ADR 0006, slice 8).
     }
-    let optional = match fields.get("optional") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(optional)) => *optional,
-        Some(_) => {
+    let optional = match (field(&["optional"]), field(&["required"])) {
+        (Some(Value::Bool(optional)), _) => *optional,
+        (None, Some(Value::Bool(required))) => !required,
+        (None, None | Some(_)) => false,
+        (Some(_), _) => {
             problems.push(format!("{at}: optional should be true or false"));
             false
         }
@@ -321,11 +324,23 @@ fn parse_question(
     if problems.len() > before {
         return None;
     }
+    // A choice question with no options is asked as text (ADR 0006, slice 8).
+    let kind = kind.map(|kind| {
+        if kind.has_options() && options.is_empty() {
+            AnswerKind::Text
+        } else {
+            kind
+        }
+    });
     Some(FormQuestion {
         id: id.to_owned(),
         question,
         kind: kind?,
-        options,
+        options: if kind.is_some_and(AnswerKind::has_options) {
+            options
+        } else {
+            Vec::new()
+        },
         optional,
     })
 }
@@ -612,8 +627,9 @@ pub fn prompt_section(render_ui_offered: bool) -> String {
     );
     if render_ui_offered {
         section.push_str(
-            " Forms that ask the user questions go through ask_user, never render_ui; \
-             render_ui is for layouts, dashboards, and choices with a presentation of their own.",
+            " Forms that ask the user questions go through ask_user, never render_ui, even \
+             when the user asks for a form: ask_user draws the form. render_ui is for \
+             layouts, dashboards, and choices with a presentation of their own.",
         );
     }
     section
@@ -1021,26 +1037,64 @@ mod tests {
     #[test]
     fn every_problem_is_named_by_index_and_id() {
         let problems = Form::parse(&args(json!({"questions": [
-            {"id": "scope", "question": "Which?", "kind": "choice", "options": ["Only one"]},
+            {"id": "scope", "question": "Which?", "kind": "choice",
+             "options": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"]},
             {"id": "scope", "question": "Again?", "kind": "text"},
             {"id": "2nd", "question": "Bad id?", "kind": "text"},
             {"id": "when", "question": "When?", "kind": "date", "options": ["now", "later"]},
             {"id": "what", "question": "What?", "kind": "dropdown"},
-            {"id": "extra", "question": "Extra?", "kind": "text", "label": "x"}
+            {"id": "blank", "kind": "text"}
         ], "wait": true})))
         .unwrap_err();
         assert_eq!(
             problems,
             [
-                "wait: not a field of ask_user (title, questions)",
-                "questions/0 (scope): a choice question needs 2 to 12 options, not 1 (\"Other\" is added for you)",
+                "questions/0 (scope): a choice question takes at most 12 options, not 13 (\"Other\" is added for you)",
                 "questions/1 (scope): id \"scope\" is used by an earlier question; ids must differ",
                 "questions/2 (2nd): id should be an identifier: letters, digits, and _, starting with a letter or _",
-                "questions/3 (when): options are only for choice and multi questions, not date",
                 "questions/4 (what): kind \"dropdown\" is not one of choice, multi, text, long_text, number, yes_no, date",
-                "questions/5 (extra): label is not a field of a question (id, question, kind, options, optional)",
+                "questions/5 (blank): question is required, the text to ask",
             ]
         );
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_and_common_names_are_taken() {
+        // What `gemma4:12b` and others sent (ADR 0006, slice 8).
+        let form = Form::parse(&args(json!({"wait": true, "questions": [
+            {"1": 1, "id": "target", "type": "text", "label": "Which folder?"},
+            {"id": "pain", "prompt": "Main problem?", "kind": "choice",
+             "choices": ["Clutter", "Clutter", "Duplicates"], "required": false}
+        ]})))
+        .unwrap();
+        assert_eq!(form.questions[0].kind, AnswerKind::Text);
+        assert_eq!(form.questions[0].question, "Which folder?");
+        assert_eq!(form.questions[1].question, "Main problem?");
+        assert_eq!(form.questions[1].options, ["Clutter", "Duplicates"]);
+        assert!(form.questions[1].optional);
+    }
+
+    #[test]
+    fn one_option_is_a_question_and_none_is_asked_as_text() {
+        let form = Form::parse(&args(json!({"questions": [
+            {"id": "where", "question": "Destination?", "kind": "choice",
+             "options": ["Suggest one for me"]},
+            {"id": "what", "question": "What else?", "kind": "multi", "options": []}
+        ]})))
+        .unwrap();
+        assert_eq!(form.questions[0].kind, AnswerKind::Choice);
+        assert_eq!(form.questions[0].options, ["Suggest one for me"]);
+        assert_eq!(form.questions[1].kind, AnswerKind::Text);
+    }
+
+    #[test]
+    fn options_on_a_question_without_them_are_ignored() {
+        let form = Form::parse(&args(json!({"questions": [
+            {"id": "pattern", "question": "Which files?", "kind": "text",
+             "options": ["*.log", "*.tmp"]}
+        ]})))
+        .unwrap();
+        assert!(form.questions[0].options.is_empty());
     }
 
     #[test]

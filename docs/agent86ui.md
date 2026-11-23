@@ -15,6 +15,32 @@ A2UI is Google's protocol, and agent86 is not affiliated with or endorsed by Goo
 
 The model can only draw where a surface has declared a renderer, so `render_ui` and its part of the system prompt (which costs a few thousand tokens per request) are absent everywhere else.
 
+## Asking questions: `ask_user`
+
+From 1.2.2 ([ADR 0006](adr/0006-ask-user.md)), when the agent needs information, a preference, or a decision from you, it calls `ask_user` instead of asking in its reply. The model sends a short, flat list of questions, and agent86 builds the form itself, so the form always works, whatever the model:
+
+```json
+{"title": "Your trip", "questions": [
+  {"id": "where", "question": "Where would you like to go?", "kind": "text"},
+  {"id": "budget", "question": "Budget?", "kind": "choice", "options": ["Under $500", "$500 to $1500", "More"]},
+  {"id": "notes", "question": "Anything else?", "kind": "long_text", "optional": true}
+]}
+```
+
+- Kinds: `choice` (one option), `multi` (any of them), `text`, `long_text`, `number`, `yes_no`, and `date`. Every choice question also offers "Other", with a field for your own words. Up to 10 questions, up to 12 options each.
+- The answers come back to the agent keyed by question id, normalized to each kind (a number as a number, yes/no as `true` or `false`, a date as `YYYY-MM-DD`), with which answers were typed rather than chosen and which required questions were left empty.
+- Closing the questions without answering is not an error: the agent is told not to ask the same questions again in that turn.
+
+| Surface | How you answer |
+|---|---|
+| The terminal interface | A form, answered in place (see [In the terminal](#in-the-terminal)) |
+| The plain loop, at a terminal | The questions as text, one at a time |
+| Programs embedding `agent86-core` whose `Ui` has `on_wait` | The form, through their own renderer (see [Embedding it](#embedding-it)) |
+| ACP clients | Planned for 1.2.3: through agent86's questions extension, agent86UI, or as text |
+| `agent86 run`, piped input, CI, sub-agents | Never offered: nobody can answer |
+
+`[ui] ask_user = "off"` turns it off, and the agent asks in its reply as before; a project file may set it without being trusted. Measured on seven hosted models and two local ones (ADR 0006), no model asked in prose, and when they asked, their `ask_user` call was valid on the first try 102 times in 104. A form the model draws itself with `render_ui` (below) stays available for anything that is not a list of questions.
+
 ## How the model draws
 
 The model calls `render_ui` with `messages`, a list of A2UI 1.0 agent-to-renderer messages: `createSurface`, `updateComponents`, `updateDataModel`, and `deleteSurface`. A surface is a flat list of components linked by id, one of them `root`, with values bound to the surface's data model (`{"@path": "/form/name"}`). The system prompt teaches it the rules and each catalog's components and functions.

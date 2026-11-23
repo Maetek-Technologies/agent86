@@ -59,7 +59,7 @@ The model's arguments:
   - `number`
   - `yes_no`
   - `date` (an ISO 8601 date)
-- `options`: 2 to 12 plain strings, for `choice` and `multi` only. Each option is its own label and value, so there is no label-and-value object to nest.
+- `options`: up to 12 plain strings, for `choice` and `multi` only (one is enough, since "Other" is added; none makes the question `text`; options on other kinds are ignored, since slice 8). Each option is its own label and value, so there is no label-and-value object to nest.
 - Every choice question also offers "Other", with a field for the user's own words. A list of options never traps the user, and the model does not have to remember to add the option.
 - `optional`: `false` unless set. A required question must be answered before the form can be sent.
 
@@ -67,7 +67,7 @@ At its deepest the arguments nest four levels (`{"questions":[{"options":["..."]
 
 The tool checks the arguments before anything is shown. Each problem is named by the question's index and id (a duplicate id, a choice question with fewer than two options, `options` on a `text` question, an unknown kind), with one line per problem, so a model that gets it wrong can fix it in one more call. The repair of JSON-string arguments (`tools::repair_arguments`) applies as for any tool.
 
-**Strict mode.** The schema is small and closed, so it is written to fit providers' strict tool modes, which constrain the model to valid JSON matching the schema. Where the provider supports strict mode, agent86 sends it for this tool. That needs a new `Tool::strict()`, which the adapters pass on in each provider's own form, checked against each provider's documentation when the slice is built. agent86 sends no strict flag today. Strict modes generally want every property required and none added, so the schema sent in strict mode lists every property as required and marks the optional ones nullable. The tool takes a missing property and a `null` the same way, so the providers without strict mode lose nothing.
+**Strict mode** (deferred to 1.3.0; see slice 6). The schema is small and closed, so it is written to fit providers' strict tool modes, which constrain the model to valid JSON matching the schema. Where the provider supports strict mode, agent86 sends it for this tool. That needs a new `Tool::strict()`, which the adapters pass on in each provider's own form, checked against each provider's documentation when the slice is built. agent86 sends no strict flag today. Strict modes generally want every property required and none added, so the schema sent in strict mode lists every property as required and marks the optional ones nullable. The tool takes a missing property and a `null` the same way, so the providers without strict mode lose nothing.
 
 **The answers** are the tool's result, as one JSON object keyed by question id, after a line the model reads as the answers:
 
@@ -190,6 +190,38 @@ No run failed on broken JSON. A repaired call counts as valid on the first try, 
 
 Both models asked through `ask_user` every time, including on requests that never mentioned a form, and neither reached for `render_ui` or asked in prose. The one call that was not valid on the first try was `gemini-3.8-flash` writing an option longer than the 120 characters then allowed, fixed by its next call; the limit is now 200. The `session` replay, which `render_ui` alone drew validly on the first try in 2 of 6 (Haiku) and 1 of 4 (Gemini), went 4 of 4 for both. The remaining measurement (ten tasks, the other hosted models, and a local ~27B model) is slice 8.
 
+**Slice 8** (2026-11-23, through OpenRouter and a local Ollama, every form dismissed). The seven hosted models of ADR 0005's table first ran the `ask` set three times, the `session` replay three times, and the `large` set twice, at the check's old budget of 4 steps a turn:
+
+| Model | `ask`: through `ask_user` / valid first try | `session` | `large` |
+|---|---|---|---|
+| `anthropic/claude-sonnet-5.5` | 18/18 / 18 | 2/3 / 2 | 8/8 / 8 |
+| `anthropic/claude-haiku-5.5` | 18/18 / 18 | 3/3 / 3 | 8/8 / 8 |
+| `google/gemini-3.8-flash` | 15/18 / 15 | 3/3 / 3 | 8/8 / 8 |
+| `moonshotai/kimi-k3.1-pro` | 18/18 / 18 | 1/3 / 1 | 8/8 / 8 |
+| `qwen/qwen3.8-27b` | 15/18 / 12 | 0/3 / 0 | 7/8 / 8 (one through `render_ui`) |
+| `openai/gpt-6.2-sol` | 18/18 / 18 | 3/3 / 3 | 8/8 / 8 |
+| `deepseek/deepseek-v4.1-flash` | 17/18 / 16 | 0/3 / 0 | 1/8 / 7 (seven through `render_ui`) |
+
+No model asked in prose. Almost every miss was a model that spent its 4 steps looking around the folder (`list_dir`, `find_files`) before it would ask, which the check's budget, not a real session's, cut short. The rest were arguments `ask_user` refused: `questions` sent as something other than a list, options on a text question, a choice with one option, and numbered keys beside a question's fields; and DeepSeek drawing "using a form" requests with `render_ui`. Slice 8 changed four things, then measured again:
+
+- **Leniency where the question is still plain.** Unknown fields are ignored (at the top level and in a question); `type`, `label`/`text`/`prompt`, `choices`, and `required` are taken for `kind`, `question`, `options`, and `optional`; options on a question without them are ignored; one option is a question (with "Other"), and none makes it `text`; an option listed twice is listed once. Too many questions or options, a bad or repeated id, a missing question, and an unknown kind are still refused.
+- **`render_ui`'s own description, and the prompt section,** say questions go through `ask_user` "even when the user asks for a form".
+- **The check's budget** is `AGENT86_TEST_UI_STEPS` (12 for the sets over a folder), and `AGENT86_TEST_UI_SHOW=1` prints the arguments of each first failing call.
+
+Again, after those changes:
+
+| Model | `ask` x2, 12 steps | `session` x3, 12 steps | `large` x2 |
+|---|---|---|---|
+| `anthropic/claude-sonnet-5.5` | 12/12 / 12 | 3/3 / 3 | |
+| `google/gemini-3.8-flash` | 12/12 / 12 | 3/3 / 3 | |
+| `moonshotai/kimi-k3.1-pro` | 12/12 / 12 | 3/3 / 3 | |
+| `qwen/qwen3.8-27b` | 12/12 / 11 (a choice with one option, since allowed) | 3/3 / 3 | 8/8 / 8 |
+| `deepseek/deepseek-v4.1-flash` | 12/12 / 12 | 2/3 / 2 (one still looking around after 12 steps) | 8/8 / 8 (none through `render_ui`) |
+| `ollama:qwen3.5:9b` (local, 9B) | 6/6 / 6 (x1) | 2/2 / 2 (x2) | |
+| `ollama:gemma4:12b` (local, 12B) | 4/6 / 4 (x1; twice it answered without asking) | 2/2 / 1 (x2; numbered keys, since ignored) | |
+
+In 104 of these 107 runs the model asked through `ask_user`, and 102 of those 104 calls were valid on the first try; both misses are shapes slice 8 now accepts. Haiku 5.5 and GPT-6.2 were 100% in the first round and were not run again. On every hosted model, no model asked in prose and every call was valid on the first try or would be now. What is left is a model choosing to look around, or to answer, before it asks, which is the model's judgment rather than the form's reliability.
+
 ### Slices
 
 1. **Core:** `ask_user`, its argument checks, the answers, the `QuestionPrompt` hook through the prompt queue, the built form and its validator test, the prompt section, the `ask_user` trace kind, and `[ui] ask_user`. Tested with recorded calls against the mock server and a scripted hook. Done 2026-11-23 (`src/ask.rs`, `tools/ask_user.rs`), with these settled as it was built:
@@ -209,13 +241,16 @@ Both models asked through `ask_user` every time, including on requests that neve
    - It is offered only when the `Ui` has `on_wait` and the basic catalog, which the form is built in. `ask::reachable` decides, for the tool and the prompt section alike.
    - The form is never kept in the agent's `UiSession` (`Agent::surfaces` does not list it); an action is taken as the answer only when it names the form's surface, else it reads as a dismissal.
 5. **ACP:** the questions extension, the text fallback that ends the turn, and the agent86UI extension's path once ADR 0005's slice 4 lands. They ship together with that slice or before it.
-6. **Strict mode:** `Tool::strict()` and the adapters, checked against each provider's documentation.
+6. **Strict mode:** `Tool::strict()` and the adapters, checked against each provider's documentation. Deferred to 1.3.0 (decided with the maintainer, 2026-11-23), for three reasons found when the slice started:
+   - **It is not needed for the goal yet.** Without it, `ask_user` was valid on the first try in 35 of 36 live calls (slice 4's measurement), and the one miss was a length limit since raised.
+   - **It is not enforced everywhere it is accepted.** Checked against the providers' documentation and by a probe the same day: Anthropic's API takes `strict: true` beside `name` and `input_schema` (no beta header, every current model; every object `additionalProperties: false`, optional properties allowed, `pattern`, `enum`, and `default` supported, `minItems` only 0 or 1, no `maxItems`, `minLength`, or numeric bounds). OpenAI's takes it inside `function` (every property in `required`, optional ones nullable through `"type": [..., "null"]`, every object `additionalProperties: false`, `pattern`, `format`, `minItems`, and `maxItems` supported, `default` not listed). OpenRouter documents `strict` only for `response_format`, not tools; sent on a tool it returned HTTP 200 for `anthropic/claude-haiku-5.5`, `google/gemini-3.8-flash`, and `openai/gpt-6.2-sol`, but Gemini's arguments left out a property the strict schema required, so its endpoint took it as a hint. Each provider also wants its own schema dialect.
+   - **It changes `sdk`'s API.** Marking a tool strict needs a field on `ToolSpec`, which `sdk` exports with public fields and without `#[non_exhaustive]`, so adding one breaks a caller that builds it; that is a minor release by the project's rule. 1.3.0 is one already (the Python bindings), so `ToolSpec` becomes `#[non_exhaustive]` and gains `strict` there, with `Tool::strict()`, a schema rewrite per dialect, and strict sent to Anthropic, OpenAI, and OpenRouter.
 7. **`render_ui` hardened:** items 1 to 7 above. They are independent of slices 1 to 6 and can land first. Done 2026-11-23, in three parts: 7a, where the JSON broke, `{}` in the replay, and calls answered before dispatch traced; 7b, the closer repair and the advice on a repeat; 7c, the optional `context`, `{"path": ...}` read as `@path` (the check item 6 asked for: A2UI 1.0 does take it as a literal object), and the prompt's rule on building large surfaces in parts.
-8. **Measurement and docs:** the live check above, `docs/agent86ui.md` (or a page of its own), the README, the site, and the plan's differences from Python.
+8. **Measurement and docs:** the live check above, `docs/agent86ui.md` (or a page of its own), the README, the site, and the plan's differences from Python. Done 2026-11-23: the measurement and the leniency it led to are under "Slice 8" above; `docs/agent86ui.md` has an `ask_user` section; the README and FEATURES say it is built; the site's claims wait for the release, as they describe released features.
 
 ### The release (settled 2026-11-23)
 
-`ask_user` with slices 1 to 4, 6, and 7 is **1.2.2**. ADR 0005's ACP release moves to **1.2.3** and takes slice 5 with it; scheduled jobs move to 1.2.4 and MCP vault secrets to 1.2.5. None of it adds to `sdk`'s API, so all of it fits patch releases.
+`ask_user` with slices 1 to 4, 7, and 8 is **1.2.2** (slice 6, strict mode, moved to 1.3.0 the same day). ADR 0005's ACP release moves to **1.2.3** and takes slice 5 with it; scheduled jobs move to 1.2.4 and MCP vault secrets to 1.2.5. None of it adds to `sdk`'s API, so all of it fits patch releases.
 
 ### Question still open
 

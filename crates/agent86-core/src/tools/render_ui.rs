@@ -22,12 +22,14 @@ impl Tool for RenderUiTool {
     }
 
     fn description(&self) -> &str {
-        "Show the user interactive UI (a form, a choice, a confirmation, a small \
-         dashboard) by sending A2UI 1.0 messages, which their screen draws natively. \
-         The result says whether the messages were valid; if not, nothing was drawn, \
-         and it lists what to fix. A button the user presses comes back later as a \
-         user message starting `[ui action]`. See the agent86UI section of the system \
-         prompt for the messages and the catalogs' components."
+        "Show the user interactive UI (a layout, a confirmation, a small dashboard, a \
+         choice with a presentation of its own) by sending A2UI 1.0 messages, which their \
+         screen draws natively. To ask the user questions, even when they ask for a form, \
+         call ask_user instead wherever it is offered: it builds the form for you. The \
+         result says whether the messages were valid; if not, nothing was drawn, and it \
+         lists what to fix. A button the user presses comes back later as a user message \
+         starting `[ui action]`. See the agent86UI section of the system prompt for the \
+         messages and the catalogs' components."
     }
 
     /// What it draws reaches the user, and surfaces are built up in call
