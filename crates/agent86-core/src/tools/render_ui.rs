@@ -8,7 +8,9 @@
 //! the validator's job, since providers' strict modes cap a schema's size.
 
 use super::{failure, success, Tool, ToolContext, ToolError};
-use crate::agent86ui::{policy, sanitize, tidy, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY};
+use crate::agent86ui::{
+    complete, policy, sanitize, tidy, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY,
+};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
 
@@ -32,6 +34,17 @@ impl Tool for RenderUiTool {
     /// order, so it never shares a parallel batch.
     fn parallel_safe(&self) -> bool {
         false
+    }
+
+    /// A surface's JSON breaks in its deepest nesting, most often in a large
+    /// one (ADR 0006), so a surface built in parts breaks less, and loses less.
+    fn retry_hint(&self) -> Option<&str> {
+        Some(
+            "Build the surface in parts: one call with createSurface holding the root and \
+             the first few components, then further calls with updateComponents adding the \
+             rest and sending the root again with its longer `children`, with `wait` only on \
+             the last call.",
+        )
     }
 
     fn parameters(&self) -> Value {
@@ -134,6 +147,10 @@ impl Tool for RenderUiTool {
                 message
             })
             .collect();
+        // A binding written `{"path": ...}` becomes `@path`, and a Button event
+        // with no context gets one carrying the surface's values (ADR 0006).
+        let (messages, rebound) = complete(&messages, |id| ui.surface_keys(id));
+        moved.extend(rebound);
         let components = component_count(&messages);
         let refusals = policy(&messages, &ctx.policy, ui.remote_media());
         if !refusals.is_empty() {
@@ -162,8 +179,8 @@ impl Tool for RenderUiTool {
                     format!(
                         "Nothing on {} sends an answer, so nothing was drawn: choosing an \
                          option or typing only changes the data model. Add a Button whose \
-                         action is an event (for example {{\"event\": {{\"name\": \"submit\", \
-                         \"context\": {{...}}}}}}) and send the messages again.",
+                         action is an event (for example {{\"event\": {{\"name\": \
+                         \"submit\"}}}}) and send the messages again.",
                         unanswerable
                             .iter()
                             .map(|id| format!("surface {id}"))

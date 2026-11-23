@@ -109,7 +109,7 @@ Conventions encoded in the types that must be preserved:
 
 - Serde JSON is the wire format and must match the Python field names and values exactly. Enums use `rename_all = "snake_case"` (e.g. `end_turn`, `tool_use`). Optional/empty fields use `skip_serializing_if` plus `default` so absent and empty round-trip the same way Python does. `ToolResult.ok` defaults to `true` when missing.
 - `ModelRef::parse` splits `provider:model` on the **first** colon only and trims whitespace (`local:model:variant` gives model `model:variant`).
-- When a provider returns malformed tool-call JSON, the raw string is kept under `INVALID_TOOL_ARGS_KEY` (`"__invalid_json__"`) in `ToolCall.arguments` rather than failing; read it back with `ToolCall::invalid_arguments()`.
+- When a provider returns malformed tool-call JSON, the raw string is kept under `INVALID_TOOL_ARGS_KEY` (`"__invalid_json__"`) in `ToolCall.arguments` rather than failing; read it back with `ToolCall::invalid_arguments()`. Beyond Python (ADR 0006): an adapter sends such a call back in the history as `ToolCall::replay_arguments()` (`{}`), never with the key; the loop first tries `Harness::repair_broken_calls` (dropping closers that match nothing, `src/broken_json.rs`, the repaired arguments replacing the raw text on the call), and the observation for one still broken says where it broke (`broken_json::describe`).
 
 ## Working rules
 

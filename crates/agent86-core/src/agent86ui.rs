@@ -188,6 +188,11 @@ impl UiSession {
         self.runtime.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The top-level keys of surface `surface_id`, if it is up ([`surface_keys`]).
+    pub fn surface_keys(&self, surface_id: &str) -> Vec<String> {
+        surface_keys(&self.runtime(), surface_id)
+    }
+
     /// Validate a batch and, when it has no errors, apply it to the surfaces.
     pub fn apply(&self, messages: &[Value]) -> Report {
         self.runtime().apply(messages)
@@ -246,6 +251,7 @@ impl UiSession {
                     .iter()
                     .map(|message| tidy(&sanitize(message, &ctx.secrets, self.egress)).0)
                     .collect();
+                let (messages, _) = complete(&messages, |id| surface_keys(&runtime, id));
                 if !policy(&messages, &ctx.policy, self.remote_media).is_empty() {
                     continue;
                 }
@@ -364,6 +370,210 @@ pub fn tidy(message: &Value) -> (Value, Vec<String>) {
     (Value::Object(envelope), moved)
 }
 
+/// Beyond the protocol (ADR 0006), after [`tidy`]: two shapes A2UI accepts but
+/// that do not do what the model meant are completed, so the form works.
+///
+/// - **A binding written with 0.9.1's key.** Inside components, an object that
+///   is exactly `{"path": "/..."}` is a literal object to A2UI 1.0, so a Button
+///   would send back `{"path": "/scope"}` instead of the user's choice. It
+///   becomes `{"@path": "/..."}`, and the result notes it so the model learns.
+///   (A ChildList template has `componentId` beside its `path`, so it is never
+///   touched.)
+/// - **A Button event with no `context`.** The action would carry nothing, so
+///   it gets a context binding every top-level value of its surface: the keys
+///   of the data model and the first segment of every absolute path the
+///   surface's components bind, from this batch and, for a surface drawn
+///   earlier, from `existing`. This is what the prompt promises, which keeps
+///   the deepest nesting out of every form the model writes.
+///
+/// `existing` gives the top-level keys of a surface already up
+/// ([`surface_keys`]). `render_ui` and replay both apply it, so a session
+/// replays the same. Returns the messages and the notes for the model.
+pub fn complete(
+    messages: &[Value],
+    existing: impl Fn(&str) -> Vec<String>,
+) -> (Vec<Value>, Vec<String>) {
+    let mut keys: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let mut notes = Vec::new();
+    let mut out = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        let mut message = message.clone();
+        if let Some(create) = message.get_mut("createSurface") {
+            let id = surface_of(create);
+            let mut known = Vec::new();
+            if let Some(Value::Object(model)) = create.get("dataModel") {
+                extend_unique(&mut known, model.keys().cloned());
+            }
+            rebind(
+                create,
+                &format!("messages/{index}/createSurface"),
+                &mut notes,
+            );
+            extend_unique(&mut known, bound_keys(create.get("components")));
+            fill_contexts(create, &known);
+            keys.insert(id, known);
+        } else if let Some(update) = message.get_mut("updateComponents") {
+            let id = surface_of(update);
+            let known = keys.entry(id.clone()).or_insert_with(|| existing(&id));
+            rebind(
+                update,
+                &format!("messages/{index}/updateComponents"),
+                &mut notes,
+            );
+            extend_unique(known, bound_keys(update.get("components")));
+            fill_contexts(update, known);
+        } else if let Some(update) = message.get("updateDataModel") {
+            let id = surface_of(update);
+            let known = keys.entry(id.clone()).or_insert_with(|| existing(&id));
+            match update.get("path").and_then(Value::as_str) {
+                None | Some("" | "/") => {
+                    if let Some(Value::Object(model)) = update.get("value") {
+                        extend_unique(known, model.keys().cloned());
+                    }
+                }
+                Some(path) => extend_unique(known, top_segment(path)),
+            }
+        }
+        out.push(message);
+    }
+    (out, notes)
+}
+
+/// The top-level keys of surface `surface_id` in `runtime`: its data model's,
+/// then the first segment of every absolute path its components bind.
+pub fn surface_keys(runtime: &Runtime, surface_id: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(Value::Object(model)) = runtime.data_model(surface_id) {
+        extend_unique(&mut keys, model.keys().cloned());
+    }
+    if let Some(components) = runtime.components(surface_id) {
+        let components = Value::Array(components.cloned().collect());
+        extend_unique(&mut keys, bound_keys(Some(&components)));
+    }
+    keys
+}
+
+fn surface_of(body: &Value) -> String {
+    body.get("surfaceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn extend_unique(keys: &mut Vec<String>, more: impl IntoIterator<Item = String>) {
+    for key in more {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+}
+
+/// The key of an absolute JSON Pointer's first segment, unescaped.
+fn top_segment(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let segment = rest.split('/').next().unwrap_or_default();
+    (!segment.is_empty()).then(|| segment.replace("~1", "/").replace("~0", "~"))
+}
+
+/// The first segment of every absolute `@path` under `value`.
+fn bound_keys(value: Option<&Value>) -> Vec<String> {
+    fn walk(value: &Value, keys: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(path)) = map.get("@path") {
+                    extend_unique(keys, top_segment(path));
+                }
+                map.values().for_each(|value| walk(value, keys));
+            }
+            Value::Array(items) => items.iter().for_each(|value| walk(value, keys)),
+            _ => {}
+        }
+    }
+    let mut keys = Vec::new();
+    if let Some(value) = value {
+        walk(value, &mut keys);
+    }
+    keys
+}
+
+/// Turn each `{"path": "/..."}` among `body`'s components into a binding,
+/// noting each component that had one.
+fn rebind(body: &mut Value, at: &str, notes: &mut Vec<String>) {
+    fn walk(value: &mut Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                let lone_path = map.len() == 1
+                    && map
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| path.starts_with('/'));
+                if lone_path {
+                    let path = map.remove("path").expect("checked above");
+                    map.insert("@path".to_owned(), path);
+                    return true;
+                }
+                let mut changed = false;
+                for value in map.values_mut() {
+                    changed |= walk(value);
+                }
+                changed
+            }
+            Value::Array(items) => items
+                .iter_mut()
+                .fold(false, |changed, item| walk(item) | changed),
+            _ => false,
+        }
+    }
+    let Some(Value::Array(components)) = body.get_mut("components") else {
+        return;
+    };
+    for (index, component) in components.iter_mut().enumerate() {
+        let Value::Object(fields) = component else {
+            continue;
+        };
+        let mut changed = false;
+        for (key, value) in fields.iter_mut() {
+            if key != "id" && key != "component" {
+                changed |= walk(value);
+            }
+        }
+        if changed {
+            let id = fields.get("id").and_then(Value::as_str).unwrap_or("?");
+            notes.push(format!(
+                "Note: read {{\"path\": ...}} as {{\"@path\": ...}} in {at}/components/{index} \
+                 ({id}); A2UI 1.0 binds a value with \"@path\", and a plain \"path\" is a literal."
+            ));
+        }
+    }
+}
+
+/// Give every event Button among `body`'s components with no `context` one
+/// binding each of `keys`.
+fn fill_contexts(body: &mut Value, keys: &[String]) {
+    let Some(Value::Array(components)) = body.get_mut("components") else {
+        return;
+    };
+    for component in components.iter_mut() {
+        if component.get("component").and_then(Value::as_str) != Some("Button") {
+            continue;
+        }
+        let Some(Value::Object(event)) = component.pointer_mut("/action/event") else {
+            continue;
+        };
+        if event.contains_key("context") {
+            continue;
+        }
+        let context: Map<String, Value> = keys
+            .iter()
+            .map(|key| {
+                let pointer = format!("/{}", key.replace('~', "~0").replace('/', "~1"));
+                (key.clone(), serde_json::json!({"@path": pointer}))
+            })
+            .collect();
+        event.insert("context".to_owned(), Value::Object(context));
+    }
+}
+
 /// Whether a component is a Button whose action sends an event (rather than
 /// running a local function such as `openUrl`).
 pub fn is_event_button(component: &Value) -> bool {
@@ -382,7 +592,7 @@ fn example(catalog_id: &str, wait: bool) -> String {
              "variant": "mutuallyExclusive", "value": {"@path": "/plan"},
              "options": [{"label": "Basic", "value": "basic"}, {"label": "Pro", "value": "pro"}]},
             {"id": "submit", "component": "Button", "child": "submit_label",
-             "action": {"event": {"name": "submit", "context": {"plan": {"@path": "/plan"}}}}},
+             "action": {"event": {"name": "submit"}}},
             {"id": "submit_label", "component": "Text", "text": "Submit"}
         ],
         "dataModel": {"plan": []}
@@ -418,14 +628,19 @@ never `submit-label`).
 bound to. A `ChildList` is an array of ids, or a template over a list in the data \
 model (`{\"path\": \"/items\", \"componentId\": \"row\"}`) whose bindings are \
 relative to each item.
-- A button's action is `{\"event\": {\"name\": \"submit\", \"context\": {\"name\": \
-{\"@path\": \"/form/name\"}}}}`: `context` goes inside `event`, beside `name`, never \
-beside `event`. When the user presses it, a later user message \
-reads `[ui action] submit on <surfaceId>: <context as JSON>`; the surface stays \
-up meanwhile.
+- A button's action is `{\"event\": {\"name\": \"submit\"}}`, and it sends every \
+top-level value of the surface's data model. To send something else, give the \
+event a `context` beside `name` (`{\"event\": {\"name\": \"pick\", \"context\": \
+{\"plan\": \"pro\"}}}`), never beside `event`. When the user presses it, a later \
+user message reads `[ui action] submit on <surfaceId>: <values as JSON>`; the \
+surface stays up meanwhile.
 - Only a Button whose action is an event sends the user's answer: choosing an \
 option or typing only changes the data model. So every form needs a Button (for \
-example Submit) whose event's `context` carries the values.
+example Submit).
+- Keep each call short: a surface's JSON breaks most often when it is large. For \
+a form of more than about four inputs, send createSurface with the root and the \
+first few components, then add the rest in further calls with updateComponents, \
+sending the root again with its longer `children`; put `wait` only on the last call.
 - render_ui's result is the validator's verdict. If it lists problems, nothing \
 was drawn: fix them and send the corrected messages again.
 - Renderer functions (`callRendererFunction`) and agent functions are not \
@@ -1225,5 +1440,134 @@ mod tests {
         assert!(report.is_ok(), "{:?}", report.errors);
         assert!(report.warnings[0].message.contains("not reachable"));
         assert_eq!(session.surface_ids(), ["s"]);
+    }
+
+    fn create_with(components: Value, data_model: Option<Value>) -> Value {
+        let mut body = json!({
+            "surfaceId": "s",
+            "catalogId": agent86_ui::BASIC_CATALOG_ID,
+            "components": components,
+        });
+        if let Some(model) = data_model {
+            body["dataModel"] = model;
+        }
+        json!({"version": "1.0", "createSurface": body})
+    }
+
+    fn submit_button() -> Value {
+        json!({"id": "go", "component": "Button", "child": "go_label",
+               "action": {"event": {"name": "submit"}}})
+    }
+
+    #[test]
+    fn a_button_without_context_sends_every_top_level_value() {
+        // The data model's keys, then the first segment of every absolute path
+        // the components bind (here one with no data model entry yet).
+        let message = create_with(
+            json!([
+                {"id": "root", "component": "Column", "children": ["plan", "note", "go"]},
+                {"id": "plan", "component": "ChoicePicker", "value": {"@path": "/plan"},
+                 "options": [{"label": "A", "value": "a"}]},
+                {"id": "note", "component": "TextField", "label": "Note",
+                 "value": {"@path": "/extra/note"}},
+                submit_button(),
+            ]),
+            Some(json!({"plan": [], "size": 1})),
+        );
+        let (messages, notes) = complete(&[message], |_| Vec::new());
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(
+            messages[0].pointer("/createSurface/components/3/action/event/context"),
+            Some(&json!({
+                "plan": {"@path": "/plan"},
+                "size": {"@path": "/size"},
+                "extra": {"@path": "/extra"}
+            }))
+        );
+    }
+
+    #[test]
+    fn a_context_the_model_gave_is_kept() {
+        let mut button = submit_button();
+        button["action"]["event"]["context"] = json!({"choice": "pro"});
+        let message = create_with(
+            json!([{"id": "root", "component": "Column", "children": ["go"]}, button]),
+            Some(json!({"plan": []})),
+        );
+        let (messages, _) = complete(&[message], |_| Vec::new());
+        assert_eq!(
+            messages[0].pointer("/createSurface/components/1/action/event/context"),
+            Some(&json!({"choice": "pro"}))
+        );
+    }
+
+    #[test]
+    fn a_button_added_later_sends_the_values_of_the_surface_already_up() {
+        let update = json!({"version": "1.0", "updateComponents": {
+            "surfaceId": "s",
+            "components": [submit_button()],
+        }});
+        let (messages, _) = complete(&[update], |id| {
+            assert_eq!(id, "s");
+            vec!["name".to_owned(), "a/b".to_owned()]
+        });
+        assert_eq!(
+            messages[0].pointer("/updateComponents/components/0/action/event/context"),
+            Some(&json!({"name": {"@path": "/name"}, "a/b": {"@path": "/a~1b"}}))
+        );
+    }
+
+    #[test]
+    fn a_lone_path_is_read_as_a_binding_and_noted() {
+        let mut button = submit_button();
+        button["action"]["event"]["context"] = json!({"plan": {"path": "/plan"}});
+        let message = create_with(
+            json!([
+                {"id": "root", "component": "Column",
+                 "children": {"path": "/items", "componentId": "row"}},
+                {"id": "row", "component": "Text", "text": {"path": "/label"}},
+                button,
+            ]),
+            Some(json!({"items": []})),
+        );
+        let (messages, notes) = complete(&[message], |_| Vec::new());
+        let components = &messages[0]["createSurface"]["components"];
+        // A template keeps its `path`, which has a componentId beside it.
+        assert_eq!(
+            components[0]["children"],
+            json!({"path": "/items", "componentId": "row"})
+        );
+        assert_eq!(components[1]["text"], json!({"@path": "/label"}));
+        assert_eq!(
+            components[2]["action"]["event"]["context"],
+            json!({"plan": {"@path": "/plan"}})
+        );
+        assert_eq!(
+            notes,
+            [
+                "Note: read {\"path\": ...} as {\"@path\": ...} in messages/0/createSurface/components/1 (row); A2UI 1.0 binds a value with \"@path\", and a plain \"path\" is a literal.",
+                "Note: read {\"path\": ...} as {\"@path\": ...} in messages/0/createSurface/components/2 (go); A2UI 1.0 binds a value with \"@path\", and a plain \"path\" is a literal.",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_completed_example_validates_and_its_button_sends_the_choice() {
+        let session = UiSession::new(vec![Catalog::basic().clone()]).unwrap();
+        let call: Value =
+            serde_json::from_str(&example(agent86_ui::BASIC_CATALOG_ID, false)).unwrap();
+        let messages = call["messages"].as_array().unwrap().clone();
+        let (messages, _) = complete(&messages, |id| session.surface_keys(id));
+        assert!(session.apply(&messages).is_ok());
+        let submit = messages[0]["createSurface"]["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["id"] == "submit")
+            .unwrap();
+        assert_eq!(
+            submit["action"]["event"]["context"],
+            json!({"plan": {"@path": "/plan"}})
+        );
     }
 }

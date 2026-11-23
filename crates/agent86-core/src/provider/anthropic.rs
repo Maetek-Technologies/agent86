@@ -444,7 +444,8 @@ fn to_messages(messages: &[Message]) -> (Option<&str>, Vec<Value>) {
                         "type": "tool_use",
                         "id": call.id,
                         "name": call.name,
-                        "input": call.arguments,
+                        // `{}` for arguments that did not parse (beyond Python).
+                        "input": call.replay_arguments(),
                     }));
                 }
                 out.push(json!({"role": "assistant", "content": content}));
@@ -880,6 +881,27 @@ impl StreamState<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_whose_json_broke_is_replayed_with_empty_input() {
+        let broken = ToolCall {
+            id: "c1".to_owned(),
+            name: "render_ui".to_owned(),
+            arguments: Map::from_iter([(
+                crate::types::INVALID_TOOL_ARGS_KEY.to_owned(),
+                json!("{oops"),
+            )]),
+        };
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![broken],
+            tool_call_id: None,
+            name: None,
+        }];
+        let (_, messages) = to_messages(&history);
+        assert_eq!(messages[0]["content"][0]["input"], json!({}));
+    }
 
     #[test]
     fn cache_floors_match_the_longest_prefix() {

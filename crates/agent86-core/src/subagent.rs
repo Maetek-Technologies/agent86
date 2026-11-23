@@ -1215,6 +1215,7 @@ impl Harness {
         let mut limits = self.limits.clone();
         limits.max_steps = max_steps;
         let mut breaker = CircuitBreaker::new(&limits);
+        let mut broken_streak = crate::agent::BrokenStreak::default();
         let mut cap_raised: Option<u32> = None;
         let output_cap = |raised: Option<u32>| {
             raised.unwrap_or_else(|| {
@@ -1341,6 +1342,9 @@ impl Harness {
                     ("tool_calls", json!(names)),
                 ],
             );
+            let mut completion = completion;
+            // Before anything keeps or sees the calls, as in the main loop.
+            let repairs = self.repair_broken_calls(&mut completion.tool_calls, &sid);
             let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
             let has_text = !completion.text.trim().is_empty();
             // Beyond Python: a cap reached before any text may be raised and the
@@ -1460,6 +1464,7 @@ impl Harness {
                     ));
                 }
                 let (result, usage) = self.run_subagent_tool(&ctx, call, &sid, depth, run).await;
+                let result = self.annotate_broken_json(call, result, &repairs, &mut broken_streak);
                 delegated = delegated + usage;
                 progress.record(breaker.steps(), spent.cost_usd + delegated.cost_usd);
                 let (content, findings) = self.guardrails.observe(observation(&result));
@@ -1594,31 +1599,34 @@ impl Harness {
         depth: u32,
         run: u64,
     ) -> (ToolResult, Usage) {
-        if let Some(raw) = call.invalid_arguments() {
-            return (invalid_arguments_result(call, raw), Usage::default());
-        }
-        let Some(tool) = self.registry.get(&call.name) else {
-            return (self.registry.dispatch(call, ctx), Usage::default());
-        };
-        // A call outside the specialty's tools gets the registry's refusal, which
-        // names the sub-agent, rather than the gate's bare "not executed".
-        let (result, usage) = if !ctx.scope_allows(&call.name) {
-            (self.registry.dispatch(call, ctx), Usage::default())
+        // Every call is recorded, including those answered before dispatch
+        // (beyond Python, as in the main loop's `resolve_call`).
+        let (result, usage) = if let Some(raw) = call.invalid_arguments() {
+            (invalid_arguments_result(call, raw), Usage::default())
+        } else if let Some(tool) = self.registry.get(&call.name) {
+            // A call outside the specialty's tools gets the registry's refusal, which
+            // names the sub-agent, rather than the gate's bare "not executed".
+            if !ctx.scope_allows(&call.name) {
+                (self.registry.dispatch(call, ctx), Usage::default())
+            } else {
+                let decision = self.gate.decide(tool.as_ref(), call, ctx);
+                if !decision.approved {
+                    let mut result = crate::tools::failure(
+                        &call.name,
+                        format!("Not executed: {}.", decision.reason),
+                    );
+                    result.call_id = call.id.clone();
+                    (result, Usage::default())
+                } else {
+                    match self.delegation(call, ctx) {
+                        Some(Ok(request)) => self.delegate(call, request, depth + 1, ctx).await,
+                        Some(Err(invalid)) => (invalid, Usage::default()),
+                        None => (self.registry.dispatch(call, ctx), Usage::default()),
+                    }
+                }
+            }
         } else {
-            let decision = self.gate.decide(tool.as_ref(), call, ctx);
-            if !decision.approved {
-                let mut result = crate::tools::failure(
-                    &call.name,
-                    format!("Not executed: {}.", decision.reason),
-                );
-                result.call_id = call.id.clone();
-                return (result, Usage::default());
-            }
-            match self.delegation(call, ctx) {
-                Some(Ok(request)) => self.delegate(call, request, depth + 1, ctx).await,
-                Some(Err(invalid)) => (invalid, Usage::default()),
-                None => (self.registry.dispatch(call, ctx), Usage::default()),
-            }
+            (self.registry.dispatch(call, ctx), Usage::default())
         };
         self.recorder.event(
             sid,

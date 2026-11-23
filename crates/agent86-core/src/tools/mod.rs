@@ -87,6 +87,14 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Beyond Python (ADR 0006): what to tell a model whose calls to this tool
+    /// have twice in a row sent arguments that did not parse, after the loop's
+    /// own advice. For a tool whose arguments can grow large, how to send them
+    /// in smaller pieces.
+    fn retry_hint(&self) -> Option<&str> {
+        None
+    }
+
     /// The JSON Schema of the arguments, exactly as Python's pydantic models advertise it.
     fn parameters(&self) -> Value;
 
