@@ -24,12 +24,12 @@ Each call is validated as a whole against the renderer's catalogs by the `agent8
 - **valid:** the messages are drawn, and the result is `Rendered surface <id>.` (with any warnings, such as a component nothing shows);
 - **not valid:** nothing is drawn, and the result lists each problem with A2UI's error code and a JSON Pointer into `messages`, worded for the model, which fixes them and tries again.
 
-A surface stays up after the call. Completeness is strict: a missing `root` or a child that is not defined is an error. A component left behind when another replaced it as a child is only a warning, because A2UI 1.0 has no message that removes a component.
+A field the model puts beside a message's kind (`"surfaceId"` next to `"createSurface"` rather than inside it) is moved inside, and the result says so. A surface stays up after the call. Completeness is strict: a missing `root` or a child that is not defined is an error. A component left behind when another replaced it as a child is only a warning, because A2UI 1.0 has no message that removes a component.
 
 ## How the user answers
 
 - **Later, as a message (the default).** A button's action, such as `{"event": {"name": "submit", "context": {"name": {"@path": "/form/name"}}}}`, comes back as the next user message: `[ui action] submit on form: {"name": "Ada"}`. It goes through the same redaction and input guardrail as typed text, and starts a turn.
-- **At once, mid-turn (`wait`).** With `"wait": true` the turn waits for the user's first action on the surface, and that action is the call's result. Use it for a form the task cannot go on without. A waiting question is asked one at a time with approvals and secrets, and never once the turn is cancelled. If the program cannot answer, a waiting call is refused and the model asks without waiting.
+- **At once, mid-turn (`wait`).** With `"wait": true` the turn waits for the user's first action on the surface, and that action is the call's result. Use it for a form the task cannot go on without. Only a Button whose action is an event sends an answer (choosing or typing only changes the data model), so a waiting call whose surface has none is refused before it is drawn. A waiting question is asked one at a time with approvals and secrets, and never once the turn is cancelled. If the program cannot answer, a waiting call is refused and the model asks without waiting.
 
 ## Embedding it
 

@@ -8,7 +8,7 @@
 //! the validator's job, since providers' strict modes cap a schema's size.
 
 use super::{failure, success, Tool, ToolContext, ToolError};
-use crate::agent86ui::{policy, sanitize, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY};
+use crate::agent86ui::{policy, sanitize, tidy, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
 
@@ -119,9 +119,20 @@ impl Tool for RenderUiTool {
         // What a surface shows reaches the user as the model's text does: through
         // the vault's redaction and the egress guardrail first. Then agent86's
         // policy, then the protocol's rules.
+        // A field beside the message's kind is moved inside it (`agent86ui::tidy`).
+        let mut moved = Vec::new();
         let messages: Vec<Value> = messages
             .iter()
-            .map(|message| sanitize(message, &ctx.secrets, ui.egress()))
+            .enumerate()
+            .map(|(index, message)| {
+                let (message, fields) = tidy(&sanitize(message, &ctx.secrets, ui.egress()));
+                moved.extend(
+                    fields
+                        .into_iter()
+                        .map(|field| format!("Note: moved {field} in messages/{index}; it belongs inside, not beside it.")),
+                );
+                message
+            })
             .collect();
         let components = component_count(&messages);
         let refusals = policy(&messages, &ctx.policy, ui.remote_media());
@@ -140,6 +151,32 @@ impl Tool for RenderUiTool {
                 trace(&messages, components, "refused", &codes),
             );
             return Ok(result);
+        }
+        // A waiting surface the user cannot answer would hold the turn until they
+        // dismissed it: only a Button with an event action sends an answer.
+        if wait {
+            let unanswerable = unanswerable(&messages, ui);
+            if !unanswerable.is_empty() {
+                let mut result = failure(
+                    self.name(),
+                    format!(
+                        "Nothing on {} sends an answer, so nothing was drawn: choosing an \
+                         option or typing only changes the data model. Add a Button whose \
+                         action is an event (for example {{\"event\": {{\"name\": \"submit\", \
+                         \"context\": {{...}}}}}}) and send the messages again.",
+                        unanswerable
+                            .iter()
+                            .map(|id| format!("surface {id}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                result.metadata.insert(
+                    TRACE_KEY.into(),
+                    trace(&messages, components, "refused", &["REFUSED"]),
+                );
+                return Ok(result);
+            }
         }
         let report = ui.apply(&messages);
         if !report.is_ok() {
@@ -182,6 +219,7 @@ impl Tool for RenderUiTool {
         for warning in &report.warnings {
             lines.push(format!("Warning: {warning}"));
         }
+        lines.extend(moved);
         let mut result = success(self.name(), lines.join("\n"));
         let typed: Vec<Value> = report
             .messages
@@ -252,4 +290,36 @@ fn trace(messages: &[Value], components: usize, verdict: &str, codes: &[&str]) -
         "verdict": verdict,
         "problems": codes,
     })
+}
+
+/// The surfaces a waiting batch creates or changes that would have no Button
+/// with an event action, counting the batch's components and those already
+/// drawn. Deleted surfaces wait on nothing and are left out.
+fn unanswerable(messages: &[Value], ui: &crate::agent86ui::UiSession) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    let mut answerable: Vec<String> = Vec::new();
+    for message in messages {
+        for key in ["createSurface", "updateComponents"] {
+            let Some(body) = message.get(key) else {
+                continue;
+            };
+            let Some(id) = body.get("surfaceId").and_then(Value::as_str) else {
+                continue;
+            };
+            if !named.iter().any(|known| known == id) {
+                named.push(id.to_owned());
+            }
+            let has = body
+                .get("components")
+                .and_then(Value::as_array)
+                .is_some_and(|components| components.iter().any(crate::agent86ui::is_event_button));
+            if has {
+                answerable.push(id.to_owned());
+            }
+        }
+    }
+    named
+        .into_iter()
+        .filter(|id| !answerable.contains(id) && !ui.has_event_button(id))
+        .collect()
 }

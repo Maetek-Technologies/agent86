@@ -325,6 +325,27 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             }
             answer.recv().ok().flatten()
         })));
+    // Beyond Python (ADR 0005): the model may draw agent86UI surfaces here, and
+    // only here, now that the terminal is up; a waiting call is answered from the
+    // surface, and a dropped sender reads as a dismissal.
+    if crate::setup::attach_renderer(&mut repl.harness, &repl.config, &repl.state) {
+        if let Some(ui) = &repl.harness.context.ui {
+            let waits = events.clone();
+            ui.set_waiter(Some(std::sync::Arc::new(
+                move |wait: &crate::agent86ui::UiWait| {
+                    let (reply, answer) = mpsc::channel();
+                    let request = UiEvent::UiWait {
+                        surface_ids: wait.surface_ids.clone(),
+                        reply,
+                    };
+                    if waits.send(request).is_err() {
+                        return None;
+                    }
+                    answer.recv().ok().flatten()
+                },
+            )));
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -762,6 +783,11 @@ fn pump(
             app.status.approval = mode.to_owned();
             app.mark_dirty();
         }
+        if let Some(url) = app.take_open_url() {
+            if let Err(error) = open_url(&url) {
+                app.note(Style::DimRed, &format!("could not open {url}: {error}"));
+            }
+        }
         if let Some(title) = app.take_title_change() {
             let _ = crossterm::execute!(io::stdout(), crossterm::terminal::SetTitle(title));
         }
@@ -808,6 +834,35 @@ fn pump(
         }
         app.tick();
     }
+}
+
+/// Open a URL a surface's `openUrl` asked for, once the user said yes, with the
+/// system's opener: never through a shell, and only `http` and `https`.
+fn open_url(url: &str) -> io::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err(io::Error::other("only http and https URLs are opened"));
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(windows) {
+        // `start` would go through cmd.exe, which reads `&` and `^` in the URL.
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut child| {
+            // Reaped on its own thread, so no zombie is left behind.
+            std::thread::spawn(move || child.wait());
+        })
 }
 
 /// Terminals without bracketed paste (Windows) deliver a paste as keystrokes, so a

@@ -16,15 +16,14 @@
 
 use super::text::{sanitize, wrap_words, Line};
 use crate::repl::Style;
-use crate::sdk::agent86_ui::runtime::{Node, Runtime};
-use crate::sdk::{AgentMessage, AgentMessageKind, Catalog};
+use crate::sdk::agent86_ui::runtime::{data, Effect, Gesture, Node, Runtime};
+use crate::sdk::{Action, AgentMessage, AgentMessageKind, Catalog};
 use serde_json::Value;
 
 /// What the frame's title says, before the surface id.
 pub const TITLE: &str = "agent86UI · drawn by the agent";
 
 /// The components a user can act on, which take the focus in turn.
-#[allow(dead_code)] // The focus arrives with slice 5c.
 const FOCUSABLE: &[&str] = &[
     "Button",
     "TextField",
@@ -47,7 +46,6 @@ pub struct Focus {
 }
 
 impl Focus {
-    #[allow(dead_code)] // The focus arrives with slice 5c.
     pub fn on(node: &Node) -> Self {
         Self {
             component_id: node.id.clone(),
@@ -69,11 +67,28 @@ pub struct Drawn {
     pub focus_row: Option<usize>,
 }
 
+/// What pressing a button did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pressed {
+    /// Nothing to tell the agent (a local function ran, or the button is off).
+    Nothing,
+    /// The action to send the agent.
+    Action(Box<Action>),
+    /// `openUrl` asked to open this URL (already checked as `http` or `https`).
+    OpenUrl(String),
+    /// Why it could not run, for a note.
+    Failed(String),
+}
+
 /// The interface's surfaces.
 pub struct Surfaces {
     runtime: Runtime,
-    /// The surfaces up, oldest first; the last is the one drawn live.
+    /// The surfaces up, oldest first; the last one not settled is drawn live.
     order: Vec<String>,
+    /// Surfaces the user has answered: still up, but no longer drawn live
+    /// (their copy is in scrollback) until the agent changes them or the user
+    /// focuses them again.
+    settled: Vec<String>,
 }
 
 impl Default for Surfaces {
@@ -92,6 +107,7 @@ impl Surfaces {
         Self {
             runtime,
             order: Vec::new(),
+            settled: Vec::new(),
         }
     }
 
@@ -100,9 +116,35 @@ impl Surfaces {
         &self.order
     }
 
-    /// The surface drawn live: the newest one up.
+    /// The surface drawn live: the newest one up that is not settled.
     pub fn current(&self) -> Option<&str> {
-        self.order.last().map(String::as_str)
+        self.order
+            .iter()
+            .rev()
+            .find(|id| !self.settled.contains(id))
+            .map(String::as_str)
+    }
+
+    /// Whether `id` is up.
+    pub fn has(&self, id: &str) -> bool {
+        self.order.iter().any(|known| known == id)
+    }
+
+    /// Make `id` the newest surface, drawn live (focusing it, or a call
+    /// waiting on it).
+    pub fn raise(&mut self, id: &str) {
+        if let Some(at) = self.order.iter().position(|known| known == id) {
+            let id = self.order.remove(at);
+            self.settled.retain(|known| known != &id);
+            self.order.push(id);
+        }
+    }
+
+    /// The user answered `id`: it stays up but leaves the live slot.
+    pub fn settle(&mut self, id: &str) {
+        if self.has(id) && !self.settled.iter().any(|known| known == id) {
+            self.settled.push(id.to_owned());
+        }
     }
 
     /// Apply one validated message. Returns the surface that leaves the live
@@ -120,6 +162,8 @@ impl Surfaces {
             return None;
         }
         if let Some(target) = target {
+            // Whatever the agent changes is live again.
+            self.settled.retain(|id| id != &target);
             self.order.retain(|id| id != &target);
             if matches!(message.kind, AgentMessageKind::DeleteSurface(_)) {
                 // Nothing to promote: the next newest is drawn live from now on.
@@ -130,6 +174,7 @@ impl Surfaces {
         // Keep only what the runtime still holds.
         let up: Vec<String> = self.runtime.surface_ids().map(String::from).collect();
         self.order.retain(|id| up.contains(id));
+        self.settled.retain(|id| up.contains(id));
         let after = self.current().map(String::from);
         match (before, leaving_copy) {
             (Some(before), Some(copy)) if after.as_deref() != Some(before.as_str()) => Some(copy),
@@ -150,7 +195,6 @@ impl Surfaces {
     }
 
     /// The component instances that take the focus, in reading order.
-    #[allow(dead_code)] // The focus arrives with slice 5c.
     pub fn focusable(&self, id: &str) -> Vec<Focus> {
         self.runtime
             .tree(id)
@@ -162,6 +206,186 @@ impl Surfaces {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+impl Surfaces {
+    /// The component instance `focus` names on surface `id`, resolved.
+    pub fn node(&self, id: &str, focus: &Focus) -> Option<Node> {
+        let root = self.runtime.tree(id)?;
+        root.walk().into_iter().find(|node| focus.is(node)).cloned()
+    }
+
+    /// The focused component's type (`Button`, `TextField`, ...).
+    pub fn kind(&self, id: &str, focus: &Focus) -> Option<String> {
+        self.node(id, focus).map(|node| node.component)
+    }
+
+    /// How many options a focused ChoicePicker has (0 for anything else).
+    pub fn options(&self, id: &str, focus: &Focus) -> usize {
+        self.node(id, focus)
+            .filter(|node| node.component == "ChoicePicker")
+            .and_then(|node| node.properties.get("options")?.as_array().map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    /// The component as the agent sent it.
+    fn raw(&self, id: &str, component_id: &str) -> Option<Value> {
+        self.runtime
+            .components(id)?
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(component_id))
+            .cloned()
+    }
+
+    /// Where `property` of the focused component is bound, as an absolute
+    /// path; `None` for a literal, which the user cannot change.
+    fn bound(&self, id: &str, focus: &Focus, property: &str) -> Option<String> {
+        let raw = self.raw(id, &focus.component_id)?;
+        let path = raw.get(property)?.get("@path")?.as_str()?;
+        Some(data::resolve(&focus.data_path, path))
+    }
+
+    /// Write what the user entered to where `property` is bound.
+    fn write(&mut self, id: &str, focus: &Focus, property: &str, value: Value) {
+        if let Some(path) = self.bound(id, focus, property) {
+            let _ = self.runtime.input(id, &path, value);
+        }
+    }
+
+    /// Edit a focused text field: `edit` gets its text and changes it.
+    pub fn edit_text(&mut self, id: &str, focus: &Focus, edit: impl FnOnce(&mut String)) {
+        let Some(node) = self.node(id, focus) else {
+            return;
+        };
+        if !matches!(node.component.as_str(), "TextField" | "DateTimeInput") {
+            return;
+        }
+        let mut text = match node.properties.get("value") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        };
+        edit(&mut text);
+        self.write(id, focus, "value", Value::String(text));
+    }
+
+    /// Space on a check box (toggles it) or a choice (picks it, or toggles it
+    /// in a multiple selection).
+    pub fn toggle(&mut self, id: &str, focus: &Focus) {
+        let Some(node) = self.node(id, focus) else {
+            return;
+        };
+        match node.component.as_str() {
+            "CheckBox" => {
+                let on = node
+                    .properties
+                    .get("value")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.write(id, focus, "value", Value::Bool(!on));
+            }
+            "ChoicePicker" => {
+                let Some(value) = node
+                    .properties
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .and_then(|options| options.get(focus.option))
+                    .and_then(|option| option.get("value"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                else {
+                    return;
+                };
+                let multiple = node.properties.get("variant").and_then(Value::as_str)
+                    == Some("multipleSelection");
+                let mut chosen: Vec<String> = match node.properties.get("value") {
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(String::from))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if !multiple {
+                    chosen = vec![value];
+                } else if let Some(at) = chosen.iter().position(|c| c == &value) {
+                    chosen.remove(at);
+                } else {
+                    chosen.push(value);
+                }
+                let list = chosen.into_iter().map(Value::String).collect();
+                self.write(id, focus, "value", Value::Array(list));
+            }
+            _ => {}
+        }
+    }
+
+    /// Left or Right on a slider: one step down or up, within its range.
+    pub fn adjust(&mut self, id: &str, focus: &Focus, up: bool) {
+        let Some(node) = self.node(id, focus).filter(|n| n.component == "Slider") else {
+            return;
+        };
+        let number = |key: &str, default: f64| {
+            node.properties
+                .get(key)
+                .and_then(Value::as_f64)
+                .unwrap_or(default)
+        };
+        let (min, max) = (number("min", 0.0), number("max", 100.0));
+        let step = match node.properties.get("steps").and_then(Value::as_f64) {
+            Some(steps) if steps > 0.0 => (max - min) / steps,
+            _ => 1.0,
+        };
+        let value = number("value", min);
+        let next = if up { value + step } else { value - step }.clamp(min, max);
+        let next = serde_json::Number::from_f64(next)
+            .map(|n| {
+                if next.fract() == 0.0 {
+                    Value::from(next as i64)
+                } else {
+                    Value::Number(n)
+                }
+            })
+            .unwrap_or(Value::Null);
+        self.write(id, focus, "value", next);
+    }
+
+    /// Enter on a button: run its action as the user's gesture.
+    pub fn press(&mut self, id: &str, focus: &Focus) -> Pressed {
+        let Some(node) = self.node(id, focus).filter(|n| n.component == "Button") else {
+            return Pressed::Nothing;
+        };
+        if !node.is_valid() {
+            return Pressed::Nothing;
+        }
+        let Some(action) = self
+            .raw(id, &focus.component_id)
+            .and_then(|raw| raw.get("action").cloned())
+        else {
+            return Pressed::Nothing;
+        };
+        match self.runtime.dispatch(&action, &Gesture::on(&node, id)) {
+            Err(error) => Pressed::Failed(error.to_string()),
+            Ok(dispatch) => {
+                if let Some(action) = dispatch.action {
+                    return Pressed::Action(Box::new(action));
+                }
+                for effect in dispatch.effects {
+                    if let Effect::OpenUrl(url) = effect {
+                        // The renderer's own check (ADR 0005): a bound or computed URL
+                        // is only known now.
+                        let lower = url.to_ascii_lowercase();
+                        if lower.starts_with("https://") || lower.starts_with("http://") {
+                            return Pressed::OpenUrl(url);
+                        }
+                        return Pressed::Failed(format!(
+                            "openUrl refused {:?}: only http and https URLs are opened",
+                            sanitize(&url)
+                        ));
+                    }
+                }
+                Pressed::Nothing
+            }
+        }
     }
 }
 

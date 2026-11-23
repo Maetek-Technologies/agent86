@@ -1402,6 +1402,104 @@ async fn a_waiting_call_gets_the_users_action_after_the_surface_is_drawn() {
 
 #[cfg(feature = "agent86ui")]
 #[tokio::test]
+async fn a_surface_id_beside_create_surface_is_moved_inside_and_noted() {
+    // Found trying the terminal renderer: the model's first call put surfaceId
+    // beside createSurface, and the turn lost a step to the error.
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-tidy");
+    let mut form = name_form();
+    let surface = form["messages"][0]["createSurface"]
+        .as_object_mut()
+        .unwrap()
+        .remove("surfaceId")
+        .unwrap();
+    form["messages"][0]["surfaceId"] = surface;
+    let provider = Scripted::new(vec![calls(&[("c1", "render_ui", form)]), text("ok")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    agent.run("Ask my name").await.unwrap();
+    assert_eq!(
+        observation(&provider, "c1"),
+        "Rendered surface form.\nNote: moved surfaceId into createSurface in messages/0; it belongs inside, not beside it."
+    );
+    // Resumed, the call replays the same way.
+    let conversation = agent.conversation().clone();
+    let agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap()
+        .with_conversation(conversation);
+    assert_eq!(agent.surfaces().len(), 1);
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_waiting_surface_with_nothing_to_press_is_refused() {
+    // Found trying the terminal renderer: a model drew a plan picker with no
+    // button and waited, so the user could only dismiss it.
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-wait-no-button");
+    let picker = form_surface(json!([
+        {"id": "root", "component": "ChoicePicker", "label": "Plan",
+         "value": {"@path": "/plan"},
+         "options": [{"label": "Basic", "value": "basic"}, {"label": "Pro", "value": "pro"}]}
+    ]));
+    // An openUrl button runs locally and answers nothing either.
+    let link = form_surface(json!([
+        {"id": "root", "component": "Button", "child": "t",
+         "action": {"functionCall": {"@call": "openUrl", "args": {"url": "https://example.com"}}}},
+        {"id": "t", "component": "Text", "text": "Site"}
+    ]));
+    // A button drawn by an earlier call counts.
+    let relabel = json!({"wait": true, "messages": [{"version": "1.0", "updateComponents": {
+        "surfaceId": "form",
+        "components": [{"id": "ok_label", "component": "Text", "text": "Send"}]
+    }}]});
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "render_ui", waiting(picker))]),
+        calls(&[("c2", "render_ui", waiting(link))]),
+        calls(&[("c3", "render_ui", name_form())]),
+        calls(&[("c4", "render_ui", relabel)]),
+        text("done"),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic().on_wait(|_| Some(submit("form", "ok", json!({"name": "Ada"})))))
+        .build()
+        .unwrap();
+    let mut drawn = 0;
+    agent
+        .run_with_events("Ask me", |event| {
+            if let TurnEvent::Ui(_) = event {
+                drawn += 1;
+            }
+        })
+        .await
+        .unwrap();
+    for id in ["c1", "c2"] {
+        let verdict = observation(&provider, id);
+        assert!(
+            verdict.contains("Nothing on surface form sends an answer, so nothing was drawn")
+                && verdict.contains("Add a Button whose action is an event"),
+            "{verdict}"
+        );
+    }
+    assert_eq!(drawn, 2, "only c3 and c4 drew");
+    assert!(observation(&provider, "c4").starts_with("Rendered surface form."));
+    assert!(provider.requests()[0].messages[0]
+        .content
+        .contains("Only a Button whose action is an event sends the user's answer"));
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
 async fn a_dismissed_or_unusable_answer_is_reported_and_no_answerer_refuses_waiting() {
     use agent86_core::sdk::Ui;
     let workspace = Workspace::new("ui-wait-no");

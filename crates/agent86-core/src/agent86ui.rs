@@ -164,6 +164,14 @@ impl UiSession {
         Ok(())
     }
 
+    /// Whether surface `id`, as drawn so far, has a Button whose action sends
+    /// an event: something the user can press to answer.
+    pub fn has_event_button(&self, id: &str) -> bool {
+        self.runtime()
+            .components(id)
+            .is_some_and(|mut components| components.any(is_event_button))
+    }
+
     pub fn egress(&self) -> EgressMode {
         self.egress
     }
@@ -236,7 +244,7 @@ impl UiSession {
                 };
                 let messages: Vec<Value> = messages
                     .iter()
-                    .map(|message| sanitize(message, &ctx.secrets, self.egress))
+                    .map(|message| tidy(&sanitize(message, &ctx.secrets, self.egress)).0)
                     .collect();
                 if !policy(&messages, &ctx.policy, self.remote_media).is_empty() {
                     continue;
@@ -280,6 +288,13 @@ impl UiSession {
              Video, and AudioPlayer must be a literal string: {media}.\n- openUrl opens only \
              http and https URLs."
         ));
+        if let Some(catalog) = self.catalogs.first() {
+            section.push_str(&format!(
+                "\n\nA complete call, a choice with a Submit button (`surfaceId` goes \
+                 inside createSurface, never beside it):\n{}",
+                example(catalog.id(), self.can_wait())
+            ));
+        }
         for catalog in &self.catalogs {
             section.push_str(&format!("\n\n### Catalog `{}`\n", catalog.id()));
             if let Some(instructions) = catalog.instructions() {
@@ -291,6 +306,91 @@ impl UiSession {
         }
         section
     }
+}
+
+/// The keys that name what an A2UI 1.0 message is; an envelope holds
+/// `version` and exactly one of them.
+const KINDS: &[&str] = &[
+    "createSurface",
+    "updateComponents",
+    "updateDataModel",
+    "deleteSurface",
+    "callRendererFunction",
+    "agentFunctionResponse",
+];
+
+/// Beyond the protocol: a message whose fields sit beside its kind instead of
+/// inside it (`{"version": "1.0", "createSurface": {...}, "surfaceId": "x"}`,
+/// the mistake models make most often) has them moved in, when the kind's body
+/// does not already have them. Such a message is never valid as written, so
+/// the move only turns an error into what the model plainly meant. Returns the
+/// message and the fields moved, for the result to mention. `render_ui` and
+/// replay both apply it, so a session written either way replays the same.
+pub fn tidy(message: &Value) -> (Value, Vec<String>) {
+    let Some(envelope) = message.as_object() else {
+        return (message.clone(), Vec::new());
+    };
+    let kinds: Vec<&String> = envelope
+        .keys()
+        .filter(|key| KINDS.contains(&key.as_str()))
+        .collect();
+    let [kind] = kinds.as_slice() else {
+        return (message.clone(), Vec::new());
+    };
+    let kind = (*kind).clone();
+    let Some(body) = envelope.get(&kind).and_then(Value::as_object) else {
+        return (message.clone(), Vec::new());
+    };
+    let strays: Vec<String> = envelope
+        .keys()
+        .filter(|key| *key != "version" && **key != kind && !body.contains_key(*key))
+        .cloned()
+        .collect();
+    if strays.is_empty() {
+        return (message.clone(), Vec::new());
+    }
+    let mut envelope = envelope.clone();
+    let mut body = body.clone();
+    for key in &strays {
+        if let Some(value) = envelope.remove(key) {
+            body.insert(key.clone(), value);
+        }
+    }
+    envelope.insert(kind.clone(), Value::Object(body));
+    let moved = strays
+        .into_iter()
+        .map(|key| format!("{key} into {kind}"))
+        .collect();
+    (Value::Object(envelope), moved)
+}
+
+/// Whether a component is a Button whose action sends an event (rather than
+/// running a local function such as `openUrl`).
+pub fn is_event_button(component: &Value) -> bool {
+    component.get("component").and_then(Value::as_str) == Some("Button")
+        && component.pointer("/action/event").is_some()
+}
+
+/// The prompt's example call, on one line, in `catalog_id`.
+fn example(catalog_id: &str, wait: bool) -> String {
+    let mut call = serde_json::json!({"messages": [{"version": "1.0", "createSurface": {
+        "surfaceId": "plan",
+        "catalogId": catalog_id,
+        "components": [
+            {"id": "root", "component": "Column", "children": ["choice", "submit"]},
+            {"id": "choice", "component": "ChoicePicker", "label": "Which plan?",
+             "variant": "mutuallyExclusive", "value": {"@path": "/plan"},
+             "options": [{"label": "Basic", "value": "basic"}, {"label": "Pro", "value": "pro"}]},
+            {"id": "submit", "component": "Button", "child": "submit_label",
+             "action": {"event": {"name": "submit", "context": {"plan": {"@path": "/plan"}}}}},
+            {"id": "submit_label", "component": "Text", "text": "Submit"}
+        ],
+        "dataModel": {"plan": []}
+    }}]});
+    if wait {
+        call["wait"] = Value::Bool(true);
+    }
+    call.to_string()
 }
 
 /// What every `render_ui` prompt says, whatever the catalogs.
@@ -309,7 +409,9 @@ exactly one of `createSurface`, `updateComponents`, `updateDataModel`, or \
 change it later with updateComponents (a component replaces the one with the same \
 id) and updateDataModel (`path` and `value`), and remove it with deleteSurface.
 - Components are a flat list linked by id, and exactly one has the id \"root\". \
-Every child id must be defined in the same call or an earlier one.
+Every child id must be defined in the same call or an earlier one. An id is an \
+identifier: letters, digits, and `_`, starting with a letter or `_` (`submit_label`, \
+never `submit-label`).
 - A value is a literal, a binding to the surface's data model (`{\"@path\": \
 \"/form/name\"}`), or a function call (`{\"@call\": \"formatString\", \"args\": \
 {...}}`). Input components write what the user enters back to the path they are \
@@ -321,6 +423,9 @@ relative to each item.
 beside `event`. When the user presses it, a later user message \
 reads `[ui action] submit on <surfaceId>: <context as JSON>`; the surface stays \
 up meanwhile.
+- Only a Button whose action is an event sends the user's answer: choosing an \
+option or typing only changes the data model. So every form needs a Button (for \
+example Submit) whose event's `context` carries the values.
 - render_ui's result is the validator's verdict. If it lists problems, nothing \
 was drawn: fix them and send the corrected messages again.
 - Renderer functions (`callRendererFunction`) and agent functions are not \
@@ -484,14 +589,19 @@ pub fn take_drawn(metadata: &mut Map<String, Value>) -> (Vec<AgentMessage>, Opti
 /// What `render_ui`'s result opens with when the call drew.
 const DREW: &[&str] = &["Rendered surface ", "Deleted surface ", "Applied."];
 
-/// Whether a `render_ui` result says the call drew.
+/// Whether a `render_ui` result says the call drew. A waiting call that was not
+/// answered says so first and what it drew after (earlier versions wrote the
+/// drawing first), so every line is looked at.
 fn drew(result: &crate::types::ToolResult) -> bool {
     let text = if result.ok {
         result.content.as_str()
     } else {
         result.error.as_deref().unwrap_or_default()
     };
-    result.ok || DREW.iter().any(|opening| text.starts_with(opening))
+    result.ok
+        || text
+            .lines()
+            .any(|line| DREW.iter().any(|opening| line.starts_with(opening)))
 }
 
 /// The surfaces a waiting call waits on, taken out of its result's metadata.
@@ -598,8 +708,8 @@ impl crate::agent::Harness {
                 return answered(failure(
                     RENDER_UI,
                     format!(
-                        "{shown}\nThe turn was cancelled before the user answered. The surface \
-                         stays up; an action on it later comes as a user message."
+                        "The turn was cancelled before the user answered. The surface stays \
+                         up; an action on it later comes as a user message.\n{shown}"
                     ),
                 ))
             }
@@ -607,8 +717,8 @@ impl crate::agent::Harness {
                 return answered(failure(
                     RENDER_UI,
                     format!(
-                        "{shown}\nThe user did not answer (they dismissed it). The surface stays \
-                         up; an action on it later comes as a user message."
+                        "The user did not answer (they dismissed it). The surface stays up; an \
+                         action on it later comes as a user message.\n{shown}"
                     ),
                 ))
             }
@@ -617,7 +727,7 @@ impl crate::agent::Harness {
         if let Err(why) = ui.check_action(&action, Some(&surfaces)) {
             return answered(failure(
                 RENDER_UI,
-                format!("{shown}\nThe screen's answer could not be used: {why}."),
+                format!("The screen's answer could not be used: {why}.\n{shown}"),
             ));
         }
         let text = self.context.secrets.redact(&action_text(&action));
@@ -647,7 +757,7 @@ impl crate::agent::Harness {
             return answered(failure(
                 RENDER_UI,
                 format!(
-                    "{shown}\nThe user's answer was refused by the input guardrail ({}).",
+                    "The user's answer was refused by the input guardrail ({}).\n{shown}",
                     report.summary()
                 ),
             ));
@@ -1023,6 +1133,48 @@ mod tests {
         assert!(section.contains(&format!("### Catalog `{}`", agent86_ui::BASIC_CATALOG_ID)));
         assert!(section.contains("## Catalog Guidelines"));
         assert!(section.contains("[ui action] submit on <surfaceId>"));
+    }
+
+    #[test]
+    fn fields_beside_the_kind_are_moved_inside_it() {
+        let (tidied, moved) = tidy(&serde_json::json!({
+            "version": "1.0",
+            "createSurface": {"catalogId": "c", "components": []},
+            "surfaceId": "plan"
+        }));
+        assert_eq!(
+            tidied,
+            serde_json::json!({"version": "1.0",
+                "createSurface": {"catalogId": "c", "components": [], "surfaceId": "plan"}})
+        );
+        assert_eq!(moved, ["surfaceId into createSurface"]);
+
+        // Never over a field the body has, and never with no kind or two kinds.
+        for message in [
+            serde_json::json!({"version": "1.0", "deleteSurface": {"surfaceId": "a"}, "surfaceId": "b"}),
+            serde_json::json!({"version": "1.0", "surfaceId": "b"}),
+            serde_json::json!({"version": "1.0", "deleteSurface": {}, "updateDataModel": {}, "x": 1}),
+            serde_json::json!({"version": "1.0", "deleteSurface": {"surfaceId": "a"}}),
+        ] {
+            assert_eq!(tidy(&message), (message.clone(), Vec::new()), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_s_example_is_valid() {
+        let session = UiSession::new(vec![Catalog::basic().clone()]).unwrap();
+        let call: Value =
+            serde_json::from_str(&example(agent86_ui::BASIC_CATALOG_ID, true)).unwrap();
+        let messages = call["messages"].as_array().unwrap();
+        let report = session.apply(messages);
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let section = session.prompt_section();
+        assert!(section.contains("surfaceId` goes inside createSurface"));
+        assert!(
+            !section.contains("\"wait\":true"),
+            "no waiter, no wait in the example"
+        );
     }
 
     #[test]

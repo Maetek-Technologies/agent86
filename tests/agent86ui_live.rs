@@ -84,9 +84,12 @@ async fn models_write_valid_render_ui_batches() {
                             if result.ok && outcome.first_valid.is_none() {
                                 outcome.first_valid = Some(outcome.calls);
                             }
-                            if !result.ok && outcome.first_valid.is_none() {
-                                let first = result.error.as_deref().unwrap_or_default();
-                                outcome.error = first.lines().nth(1).map(str::to_owned);
+                            // The first failure's first problem (the line after
+                            // "Nothing was drawn"), or its only line.
+                            if !result.ok && outcome.error.is_none() {
+                                let text = result.error.as_deref().unwrap_or_default();
+                                let problem = text.lines().nth(1).unwrap_or(text);
+                                outcome.error = Some(problem.to_owned());
                             }
                         }
                     }
