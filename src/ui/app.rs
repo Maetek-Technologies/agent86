@@ -2115,6 +2115,124 @@ mod tests {
         );
     }
 
+    /// Run `ask_in_form` (ADR 0006) on its own thread, as the turn's worker
+    /// does, feeding what it sends into `app` until it waits.
+    fn ask(
+        app: &mut App,
+        form: crate::ask::Form,
+    ) -> (
+        mpsc::Receiver<UiEvent>,
+        std::thread::JoinHandle<crate::ask::Reply>,
+    ) {
+        let (events, inbox) = mpsc::channel();
+        let worker =
+            std::thread::spawn(move || crate::ui::ask_in_form(&events, "agent86_ask_1", &form));
+        loop {
+            let event = inbox.recv().unwrap();
+            let waits = matches!(event, UiEvent::UiWait { .. });
+            app.on_turn_event(event);
+            if waits {
+                return (inbox, worker);
+            }
+        }
+    }
+
+    fn plan_form() -> crate::ask::Form {
+        crate::ask::Form::parse(
+            serde_json::json!({"title": "Your plan", "questions": [
+                {"id": "plan", "question": "Which plan?", "kind": "choice",
+                 "options": ["Basic", "Pro"]},
+                {"id": "name", "question": "Your name?", "kind": "text"},
+                {"id": "note", "question": "Anything else?", "kind": "text", "optional": true}
+            ]})
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ask_user_questions_are_a_form_answered_in_place() {
+        use crate::ask::{Outcome, Via};
+        let mut app = app();
+        app.start_turn();
+        let form = plan_form();
+        let (inbox, worker) = ask(&mut app, form.clone());
+        let live = live_text(&mut app);
+        assert!(
+            live.iter().any(|row| row.contains("agent86UI · questions")),
+            "{live:#?}"
+        );
+        assert!(
+            live.iter().any(|row| row.contains("Your plan")),
+            "{live:#?}"
+        );
+
+        // Pro, then past the "Other" field to the name, past the note, to Send.
+        app.on_key(key(KeyCode::Down), &[]);
+        app.on_key(key(KeyCode::Char(' ')), &[]);
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Tab), &[]);
+        for ch in "Ada".chars() {
+            app.on_key(key(KeyCode::Char(ch)), &[]);
+        }
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Enter), &[]);
+
+        let reply = worker.join().unwrap();
+        assert_eq!(reply.via, Via::Form);
+        let Outcome::Answered(values) = reply.outcome else {
+            panic!("answered");
+        };
+        let accepted = form.accept(&values);
+        assert_eq!(
+            Value::Object(accepted.answers),
+            serde_json::json!({"plan": "Pro", "name": "Ada", "note": null})
+        );
+        // The form leaves the live region; its answered copy is in scrollback.
+        for event in inbox.try_iter() {
+            app.on_turn_event(event);
+        }
+        assert!(committed_text(&mut app)
+            .iter()
+            .any(|row| row.contains("agent86UI · questions")));
+        assert!(!live_text(&mut app)
+            .iter()
+            .any(|row| row.contains("agent86UI · questions")));
+    }
+
+    #[test]
+    fn escape_dismisses_an_ask_user_form() {
+        use crate::ask::Outcome;
+        let mut app = app();
+        app.start_turn();
+        let (inbox, worker) = ask(&mut app, plan_form());
+        app.on_key(key(KeyCode::Esc), &[]);
+        assert_eq!(worker.join().unwrap().outcome, Outcome::Dismissed);
+        for event in inbox.try_iter() {
+            app.on_turn_event(event);
+        }
+        assert!(!live_text(&mut app)
+            .iter()
+            .any(|row| row.contains("agent86UI · questions")));
+    }
+
+    #[test]
+    fn enter_on_send_does_nothing_until_the_required_questions_are_answered() {
+        let mut app = app();
+        app.start_turn();
+        let (_inbox, worker) = ask(&mut app, plan_form());
+        // Straight to Send: plan picker, Other, name, note, Send.
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Tab), &[]);
+        }
+        app.on_key(key(KeyCode::Enter), &[]);
+        assert!(!worker.is_finished(), "nothing was sent");
+        app.on_key(key(KeyCode::Esc), &[]);
+        worker.join().unwrap();
+    }
+
     fn alt_up() -> KeyEvent {
         KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)
     }

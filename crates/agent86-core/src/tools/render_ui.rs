@@ -152,7 +152,8 @@ impl Tool for RenderUiTool {
         let (messages, rebound) = complete(&messages, |id| ui.surface_keys(id));
         moved.extend(rebound);
         let components = component_count(&messages);
-        let refusals = policy(&messages, &ctx.policy, ui.remote_media());
+        let mut refusals = policy(&messages, &ctx.policy, ui.remote_media());
+        refusals.extend(reserved_surfaces(&messages));
         if !refusals.is_empty() {
             let codes = vec!["REFUSED"; refusals.len()];
             let mut result = failure(
@@ -262,6 +263,36 @@ impl Tool for RenderUiTool {
         }
         Ok(result)
     }
+}
+
+/// Messages about a surface named like the forms `ask_user` builds
+/// (`ask::FORM_SURFACE_PREFIX`, ADR 0006): refused, so the model cannot replace
+/// a form while the user answers it.
+fn reserved_surfaces(messages: &[Value]) -> Vec<crate::agent86ui::Refusal> {
+    let mut refusals = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Some((kind, body)) = message
+            .as_object()
+            .and_then(|envelope| envelope.iter().find(|(key, _)| *key != "version"))
+        else {
+            continue;
+        };
+        let reserved = body
+            .get("surfaceId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with(crate::ask::FORM_SURFACE_PREFIX));
+        if reserved {
+            refusals.push(crate::agent86ui::Refusal {
+                path: format!("/{index}/{kind}/surfaceId"),
+                message: format!(
+                    "surface ids starting with {} are agent86's own forms; choose another id \
+                     (and to ask the user questions, call ask_user)",
+                    crate::ask::FORM_SURFACE_PREFIX
+                ),
+            });
+        }
+    }
+    refusals
 }
 
 fn bullets<T: std::fmt::Display>(items: &[T]) -> String {

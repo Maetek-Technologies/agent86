@@ -346,6 +346,20 @@ fn run(repl: &mut Repl) -> io::Result<()> {
             )));
         }
     }
+    // Beyond Python (ADR 0006): the model asks its questions through a form
+    // agent86 builds, answered in place, unless `[ui] ask_user = "off"`.
+    if repl.config.ui.ask_user == crate::config::AskUserMode::Auto {
+        let asks = events.clone();
+        let count = std::sync::atomic::AtomicU64::new(0);
+        let _ = repl.harness.attach_questions(Box::new(move |form| {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            ask_in_form(
+                &asks,
+                &format!("{}{n}", crate::ask::FORM_SURFACE_PREFIX),
+                form,
+            )
+        }));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -882,6 +896,54 @@ fn pump(
             }
         }
         app.tick();
+    }
+}
+
+/// The terminal's answer to `ask_user` (ADR 0006): the form agent86 builds
+/// (`ask::form_messages`), drawn as surface `surface` by the interface's own
+/// agent86UI renderer, which takes the keys at once, and answered in place.
+/// Only the interface draws it; the agent's renderer never holds it, so
+/// `render_ui` cannot change it and a resumed session does not redraw it. Once
+/// answered or dismissed the form leaves the live region (an answered one has
+/// its copy in scrollback already). A dropped channel reads as a dismissal.
+pub(crate) fn ask_in_form(
+    events: &mpsc::Sender<UiEvent>,
+    surface: &str,
+    form: &crate::ask::Form,
+) -> crate::ask::Reply {
+    use crate::ask::{Outcome, Reply, Via};
+    let dismissed = || Reply {
+        outcome: Outcome::Dismissed,
+        via: Via::Form,
+    };
+    let catalog = crate::sdk::Catalog::basic().id().to_owned();
+    for message in crate::ask::form_messages(form, surface, &catalog) {
+        let Ok(message) = serde_json::from_value::<crate::sdk::AgentMessage>(message) else {
+            return dismissed();
+        };
+        if events.send(UiEvent::Ui(Box::new(message))).is_err() {
+            return dismissed();
+        }
+    }
+    let (reply, answer) = mpsc::channel();
+    let wait = UiEvent::UiWait {
+        surface_ids: vec![surface.to_owned()],
+        reply,
+    };
+    if events.send(wait).is_err() {
+        return dismissed();
+    }
+    let action = answer.recv().ok().flatten();
+    let delete = serde_json::json!({"version": "1.0", "deleteSurface": {"surfaceId": surface}});
+    if let Ok(delete) = serde_json::from_value::<crate::sdk::AgentMessage>(delete) {
+        let _ = events.send(UiEvent::Ui(Box::new(delete)));
+    }
+    match action {
+        Some(action) => Reply {
+            outcome: Outcome::Answered(crate::ask::values_from_context(form, &action.context)),
+            via: Via::Form,
+        },
+        None => dismissed(),
     }
 }
 

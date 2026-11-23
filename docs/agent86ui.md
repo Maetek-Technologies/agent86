@@ -46,6 +46,7 @@ From 1.2.1 the interactive interface (`agent86` with no subcommand, at a termina
 - **Links:** a button that opens a URL shows it and asks y/n, then opens it with your system's opener, `http` and `https` only.
 - **Resuming:** starting with a session, `/resume`, and `/clear` redraw the surfaces the session has up. Ctrl+O's transcript view ends with the live surface in full.
 - **Settings** (`[ui]`): `agent86ui = "auto"` (the default: on for every model) or `"off"`, which a project file may set without being trusted; `agent86ui_remote_media = true` lets media load `https` URLs, and needs trust.
+- **Questions from the agent** (from 1.2.2, [ADR 0006](adr/0006-ask-user.md)): when the agent needs something from you, it calls `ask_user` with a list of questions, and agent86 builds the form itself, so it always works. It is titled `agent86UI · questions from the agent` and takes the keys at once: each choice question has an "Other" option and a field for your own words, Send stays dimmed until every question not marked (optional) has an answer, Escape dismisses it (the agent is told not to ask again in that turn), and Ctrl+C dismisses it and cancels the turn. Once sent, a copy goes into scrollback. `[ui] ask_user = "off"` (allowed in an untrusted project file) turns it off, and the agent asks in its reply as before. It does not depend on `[ui] agent86ui`, since the agent writes none of the form.
 
 ## Embedding it
 
