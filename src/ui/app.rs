@@ -23,6 +23,7 @@ use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
 use super::server_form::{ServerDraft, ServerForm};
 use super::status::{fit_status_line, StatusState};
+use super::surface::Surfaces;
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
@@ -133,6 +134,9 @@ pub enum UiEvent {
     /// A specialist sub-agent started or finished (beyond Python): printed at
     /// once, dimmed, unless tool use is hidden.
     Agent(String),
+    /// One validated agent86UI message from `render_ui` (beyond Python; ADR
+    /// 0005), for the interface's own renderer.
+    Ui(Box<crate::sdk::AgentMessage>),
 }
 
 /// What a catalog was fetched for, as Python's `CatalogReady.purpose`.
@@ -154,9 +158,7 @@ impl From<TurnEvent<'_>> for UiEvent {
             | TurnEvent::Compacted { notice: text, .. } => Self::Text(text.to_owned()),
             // Never sent (the worker drops it); it adds no text.
             TurnEvent::Usage { .. } => Self::Text(String::new()),
-            // The interface declares no renderer until its own lands (ADR 0005,
-            // 1.2.1), so `render_ui` is not offered; dropped by the worker too.
-            TurnEvent::Ui(_) => Self::Text(String::new()),
+            TurnEvent::Ui(message) => Self::Ui(Box::new(message.clone())),
             TurnEvent::Thinking(text) => Self::Thinking(text.to_owned()),
             TurnEvent::ToolCall { call, .. } => Self::ToolCall {
                 id: call.id.clone(),
@@ -314,6 +316,9 @@ pub struct App {
     secret: Option<(KeyEntry, mpsc::Sender<Option<SecretAnswer>>)>,
     /// A picker or a `/config model` panel.
     panel: Option<Panel>,
+    /// agent86UI's surfaces (beyond Python): the newest one up is drawn above
+    /// the input box, whatever the display levels, since it is a question.
+    surfaces: Surfaces,
     /// The `/` or `@` completion menu under the input box.
     menu: Option<Menu>,
     /// The Ctrl+O transcript view, when open.
@@ -361,6 +366,7 @@ impl App {
             limit: None,
             secret: None,
             panel: None,
+            surfaces: Surfaces::new(),
             menu: None,
             view: None,
             workspace: None,
@@ -782,6 +788,12 @@ impl App {
                 purpose,
             }),
             UiEvent::Note(style, text) => self.deferred.push_back(Request::Note(style, text)),
+            UiEvent::Ui(message) => {
+                // The surface leaving the live slot keeps its last state in scrollback.
+                if let Some(copy) = self.surfaces.apply(&message, self.width) {
+                    self.commit(std::iter::once(Line::default()).chain(copy.lines));
+                }
+            }
             UiEvent::Agent(text) => {
                 // A notice (a specialty's model fell back) shows at every level.
                 if self.tool_level != DisplayLevel::Hidden || text.starts_with("[agent]") {
@@ -1458,6 +1470,11 @@ impl App {
         }
 
         let mut bottom = vec![Line::default()];
+        // The newest surface, above the input box, unless one of the harness's own
+        // questions (an approval, a secret, a limit) needs the room.
+        if self.approval.is_none() && self.secret.is_none() && self.limit.is_none() {
+            bottom.extend(self.surface_rows());
+        }
         let caret_base;
         let mut caret = None;
         if let Some(panel) = &self.approval {
@@ -1523,6 +1540,46 @@ impl App {
             live.drain(..live.len() - room);
         }
         (live, caret)
+    }
+
+    /// The live surface, cut to about 40% of the screen around its focus, then a
+    /// line for the others up; nothing when no surface is up.
+    fn surface_rows(&self) -> Vec<Line> {
+        let Some(id) = self.surfaces.current() else {
+            return Vec::new();
+        };
+        let drawn = self.surfaces.draw(id, self.width, None);
+        let cap = (self.height * 2 / 5).max(5);
+        let mut rows = drawn.lines;
+        if rows.len() > cap {
+            // Keep the frame's top, the rows around the focus, and its bottom.
+            let around = drawn.focus_row.unwrap_or(1);
+            let body = cap.saturating_sub(3).max(1);
+            let start = around
+                .saturating_sub(body / 2)
+                .clamp(1, rows.len().saturating_sub(1 + body).max(1));
+            let hidden = rows.len() - 2 - body;
+            let mut cut = vec![rows[0].clone()];
+            cut.extend(
+                rows[start..(start + body).min(rows.len() - 1)]
+                    .iter()
+                    .cloned(),
+            );
+            cut.push(
+                Line::styled(Style::Dim, format!("  … {hidden} more rows")).truncate(self.width),
+            );
+            cut.push(rows[rows.len() - 1].clone());
+            rows = cut;
+        }
+        let others = self.surfaces.ids().len() - 1;
+        if others > 0 {
+            let s = if others == 1 { "" } else { "s" };
+            rows.push(
+                Line::styled(Style::Dim, format!("  {others} more surface{s} up"))
+                    .truncate(self.width),
+            );
+        }
+        rows
     }
 
     fn spinner_line(&self, running: &Running) -> Line {
@@ -1666,6 +1723,126 @@ mod tests {
 
     fn live_text(app: &mut App) -> Vec<String> {
         app.live().0.iter().map(Line::plain_text).collect()
+    }
+
+    fn ui(value: Value) -> UiEvent {
+        UiEvent::Ui(Box::new(serde_json::from_value(value).unwrap()))
+    }
+
+    fn create_surface(id: &str, text: &str) -> UiEvent {
+        ui(serde_json::json!({"version": "1.0", "createSurface": {
+            "surfaceId": id,
+            "catalogId": crate::sdk::Catalog::basic().id(),
+            "components": [{"id": "root", "component": "Text", "text": text}]
+        }}))
+    }
+
+    #[test]
+    fn a_surface_is_drawn_above_the_input_box_at_every_display_level() {
+        let mut app = app();
+        app.set_tool_level(DisplayLevel::Hidden);
+        app.start_turn();
+        app.on_turn_event(create_surface("plan", "Pick a plan"));
+        let live = live_text(&mut app);
+        let top = live
+            .iter()
+            .position(|row| row.starts_with("┏━ agent86UI · "))
+            .expect("the surface's frame");
+        assert!(live[top + 1].contains("Pick a plan"), "{live:#?}");
+        let input = live.iter().position(|row| row.starts_with('╭')).unwrap();
+        assert!(top < input, "above the input box: {live:#?}");
+        assert!(
+            committed_text(&mut app).is_empty(),
+            "nothing reaches scrollback while it is live"
+        );
+    }
+
+    #[test]
+    fn a_surface_leaving_the_live_slot_is_copied_into_scrollback() {
+        let mut app = app();
+        app.on_turn_event(create_surface("one", "First"));
+        app.on_turn_event(create_surface("two", "Second"));
+        let committed = committed_text(&mut app);
+        assert!(
+            committed.iter().any(|row| row.contains("· one")),
+            "{committed:#?}"
+        );
+        assert!(committed.iter().any(|row| row.contains("First")));
+        let live = live_text(&mut app);
+        assert!(live.iter().any(|row| row.contains("Second")));
+        assert!(
+            live.iter().any(|row| row == "  1 more surface up"),
+            "{live:#?}"
+        );
+
+        app.on_turn_event(ui(serde_json::json!({"version": "1.0",
+            "deleteSurface": {"surfaceId": "two"}})));
+        assert!(committed_text(&mut app)
+            .iter()
+            .any(|row| row.contains("Second")));
+        let live = live_text(&mut app);
+        assert!(live.iter().any(|row| row.contains("First")), "{live:#?}");
+        assert!(!live.iter().any(|row| row.contains("more surface")));
+    }
+
+    #[test]
+    fn a_tall_surface_is_cut_to_fit() {
+        let mut app = app();
+        let components: Vec<Value> = std::iter::once(serde_json::json!({
+            "id": "root", "component": "Column",
+            "children": (0..40).map(|i| format!("t{i}")).collect::<Vec<_>>()
+        }))
+        .chain((0..40).map(|i| {
+            serde_json::json!({
+                "id": format!("t{i}"), "component": "Text", "text": format!("row {i}")
+            })
+        }))
+        .collect();
+        app.on_turn_event(ui(serde_json::json!({"version": "1.0", "createSurface": {
+            "surfaceId": "tall",
+            "catalogId": crate::sdk::Catalog::basic().id(),
+            "components": components
+        }})));
+        let live = live_text(&mut app);
+        let frame = live
+            .iter()
+            .skip_while(|row| !row.starts_with("┏━"))
+            .take_while(|row| !row.starts_with('╭'))
+            .count();
+        assert!(frame <= 30 * 2 / 5 + 1, "{live:#?}");
+        assert!(
+            live.iter().any(|row| row.contains("more rows")),
+            "{live:#?}"
+        );
+        assert!(live.iter().any(|row| row.starts_with("┗━")));
+    }
+
+    #[test]
+    fn an_approval_takes_the_surface_s_room() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(create_surface("plan", "Pick a plan"));
+        let (reply, _answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::Approval {
+            tool: "write_file".into(),
+            preview: ApprovalPreview {
+                summary: "write_file(a.txt)".into(),
+                detail: None,
+                lexer: None,
+                warning: None,
+                full: false,
+                agent: None,
+                change: None,
+                asker: None,
+            },
+            reply,
+        });
+        let live = live_text(&mut app);
+        assert!(
+            !live.iter().any(|row| row.contains("agent86UI")),
+            "{live:#?}"
+        );
+        assert!(live.iter().any(|row| row.contains("Approve tool")));
     }
 
     #[test]

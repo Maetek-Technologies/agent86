@@ -73,6 +73,10 @@ pub enum Style {
     DimYellow,
     Italic,
     BoldUnderline,
+    /// agent86UI's surfaces (beyond Python): their frame, never used for
+    /// agent86's own panels or approvals.
+    Magenta,
+    BoldMagenta,
     /// Bold in one of the 256 terminal colours (the interface's logo gradient).
     BoldColor(u8),
     /// A foreground colour over an optional background, both in the 256 terminal
@@ -108,6 +112,8 @@ impl Style {
             Self::DimYellow => "\x1b[2;33m",
             Self::Italic => "\x1b[3m",
             Self::BoldUnderline => "\x1b[1;4m",
+            Self::Magenta => "\x1b[35m",
+            Self::BoldMagenta => "\x1b[1;35m",
         })
     }
 }
