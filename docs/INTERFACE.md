@@ -114,6 +114,7 @@ Text from users, models, tools, MCP servers, and file names is never interpreted
 | Ctrl+O | Expand or collapse the last tool block in place | Open the transcript view (section 7). **Known difference** |
 | Ctrl+Shift+O | Expand or collapse all tool blocks | In the transcript view, toggle all blocks; it is not reported on every terminal, so `a` does the same there |
 | In panels | `y`/`n`/Escape on approval; arrow keys and Enter on pickers | Same keys, plus number keys for numbered choices |
+| In an agent86UI surface (beyond Python) | — | Tab and Shift+Tab, or Up and Down, move between inputs (Up and Down go through a choice's options first); Space toggles a check box or picks a choice; Left and Right move a slider; typing edits a text field; Enter presses a button (elsewhere it moves on); Escape dismisses a waiting surface; `openUrl` asks y/n |
 
 ## 6. Streaming and Markdown
 
@@ -172,6 +173,7 @@ Scrollback can't be edited, so the expanded tool blocks Python shows in place ar
 - **Approvals:** the gate's prompt closure, running on the worker, sends an `ApprovalRequest` with a one-shot reply channel and blocks on it. The UI opens the approval panel and answers. On shutdown, every pending request is answered with deny, as Python's `_shutdown_workers` does.
 - **Limit offers** (beyond Python) work like approvals: the harness's limit prompt sends a `UiEvent::Limit` with a reply channel and blocks; the panel answers with the new value or none, Ctrl+C stops it and cancels the turn, and a turn that ends drops an offer nobody answered.
 - **Secret entry** (beyond Python) works the same way: `request_secret`'s prompt sends a `UiEvent::Secret` with a reply channel and blocks; the panel is a `KeyEntry` (one dot per character, pastes go to it, never to the draft), Enter answers the value, Esc declines, Ctrl+C declines and cancels the turn, and a turn that ends drops it. `/secret NAME` opens the same entry as an ordinary panel, answered as `Request::Secret`.
+- **agent86UI waits** (beyond Python, ADR 0005) work the same way: a `render_ui` call with `wait` sends a `UiEvent::UiWait` with a reply channel and blocks; the surface takes the keys, a button's action answers, Escape answers nothing (the surface stays up), Ctrl+C does too and cancels the turn, and a turn that ends drops it.
 - **Cancellation:** cancellation uses the existing `CancelToken`. Escape and Ctrl+C call `cancel()` and write the `cancelling…` note, and the turn ends at its next safe point.
 - **MCP notes:** these arrive through `McpManager::add_note_listener` and are forwarded as `UiEvent`s, so they show up even while idle (Python's `on_mcp_note`).
 - **Slow work never blocks the UI thread.** That covers catalog fetches, connection tests, and MCP tests, which run on workers and report back with events (Python's `CatalogReady` and the test modals' workers).

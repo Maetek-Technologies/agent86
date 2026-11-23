@@ -309,7 +309,9 @@ exactly one of `createSurface`, `updateComponents`, `updateDataModel`, or \
 change it later with updateComponents (a component replaces the one with the same \
 id) and updateDataModel (`path` and `value`), and remove it with deleteSurface.
 - Components are a flat list linked by id, and exactly one has the id \"root\". \
-Every child id must be defined in the same call or an earlier one.
+Every child id must be defined in the same call or an earlier one. An id is an \
+identifier: letters, digits, and `_`, starting with a letter or `_` (`submit_label`, \
+never `submit-label`).
 - A value is a literal, a binding to the surface's data model (`{\"@path\": \
 \"/form/name\"}`), or a function call (`{\"@call\": \"formatString\", \"args\": \
 {...}}`). Input components write what the user enters back to the path they are \

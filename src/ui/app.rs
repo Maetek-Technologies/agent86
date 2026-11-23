@@ -23,7 +23,7 @@ use super::picker::{Picker, PickerKind, PickerOutcome};
 use super::screen::Caret;
 use super::server_form::{ServerDraft, ServerForm};
 use super::status::{fit_status_line, StatusState};
-use super::surface::Surfaces;
+use super::surface::{Pressed, Surfaces};
 use super::text::{ellipsize, sanitize, text_lines, wrap_words, Line};
 use crate::agent::{preview_arguments, summarize, TurnEvent};
 use crate::approval::{ApprovalPreview, APPROVAL_DETAIL_LINES};
@@ -137,6 +137,13 @@ pub enum UiEvent {
     /// One validated agent86UI message from `render_ui` (beyond Python; ADR
     /// 0005), for the interface's own renderer.
     Ui(Box<crate::sdk::AgentMessage>),
+    /// A `render_ui` call with `wait` asks for the user's first action on one
+    /// of these surfaces (beyond Python); the worker waits on `reply`, and a
+    /// dropped `reply` reads as a dismissal.
+    UiWait {
+        surface_ids: Vec<String>,
+        reply: mpsc::Sender<Option<crate::sdk::Action>>,
+    },
 }
 
 /// What a catalog was fetched for, as Python's `CatalogReady.purpose`.
@@ -256,6 +263,19 @@ struct Running {
     quit_after: bool,
 }
 
+/// Where the keys go inside a surface (beyond Python; ADR 0005).
+struct SurfaceFocus {
+    surface: String,
+    /// Which of the surface's focusable inputs, in reading order.
+    index: usize,
+    /// The option, in a ChoicePicker.
+    option: usize,
+    /// A waiting `render_ui` call's answer.
+    waiting: Option<mpsc::Sender<Option<crate::sdk::Action>>>,
+    /// `openUrl` asked to open this; y opens it, anything else does not.
+    confirm_url: Option<String>,
+}
+
 struct ApprovalPanel {
     tool: String,
     preview: ApprovalPreview,
@@ -319,6 +339,10 @@ pub struct App {
     /// agent86UI's surfaces (beyond Python): the newest one up is drawn above
     /// the input box, whatever the display levels, since it is a question.
     surfaces: Surfaces,
+    /// The surface the user is working in, when the keys go to it.
+    surface_focus: Option<SurfaceFocus>,
+    /// A URL the user agreed to open, for the driver (`take_open_url`).
+    open_url: Option<String>,
     /// The `/` or `@` completion menu under the input box.
     menu: Option<Menu>,
     /// The Ctrl+O transcript view, when open.
@@ -367,6 +391,8 @@ impl App {
             secret: None,
             panel: None,
             surfaces: Surfaces::new(),
+            surface_focus: None,
+            open_url: None,
             menu: None,
             view: None,
             workspace: None,
@@ -423,6 +449,12 @@ impl App {
         self.approval = None;
         self.limit = None;
         self.secret = None;
+        self.surface_focus = None;
+    }
+
+    /// A URL the user agreed to open from a surface, `http` or `https` only.
+    pub fn take_open_url(&mut self) -> Option<String> {
+        self.open_url.take()
     }
 
     /// Show a picker in place of the input box until it is answered or cancelled.
@@ -766,6 +798,12 @@ impl App {
                 self.approval = None;
                 self.limit = None;
                 self.secret = None;
+                // A surface nobody answered stays up; the waiting call is gone.
+                if let Some(focus) = &mut self.surface_focus {
+                    focus.waiting = None;
+                    focus.confirm_url = None;
+                }
+                self.surface_focus = None;
                 let quit = self
                     .running
                     .take()
@@ -792,6 +830,20 @@ impl App {
                 // The surface leaving the live slot keeps its last state in scrollback.
                 if let Some(copy) = self.surfaces.apply(&message, self.width) {
                     self.commit(std::iter::once(Line::default()).chain(copy.lines));
+                }
+            }
+            UiEvent::UiWait { surface_ids, reply } => {
+                // The first of the call's surfaces that is up takes the keys.
+                if let Some(id) = surface_ids.iter().find(|id| self.surfaces.has(id)) {
+                    self.surfaces.raise(id);
+                    self.menu = None;
+                    self.surface_focus = Some(SurfaceFocus {
+                        surface: id.clone(),
+                        index: 0,
+                        option: 0,
+                        waiting: Some(reply),
+                        confirm_url: None,
+                    });
                 }
             }
             UiEvent::Agent(text) => {
@@ -1125,6 +1177,10 @@ impl App {
             }
             return Effect::None;
         }
+        if self.surface_focus.is_some() {
+            self.surface_key(key);
+            return Effect::None;
+        }
         // In the MCP form, Shift+Tab moves between fields instead.
         if key.code == KeyCode::BackTab
             && !matches!(self.panel, Some(Panel::McpForm(_) | Panel::Server(_)))
@@ -1275,6 +1331,9 @@ impl App {
         if let Some((entry, _)) = &mut self.secret {
             entry.on_paste(text);
             self.dirty = true;
+        } else if self.surface_focus.is_some() && self.approval.is_none() {
+            self.surface_paste(text);
+            self.dirty = true;
         } else if let Some(Panel::Key(entry)) = &mut self.panel {
             entry.on_paste(text);
             self.dirty = true;
@@ -1340,6 +1399,11 @@ impl App {
         if let Some((_, reply)) = self.secret.take() {
             let _ = reply.send(None);
         }
+        if let Some(focus) = self.surface_focus.take() {
+            if let Some(reply) = focus.waiting {
+                let _ = reply.send(None);
+            }
+        }
         if let Some(running) = &mut self.running {
             if running.cancel_requested {
                 running.quit_after = true;
@@ -1359,6 +1423,120 @@ impl App {
             self.exit_armed = Some(Instant::now());
         }
         Effect::None
+    }
+
+    /// A key while a surface has the focus (ADR 0005's keys): Tab and Shift+Tab
+    /// or Up and Down move between inputs (Up and Down go through a choice's
+    /// options first), Space toggles or picks, Left and Right move a slider,
+    /// typing edits a text field, Enter presses a button (elsewhere it moves
+    /// on), and Escape dismisses.
+    fn surface_key(&mut self, key: KeyEvent) {
+        let Some(focus) = &mut self.surface_focus else {
+            return;
+        };
+        if let Some(url) = focus.confirm_url.take() {
+            if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                self.open_url = Some(url);
+            }
+            return;
+        }
+        let id = focus.surface.clone();
+        let inputs = self.surfaces.focusable(&id);
+        if key.code == KeyCode::Esc {
+            self.leave_surface(None);
+            return;
+        }
+        let Some(focus) = &mut self.surface_focus else {
+            return;
+        };
+        if inputs.is_empty() {
+            return;
+        }
+        focus.index = focus.index.min(inputs.len() - 1);
+        let mut at = inputs[focus.index].clone();
+        at.option = focus.option;
+        let options = self.surfaces.options(&id, &at);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let kind = self.surfaces.kind(&id, &at).unwrap_or_default();
+        let text_field = matches!(kind.as_str(), "TextField" | "DateTimeInput");
+        let step = |focus: &mut SurfaceFocus, forward: bool| {
+            focus.index = if forward {
+                (focus.index + 1) % inputs.len()
+            } else {
+                (focus.index + inputs.len() - 1) % inputs.len()
+            };
+            focus.option = 0;
+        };
+        match key.code {
+            KeyCode::Tab => step(focus, true),
+            KeyCode::BackTab => step(focus, false),
+            KeyCode::Down if options > 0 && focus.option + 1 < options => focus.option += 1,
+            KeyCode::Up if options > 0 && focus.option > 0 => focus.option -= 1,
+            KeyCode::Down => step(focus, true),
+            KeyCode::Up => {
+                step(focus, false);
+                // Coming back up into a choice lands on its last option.
+                let mut back = inputs[focus.index].clone();
+                back.option = 0;
+                focus.option = self.surfaces.options(&id, &back).saturating_sub(1);
+            }
+            KeyCode::Left | KeyCode::Right if kind == "Slider" => {
+                self.surfaces.adjust(&id, &at, key.code == KeyCode::Right);
+            }
+            KeyCode::Char(' ') if !text_field => self.surfaces.toggle(&id, &at),
+            KeyCode::Enter if kind == "Button" => match self.surfaces.press(&id, &at) {
+                Pressed::Nothing => {}
+                Pressed::Action(action) => self.leave_surface(Some(*action)),
+                Pressed::OpenUrl(url) => focus.confirm_url = Some(url),
+                Pressed::Failed(why) => self.note(Style::DimRed, &format!("agent86UI: {why}")),
+            },
+            KeyCode::Enter => step(focus, true),
+            KeyCode::Backspace if text_field => {
+                self.surfaces.edit_text(&id, &at, |text| {
+                    text.pop();
+                });
+            }
+            KeyCode::Char('u') if ctrl && text_field => {
+                self.surfaces.edit_text(&id, &at, String::clear);
+            }
+            KeyCode::Char(ch) if !ctrl && text_field => {
+                self.surfaces.edit_text(&id, &at, |text| text.push(ch));
+            }
+            _ => {}
+        }
+    }
+
+    /// A paste into the focused text field, on one line.
+    fn surface_paste(&mut self, text: &str) {
+        let Some(focus) = &self.surface_focus else {
+            return;
+        };
+        let id = focus.surface.clone();
+        let Some(mut at) = self.surfaces.focusable(&id).get(focus.index).cloned() else {
+            return;
+        };
+        at.option = focus.option;
+        let clean = sanitize(text).replace('\n', " ");
+        self.surfaces
+            .edit_text(&id, &at, |field| field.push_str(&clean));
+    }
+
+    /// Give the keys back to the input box. With an action, the waiting call
+    /// gets it and the surface, answered, leaves the live slot for a copy in
+    /// scrollback; without one, a waiting call is dismissed.
+    fn leave_surface(&mut self, action: Option<crate::sdk::Action>) {
+        let Some(focus) = self.surface_focus.take() else {
+            return;
+        };
+        let answered = action.is_some();
+        if let Some(reply) = focus.waiting {
+            let _ = reply.send(action);
+        }
+        if answered {
+            let copy = self.surfaces.draw(&focus.surface, self.width, None);
+            self.commit(std::iter::once(Line::default()).chain(copy.lines));
+            self.surfaces.settle(&focus.surface);
+        }
     }
 
     fn request_cancel(&mut self) -> Effect {
@@ -1545,10 +1723,19 @@ impl App {
     /// The live surface, cut to about 40% of the screen around its focus, then a
     /// line for the others up; nothing when no surface is up.
     fn surface_rows(&self) -> Vec<Line> {
-        let Some(id) = self.surfaces.current() else {
+        let focused = self.surface_focus.as_ref();
+        let Some(id) = focused
+            .map(|focus| focus.surface.as_str())
+            .or_else(|| self.surfaces.current())
+        else {
             return Vec::new();
         };
-        let drawn = self.surfaces.draw(id, self.width, None);
+        let at = focused.and_then(|focus| {
+            let mut at = self.surfaces.focusable(id).get(focus.index).cloned()?;
+            at.option = focus.option;
+            Some(at)
+        });
+        let drawn = self.surfaces.draw(id, self.width, at.as_ref());
         let cap = (self.height * 2 / 5).max(5);
         let mut rows = drawn.lines;
         if rows.len() > cap {
@@ -1571,7 +1758,22 @@ impl App {
             cut.push(rows[rows.len() - 1].clone());
             rows = cut;
         }
-        let others = self.surfaces.ids().len() - 1;
+        if let Some(focus) = focused {
+            let hint = match &focus.confirm_url {
+                Some(url) => format!("  Open {}? y/n", sanitize(url)),
+                None if focus.waiting.is_some() => {
+                    "  tab next · space toggle · ←→ slider · enter press · esc dismiss".to_owned()
+                }
+                None => "  tab next · space toggle · ←→ slider · enter press · esc back".to_owned(),
+            };
+            let style = if focus.confirm_url.is_some() {
+                Style::Bold
+            } else {
+                Style::Dim
+            };
+            rows.extend(Line::styled(style, hint).hard_wrap(self.width));
+        }
+        let others = self.surfaces.ids().len().saturating_sub(1);
         if others > 0 {
             let s = if others == 1 { "" } else { "s" };
             rows.push(
@@ -1735,6 +1937,140 @@ mod tests {
             "catalogId": crate::sdk::Catalog::basic().id(),
             "components": [{"id": "root", "component": "Text", "text": text}]
         }}))
+    }
+
+    fn form_surface() -> UiEvent {
+        ui(serde_json::json!({"version": "1.0", "createSurface": {
+            "surfaceId": "meet",
+            "catalogId": crate::sdk::Catalog::basic().id(),
+            "components": [
+                {"id": "root", "component": "Column",
+                 "children": ["title", "weekly", "ok", "site"]},
+                {"id": "title", "component": "TextField", "label": "Title",
+                 "value": {"@path": "/title"}},
+                {"id": "weekly", "component": "CheckBox", "label": "Weekly",
+                 "value": {"@path": "/weekly"}},
+                {"id": "ok", "component": "Button", "child": "ok_text",
+                 "action": {"event": {"name": "book", "context": {
+                     "title": {"@path": "/title"}, "weekly": {"@path": "/weekly"}}}}},
+                {"id": "ok_text", "component": "Text", "text": "Book"},
+                {"id": "site", "component": "Button", "child": "site_text",
+                 "action": {"functionCall": {"@call": "openUrl",
+                                             "args": {"url": "https://example.com/a"}}}},
+                {"id": "site_text", "component": "Text", "text": "Site"}
+            ],
+            "dataModel": {"title": "", "weekly": false}
+        }}))
+    }
+
+    fn waiting(app: &mut App) -> mpsc::Receiver<Option<crate::sdk::Action>> {
+        let (reply, answer) = mpsc::channel();
+        app.on_turn_event(UiEvent::UiWait {
+            surface_ids: vec!["meet".into()],
+            reply,
+        });
+        answer
+    }
+
+    #[test]
+    fn a_waiting_surface_takes_the_keys_and_answers_with_its_action() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(form_surface());
+        let answer = waiting(&mut app);
+        for ch in "Sync".chars() {
+            app.on_key(key(KeyCode::Char(ch)), &[]);
+        }
+        assert!(app.editor.is_empty(), "the keys went to the surface");
+        let live = live_text(&mut app);
+        assert!(
+            live.iter().any(|row| row.contains("› [ Sync▏")),
+            "{live:#?}"
+        );
+        assert!(live.iter().any(|row| row.contains("esc dismiss")));
+
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Char(' ')), &[]);
+        assert!(live_text(&mut app)
+            .iter()
+            .any(|row| row.contains("› [x] Weekly")));
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Enter), &[]);
+
+        let action = answer.try_recv().unwrap().expect("the action");
+        assert_eq!(action.name, "book");
+        assert_eq!(action.surface_id, "meet");
+        assert_eq!(action.source_component_id, "ok");
+        assert_eq!(
+            Value::Object(action.context),
+            serde_json::json!({"title": "Sync", "weekly": true})
+        );
+        // Answered: a copy in scrollback, and the live slot is free.
+        assert!(committed_text(&mut app)
+            .iter()
+            .any(|row| row.contains("[x] Weekly")));
+        let live = live_text(&mut app);
+        assert!(
+            !live.iter().any(|row| row.contains("agent86UI")),
+            "{live:#?}"
+        );
+        app.on_turn_event(UiEvent::Finished(None));
+        app.on_key(key(KeyCode::Char('z')), &[]);
+        assert!(
+            !app.editor.is_empty(),
+            "the keys are back with the input box"
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_a_waiting_surface_and_ctrl_c_also_cancels() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(form_surface());
+        let answer = waiting(&mut app);
+        assert_eq!(app.on_key(key(KeyCode::Esc), &[]), Effect::None);
+        assert_eq!(answer.try_recv().unwrap(), None);
+        assert!(
+            live_text(&mut app)
+                .iter()
+                .any(|row| row.contains("agent86UI")),
+            "a dismissed surface stays up"
+        );
+
+        let answer = waiting(&mut app);
+        assert_eq!(app.on_key(ctrl('c'), &[]), Effect::Cancel);
+        assert_eq!(answer.try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn a_turn_that_ends_drops_the_wait() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(form_surface());
+        let answer = waiting(&mut app);
+        app.on_turn_event(UiEvent::Finished(None));
+        assert!(answer.try_recv().is_err(), "the sender is gone");
+        app.on_key(key(KeyCode::Char('z')), &[]);
+        assert!(!app.editor.is_empty());
+    }
+
+    #[test]
+    fn open_url_asks_first() {
+        let mut app = app();
+        app.start_turn();
+        app.on_turn_event(form_surface());
+        let _answer = waiting(&mut app);
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Tab), &[]);
+        }
+        app.on_key(key(KeyCode::Enter), &[]);
+        let live = live_text(&mut app).join("\n");
+        assert!(live.contains("Open https://example.com/a? y/n"), "{live}");
+        app.on_key(key(KeyCode::Char('n')), &[]);
+        assert_eq!(app.take_open_url(), None);
+        app.on_key(key(KeyCode::Enter), &[]);
+        app.on_key(key(KeyCode::Char('y')), &[]);
+        assert_eq!(app.take_open_url(), Some("https://example.com/a".into()));
     }
 
     #[test]
