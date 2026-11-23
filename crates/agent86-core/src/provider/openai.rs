@@ -439,8 +439,9 @@ fn to_messages(messages: &[Message]) -> Value {
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        // json.dumps(arguments), as Python sends them back.
-                        "arguments": python_json_dumps(&Value::Object(call.arguments.clone()), true),
+                        // json.dumps(arguments), as Python sends them back
+                        // (`{}` for arguments that did not parse, beyond Python).
+                        "arguments": python_json_dumps(&Value::Object(call.replay_arguments().into_owned()), true),
                     },
                 })).collect::<Vec<_>>(),
             }),

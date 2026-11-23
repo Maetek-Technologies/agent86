@@ -271,7 +271,8 @@ fn to_messages(messages: &[Message]) -> Value {
                 "role": "assistant",
                 "content": message.content,
                 "tool_calls": message.tool_calls.iter().map(|call| json!({
-                    "function": {"name": call.name, "arguments": call.arguments},
+                    // `{}` for arguments that did not parse (beyond Python).
+                    "function": {"name": call.name, "arguments": call.replay_arguments()},
                 })).collect::<Vec<_>>(),
             }),
             role => json!({"role": role, "content": message.content}),
@@ -589,6 +590,30 @@ mod tests {
         );
         assert_eq!(normalize_stop_reason(None, true), Some(StopReason::ToolUse));
         assert_eq!(normalize_stop_reason(None, false), None);
+    }
+
+    #[test]
+    fn a_call_whose_json_broke_is_replayed_with_empty_arguments() {
+        let broken = ToolCall {
+            id: "c1".to_owned(),
+            name: "render_ui".to_owned(),
+            arguments: Map::from_iter([(
+                crate::types::INVALID_TOOL_ARGS_KEY.to_owned(),
+                json!("{oops"),
+            )]),
+        };
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![broken],
+            tool_call_id: None,
+            name: None,
+        }];
+        let messages = to_messages(&history);
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            json!({})
+        );
     }
 
     #[test]

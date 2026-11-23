@@ -430,11 +430,7 @@ fn to_contents_with(
                 });
                 for (index, call) in message.tool_calls.iter().enumerate() {
                     names.insert(call.id.as_str(), call.name.as_str());
-                    let args = if call.invalid_arguments().is_some() {
-                        Map::new()
-                    } else {
-                        call.arguments.clone()
-                    };
+                    let args = call.replay_arguments().into_owned();
                     let meta = calls.get(&call.id);
                     let mut function = json!({"name": rename(&call.name), "args": args});
                     if meta.is_some_and(|meta| meta.google_id) {

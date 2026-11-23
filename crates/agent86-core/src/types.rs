@@ -195,6 +195,21 @@ impl ToolCall {
     pub fn invalid_arguments(&self) -> Option<&str> {
         self.arguments.get(INVALID_TOOL_ARGS_KEY)?.as_str()
     }
+
+    /// The arguments to send back to a provider in the history: these, or an
+    /// empty object for a call whose arguments did not parse.
+    ///
+    /// Beyond Python, which sends `{"__invalid_json__": "<raw>"}`: a model shown
+    /// a key it never wrote concludes it used the wrong parameter name (ADR
+    /// 0006), while the call's observation already says what broke. The session
+    /// keeps the raw text either way; only the request changes.
+    pub fn replay_arguments(&self) -> std::borrow::Cow<'_, Map<String, Value>> {
+        if self.invalid_arguments().is_some() {
+            std::borrow::Cow::Owned(Map::new())
+        } else {
+            std::borrow::Cow::Borrowed(&self.arguments)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

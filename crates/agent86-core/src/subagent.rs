@@ -1594,31 +1594,34 @@ impl Harness {
         depth: u32,
         run: u64,
     ) -> (ToolResult, Usage) {
-        if let Some(raw) = call.invalid_arguments() {
-            return (invalid_arguments_result(call, raw), Usage::default());
-        }
-        let Some(tool) = self.registry.get(&call.name) else {
-            return (self.registry.dispatch(call, ctx), Usage::default());
-        };
-        // A call outside the specialty's tools gets the registry's refusal, which
-        // names the sub-agent, rather than the gate's bare "not executed".
-        let (result, usage) = if !ctx.scope_allows(&call.name) {
-            (self.registry.dispatch(call, ctx), Usage::default())
+        // Every call is recorded, including those answered before dispatch
+        // (beyond Python, as in the main loop's `resolve_call`).
+        let (result, usage) = if let Some(raw) = call.invalid_arguments() {
+            (invalid_arguments_result(call, raw), Usage::default())
+        } else if let Some(tool) = self.registry.get(&call.name) {
+            // A call outside the specialty's tools gets the registry's refusal, which
+            // names the sub-agent, rather than the gate's bare "not executed".
+            if !ctx.scope_allows(&call.name) {
+                (self.registry.dispatch(call, ctx), Usage::default())
+            } else {
+                let decision = self.gate.decide(tool.as_ref(), call, ctx);
+                if !decision.approved {
+                    let mut result = crate::tools::failure(
+                        &call.name,
+                        format!("Not executed: {}.", decision.reason),
+                    );
+                    result.call_id = call.id.clone();
+                    (result, Usage::default())
+                } else {
+                    match self.delegation(call, ctx) {
+                        Some(Ok(request)) => self.delegate(call, request, depth + 1, ctx).await,
+                        Some(Err(invalid)) => (invalid, Usage::default()),
+                        None => (self.registry.dispatch(call, ctx), Usage::default()),
+                    }
+                }
+            }
         } else {
-            let decision = self.gate.decide(tool.as_ref(), call, ctx);
-            if !decision.approved {
-                let mut result = crate::tools::failure(
-                    &call.name,
-                    format!("Not executed: {}.", decision.reason),
-                );
-                result.call_id = call.id.clone();
-                return (result, Usage::default());
-            }
-            match self.delegation(call, ctx) {
-                Some(Ok(request)) => self.delegate(call, request, depth + 1, ctx).await,
-                Some(Err(invalid)) => (invalid, Usage::default()),
-                None => (self.registry.dispatch(call, ctx), Usage::default()),
-            }
+            (self.registry.dispatch(call, ctx), Usage::default())
         };
         self.recorder.event(
             sid,

@@ -408,11 +408,27 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
         "{}",
         observed[0]
     );
+    // Python's line, then where the JSON broke (beyond Python).
     assert_eq!(
-        observed[1],
-        "invalid JSON in tool arguments: '{\"path\": ' could not be parsed. \
-         Call the tool again with its arguments as a single valid JSON object."
+        observed[1].lines().next(),
+        Some(
+            "invalid JSON in tool arguments: '{\"path\": ' could not be parsed. \
+             Call the tool again with its arguments as a single valid JSON object."
+        )
     );
+    assert!(
+        observed[1].contains("The JSON ends at character 9 inside the top-level object"),
+        "{}",
+        observed[1]
+    );
+    // The call whose JSON broke goes back to the model as `{}`, never as the
+    // `__invalid_json__` key it did not write (beyond Python).
+    let replayed = &messages[2]["tool_calls"];
+    assert_eq!(
+        replayed[0]["function"]["arguments"],
+        r#"{"path": "../escape.txt"}"#
+    );
+    assert_eq!(replayed[1]["function"]["arguments"], "{}");
     assert_eq!(
         observed[2],
         "Unknown tool 'delegate'. Available: edit_file, list_dir, python_exec, read_file, run_command, web_fetch, write_file."
@@ -421,6 +437,55 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
         .output
         .contains("[tool] delegate -> error: Unknown tool 'delegate'."));
     assert!(output.output.ends_with("I could not do that."));
+}
+
+#[tokio::test]
+async fn calls_answered_before_dispatch_are_traced() {
+    // Beyond Python, which records only the calls it dispatches: a call whose
+    // JSON broke, one to an unknown tool, and one the gate refused each leave a
+    // `tool_call` event saying why.
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[
+            ("a", "read_file", r#"{"path": "#),
+            ("b", "no_such_tool", r#"{}"#),
+            ("c", "write_file", r#"{"path": "a.txt", "content": "A"}"#),
+        ]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("settled-traced");
+
+    let events = recorded_turn(
+        &server,
+        &workspace,
+        "try",
+        ApprovalGate::new(ApprovalMode::Deny, None),
+    )
+    .await;
+
+    let calls: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_call")
+        .collect();
+    assert_eq!(calls.len(), 3, "{events:?}");
+    assert_eq!(calls[0]["tool"], "read_file");
+    assert_eq!(calls[0]["ok"], false);
+    assert!(calls[0]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("invalid JSON in tool arguments"));
+    assert_eq!(calls[1]["tool"], "no_such_tool");
+    assert!(calls[1]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Unknown tool 'no_such_tool'."));
+    assert_eq!(calls[2]["tool"], "write_file");
+    assert_eq!(calls[2]["arguments"]["path"], "a.txt");
+    assert!(calls[2]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Not executed:"));
+    assert!(!workspace.root.join("a.txt").exists());
 }
 
 #[tokio::test]
@@ -1412,7 +1477,8 @@ async fn failed_turns_are_recorded_with_pythons_reason() {
         last["reason"],
         "circuit tripped: aborted after 4 consecutive tool errors"
     );
-    // Calls the gate declined are never dispatched, so they are not tool_call events.
+    // A call the gate declined is never dispatched, yet beyond Python it is a
+    // tool_call event too, so the trace says why it never ran (ADR 0006).
     let server = MockServer::start(vec![
         sse_tool_calls(&[("w", "write_file", r#"{"path": "x.txt", "content": "hi"}"#)]),
         sse_text("ok", "stop"),
@@ -1420,11 +1486,16 @@ async fn failed_turns_are_recorded_with_pythons_reason() {
     .await;
     let workspace = Workspace::new("recorded-declined");
     let events = recorded_turn(&server, &workspace, "write", ask_gate()).await;
-    assert!(
-        !kinds(&events).contains(&"tool_call"),
-        "{:?}",
-        kinds(&events)
-    );
+    let declined: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_call")
+        .collect();
+    assert_eq!(declined.len(), 1, "{:?}", kinds(&events));
+    assert_eq!(declined[0]["ok"], false);
+    assert!(declined[0]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Not executed:"));
 }
 
 /// A harness on `server` whose turns can be cancelled with `cancel`.

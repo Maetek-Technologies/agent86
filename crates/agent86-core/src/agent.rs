@@ -1359,7 +1359,7 @@ impl Harness {
         let mut settled: Vec<Option<(ToolResult, Usage)>> = Vec::with_capacity(calls.len());
         let mut may_parallel = Vec::with_capacity(calls.len());
         for call in calls {
-            let (result, parallel) = self.resolve_call(call);
+            let (result, parallel) = self.resolve_call(call, sid);
             settled.push(result.map(|result| (result, Usage::default())));
             may_parallel.push(parallel);
         }
@@ -1451,22 +1451,30 @@ impl Harness {
     ///
     /// Arguments the provider could not parse are answered here, before the
     /// registry, the approval gate, or any tool sees them.
-    fn resolve_call(&self, call: &ToolCall) -> (Option<ToolResult>, bool) {
+    ///
+    /// Beyond Python, a call answered here is recorded as a `tool_call` event
+    /// too, with Python's fields, so the trace says why a step's calls never ran
+    /// (Python records only the calls it dispatches).
+    fn resolve_call(&self, call: &ToolCall, sid: &str) -> (Option<ToolResult>, bool) {
+        let settled = |result: ToolResult| {
+            self.record_tool_call(call, &result, sid);
+            (Some(result), false)
+        };
         if let Some(raw) = call.invalid_arguments() {
-            return (Some(invalid_arguments_result(call, raw)), false);
+            return settled(invalid_arguments_result(call, raw));
         }
         let Some(tool) = self.registry.get(&call.name) else {
             // The registry's own "Unknown tool" answer.
-            return (Some(self.registry.dispatch(call, &self.context)), false);
+            return settled(self.registry.dispatch(call, &self.context));
         };
         // Under `run --agent`, a call outside the specialty's tools gets the
         // registry's refusal, which says so, before the gate is consulted.
         if !self.context.scope_allows(&call.name) {
-            return (Some(self.registry.dispatch(call, &self.context)), false);
+            return settled(self.registry.dispatch(call, &self.context));
         }
         let decision = self.gate.decide(tool.as_ref(), call, &self.context);
         if !decision.approved {
-            return (Some(not_executed(call, decision.reason)), false);
+            return settled(not_executed(call, decision.reason));
         }
         (None, !tool.side_effecting() && tool.parallel_safe())
     }
@@ -1569,7 +1577,7 @@ impl Harness {
 
     /// Resolve and run one call.
     async fn execute_tool(&self, call: &ToolCall, sid: &str) -> (ToolResult, Usage) {
-        match self.resolve_call(call) {
+        match self.resolve_call(call, sid) {
             (Some(result), _) => (result, Usage::default()),
             (None, _) => self.dispatch_call(call, sid).await,
         }
@@ -1654,18 +1662,27 @@ fn message(role: Role, content: &str) -> Message {
 }
 
 /// The observation for a tool call whose arguments were not valid JSON.
+///
+/// Its first line is Python's. Beyond Python, the lines after it say where the
+/// JSON broke (`broken_json::describe`): the first 200 characters Python quotes
+/// are usually fine, and a model shown only them guesses at what to fix.
 pub fn invalid_arguments_result(call: &ToolCall, raw: &str) -> ToolResult {
     let preview = truncate_chars(raw, 200);
+    let mut error = format!(
+        "invalid JSON in tool arguments: {} could not be parsed. \
+         Call the tool again with its arguments as a single valid JSON object.",
+        python_repr(&preview)
+    );
+    if let Some(location) = crate::broken_json::describe(raw) {
+        error.push('\n');
+        error.push_str(&location);
+    }
     ToolResult {
         call_id: call.id.clone(),
         name: call.name.clone(),
         ok: false,
         content: String::new(),
-        error: Some(format!(
-            "invalid JSON in tool arguments: {} could not be parsed. \
-             Call the tool again with its arguments as a single valid JSON object.",
-            python_repr(&preview)
-        )),
+        error: Some(error),
         metadata: serde_json::Map::new(),
     }
 }
@@ -1852,11 +1869,20 @@ mod tests {
             arguments: serde_json::Map::new(),
         };
         let result = invalid_arguments_result(&call, "{\"path\": ");
+        let error = result.error.as_deref().unwrap();
+        // Python's line first, then where it broke (beyond Python).
         assert_eq!(
-            result.error.as_deref(),
+            error.lines().next(),
             Some(
                 "invalid JSON in tool arguments: '{\"path\": ' could not be parsed. \
                  Call the tool again with its arguments as a single valid JSON object."
+            )
+        );
+        assert_eq!(
+            error.lines().nth(1),
+            Some(
+                "The JSON ends at character 9 inside the top-level object, before it is \
+                 complete: EOF while parsing a value."
             )
         );
         assert!(!result.ok);
