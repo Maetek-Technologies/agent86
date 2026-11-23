@@ -1215,6 +1215,7 @@ impl Harness {
         let mut limits = self.limits.clone();
         limits.max_steps = max_steps;
         let mut breaker = CircuitBreaker::new(&limits);
+        let mut broken_streak = crate::agent::BrokenStreak::default();
         let mut cap_raised: Option<u32> = None;
         let output_cap = |raised: Option<u32>| {
             raised.unwrap_or_else(|| {
@@ -1341,6 +1342,9 @@ impl Harness {
                     ("tool_calls", json!(names)),
                 ],
             );
+            let mut completion = completion;
+            // Before anything keeps or sees the calls, as in the main loop.
+            let repairs = self.repair_broken_calls(&mut completion.tool_calls, &sid);
             let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
             let has_text = !completion.text.trim().is_empty();
             // Beyond Python: a cap reached before any text may be raised and the
@@ -1460,6 +1464,7 @@ impl Harness {
                     ));
                 }
                 let (result, usage) = self.run_subagent_tool(&ctx, call, &sid, depth, run).await;
+                let result = self.annotate_broken_json(call, result, &repairs, &mut broken_streak);
                 delegated = delegated + usage;
                 progress.record(breaker.steps(), spent.cost_usd + delegated.cost_usd);
                 let (content, findings) = self.guardrails.observe(observation(&result));

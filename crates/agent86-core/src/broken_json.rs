@@ -81,10 +81,10 @@ pub fn describe(raw: &str) -> Option<String> {
 }
 
 /// `raw` with every closer that matches nothing dropped, when that and only
-/// that makes it a JSON object: the object and the (1-based) character
-/// positions dropped. `None` when `raw` already parses, when nothing would be
-/// dropped, or when the result still does not parse as an object.
-pub fn drop_unmatched_closers(raw: &str) -> Option<(Map<String, Value>, Vec<usize>)> {
+/// that makes it a JSON object: the object and each closer dropped, with its
+/// (1-based) character position. `None` when `raw` already parses, when nothing
+/// would be dropped, or when the result still does not parse as an object.
+pub fn drop_unmatched_closers(raw: &str) -> Option<(Map<String, Value>, Vec<(usize, char)>)> {
     if serde_json::from_str::<Value>(raw).is_ok() {
         return None;
     }
@@ -104,7 +104,7 @@ pub fn drop_unmatched_closers(raw: &str) -> Option<(Map<String, Value>, Vec<usiz
                 if stack.last().is_some_and(|open| open.closer() == ch) {
                     stack.pop();
                 } else {
-                    dropped.push(position + 1);
+                    dropped.push((position + 1, ch));
                     continue;
                 }
             }
@@ -378,7 +378,7 @@ mod tests {
     fn the_repair_drops_only_the_closer_that_matches_nothing() {
         let raw = r#"{"messages": [{"createSurface": {"components": [{"id": "a", "action": {"event": {"name": "go"}}}}], "dataModel": {}}}]}"#;
         let (arguments, dropped) = drop_unmatched_closers(raw).unwrap();
-        assert_eq!(dropped, vec![raw.find("}}}}]").unwrap() + 3 + 1]);
+        assert_eq!(dropped, vec![(raw.find("}}}}]").unwrap() + 3 + 1, '}')]);
         assert_eq!(
             Value::Object(arguments),
             json!({"messages": [{"createSurface": {
@@ -393,7 +393,7 @@ mod tests {
         let raw = r#"{"text": "a } and a ] and a \" quote"}}"#;
         let (arguments, dropped) = drop_unmatched_closers(raw).unwrap();
         assert_eq!(arguments["text"], json!("a } and a ] and a \" quote"));
-        assert_eq!(dropped, vec![raw.chars().count()]);
+        assert_eq!(dropped, vec![(raw.chars().count(), '}')]);
         let text = describe(raw).unwrap();
         assert!(
             text.contains("That `}` closes nothing: every container was already closed."),

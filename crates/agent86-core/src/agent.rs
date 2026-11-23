@@ -47,6 +47,7 @@ use crate::types::{
 use crate::vault::StreamRedactor;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -777,6 +778,7 @@ impl Harness {
         let mut limits = self.limits.clone();
         limits.max_steps = self.max_steps();
         let mut breaker = CircuitBreaker::new(&limits);
+        let mut broken_streak = BrokenStreak::default();
         // Where the first partial answer went, and the pieces collected so far.
         let mut continuation_start: Option<usize> = None;
         let mut continuation_parts: Vec<String> = Vec::new();
@@ -1074,7 +1076,9 @@ impl Harness {
                     egress.summary()
                 )));
             }
-            let tool_calls = completion.tool_calls;
+            let mut tool_calls = completion.tool_calls;
+            // Before anything keeps or sees the calls, so all see the repair.
+            let repairs = self.repair_broken_calls(&mut tool_calls, &sid);
             self.scan_tool_arguments(&tool_calls, &sid);
             let cut_off = completion.stop_reason.as_deref() == Some("max_tokens");
             // Beyond Python: a reply that reached the cap before writing anything (a
@@ -1239,6 +1243,7 @@ impl Harness {
                         None => result,
                     }
                 };
+                let result = self.annotate_broken_json(call, result, &repairs, &mut broken_streak);
                 // What a sub-agent spent is what this turn spent: in the summary, the
                 // step, and the cost cap, but not as one of this turn's steps.
                 summary.add_usage(&delegated);
@@ -1552,6 +1557,80 @@ impl Harness {
         }
     }
 
+    /// Beyond Python (ADR 0006): repair each call whose arguments did not parse
+    /// but do once every closer that matches nothing is dropped
+    /// (`broken_json::drop_unmatched_closers`). Unlike the JSON-string repair, the
+    /// repaired arguments replace the raw text on the call itself, since that text
+    /// is no call at all: the history, the approval gate, the tool, and replay on
+    /// resume then all see the same call. A `tool_args_repaired` event records
+    /// what was dropped. Returns the note each repaired call's result gets, by id.
+    pub(crate) fn repair_broken_calls(
+        &self,
+        calls: &mut [ToolCall],
+        sid: &str,
+    ) -> HashMap<String, String> {
+        let mut notes = HashMap::new();
+        for call in calls.iter_mut() {
+            let Some(raw) = call.invalid_arguments() else {
+                continue;
+            };
+            let Some((arguments, dropped)) = crate::broken_json::drop_unmatched_closers(raw) else {
+                continue;
+            };
+            self.recorder.event(
+                sid,
+                "tool_args_repaired",
+                vec![
+                    ("tool", json!(call.name)),
+                    (
+                        "dropped",
+                        json!(dropped
+                            .iter()
+                            .map(|(at, closer)| json!({"at": at, "char": closer.to_string()}))
+                            .collect::<Vec<_>>()),
+                    ),
+                ],
+            );
+            notes.insert(call.id.clone(), repair_note(&dropped));
+            call.arguments = arguments;
+        }
+        notes
+    }
+
+    /// `result` with what the model should know about its call's JSON: the
+    /// repair's note, for a call [`Harness::repair_broken_calls`] repaired, and,
+    /// once a tool's arguments have failed to parse twice in a row, advice on
+    /// sending less (beyond Python; ADR 0006).
+    pub(crate) fn annotate_broken_json(
+        &self,
+        call: &ToolCall,
+        result: ToolResult,
+        repairs: &HashMap<String, String>,
+        streak: &mut BrokenStreak,
+    ) -> ToolResult {
+        let mut result = result;
+        if let Some(note) = repairs.get(&call.id) {
+            append_note(&mut result, note);
+        }
+        if let Some(count) = streak.observe(call) {
+            let mut advice = format!(
+                "{count} calls in a row to {} have sent arguments that do not parse. Long, \
+                 deeply nested arguments break most often: send less in each call.",
+                call.name
+            );
+            if let Some(hint) = self
+                .registry
+                .get(&call.name)
+                .and_then(|tool| tool.retry_hint().map(str::to_owned))
+            {
+                advice.push(' ');
+                advice.push_str(&hint);
+            }
+            append_note(&mut result, &advice);
+        }
+        result
+    }
+
     /// Egress-scan tool-call arguments, the other way a secret leaves the harness.
     /// Findings are recorded, not acted on; the approval gate stops side effects.
     fn scan_tool_arguments(&self, calls: &[ToolCall], sid: &str) {
@@ -1582,6 +1661,59 @@ impl Harness {
             (None, _) => self.dispatch_call(call, sid).await,
         }
     }
+}
+
+/// How many calls in a row to each tool have sent arguments that did not parse,
+/// in one loop's turn (beyond Python; ADR 0006).
+#[derive(Debug, Default)]
+pub(crate) struct BrokenStreak(HashMap<String, u32>);
+
+impl BrokenStreak {
+    /// Count `call`: the streak when its arguments did not parse and it is at
+    /// least the second such call to its tool in a row, else `None`. A call
+    /// that parsed (or was repaired) ends its tool's streak.
+    fn observe(&mut self, call: &ToolCall) -> Option<u32> {
+        let count = self.0.entry(call.name.clone()).or_default();
+        if call.invalid_arguments().is_none() {
+            *count = 0;
+            return None;
+        }
+        *count += 1;
+        (*count >= 2).then_some(*count)
+    }
+}
+
+/// What the model is told about a call whose broken arguments were repaired.
+fn repair_note(dropped: &[(usize, char)]) -> String {
+    let closers: Vec<String> = dropped
+        .iter()
+        .map(|(at, closer)| format!("`{closer}` at character {at}"))
+        .collect();
+    let noun = if dropped.len() == 1 {
+        "closer"
+    } else {
+        "closers"
+    };
+    format!(
+        "Note: these arguments were not valid JSON. agent86 dropped the unmatched {noun} {}, \
+         which matched nothing, and ran the call with the rest. Check next time that every \
+         bracket closes in order.",
+        closers.join(", ")
+    )
+}
+
+/// Add `note` to what the model reads of `result`: after its output when the
+/// call worked, after its error when it failed.
+fn append_note(result: &mut ToolResult, note: &str) {
+    let text = if result.ok {
+        &mut result.content
+    } else {
+        result.error.get_or_insert_with(String::new)
+    };
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(note);
 }
 
 /// The observation for a call that was not run.

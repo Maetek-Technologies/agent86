@@ -440,6 +440,72 @@ async fn tool_failures_and_bad_json_are_observed_not_fatal() {
 }
 
 #[tokio::test]
+async fn a_closer_that_matches_nothing_is_dropped_and_the_call_runs() {
+    // Beyond Python (ADR 0006): one `}` too many is the commonest way a model's
+    // deep JSON breaks, and it has only one reading.
+    let broken = r#"{"path": "notes.txt"}}"#;
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("a", "read_file", broken)]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("closer-repair");
+
+    let events = recorded_turn(&server, &workspace, "read", ask_gate()).await;
+
+    let messages = server.requests()[1].body["messages"].clone();
+    // The call kept and replayed is the repaired one.
+    assert_eq!(
+        messages[2]["tool_calls"][0]["function"]["arguments"],
+        r#"{"path": "notes.txt"}"#
+    );
+    let observed = messages[3]["content"].as_str().unwrap();
+    assert!(observed.starts_with("remember the milk"), "{observed}");
+    assert!(
+        observed.ends_with(
+            "Note: these arguments were not valid JSON. agent86 dropped the unmatched closer \
+             `}` at character 22, which matched nothing, and ran the call with the rest. \
+             Check next time that every bracket closes in order."
+        ),
+        "{observed}"
+    );
+    let repaired: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_args_repaired")
+        .collect();
+    assert_eq!(repaired.len(), 1, "{events:?}");
+    assert_eq!(repaired[0]["tool"], "read_file");
+    assert_eq!(repaired[0]["dropped"], json!([{"at": 22, "char": "}"}]));
+    let call = events
+        .iter()
+        .find(|event| event["kind"] == "tool_call")
+        .unwrap();
+    assert_eq!(call["ok"], true);
+    assert_eq!(call["arguments"], json!({"path": "notes.txt"}));
+}
+
+#[tokio::test]
+async fn a_second_broken_call_in_a_row_is_told_to_send_less() {
+    let broken = || sse_tool_calls(&[("a", "read_file", r#"{"path": "#)]);
+    let server = MockServer::start(vec![broken(), broken(), sse_text("Done.", "stop")]).await;
+    let workspace = Workspace::new("broken-streak");
+
+    run(&server, &workspace, limits(), "read").await.unwrap();
+
+    let messages = server.requests()[2].body["messages"].clone();
+    let first = messages[3]["content"].as_str().unwrap();
+    let second = messages[5]["content"].as_str().unwrap();
+    let advice = "2 calls in a row to read_file have sent arguments that do not parse.";
+    assert!(!first.contains("in a row"), "{first}");
+    assert!(
+        second.ends_with(&format!(
+            "{advice} Long, deeply nested arguments break most often: send less in each call."
+        )),
+        "{second}"
+    );
+}
+
+#[tokio::test]
 async fn calls_answered_before_dispatch_are_traced() {
     // Beyond Python, which records only the calls it dispatches: a call whose
     // JSON broke, one to an unknown tool, and one the gate refused each leave a

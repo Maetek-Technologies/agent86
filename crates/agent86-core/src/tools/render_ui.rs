@@ -34,6 +34,16 @@ impl Tool for RenderUiTool {
         false
     }
 
+    /// A surface's JSON breaks in its deepest nesting, most often in a large
+    /// one (ADR 0006), so a surface built in parts breaks less, and loses less.
+    fn retry_hint(&self) -> Option<&str> {
+        Some(
+            "Build the surface in parts: one call with createSurface holding the root and \
+             the first few components, then further calls with updateComponents adding the \
+             rest, with `wait` only on the last call.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "properties": {

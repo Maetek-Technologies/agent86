@@ -1137,6 +1137,87 @@ async fn an_invalid_batch_draws_nothing_and_tells_the_model_what_to_fix() {
     assert_eq!(answer_in(&requests[2], "c2"), "Rendered surface form.");
 }
 
+/// `arguments` as a provider hands over arguments it could not parse.
+#[cfg(feature = "agent86ui")]
+fn unparsed(arguments: &str) -> Value {
+    json!({ agent86_core::types::INVALID_TOOL_ARGS_KEY: arguments })
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_surface_with_one_closer_too_many_is_repaired_and_drawn() {
+    // ADR 0006: the shape that failed twelve times running, one `}` too many
+    // after the Button's action, inside the components list.
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-repair");
+    let sent = name_form().to_string();
+    let broken = sent.replacen("}}}}},", "}}}}}},", 1);
+    assert_ne!(sent, broken, "the form has the run of closers");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "render_ui", unparsed(&broken))]),
+        text("Done."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    let mut drawn = 0;
+    agent
+        .run_with_events("Ask me my name", |event| {
+            if let TurnEvent::Ui(_) = event {
+                drawn += 1;
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(drawn, 1);
+    let seen = observation(&provider, "c1");
+    assert!(seen.starts_with("Rendered surface form."), "{seen}");
+    assert!(
+        seen.contains("agent86 dropped the unmatched closer `}`"),
+        "{seen}"
+    );
+    // The session keeps the repaired call, which replay on resume can read.
+    assert!(agent
+        .conversation()
+        .to_json()
+        .contains(r#""surfaceId":"form""#));
+    assert!(!agent.conversation().to_json().contains("__invalid_json__"));
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_second_broken_surface_is_told_to_build_it_in_parts() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-streak");
+    let truncated = r#"{"messages": [{"version": "1.0", "createSurface": {"#;
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "render_ui", unparsed(truncated))]),
+        calls(&[("c2", "render_ui", unparsed(truncated))]),
+        text("Done."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    agent.run("Ask me my name").await.unwrap();
+    let first = observation(&provider, "c1");
+    let second = observation(&provider, "c2");
+    assert!(!first.contains("in a row"), "{first}");
+    assert!(
+        second.contains("2 calls in a row to render_ui have sent arguments that do not parse."),
+        "{second}"
+    );
+    assert!(
+        second.ends_with("with `wait` only on the last call."),
+        "{second}"
+    );
+}
+
 #[cfg(feature = "agent86ui")]
 #[tokio::test]
 async fn without_a_renderer_render_ui_is_not_offered() {
