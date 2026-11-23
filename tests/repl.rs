@@ -594,6 +594,11 @@ async fn secrets_cannot_be_entered_on_piped_input_and_the_agent_is_not_offered_t
     let tools = server.requests()[0].body["tools"].to_string();
     assert!(tools.contains("\"run_command\""), "{tools}");
     assert!(!tools.contains("request_secret"), "{tools}");
+    // Nobody can answer questions on piped input either (ADR 0006), so
+    // `ask_user` is not offered and the system message does not mention it.
+    assert!(!tools.contains("ask_user"), "{tools}");
+    let system = server.requests()[0].body["messages"][0]["content"].to_string();
+    assert!(!system.contains("Asking the user"), "{system}");
 }
 
 #[tokio::test]

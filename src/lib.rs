@@ -11,6 +11,7 @@
 //! they did before the split.
 
 pub mod acp;
+pub mod ask_text;
 pub mod auth;
 pub mod history;
 pub mod keys;
