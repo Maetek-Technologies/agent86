@@ -170,6 +170,15 @@ To check alongside item 6: half the session's retries wrote `{"path": ...}` for 
 
 `gemini-3.8-flash` failed differently from Haiku: its JSON was valid, but its first calls broke A2UI's rules (a message without `"version": "1.0"`, a `null` in the component list), which the validator caught and the next call fixed. With `ask_user` neither failure can happen, since the model writes neither the envelope nor the components. These runs are few, and the numbers will move between runs. The point they make is the gap between `large` and `session` on the same model.
 
+**After slice 7** (2026-11-23, the `session` set, six runs each, `render_ui` hardened, no `ask_user` yet):
+
+| Model (through OpenRouter) | Runs | valid first try | valid within one correction | never drew |
+|---|---|---|---|---|
+| `anthropic/claude-haiku-5.5` | 6 | 5 (was 2 of 6) | 5 | 1 (no `render_ui` call before the check's four-step budget) |
+| `google/gemini-3.8-flash` | 6 | 3 (was 1 of 4) | 4 | 1 (likewise) |
+
+No run failed on broken JSON. A repaired call counts as valid on the first try, since the user saw the form. Gemini's remaining failures were A2UI's rules (a message without `"version"`), which only `ask_user` removes. The two runs that never drew made no `render_ui` call within the check's four steps, which is a different problem from this one.
+
 ### Slices
 
 1. **Core:** `ask_user`, its argument checks, the answers, the `QuestionPrompt` hook through the prompt queue, the built form and its validator test, the prompt section, the `ask_user` trace kind, and `[ui] ask_user`. Tested with recorded calls against the mock server and a scripted hook.
