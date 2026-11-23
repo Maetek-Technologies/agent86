@@ -9,7 +9,7 @@ A2UI is Google's protocol, and agent86 is not affiliated with or endorsed by Goo
 | Surface | agent86UI |
 |---|---|
 | Programs embedding `agent86-core` (`sdk`), such as agent86-desktop | From 1.2.0 |
-| The terminal interface | 1.2.1, built on `main` and not yet released: see [In the terminal](#in-the-terminal) |
+| The terminal interface | From 1.2.1: see [In the terminal](#in-the-terminal) |
 | ACP clients (agent86-web, editors) | Planned for 1.2.2: the `com.maetek.agent86/a2ui` extension, and a text version for other clients |
 | `agent86 run`, the plain loop, piped input, CI | Never: the tool is not offered, so their output is unchanged |
 
