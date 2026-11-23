@@ -474,6 +474,33 @@ fn run(repl: &mut Repl) -> io::Result<()> {
                 app.note(style, &text);
                 None
             }
+            // Beyond Python (ADR 0005): an action on a surface no call waited on is
+            // checked and recorded, then runs as a turn with its text as the user's
+            // message, through the vault and the ingress guardrail like typed input.
+            // It is not typed, so it stays out of the prompt history.
+            Request::UiAction(action) => {
+                match repl
+                    .harness
+                    .accept_ui_action(&repl.state.session_id, &action)
+                {
+                    Err(why) => app.note(Style::DimRed, &format!("agent86UI: {why}")),
+                    Ok(text) => {
+                        app.echo_user(&text);
+                        let turn = TurnInput {
+                            line: &text,
+                            typed: &text,
+                            kind: crate::specialty_turn::TurnKind::Plain,
+                            mentions: false,
+                        };
+                        let outcome =
+                            run_turn(&mut app, &mut screen, repl, &inbox, &events, &runtime, turn)?;
+                        if outcome == Request::Exit {
+                            break;
+                        }
+                    }
+                }
+                None
+            }
             Request::Catalog {
                 provider,
                 result,
@@ -583,6 +610,7 @@ fn dispatch(
                 line,
                 typed: &hinted,
                 kind,
+                mentions: true,
             };
             let outcome = run_turn(app, screen, repl, inbox, events, runtime, turn)?;
             return Ok(outcome != Request::Exit);
@@ -682,6 +710,9 @@ struct TurnInput<'a> {
     line: &'a str,
     typed: &'a str,
     kind: crate::specialty_turn::TurnKind,
+    /// Expand `@path` mentions; never for a surface's action, whose text holds
+    /// what the user entered in a form, not a request to read a file.
+    mentions: bool,
 }
 
 fn run_turn(
@@ -693,13 +724,26 @@ fn run_turn(
     runtime: &tokio::runtime::Runtime,
     turn: TurnInput<'_>,
 ) -> io::Result<Request> {
-    let TurnInput { line, typed, kind } = turn;
-    // `@path` mentions are inlined for the model; refusals are shown and sent along.
-    let mentions = expand_mentions(
+    let TurnInput {
+        line,
         typed,
-        &repl.harness.context.policy,
-        repl.config.tools.mention_max_bytes,
-    );
+        kind,
+        mentions,
+    } = turn;
+    // `@path` mentions are inlined for the model; refusals are shown and sent along.
+    let mentions = if mentions {
+        expand_mentions(
+            typed,
+            &repl.harness.context.policy,
+            repl.config.tools.mention_max_bytes,
+        )
+    } else {
+        crate::mentions::MentionResult {
+            prompt: typed.to_owned(),
+            attachments: Vec::new(),
+            errors: Vec::new(),
+        }
+    };
     for problem in &mentions.errors {
         app.note(Style::DimYellow, problem);
     }
