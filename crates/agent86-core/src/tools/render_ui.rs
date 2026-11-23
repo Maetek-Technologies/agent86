@@ -141,6 +141,32 @@ impl Tool for RenderUiTool {
             );
             return Ok(result);
         }
+        // A waiting surface the user cannot answer would hold the turn until they
+        // dismissed it: only a Button with an event action sends an answer.
+        if wait {
+            let unanswerable = unanswerable(&messages, ui);
+            if !unanswerable.is_empty() {
+                let mut result = failure(
+                    self.name(),
+                    format!(
+                        "Nothing on {} sends an answer, so nothing was drawn: choosing an \
+                         option or typing only changes the data model. Add a Button whose \
+                         action is an event (for example {{\"event\": {{\"name\": \"submit\", \
+                         \"context\": {{...}}}}}}) and send the messages again.",
+                        unanswerable
+                            .iter()
+                            .map(|id| format!("surface {id}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                result.metadata.insert(
+                    TRACE_KEY.into(),
+                    trace(&messages, components, "refused", &["REFUSED"]),
+                );
+                return Ok(result);
+            }
+        }
         let report = ui.apply(&messages);
         if !report.is_ok() {
             let codes: Vec<&str> = report.errors.iter().map(|p| p.code.as_str()).collect();
@@ -252,4 +278,36 @@ fn trace(messages: &[Value], components: usize, verdict: &str, codes: &[&str]) -
         "verdict": verdict,
         "problems": codes,
     })
+}
+
+/// The surfaces a waiting batch creates or changes that would have no Button
+/// with an event action, counting the batch's components and those already
+/// drawn. Deleted surfaces wait on nothing and are left out.
+fn unanswerable(messages: &[Value], ui: &crate::agent86ui::UiSession) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    let mut answerable: Vec<String> = Vec::new();
+    for message in messages {
+        for key in ["createSurface", "updateComponents"] {
+            let Some(body) = message.get(key) else {
+                continue;
+            };
+            let Some(id) = body.get("surfaceId").and_then(Value::as_str) else {
+                continue;
+            };
+            if !named.iter().any(|known| known == id) {
+                named.push(id.to_owned());
+            }
+            let has = body
+                .get("components")
+                .and_then(Value::as_array)
+                .is_some_and(|components| components.iter().any(crate::agent86ui::is_event_button));
+            if has {
+                answerable.push(id.to_owned());
+            }
+        }
+    }
+    named
+        .into_iter()
+        .filter(|id| !answerable.contains(id) && !ui.has_event_button(id))
+        .collect()
 }

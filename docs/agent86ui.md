@@ -29,7 +29,7 @@ A surface stays up after the call. Completeness is strict: a missing `root` or a
 ## How the user answers
 
 - **Later, as a message (the default).** A button's action, such as `{"event": {"name": "submit", "context": {"name": {"@path": "/form/name"}}}}`, comes back as the next user message: `[ui action] submit on form: {"name": "Ada"}`. It goes through the same redaction and input guardrail as typed text, and starts a turn.
-- **At once, mid-turn (`wait`).** With `"wait": true` the turn waits for the user's first action on the surface, and that action is the call's result. Use it for a form the task cannot go on without. A waiting question is asked one at a time with approvals and secrets, and never once the turn is cancelled. If the program cannot answer, a waiting call is refused and the model asks without waiting.
+- **At once, mid-turn (`wait`).** With `"wait": true` the turn waits for the user's first action on the surface, and that action is the call's result. Use it for a form the task cannot go on without. Only a Button whose action is an event sends an answer (choosing or typing only changes the data model), so a waiting call whose surface has none is refused before it is drawn. A waiting question is asked one at a time with approvals and secrets, and never once the turn is cancelled. If the program cannot answer, a waiting call is refused and the model asks without waiting.
 
 ## Embedding it
 

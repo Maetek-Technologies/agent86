@@ -164,6 +164,14 @@ impl UiSession {
         Ok(())
     }
 
+    /// Whether surface `id`, as drawn so far, has a Button whose action sends
+    /// an event: something the user can press to answer.
+    pub fn has_event_button(&self, id: &str) -> bool {
+        self.runtime()
+            .components(id)
+            .is_some_and(|mut components| components.any(is_event_button))
+    }
+
     pub fn egress(&self) -> EgressMode {
         self.egress
     }
@@ -293,6 +301,13 @@ impl UiSession {
     }
 }
 
+/// Whether a component is a Button whose action sends an event (rather than
+/// running a local function such as `openUrl`).
+pub fn is_event_button(component: &Value) -> bool {
+    component.get("component").and_then(Value::as_str) == Some("Button")
+        && component.pointer("/action/event").is_some()
+}
+
 /// What every `render_ui` prompt says, whatever the catalogs.
 const PROMPT: &str = "## agent86UI: drawing UI with render_ui
 
@@ -323,6 +338,9 @@ relative to each item.
 beside `event`. When the user presses it, a later user message \
 reads `[ui action] submit on <surfaceId>: <context as JSON>`; the surface stays \
 up meanwhile.
+- Only a Button whose action is an event sends the user's answer: choosing an \
+option or typing only changes the data model. So every form needs a Button (for \
+example Submit) whose event's `context` carries the values.
 - render_ui's result is the validator's verdict. If it lists problems, nothing \
 was drawn: fix them and send the corrected messages again.
 - Renderer functions (`callRendererFunction`) and agent functions are not \
@@ -486,14 +504,19 @@ pub fn take_drawn(metadata: &mut Map<String, Value>) -> (Vec<AgentMessage>, Opti
 /// What `render_ui`'s result opens with when the call drew.
 const DREW: &[&str] = &["Rendered surface ", "Deleted surface ", "Applied."];
 
-/// Whether a `render_ui` result says the call drew.
+/// Whether a `render_ui` result says the call drew. A waiting call that was not
+/// answered says so first and what it drew after (earlier versions wrote the
+/// drawing first), so every line is looked at.
 fn drew(result: &crate::types::ToolResult) -> bool {
     let text = if result.ok {
         result.content.as_str()
     } else {
         result.error.as_deref().unwrap_or_default()
     };
-    result.ok || DREW.iter().any(|opening| text.starts_with(opening))
+    result.ok
+        || text
+            .lines()
+            .any(|line| DREW.iter().any(|opening| line.starts_with(opening)))
 }
 
 /// The surfaces a waiting call waits on, taken out of its result's metadata.
@@ -600,8 +623,8 @@ impl crate::agent::Harness {
                 return answered(failure(
                     RENDER_UI,
                     format!(
-                        "{shown}\nThe turn was cancelled before the user answered. The surface \
-                         stays up; an action on it later comes as a user message."
+                        "The turn was cancelled before the user answered. The surface stays \
+                         up; an action on it later comes as a user message.\n{shown}"
                     ),
                 ))
             }
@@ -609,8 +632,8 @@ impl crate::agent::Harness {
                 return answered(failure(
                     RENDER_UI,
                     format!(
-                        "{shown}\nThe user did not answer (they dismissed it). The surface stays \
-                         up; an action on it later comes as a user message."
+                        "The user did not answer (they dismissed it). The surface stays up; an \
+                         action on it later comes as a user message.\n{shown}"
                     ),
                 ))
             }
@@ -619,7 +642,7 @@ impl crate::agent::Harness {
         if let Err(why) = ui.check_action(&action, Some(&surfaces)) {
             return answered(failure(
                 RENDER_UI,
-                format!("{shown}\nThe screen's answer could not be used: {why}."),
+                format!("The screen's answer could not be used: {why}.\n{shown}"),
             ));
         }
         let text = self.context.secrets.redact(&action_text(&action));
@@ -649,7 +672,7 @@ impl crate::agent::Harness {
             return answered(failure(
                 RENDER_UI,
                 format!(
-                    "{shown}\nThe user's answer was refused by the input guardrail ({}).",
+                    "The user's answer was refused by the input guardrail ({}).\n{shown}",
                     report.summary()
                 ),
             ));
