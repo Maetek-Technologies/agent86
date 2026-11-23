@@ -1272,7 +1272,8 @@ impl Harness {
             if !offered {
                 specs.retain(|spec| spec.name != DELEGATE);
             }
-            // Only the main loop draws UI (ADR 0005).
+            // Only the main loop asks the user (ADR 0006) or draws UI (ADR 0005).
+            specs.retain(|spec| spec.name != crate::ask::ASK_USER);
             #[cfg(feature = "agent86ui")]
             specs.retain(|spec| spec.name != crate::agent86ui::RENDER_UI);
             // The same window discipline as the main loop, with the system message

@@ -2239,3 +2239,178 @@ async fn a_repaired_argument_is_traced_and_the_call_is_kept_as_sent() {
         .expect("a tool call");
     assert_eq!(call.arguments["formats"], "[\"markdown\"]");
 }
+
+// `ask_user` (ADR 0006): the model asks, the surface's hook answers.
+
+const QUESTIONS: &str = r#"{"title": "Plan", "questions": [{"id": "scope", "question": "Which content?", "kind": "choice", "options": ["Everything", "Personal only"]}, {"id": "keep", "question": "What must not move?", "kind": "text", "optional": true}, {"id": "archive", "question": "Archive backups?", "kind": "yes_no"}]}"#;
+
+fn offered_tools(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn asking_harness(
+    server: &MockServer,
+    workspace: &Workspace,
+    traces: &std::path::Path,
+    reply: impl Fn(&agent86::ask::Form) -> agent86::ask::Reply + Send + Sync + 'static,
+) -> Harness {
+    let mut harness = cancellable(
+        server,
+        workspace,
+        ApprovalGate::new(ApprovalMode::Auto, None),
+        trace_recorder(traces),
+        &CancelToken::default(),
+    );
+    harness.attach_questions(Box::new(reply)).unwrap();
+    harness
+}
+
+#[tokio::test]
+async fn ask_user_returns_the_answers_keyed_by_question_id() {
+    use agent86::ask::{Outcome, Reply, Via};
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("q", "ask_user", QUESTIONS)]),
+        sse_text("Thanks.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("ask-answered");
+    let traces = workspace.root.join("traces");
+    let asked: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let seen = Arc::clone(&asked);
+    let harness = asking_harness(&server, &workspace, &traces, move |form| {
+        seen.lock()
+            .unwrap()
+            .push(form.questions.iter().map(|q| q.id.clone()).collect());
+        Reply {
+            outcome: Outcome::Answered(
+                json!({"scope": ["Personal only"], "archive": "Yes"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            via: Via::Form,
+        }
+    });
+
+    let mut state = AgentState::new();
+    harness
+        .run_turn(&mut state, "plan my folder", |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(*asked.lock().unwrap(), [["scope", "keep", "archive"]]);
+    let requests = server.requests();
+    assert!(offered_tools(&requests[0].body).contains(&"ask_user".to_owned()));
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("## Asking the user"), "{system}");
+    assert!(system.contains("call ask_user with all your questions at once"));
+    let answer = requests[1].body["messages"][3]["content"].as_str().unwrap();
+    assert_eq!(
+        answer,
+        "The user answered:\n{\"scope\": \"Personal only\", \"keep\": null, \"archive\": true}"
+    );
+    // The session keeps the answers as the call's result, and never the form
+    // the tool handed the loop.
+    let result = &state.steps[0].results[0];
+    assert!(result.ok);
+    assert!(!result.metadata.contains_key("agent86_ask"));
+    let event = trace_events(&traces)
+        .into_iter()
+        .find(|event| event["kind"] == "ask_user")
+        .expect("an ask_user event");
+    assert_eq!(event["questions"], 3);
+    assert_eq!(event["kinds"], json!(["choice", "text", "yes_no"]));
+    assert_eq!(event["via"], "form");
+    assert_eq!(event["outcome"], "answered");
+    assert_eq!(event["unanswered"], 0);
+    assert!(!event.to_string().contains("Personal only"));
+}
+
+#[tokio::test]
+async fn a_dismissed_form_is_not_an_error_and_says_not_to_ask_again() {
+    use agent86::ask::{Outcome, Reply, Via, DISMISSED};
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("q", "ask_user", QUESTIONS)]),
+        sse_text("I will assume defaults.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("ask-dismissed");
+    let traces = workspace.root.join("traces");
+    let harness = asking_harness(&server, &workspace, &traces, |_| Reply {
+        outcome: Outcome::Dismissed,
+        via: Via::Text,
+    });
+
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "plan", |_| {}).await.unwrap();
+
+    assert_eq!(
+        server.requests()[1].body["messages"][3]["content"],
+        DISMISSED
+    );
+    assert!(state.steps[0].results[0].ok);
+    let event = trace_events(&traces)
+        .into_iter()
+        .find(|event| event["kind"] == "ask_user")
+        .unwrap();
+    assert_eq!(event["outcome"], "dismissed");
+    assert_eq!(event["via"], "text");
+}
+
+#[tokio::test]
+async fn questions_with_problems_are_not_asked_and_the_model_is_told_each() {
+    let broken = r#"{"questions": [{"id": "scope", "question": "Which?", "kind": "choice", "options": ["Only"]}]}"#;
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("q", "ask_user", broken)]),
+        sse_text("Sorry.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("ask-invalid");
+    let traces = workspace.root.join("traces");
+    let calls = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&calls);
+    let harness = asking_harness(&server, &workspace, &traces, move |_| {
+        *counted.lock().unwrap() += 1;
+        agent86::ask::Reply {
+            outcome: agent86::ask::Outcome::Dismissed,
+            via: agent86::ask::Via::Form,
+        }
+    });
+
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "plan", |_| {}).await.unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), 0);
+    assert_eq!(
+        server.requests()[1].body["messages"][3]["content"],
+        "The questions were not asked. Fix these and call ask_user again:\n- questions/0 (scope): a choice question needs 2 to 12 options, not 1 (\"Other\" is added for you)"
+    );
+}
+
+#[tokio::test]
+async fn without_a_hook_ask_user_is_not_offered() {
+    let server = MockServer::start(vec![sse_text("Hello.", "stop")]).await;
+    let workspace = Workspace::new("ask-none");
+    let harness = cancellable(
+        &server,
+        &workspace,
+        ApprovalGate::new(ApprovalMode::Auto, None),
+        Recorder::disabled(),
+        &CancelToken::default(),
+    );
+
+    let mut state = AgentState::new();
+    harness.run_turn(&mut state, "hi", |_| {}).await.unwrap();
+
+    let request = &server.requests()[0].body;
+    assert!(!offered_tools(request).contains(&"ask_user".to_owned()));
+    assert!(!request["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Asking the user"));
+}

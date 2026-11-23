@@ -6,6 +6,7 @@
 //! [`ToolResult`] with `ok = false` that the model can correct itself from;
 //! nothing a tool does can crash the agent loop.
 
+pub mod ask_user;
 pub mod delegate;
 pub mod exec;
 pub mod files;
@@ -882,6 +883,10 @@ pub struct ToolContext {
     /// The sub-agent run this context belongs to (beyond Python), with its progress,
     /// so a question it asks can say who asks. Set when a sub-agent is spawned.
     pub subagent: Option<Arc<crate::subagent::SubagentRun>>,
+    /// The hook `ask_user` asks the user through (beyond Python; ADR 0006), once
+    /// a surface installs one. Shared by clones; sub-agent forks get an empty
+    /// one, since only the main loop asks.
+    pub asker: crate::ask::Asker,
     /// The renderer the embedder declared (beyond Python; ADR 0005), for
     /// `render_ui`: its catalogs and the surfaces drawn. Shared by clones;
     /// sub-agent forks have none, since only the main loop draws.
@@ -992,6 +997,7 @@ impl ToolContext {
             worktree: None,
             card: None,
             subagent: None,
+            asker: crate::ask::Asker::default(),
             #[cfg(feature = "agent86ui")]
             ui: None,
         })
@@ -1015,10 +1021,12 @@ impl ToolContext {
 
     /// A copy for a sub-agent: the same tools and jail, and its own active skill,
     /// starting as this context's, so what it activates restricts only itself.
-    /// It draws no UI: only the main loop has the renderer.
+    /// It draws no UI and asks the user nothing: only the main loop has the
+    /// renderer and the `ask_user` hook.
     pub fn fork(&self) -> Self {
         let mut forked = self.clone();
         forked.active_skill = Arc::new(std::sync::Mutex::new(self.active_skill()));
+        forked.asker = crate::ask::Asker::default();
         #[cfg(feature = "agent86ui")]
         {
             forked.ui = None;

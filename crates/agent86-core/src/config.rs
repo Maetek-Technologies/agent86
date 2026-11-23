@@ -100,6 +100,7 @@ thinking = "summary"
 tool_use = "summary"
 agent86ui = "auto"
 agent86ui_remote_media = false
+ask_user = "auto"
 
 [run]
 output = "final"
@@ -246,6 +247,20 @@ pub struct UiConfig {
     /// workspace files. Needs project trust, since a fetch can track the user.
     #[serde(default)]
     pub agent86ui_remote_media: bool,
+    /// Whether the surfaces where someone can answer offer the model `ask_user`
+    /// (beyond Python; ADR 0006). `run` never reads it.
+    #[serde(default)]
+    pub ask_user: AskUserMode,
+}
+
+/// `[ui] ask_user` (beyond Python): `auto` offers `ask_user` wherever someone
+/// can answer; `off` never does, and the model asks in prose as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AskUserMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 /// `[ui] agent86ui` (beyond Python): `auto` offers `render_ui` wherever a
@@ -1161,6 +1176,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("auto") && error.contains("off"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ask_user_defaults_to_auto_and_can_be_turned_off() {
+        let dir = temp_dir("ask-user-setting");
+        let paths = paths_in(&dir);
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert_eq!(config.ui.ask_user, AskUserMode::Auto);
+        std::fs::write(&paths.project, "[ui]\nask_user = \"off\"\n").unwrap();
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert_eq!(config.ui.ask_user, AskUserMode::Off);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
