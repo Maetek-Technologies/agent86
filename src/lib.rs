@@ -22,7 +22,8 @@ pub mod ui;
 pub mod update;
 
 pub use agent86_core::{
-    agent, agent86ui, agents_def, approval, config, config_writer, difflib, escape, guardrails,
-    limits, mcp, memory, observability, otel, pricing, prompt, provider, pyjson, router, sdk,
-    secrets, session, skills, specialty_turn, subagent, tools, trust, turn, types, vault, worktree,
+    agent, agent86ui, agents_def, approval, ask, broken_json, config, config_writer, difflib,
+    escape, guardrails, limits, mcp, memory, observability, otel, pricing, prompt, provider,
+    pyjson, router, sdk, secrets, session, skills, specialty_turn, subagent, tools, trust, turn,
+    types, vault, worktree,
 };

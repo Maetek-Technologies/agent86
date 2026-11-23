@@ -28,6 +28,8 @@ pub mod agents_def;
 #[doc(hidden)]
 pub mod approval;
 #[doc(hidden)]
+pub mod ask;
+#[doc(hidden)]
 pub mod broken_json;
 #[doc(hidden)]
 pub mod config;

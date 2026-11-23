@@ -181,7 +181,12 @@ No run failed on broken JSON. A repaired call counts as valid on the first try, 
 
 ### Slices
 
-1. **Core:** `ask_user`, its argument checks, the answers, the `QuestionPrompt` hook through the prompt queue, the built form and its validator test, the prompt section, the `ask_user` trace kind, and `[ui] ask_user`. Tested with recorded calls against the mock server and a scripted hook.
+1. **Core:** `ask_user`, its argument checks, the answers, the `QuestionPrompt` hook through the prompt queue, the built form and its validator test, the prompt section, the `ask_user` trace kind, and `[ui] ask_user`. Tested with recorded calls against the mock server and a scripted hook. Done 2026-11-23 (`src/ask.rs`, `tools/ask_user.rs`), with these settled as it was built:
+   - The hook is `ask::AskPrompt` on `ToolContext::asker` (`ask::Asker`), installed by `Harness::attach_questions`, which also registers the tool. A sub-agent's fork gets an empty `Asker`, and its tool list leaves `ask_user` out.
+   - The tool only checks the questions and hands the `ask::Form` to the main loop in its result's metadata (`ask::ASK_KEY`), as a waiting `render_ui` call does. The loop asks (`Harness::ask_questions`, a new `QuestionKind::Ask` in the prompt queue), so the answers pass the vault and the ingress guardrail where typed input does.
+   - A hook returns an `ask::Reply`: the `Outcome` (`Answered` with the values by id, or `Dismissed`) and the `Via`. The loop normalizes the values (`Form::accept`), so every surface's answers read the same.
+   - `yes_no` is a Yes/No ChoicePicker in the built form, not a CheckBox: a CheckBox starts unchecked, so a required question could not tell "no" from "not answered".
+   - Limits: question text 300 characters, the title and each option 120.
 2. **The terminal interface:** the hook as the built form, drawn by the agent86UI renderer and answered in place, including "Other", required questions, Escape and Ctrl+C, and the Ctrl+O transcript view.
 3. **The plain loop:** the text hook.
 4. **`sdk`:** the built form through an embedder's `Ui` and `on_wait`, with no new API, so agent86-desktop picks it up from the release.
