@@ -2052,6 +2052,21 @@ pub fn plain_loop(mut repl: Repl) {
         console.line(style, note);
     }
 
+    // Beyond Python (ADR 0006): at a terminal the agent asks its questions here,
+    // as text, one at a time; piped input has nobody to answer, so the tool is
+    // not offered. The interface installs its own form instead.
+    if std::io::stdin().is_terminal() && repl.config.ui.ask_user == crate::config::AskUserMode::Auto
+    {
+        let cancel = repl.harness.cancel.clone();
+        let color = console.color;
+        let _ = repl.harness.attach_questions(Box::new(move |form| {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            crate::ask_text::ask_in_text(form, &mut input, &mut std::io::stdout(), color, &|| {
+                cancel.is_cancelled()
+            })
+        }));
+    }
     let mut input = TerminalInput::start(&repl.harness);
     loop {
         for note in repl.pending_mcp_notes() {

@@ -192,7 +192,7 @@ No run failed on broken JSON. A repaired call counts as valid on the first try, 
    - The surface is `agent86_ask_<n>` (`ask::FORM_SURFACE_PREFIX`) and is drawn only by the interface's renderer, never the agent's `UiSession`, so `render_ui` cannot change it and a resumed session does not redraw it. `render_ui` refuses surface ids with that prefix, since a model-drawn surface of the same id would otherwise replace the form on screen. The frame is titled `agent86UI · questions from the agent` instead of the id.
    - The title is plain text, since the terminal renderer does not render Markdown in a Text.
    - `[ui] ask_user` decides; `[ui] agent86ui = "off"` does not turn the form off, since the model writes none of it.
-3. **The plain loop:** the text hook.
+3. **The plain loop:** the text hook. Done 2026-11-23 (`ask_text::ask_in_text`, installed by `repl::plain_loop` when stdin is a terminal, never by `setup::assemble`, which `run` shares): numbered options take a number or the user's own words, an answer that does not fit its kind is asked again, `/skip` alone (or end of input, or Ctrl+C, which cancels the turn) dismisses, and model text goes through `escape::show_controls`.
 4. **`sdk`:** the built form through an embedder's `Ui` and `on_wait`, with no new API, so agent86-desktop picks it up from the release.
 5. **ACP:** the questions extension, the text fallback that ends the turn, and the agent86UI extension's path once ADR 0005's slice 4 lands. They ship together with that slice or before it.
 6. **Strict mode:** `Tool::strict()` and the adapters, checked against each provider's documentation.
