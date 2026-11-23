@@ -80,11 +80,15 @@ pub fn describe(raw: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// The closers [`drop_unmatched_closers`] dropped, each with its (1-based)
+/// character position.
+pub type Dropped = Vec<(usize, char)>;
+
 /// `raw` with every closer that matches nothing dropped, when that and only
-/// that makes it a JSON object: the object and each closer dropped, with its
-/// (1-based) character position. `None` when `raw` already parses, when nothing
-/// would be dropped, or when the result still does not parse as an object.
-pub fn drop_unmatched_closers(raw: &str) -> Option<(Map<String, Value>, Vec<(usize, char)>)> {
+/// that makes it a JSON object: the object and the closers dropped. `None` when
+/// `raw` already parses, when nothing would be dropped, or when the result
+/// still does not parse as an object.
+pub fn drop_unmatched_closers(raw: &str) -> Option<(Map<String, Value>, Dropped)> {
     if serde_json::from_str::<Value>(raw).is_ok() {
         return None;
     }
