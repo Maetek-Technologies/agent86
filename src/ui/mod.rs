@@ -32,6 +32,7 @@ mod picker;
 mod screen;
 mod server_form;
 pub mod status;
+mod surface;
 mod text;
 
 use crate::agent::Harness;
@@ -700,12 +701,8 @@ fn run_turn(
         let prompt = mentions.prompt;
         scope.spawn(move || {
             let on_event = |event: crate::agent::TurnEvent<'_>| {
-                // The status line reads usage from the session when the turn ends;
-                // a surface has no renderer here yet (ADR 0005, 1.2.1).
-                if !matches!(
-                    event,
-                    crate::agent::TurnEvent::Usage { .. } | crate::agent::TurnEvent::Ui(_)
-                ) {
+                // The status line reads usage from the session when the turn ends.
+                if !matches!(event, crate::agent::TurnEvent::Usage { .. }) {
                     let _ = worker_events.send(event.into());
                 }
             };
