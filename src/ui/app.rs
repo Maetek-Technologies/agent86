@@ -225,6 +225,9 @@ pub enum Request {
     ServerForm(Box<ServerDraft>),
     /// A line from background work, to print now. Held as a catalog is.
     Note(Style, String),
+    /// The user pressed a button on a surface no call was waiting on (beyond
+    /// Python; ADR 0005): the action becomes the next user message.
+    UiAction(Box<crate::sdk::Action>),
     /// A catalog arrived. Held until no turn runs and no panel is open.
     Catalog {
         provider: String,
@@ -1181,6 +1184,12 @@ impl App {
             self.surface_key(key);
             return Effect::None;
         }
+        // Alt+Up opens the surfaces while no turn runs: an action taken now starts
+        // one, and during a turn it would have to wait, as typed input does.
+        if is_alt_up(&key) && self.panel.is_none() && self.running.is_none() {
+            self.focus_surface(None);
+            return Effect::None;
+        }
         // In the MCP form, Shift+Tab moves between fields instead.
         if key.code == KeyCode::BackTab
             && !matches!(self.panel, Some(Panel::McpForm(_) | Panel::Server(_)))
@@ -1425,6 +1434,35 @@ impl App {
         Effect::None
     }
 
+    /// Give a surface the keys: `after` names the one focused now, so Alt+Up
+    /// again goes to the next older surface; with none, the one drawn live (or,
+    /// when every surface is answered, the newest).
+    fn focus_surface(&mut self, after: Option<&str>) {
+        let ids = self.surfaces.ids().to_vec();
+        let target = match after {
+            Some(current) => {
+                let at = ids.iter().position(|id| id == current).unwrap_or(0);
+                ids[(at + ids.len() - 1) % ids.len()].clone()
+            }
+            None => match self.surfaces.current() {
+                Some(id) => id.to_owned(),
+                None => match ids.last() {
+                    Some(id) => id.clone(),
+                    None => return,
+                },
+            },
+        };
+        self.surfaces.raise(&target);
+        self.menu = None;
+        self.surface_focus = Some(SurfaceFocus {
+            surface: target,
+            index: 0,
+            option: 0,
+            waiting: None,
+            confirm_url: None,
+        });
+    }
+
     /// A key while a surface has the focus (ADR 0005's keys): Tab and Shift+Tab
     /// or Up and Down move between inputs (Up and Down go through a choice's
     /// options first), Space toggles or picks, Left and Right move a slider,
@@ -1441,6 +1479,13 @@ impl App {
             return;
         }
         let id = focus.surface.clone();
+        // Alt+Up again, with no call waiting, goes to the next older surface.
+        if is_alt_up(&key) {
+            if focus.waiting.is_none() && self.surfaces.ids().len() > 1 {
+                self.focus_surface(Some(&id));
+            }
+            return;
+        }
         let inputs = self.surfaces.focusable(&id);
         if key.code == KeyCode::Esc {
             self.leave_surface(None);
@@ -1529,8 +1574,13 @@ impl App {
             return;
         };
         let answered = action.is_some();
-        if let Some(reply) = focus.waiting {
-            let _ = reply.send(action);
+        match (focus.waiting, action) {
+            (Some(reply), action) => {
+                let _ = reply.send(action);
+            }
+            // No call waits: the action is the next user message.
+            (None, Some(action)) => self.request = Some(Request::UiAction(Box::new(action))),
+            (None, None) => {}
         }
         if answered {
             let copy = self.surfaces.draw(&focus.surface, self.width, None);
@@ -1724,11 +1774,22 @@ impl App {
     /// line for the others up; nothing when no surface is up.
     fn surface_rows(&self) -> Vec<Line> {
         let focused = self.surface_focus.as_ref();
+        let idle = self.running.is_none();
         let Some(id) = focused
             .map(|focus| focus.surface.as_str())
             .or_else(|| self.surfaces.current())
         else {
-            return Vec::new();
+            // Every surface is answered: one line says they are still there.
+            let up = self.surfaces.ids().len();
+            if up == 0 || !idle {
+                return Vec::new();
+            }
+            let s = if up == 1 { "" } else { "s" };
+            return vec![Line::styled(
+                Style::Dim,
+                format!("  {up} agent86UI surface{s} up · alt+↑ to open"),
+            )
+            .truncate(self.width)];
         };
         let at = focused.and_then(|focus| {
             let mut at = self.surfaces.focusable(id).get(focus.index).cloned()?;
@@ -1774,11 +1835,19 @@ impl App {
             rows.extend(Line::styled(style, hint).hard_wrap(self.width));
         }
         let others = self.surfaces.ids().len().saturating_sub(1);
+        let mut tail = Vec::new();
         if others > 0 {
             let s = if others == 1 { "" } else { "s" };
+            tail.push(format!("{others} more surface{s} up"));
+        }
+        if focused.is_none() && idle {
+            tail.push("alt+↑ to answer".to_owned());
+        } else if focused.is_some_and(|focus| focus.waiting.is_none()) && others > 0 {
+            tail.push("alt+↑ for the next".to_owned());
+        }
+        if !tail.is_empty() {
             rows.push(
-                Line::styled(Style::Dim, format!("  {others} more surface{s} up"))
-                    .truncate(self.width),
+                Line::styled(Style::Dim, format!("  {}", tail.join(" · "))).truncate(self.width),
             );
         }
         rows
@@ -1804,6 +1873,11 @@ impl App {
             .push(Style::Plain, format!("{phase}…"))
             .push(Style::Dim, format!(" ({}s{hint})", elapsed.as_secs()))
     }
+}
+
+/// Alt+Up (Option+Up on a Mac terminal that sends it as Alt).
+fn is_alt_up(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// The approval request, boxed, in place of the input box; at most `budget` rows.
@@ -2022,6 +2096,82 @@ mod tests {
         );
     }
 
+    fn alt_up() -> KeyEvent {
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn alt_up_opens_a_surface_while_idle_and_its_action_is_the_next_message() {
+        let mut app = app();
+        app.on_turn_event(form_surface());
+        assert!(live_text(&mut app)
+            .iter()
+            .any(|row| row.contains("alt+↑ to answer")));
+        app.on_key(alt_up(), &[]);
+        for ch in "Plan".chars() {
+            app.on_key(key(KeyCode::Char(ch)), &[]);
+        }
+        assert!(app.editor.is_empty(), "the keys went to the surface");
+        let live = live_text(&mut app);
+        assert!(live.iter().any(|row| row.contains("esc back")), "{live:#?}");
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Tab), &[]);
+        app.on_key(key(KeyCode::Enter), &[]);
+        let Some(Request::UiAction(action)) = app.take_request() else {
+            panic!("an action request");
+        };
+        assert_eq!(action.name, "book");
+        assert_eq!(
+            Value::Object(action.context),
+            serde_json::json!({"title": "Plan", "weekly": false})
+        );
+        // Answered: copied into scrollback, and one line says it is still up.
+        assert!(committed_text(&mut app)
+            .iter()
+            .any(|row| row.contains("Plan")));
+        let live = live_text(&mut app);
+        assert!(
+            live.iter()
+                .any(|row| row == "  1 agent86UI surface up · alt+↑ to open"),
+            "{live:#?}"
+        );
+        app.on_key(key(KeyCode::Char('z')), &[]);
+        assert!(
+            !app.editor.is_empty(),
+            "the keys are back with the input box"
+        );
+    }
+
+    #[test]
+    fn alt_up_waits_for_the_turn_and_cycles_between_surfaces() {
+        let mut app = app();
+        app.on_turn_event(form_surface());
+        app.on_turn_event(create_surface("note", "A note"));
+        app.start_turn();
+        app.on_key(alt_up(), &[]);
+        assert!(
+            !live_text(&mut app)
+                .iter()
+                .any(|row| row.contains("esc back")),
+            "not during a turn"
+        );
+        app.on_turn_event(UiEvent::Finished(None));
+        app.take_request();
+
+        app.on_key(alt_up(), &[]);
+        let live = live_text(&mut app);
+        assert!(live.iter().any(|row| row.contains("· note")), "{live:#?}");
+        assert!(live.iter().any(|row| row.contains("alt+↑ for the next")));
+        app.on_key(alt_up(), &[]);
+        let live = live_text(&mut app);
+        assert!(live.iter().any(|row| row.contains("· meet")), "{live:#?}");
+        // Escape goes back with nothing sent.
+        app.on_key(key(KeyCode::Esc), &[]);
+        assert_eq!(app.take_request(), None);
+        app.on_key(key(KeyCode::Char('z')), &[]);
+        assert!(!app.editor.is_empty());
+    }
+
     #[test]
     fn escape_dismisses_a_waiting_surface_and_ctrl_c_also_cancels() {
         let mut app = app();
@@ -2107,7 +2257,8 @@ mod tests {
         let live = live_text(&mut app);
         assert!(live.iter().any(|row| row.contains("Second")));
         assert!(
-            live.iter().any(|row| row == "  1 more surface up"),
+            live.iter()
+                .any(|row| row == "  1 more surface up · alt+↑ to answer"),
             "{live:#?}"
         );
 

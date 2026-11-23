@@ -114,7 +114,7 @@ Text from users, models, tools, MCP servers, and file names is never interpreted
 | Ctrl+O | Expand or collapse the last tool block in place | Open the transcript view (section 7). **Known difference** |
 | Ctrl+Shift+O | Expand or collapse all tool blocks | In the transcript view, toggle all blocks; it is not reported on every terminal, so `a` does the same there |
 | In panels | `y`/`n`/Escape on approval; arrow keys and Enter on pickers | Same keys, plus number keys for numbered choices |
-| In an agent86UI surface (beyond Python) | — | Tab and Shift+Tab, or Up and Down, move between inputs (Up and Down go through a choice's options first); Space toggles a check box or picks a choice; Left and Right move a slider; typing edits a text field; Enter presses a button (elsewhere it moves on); Escape dismisses a waiting surface; `openUrl` asks y/n |
+| In an agent86UI surface (beyond Python) | — | Tab and Shift+Tab, or Up and Down, move between inputs (Up and Down go through a choice's options first); Space toggles a check box or picks a choice; Left and Right move a slider; typing edits a text field; Enter presses a button (elsewhere it moves on); Escape dismisses a waiting surface or goes back to the input box; `openUrl` asks y/n. Alt+Up focuses the surface drawn live (or the newest, when all are answered) while no turn runs, and again goes to the next older one; a button's action then runs as a turn, `[ui action] ...` echoed as the user's line, never `@`-expanded, kept out of the prompt history |
 
 ## 6. Streaming and Markdown
 
