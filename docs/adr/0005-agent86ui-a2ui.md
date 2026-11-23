@@ -112,6 +112,8 @@ What that means:
 
    Revised again 2026-11-22: the terminal renderer goes first, as **1.2.1**, and the ACP extension with its text fallback becomes **1.2.2**. Scheduled jobs (1.2.3) and MCP vault secrets (1.2.4) stay put.
 
+   Revised again 2026-11-23: `ask_user` ([ADR 0006](0006-ask-user.md)) goes first, as **1.2.2**. The ACP extension becomes **1.2.3** and carries `ask_user` for ACP clients too; scheduled jobs become 1.2.4 and MCP vault secrets 1.2.5.
+
 ### Questions still open, for the first slice
 
 2. **The password-style field** (answered 2026-11-22). It is `TextField` with `"variant": "obscured"` (the basic catalog's `variant` enum is `longText`, `number`, `shortText`, `obscured`). The core refuses it in slice 2; the protocol crate stays policy-free.
@@ -122,8 +124,8 @@ What that means:
 
 1. **`agent86-ui`** (1.2.0), in two parts: (a) the message types, catalogs, the validator, and the conformance fixtures (done 2026-11-22); (b) the headless surface runtime (data model, bindings, templates, checks, the basic catalog's functions, building actions), which answers the rest of question 3 (done 2026-11-22; see the second amendment).
 2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth); 2c the redaction, guardrails, policy, and the `ui_render` trace kind (done 2026-11-22; see the fifth); 2d the blocking wait (done 2026-11-22; see the sixth); 2e actions after the turn (done 2026-11-22; see the seventh); 2f replay on resume and `Agent::surfaces` (done 2026-11-22; see the eighth); 2g the docs and the first measurement of question 4 (done 2026-11-22; see the ninth); 2h the validator's remaining rules (done 2026-11-22; see the tenth).
-3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.2.
-4. **The ACP extension and its text fallback** (1.2.2; planned as 1.2.1 until 2026-11-22).
+3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.3.
+4. **The ACP extension and its text fallback** (1.2.3; planned as 1.2.1 until 2026-11-22, then 1.2.2 until 2026-11-23).
 5. **The terminal renderer** (1.2.1; planned as 1.2.4, then 1.2.2, until 2026-11-22), in five parts (see the eleventh amendment): 5a, the config and the core entry points (done 2026-11-22); 5b, drawing (done 2026-11-22); 5c, the blocking wait (done 2026-11-22); 5d, actions after the turn (done 2026-11-22); 5e, resume, the transcript view, and the docs (done 2026-11-22).
 6. **Docs** (1.2.0, extended by each later release): `docs/agent86ui.md`, the README's and the site's claims, and the plan's differences.
 
@@ -318,3 +320,7 @@ Trying 5c at a terminal (`qwen3.8:27b-mlx`) found two more things, fixed in it:
 - **A waiting call's outcome comes first.** A dismissed, cancelled, refused, or unusable answer used to follow the `Rendered surface ...` line, so the interface's one-line summary read `error: Rendered surface plan.`; the outcome now comes first, and replay finds the drawing line wherever it is, so sessions written either way replay.
 - **A field beside the message's kind is moved inside it.** The same model's next first call put `surfaceId` beside `createSurface`, the mistake the first measurement saw most. Such a message is never valid as written, so `agent86ui::tidy` moves every field beside the single kind into its body when the body lacks it, the result notes each move so the model learns, and replay applies the same move. The prompt now also carries one complete example call (a choice with a Submit button), checked against the validator by a test.
 - Also: a string of broken JSON where an array or object belongs is told where it broke when the call fails (`tools::unparsed_json_hint`), since the same model wrapped `messages` in a string whose brackets closed out of order.
+
+## Amendment: questions go through `ask_user`, and `render_ui` is hardened (2026-11-23)
+
+[ADR 0006](0006-ask-user.md) adds `ask_user`, a tool whose form agent86 builds from a flat list of questions, so asking the user something no longer depends on the model writing valid A2UI; `render_ui`'s prompt points questions there. It also changes `render_ui` itself: a Button event's `context` becomes optional (left out, agent86 binds every top-level key of the surface's data model when the surface is created), which goes beyond A2UI; the prompt asks for large surfaces in parts; and the hardening every tool gets (where broken JSON broke, failed calls replayed as `{}`, unmatched closers dropped, calls answered before dispatch traced, advice that changes on a repeated failure) applies to it. See ADR 0006's "`render_ui`, hardened alongside".
