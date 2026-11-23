@@ -1402,6 +1402,44 @@ async fn a_waiting_call_gets_the_users_action_after_the_surface_is_drawn() {
 
 #[cfg(feature = "agent86ui")]
 #[tokio::test]
+async fn a_surface_id_beside_create_surface_is_moved_inside_and_noted() {
+    // Found trying the terminal renderer: the model's first call put surfaceId
+    // beside createSurface, and the turn lost a step to the error.
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-tidy");
+    let mut form = name_form();
+    let surface = form["messages"][0]["createSurface"]
+        .as_object_mut()
+        .unwrap()
+        .remove("surfaceId")
+        .unwrap();
+    form["messages"][0]["surfaceId"] = surface;
+    let provider = Scripted::new(vec![calls(&[("c1", "render_ui", form)]), text("ok")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    agent.run("Ask my name").await.unwrap();
+    assert_eq!(
+        observation(&provider, "c1"),
+        "Rendered surface form.\nNote: moved surfaceId into createSurface in messages/0; it belongs inside, not beside it."
+    );
+    // Resumed, the call replays the same way.
+    let conversation = agent.conversation().clone();
+    let agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap()
+        .with_conversation(conversation);
+    assert_eq!(agent.surfaces().len(), 1);
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
 async fn a_waiting_surface_with_nothing_to_press_is_refused() {
     // Found trying the terminal renderer: a model drew a plan picker with no
     // button and waited, so the user could only dismiss it.

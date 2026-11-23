@@ -244,7 +244,7 @@ impl UiSession {
                 };
                 let messages: Vec<Value> = messages
                     .iter()
-                    .map(|message| sanitize(message, &ctx.secrets, self.egress))
+                    .map(|message| tidy(&sanitize(message, &ctx.secrets, self.egress)).0)
                     .collect();
                 if !policy(&messages, &ctx.policy, self.remote_media).is_empty() {
                     continue;
@@ -288,6 +288,13 @@ impl UiSession {
              Video, and AudioPlayer must be a literal string: {media}.\n- openUrl opens only \
              http and https URLs."
         ));
+        if let Some(catalog) = self.catalogs.first() {
+            section.push_str(&format!(
+                "\n\nA complete call, a choice with a Submit button (`surfaceId` goes \
+                 inside createSurface, never beside it):\n{}",
+                example(catalog.id(), self.can_wait())
+            ));
+        }
         for catalog in &self.catalogs {
             section.push_str(&format!("\n\n### Catalog `{}`\n", catalog.id()));
             if let Some(instructions) = catalog.instructions() {
@@ -301,11 +308,89 @@ impl UiSession {
     }
 }
 
+/// The keys that name what an A2UI 1.0 message is; an envelope holds
+/// `version` and exactly one of them.
+const KINDS: &[&str] = &[
+    "createSurface",
+    "updateComponents",
+    "updateDataModel",
+    "deleteSurface",
+    "callRendererFunction",
+    "agentFunctionResponse",
+];
+
+/// Beyond the protocol: a message whose fields sit beside its kind instead of
+/// inside it (`{"version": "1.0", "createSurface": {...}, "surfaceId": "x"}`,
+/// the mistake models make most often) has them moved in, when the kind's body
+/// does not already have them. Such a message is never valid as written, so
+/// the move only turns an error into what the model plainly meant. Returns the
+/// message and the fields moved, for the result to mention. `render_ui` and
+/// replay both apply it, so a session written either way replays the same.
+pub fn tidy(message: &Value) -> (Value, Vec<String>) {
+    let Some(envelope) = message.as_object() else {
+        return (message.clone(), Vec::new());
+    };
+    let kinds: Vec<&String> = envelope
+        .keys()
+        .filter(|key| KINDS.contains(&key.as_str()))
+        .collect();
+    let [kind] = kinds.as_slice() else {
+        return (message.clone(), Vec::new());
+    };
+    let kind = (*kind).clone();
+    let Some(body) = envelope.get(&kind).and_then(Value::as_object) else {
+        return (message.clone(), Vec::new());
+    };
+    let strays: Vec<String> = envelope
+        .keys()
+        .filter(|key| *key != "version" && **key != kind && !body.contains_key(*key))
+        .cloned()
+        .collect();
+    if strays.is_empty() {
+        return (message.clone(), Vec::new());
+    }
+    let mut envelope = envelope.clone();
+    let mut body = body.clone();
+    for key in &strays {
+        if let Some(value) = envelope.remove(key) {
+            body.insert(key.clone(), value);
+        }
+    }
+    envelope.insert(kind.clone(), Value::Object(body));
+    let moved = strays
+        .into_iter()
+        .map(|key| format!("{key} into {kind}"))
+        .collect();
+    (Value::Object(envelope), moved)
+}
+
 /// Whether a component is a Button whose action sends an event (rather than
 /// running a local function such as `openUrl`).
 pub fn is_event_button(component: &Value) -> bool {
     component.get("component").and_then(Value::as_str) == Some("Button")
         && component.pointer("/action/event").is_some()
+}
+
+/// The prompt's example call, on one line, in `catalog_id`.
+fn example(catalog_id: &str, wait: bool) -> String {
+    let mut call = serde_json::json!({"messages": [{"version": "1.0", "createSurface": {
+        "surfaceId": "plan",
+        "catalogId": catalog_id,
+        "components": [
+            {"id": "root", "component": "Column", "children": ["choice", "submit"]},
+            {"id": "choice", "component": "ChoicePicker", "label": "Which plan?",
+             "variant": "mutuallyExclusive", "value": {"@path": "/plan"},
+             "options": [{"label": "Basic", "value": "basic"}, {"label": "Pro", "value": "pro"}]},
+            {"id": "submit", "component": "Button", "child": "submit_label",
+             "action": {"event": {"name": "submit", "context": {"plan": {"@path": "/plan"}}}}},
+            {"id": "submit_label", "component": "Text", "text": "Submit"}
+        ],
+        "dataModel": {"plan": []}
+    }}]});
+    if wait {
+        call["wait"] = Value::Bool(true);
+    }
+    call.to_string()
 }
 
 /// What every `render_ui` prompt says, whatever the catalogs.
@@ -1048,6 +1133,48 @@ mod tests {
         assert!(section.contains(&format!("### Catalog `{}`", agent86_ui::BASIC_CATALOG_ID)));
         assert!(section.contains("## Catalog Guidelines"));
         assert!(section.contains("[ui action] submit on <surfaceId>"));
+    }
+
+    #[test]
+    fn fields_beside_the_kind_are_moved_inside_it() {
+        let (tidied, moved) = tidy(&serde_json::json!({
+            "version": "1.0",
+            "createSurface": {"catalogId": "c", "components": []},
+            "surfaceId": "plan"
+        }));
+        assert_eq!(
+            tidied,
+            serde_json::json!({"version": "1.0",
+                "createSurface": {"catalogId": "c", "components": [], "surfaceId": "plan"}})
+        );
+        assert_eq!(moved, ["surfaceId into createSurface"]);
+
+        // Never over a field the body has, and never with no kind or two kinds.
+        for message in [
+            serde_json::json!({"version": "1.0", "deleteSurface": {"surfaceId": "a"}, "surfaceId": "b"}),
+            serde_json::json!({"version": "1.0", "surfaceId": "b"}),
+            serde_json::json!({"version": "1.0", "deleteSurface": {}, "updateDataModel": {}, "x": 1}),
+            serde_json::json!({"version": "1.0", "deleteSurface": {"surfaceId": "a"}}),
+        ] {
+            assert_eq!(tidy(&message), (message.clone(), Vec::new()), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_s_example_is_valid() {
+        let session = UiSession::new(vec![Catalog::basic().clone()]).unwrap();
+        let call: Value =
+            serde_json::from_str(&example(agent86_ui::BASIC_CATALOG_ID, true)).unwrap();
+        let messages = call["messages"].as_array().unwrap();
+        let report = session.apply(messages);
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let section = session.prompt_section();
+        assert!(section.contains("surfaceId` goes inside createSurface"));
+        assert!(
+            !section.contains("\"wait\":true"),
+            "no waiter, no wait in the example"
+        );
     }
 
     #[test]

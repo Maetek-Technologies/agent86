@@ -24,7 +24,7 @@ Each call is validated as a whole against the renderer's catalogs by the `agent8
 - **valid:** the messages are drawn, and the result is `Rendered surface <id>.` (with any warnings, such as a component nothing shows);
 - **not valid:** nothing is drawn, and the result lists each problem with A2UI's error code and a JSON Pointer into `messages`, worded for the model, which fixes them and tries again.
 
-A surface stays up after the call. Completeness is strict: a missing `root` or a child that is not defined is an error. A component left behind when another replaced it as a child is only a warning, because A2UI 1.0 has no message that removes a component.
+A field the model puts beside a message's kind (`"surfaceId"` next to `"createSurface"` rather than inside it) is moved inside, and the result says so. A surface stays up after the call. Completeness is strict: a missing `root` or a child that is not defined is an error. A component left behind when another replaced it as a child is only a warning, because A2UI 1.0 has no message that removes a component.
 
 ## How the user answers
 

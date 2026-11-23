@@ -8,7 +8,7 @@
 //! the validator's job, since providers' strict modes cap a schema's size.
 
 use super::{failure, success, Tool, ToolContext, ToolError};
-use crate::agent86ui::{policy, sanitize, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY};
+use crate::agent86ui::{policy, sanitize, tidy, MESSAGES_KEY, RENDER_UI, TRACE_KEY, WAIT_KEY};
 use crate::types::ToolResult;
 use serde_json::{json, Map, Value};
 
@@ -119,9 +119,20 @@ impl Tool for RenderUiTool {
         // What a surface shows reaches the user as the model's text does: through
         // the vault's redaction and the egress guardrail first. Then agent86's
         // policy, then the protocol's rules.
+        // A field beside the message's kind is moved inside it (`agent86ui::tidy`).
+        let mut moved = Vec::new();
         let messages: Vec<Value> = messages
             .iter()
-            .map(|message| sanitize(message, &ctx.secrets, ui.egress()))
+            .enumerate()
+            .map(|(index, message)| {
+                let (message, fields) = tidy(&sanitize(message, &ctx.secrets, ui.egress()));
+                moved.extend(
+                    fields
+                        .into_iter()
+                        .map(|field| format!("Note: moved {field} in messages/{index}; it belongs inside, not beside it.")),
+                );
+                message
+            })
             .collect();
         let components = component_count(&messages);
         let refusals = policy(&messages, &ctx.policy, ui.remote_media());
@@ -208,6 +219,7 @@ impl Tool for RenderUiTool {
         for warning in &report.warnings {
             lines.push(format!("Warning: {warning}"));
         }
+        lines.extend(moved);
         let mut result = success(self.name(), lines.join("\n"));
         let typed: Vec<Value> = report
             .messages
