@@ -41,7 +41,7 @@ const TASKS: &[&str] = &[
 /// 0006): `AGENT86_TEST_UI_TASKS=large`. The first is the session that failed
 /// on `claude-haiku-5.5` twelve times in a row (2026-11-23).
 const LARGE_TASKS: &[&str] = &[
-    "Using a form, ask me these questions about reorganizing my home folder: 1. Scope: the whole home folder, personal content only, or specific folders I list? 2. Main goal (pick any): reduce clutter, find files faster, remove duplicates or old backups, prepare for a move. 3. Project folders (homelab, paperless, sage-*): leave them, or group them under Projects? 4. Loose files at the top level: leave them, group by type, or group by project? 5. Recovery and backup folders: keep, archive together, or delete? 6. Folders that must not move (free text). 7. Output: a plan document, a folder tree, or both?",
+    "Using a form, ask me these questions about reorganizing my home folder: 1. Scope: the whole home folder, personal content only, or specific folders I list? 2. Main goal (pick any): reduce clutter, find files faster, remove duplicates or old backups, prepare for a move. 3. Project folders (homelab, paperless, media-server): leave them, or group them under Projects? 4. Loose files at the top level: leave them, group by type, or group by project? 5. Recovery and backup folders: keep, archive together, or delete? 6. Folders that must not move (free text). 7. Output: a plan document, a folder tree, or both?",
     "Using a form, ask me how to set up a new project: its name, the language (Rust, Go, Python, TypeScript), the license (MIT, Apache-2.0, GPL-3.0, none), the features to enable (CI, Docker, docs site, benchmarks; any of them), the minimum supported version, a one-paragraph description, and whether to publish it.",
     "Using a form, ask me about the trip I want planned: the destination, the start and end dates, the number of travellers, the budget (under $1000, $1000 to $3000, over $3000), the kind of stay (hotel, rental, hostel), my interests (food, museums, hiking, nightlife; any of them), dietary restrictions, and whether you should look for flights.",
     "Using a form, take a bug report from me: a title, the severity (low, medium, high, critical), the affected areas (CLI, interface, ACP, providers; any of them), the steps to reproduce, what I expected, what happened instead, my OS (Windows, macOS, Linux), the agent86 version, and whether it happens every time.",
@@ -233,9 +233,9 @@ fn home_folder(root: &std::path::Path) {
         "paperless",
         "notes",
         "ssl",
-        "sage-backups",
-        "sage-migration-20260917",
-        "sage-recovery-20261001",
+        "app-backups",
+        "app-migration-20260917",
+        "app-recovery-20261001",
         "photos-recovery-20261012",
         "gpu-logs-20260920",
         "gpu-logs-20260923",
