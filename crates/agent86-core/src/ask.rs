@@ -29,7 +29,7 @@ pub const MAX_OPTIONS: usize = 12;
 /// The longest question text, title, and option, in characters.
 pub const MAX_QUESTION_CHARS: usize = 300;
 pub const MAX_TITLE_CHARS: usize = 120;
-pub const MAX_OPTION_CHARS: usize = 120;
+pub const MAX_OPTION_CHARS: usize = 200;
 
 /// What kind of answer a question takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,11 +524,17 @@ pub struct Reply {
 /// the prompt queue.
 pub type AskPrompt = Box<dyn Fn(&Form) -> Reply + Send + Sync>;
 
-/// The hook that asks the user, once a surface installs one. Clones share it;
-/// a sub-agent's context has its own, empty one, since only the main loop asks.
+/// How the user is asked, once a surface says: through a hook it installed (the
+/// terminal interface, the plain loop), or (for an embedder's renderer, slice 4)
+/// by the loop drawing the built form as `TurnEvent::Ui` messages and waiting
+/// through the renderer's waiter. Clones share it; a sub-agent's context has
+/// its own, empty one, since only the main loop asks.
 #[derive(Clone, Default)]
 pub struct Asker {
     prompt: Arc<Mutex<Option<Arc<AskPrompt>>>>,
+    form: Arc<std::sync::atomic::AtomicBool>,
+    /// The last form surface's number, for `agent86_ask_<n>`.
+    forms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Asker {
@@ -536,6 +542,7 @@ impl std::fmt::Debug for Asker {
         formatter
             .debug_struct("Asker")
             .field("can_ask", &self.can_ask())
+            .field("draws_form", &self.draws_form())
             .finish()
     }
 }
@@ -546,9 +553,28 @@ impl Asker {
         *self.prompt.lock().unwrap_or_else(PoisonError::into_inner) = prompt.map(Arc::new);
     }
 
-    /// Whether anyone can be asked.
+    /// Whether a hook is installed. See [`reachable`] for whether anyone can
+    /// be asked at all.
     pub fn can_ask(&self) -> bool {
         self.prompt().is_some()
+    }
+
+    /// Ask by drawing the built form through the context's renderer (or stop).
+    pub fn set_draws_form(&self, draws: bool) {
+        self.form.store(draws, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn draws_form(&self) -> bool {
+        self.form.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The surface id of the next form agent86 draws (`agent86_ask_<n>`).
+    pub fn next_surface(&self) -> String {
+        let n = self
+            .forms
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        format!("{FORM_SURFACE_PREFIX}{n}")
     }
 
     /// The hook, if one is installed. The lock is not held while the user answers.
@@ -558,6 +584,19 @@ impl Asker {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+}
+
+/// Whether anyone can answer `ask_user` from `ctx`: a hook is installed, or the
+/// loop draws the form and the context's renderer can answer a wait.
+pub fn reachable(ctx: &crate::tools::ToolContext) -> bool {
+    if ctx.asker.can_ask() {
+        return true;
+    }
+    #[cfg(feature = "agent86ui")]
+    if ctx.asker.draws_form() {
+        return ctx.ui.as_deref().is_some_and(|ui| ui.can_wait());
+    }
+    false
 }
 
 /// The system-prompt section wherever `ask_user` is offered (ADR 0006). With
@@ -594,6 +633,72 @@ impl crate::agent::Harness {
         Ok(())
     }
 
+    /// Offer `ask_user` answered through the renderer the embedder declared
+    /// (ADR 0006, slice 4): the loop draws the built form as `TurnEvent::Ui`
+    /// messages, as `render_ui` draws, and waits through the renderer's waiter,
+    /// so an embedder that answers waiting `render_ui` calls answers the
+    /// questions with no new code. Offered only when the renderer can answer a
+    /// wait and has the basic catalog the form is built in. Returns whether it
+    /// was offered.
+    #[cfg(feature = "agent86ui")]
+    pub fn offer_questions_as_forms(&mut self) -> Result<bool, String> {
+        let drawable = self.context.ui.as_deref().is_some_and(|ui| {
+            ui.can_wait()
+                && ui
+                    .catalogs()
+                    .iter()
+                    .any(|catalog| catalog.id() == agent86_ui::BASIC_CATALOG_ID)
+        });
+        if !drawable {
+            return Ok(false);
+        }
+        if self.registry.get(ASK_USER).is_none() {
+            self.registry
+                .register(Box::new(crate::tools::ask_user::AskUserTool))?;
+        }
+        self.context.asker.set_draws_form(true);
+        Ok(true)
+    }
+
+    /// Draw the built form through the context's renderer and wait for its
+    /// Send (slice 4): `None` when the turn was cancelled while it waited.
+    #[cfg(feature = "agent86ui")]
+    fn ask_through_renderer(
+        &self,
+        form: &Form,
+        question: crate::approval::Question,
+        emit: &mut dyn FnMut(crate::agent::TurnEvent<'_>),
+    ) -> Option<Reply> {
+        let dismissed = Reply {
+            outcome: Outcome::Dismissed,
+            via: Via::Form,
+        };
+        let Some(ui) = self.context.ui.as_deref() else {
+            return Some(dismissed);
+        };
+        let surface = self.context.asker.next_surface();
+        for message in form_messages(form, &surface, agent86_ui::BASIC_CATALOG_ID) {
+            if let Ok(message) = serde_json::from_value::<agent86_ui::AgentMessage>(message) {
+                emit(crate::agent::TurnEvent::Ui(&message));
+            }
+        }
+        let request = crate::agent86ui::UiWait {
+            surface_ids: vec![surface.clone()],
+        };
+        let action = self.gate.queue.ask(question, || ui.wait(&request));
+        let delete = serde_json::json!({"version": "1.0", "deleteSurface": {"surfaceId": surface}});
+        if let Ok(delete) = serde_json::from_value::<agent86_ui::AgentMessage>(delete) {
+            emit(crate::agent::TurnEvent::Ui(&delete));
+        }
+        Some(match action? {
+            Some(action) if action.surface_id == surface => Reply {
+                outcome: Outcome::Answered(values_from_context(form, &action.context)),
+                via: Via::Form,
+            },
+            _ => dismissed,
+        })
+    }
+
     /// Ask the questions an `ask_user` call checked, when `result` carries them
     /// ([`ASK_KEY`]), and make the answer its result; any other result is
     /// returned as it is. Asked through the prompt queue like a secret (one
@@ -605,6 +710,7 @@ impl crate::agent::Harness {
         call: &crate::types::ToolCall,
         result: crate::types::ToolResult,
         sid: &str,
+        emit: &mut dyn FnMut(crate::agent::TurnEvent<'_>),
     ) -> crate::types::ToolResult {
         use crate::approval::{Question, QuestionKind};
         use crate::tools::{failure, success};
@@ -617,9 +723,9 @@ impl crate::agent::Harness {
             call_id: call.id.clone(),
             ..result
         };
-        let (Ok(form), Some(prompt)) = (
+        let (Ok(form), true) = (
             serde_json::from_value::<Form>(value),
-            self.context.asker.prompt(),
+            reachable(&self.context),
         ) else {
             return answered(failure(
                 ASK_USER,
@@ -644,7 +750,19 @@ impl crate::agent::Harness {
             call: Some(call.id.clone()),
             ..Question::new(QuestionKind::Ask)
         };
-        match self.gate.queue.ask(question, || prompt(&form)) {
+        // A hook the surface installed, else the built form drawn through the
+        // embedder's renderer.
+        let asked = match self.context.asker.prompt() {
+            Some(prompt) => self.gate.queue.ask(question, || prompt(&form)),
+            #[cfg(feature = "agent86ui")]
+            None => self.ask_through_renderer(&form, question, emit),
+            #[cfg(not(feature = "agent86ui"))]
+            None => {
+                let _ = (question, &emit);
+                None
+            }
+        };
+        match asked {
             None => {
                 record("cancelled", None, 0);
                 answered(failure(

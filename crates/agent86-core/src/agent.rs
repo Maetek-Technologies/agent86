@@ -417,7 +417,7 @@ impl Harness {
         }
         // Beyond Python (ADR 0006): how to ask the user, wherever someone can
         // answer and the context may ask.
-        if ctx.asker.can_ask() && ctx.allowed_tool(crate::ask::ASK_USER) {
+        if crate::ask::reachable(ctx) && ctx.allowed_tool(crate::ask::ASK_USER) {
             #[cfg(feature = "agent86ui")]
             let drawing = ctx.ui.is_some() && ctx.allowed_tool(crate::agent86ui::RENDER_UI);
             #[cfg(not(feature = "agent86ui"))]
@@ -1258,7 +1258,7 @@ impl Harness {
                 };
                 // An `ask_user` call asks now (ADR 0006), after anything drawn
                 // before it in the batch is out.
-                let result = self.ask_questions(call, result, &sid);
+                let result = self.ask_questions(call, result, &sid, &mut emit);
                 let result = self.annotate_broken_json(call, result, &repairs, &mut broken_streak);
                 // What a sub-agent spent is what this turn spent: in the summary, the
                 // step, and the cost cap, but not as one of this turn's steps.
