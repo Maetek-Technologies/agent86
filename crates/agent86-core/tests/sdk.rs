@@ -1220,6 +1220,52 @@ async fn a_second_broken_surface_is_told_to_build_it_in_parts() {
 
 #[cfg(feature = "agent86ui")]
 #[tokio::test]
+async fn a_button_without_context_is_drawn_sending_the_forms_values() {
+    // ADR 0006: the prompt's form leaves `context` out, and a 0.9.1-style
+    // `{"path": ...}` binding is read as `@path`, so the press sends the answer.
+    use agent86_core::sdk::{AgentMessageKind, Ui};
+    let workspace = Workspace::new("ui-context");
+    let form = form_surface(json!([
+        {"id": "root", "component": "Column", "children": ["name", "ok"]},
+        {"id": "name", "component": "TextField", "label": "Name", "value": {"path": "/name"}},
+        {"id": "ok", "component": "Button", "child": "ok_label",
+         "action": {"event": {"name": "submit"}}},
+        {"id": "ok_label", "component": "Text", "text": "OK"}
+    ]));
+    let provider = Scripted::new(vec![calls(&[("c1", "render_ui", form)]), text("Done.")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    let mut drawn = Vec::new();
+    agent
+        .run_with_events("Ask me my name", |event| {
+            if let TurnEvent::Ui(message) = event {
+                if let AgentMessageKind::CreateSurface(create) = &message.kind {
+                    drawn.push(serde_json::to_value(&create.components).unwrap());
+                }
+            }
+        })
+        .await
+        .unwrap();
+    let components = drawn.pop().expect("the form was drawn");
+    assert_eq!(components[1]["value"], json!({"@path": "/name"}));
+    assert_eq!(
+        components[2]["action"]["event"]["context"],
+        json!({"name": {"@path": "/name"}})
+    );
+    let seen = observation(&provider, "c1");
+    assert!(seen.starts_with("Rendered surface form."), "{seen}");
+    assert!(
+        seen.contains("read {\"path\": ...} as {\"@path\": ...} in messages/0/createSurface/components/1 (name)"),
+        "{seen}"
+    );
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
 async fn without_a_renderer_render_ui_is_not_offered() {
     let workspace = Workspace::new("ui-none");
     let provider = Scripted::new(vec![text("Hello.")]);

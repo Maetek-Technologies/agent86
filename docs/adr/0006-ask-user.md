@@ -178,7 +178,7 @@ To check alongside item 6: half the session's retries wrote `{"path": ...}` for 
 4. **`sdk`:** the built form through an embedder's `Ui` and `on_wait`, with no new API, so agent86-desktop picks it up from the release.
 5. **ACP:** the questions extension, the text fallback that ends the turn, and the agent86UI extension's path once ADR 0005's slice 4 lands. They ship together with that slice or before it.
 6. **Strict mode:** `Tool::strict()` and the adapters, checked against each provider's documentation.
-7. **`render_ui` hardened:** items 1 to 7 above. They are independent of slices 1 to 6 and can land first.
+7. **`render_ui` hardened:** items 1 to 7 above. They are independent of slices 1 to 6 and can land first. Done 2026-11-23, in three parts: 7a, where the JSON broke, `{}` in the replay, and calls answered before dispatch traced; 7b, the closer repair and the advice on a repeat; 7c, the optional `context`, `{"path": ...}` read as `@path` (the check item 6 asked for: A2UI 1.0 does take it as a literal object), and the prompt's rule on building large surfaces in parts.
 8. **Measurement and docs:** the live check above, `docs/agent86ui.md` (or a page of its own), the README, the site, and the plan's differences from Python.
 
 ### The release (settled 2026-11-23)
