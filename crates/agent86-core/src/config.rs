@@ -98,6 +98,8 @@ markdown = true
 update_check = true
 thinking = "summary"
 tool_use = "summary"
+agent86ui = "auto"
+agent86ui_remote_media = false
 
 [run]
 output = "final"
@@ -236,6 +238,24 @@ pub struct UiConfig {
     /// How much of each tool call the interface shows (beyond Python).
     #[serde(default = "default_summary")]
     pub tool_use: DisplayLevel,
+    /// Whether the interface offers the model `render_ui` (agent86UI, beyond
+    /// Python; ADR 0005). `run`, the plain loop, and ACP never read it.
+    #[serde(default)]
+    pub agent86ui: Agent86UiMode,
+    /// Let a surface's media load `https` URLs, not only `data:` URLs and
+    /// workspace files. Needs project trust, since a fetch can track the user.
+    #[serde(default)]
+    pub agent86ui_remote_media: bool,
+}
+
+/// `[ui] agent86ui` (beyond Python): `auto` offers `render_ui` wherever a
+/// renderer is (the interactive interface); `off` never does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Agent86UiMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 /// `agent86 run` settings (`[run]`, beyond Python).
@@ -1116,6 +1136,31 @@ mod tests {
             error.contains("loud") && error.contains("full") && error.contains("hidden"),
             "{error}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent86ui_defaults_to_auto_without_remote_media() {
+        let dir = temp_dir("agent86ui-settings");
+        let paths = paths_in(&dir);
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert_eq!(config.ui.agent86ui, Agent86UiMode::Auto);
+        assert!(!config.ui.agent86ui_remote_media);
+
+        std::fs::write(
+            &paths.project,
+            "[ui]\nagent86ui = \"off\"\nagent86ui_remote_media = true\n",
+        )
+        .unwrap();
+        let config = load_config(&paths, &Overrides::default()).unwrap();
+        assert_eq!(config.ui.agent86ui, Agent86UiMode::Off);
+        assert!(config.ui.agent86ui_remote_media);
+
+        std::fs::write(&paths.project, "[ui]\nagent86ui = \"on\"\n").unwrap();
+        let error = load_config(&paths, &Overrides::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("auto") && error.contains("off"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

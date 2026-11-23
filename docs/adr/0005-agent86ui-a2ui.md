@@ -116,7 +116,7 @@ What that means:
 
 2. **The password-style field** (answered 2026-11-22). It is `TextField` with `"variant": "obscured"` (the basic catalog's `variant` enum is `longText`, `number`, `shortText`, `obscured`). The core refuses it in slice 2; the protocol crate stays policy-free.
 3. **The spec's finer points** (partly answered 2026-11-22 from the specification's text). The `action` fields are `name`, `surfaceId`, `sourceComponentId`, `timestamp` (an RFC 3339 date-time), and `context`, all required, plus `userMessage` and `metadata`. The agent-side error codes are `VALIDATION_FAILED`, `UNALLOWED_PARENT`, `UNALLOWED_CHILD`, `INTEGRITY_ERROR`, and `INVALID_FUNCTION_CALL`; `EXPRESSION_ERROR` and `EXECUTION_ERROR` are the renderer's. Still to read for the headless runtime: the `DynamicBoolean` coercion table and the regex dialect's limits.
-4. **The model's quality** (first measured 2026-11-22 on a local 27B model, see the ninth amendment; still open for hosted models). Measure, on the providers people use (including a local ~27B model), how often `render_ui` validates on the first try and after one correction. If smaller models fail often, `auto` may need to mean "on for models known to manage it", as the reasoning and sampling tables already single out models.
+4. **The model's quality** (first measured 2026-11-22 on a local 27B model, see the ninth amendment, and on seven hosted models the same day, see the eleventh; whether `auto` singles out models is still open). Measure, on the providers people use (including a local ~27B model), how often `render_ui` validates on the first try and after one correction. If smaller models fail often, `auto` may need to mean "on for models known to manage it", as the reasoning and sampling tables already single out models.
 
 ### Slices
 
@@ -124,7 +124,7 @@ What that means:
 2. **Core and `sdk`** (1.2.0): the feature, `render_ui`, the prompt section, `TurnEvent::Ui`, the blocking path through the prompt queue, redaction and guardrails, the trace kinds, the config, and replay on resume. Tested against the mock server with recorded `render_ui` calls; question 4 is measured here, live and opt-in. Its first part, 2a, settled completeness and ran the validator suites (done 2026-11-22; see the third amendment); 2b put the tool, the prompt section, the event, and the builder in place (done 2026-11-22; see the fourth); 2c the redaction, guardrails, policy, and the `ui_render` trace kind (done 2026-11-22; see the fifth); 2d the blocking wait (done 2026-11-22; see the sixth); 2e actions after the turn (done 2026-11-22; see the seventh); 2f replay on resume and `Agent::surfaces` (done 2026-11-22; see the eighth); 2g the docs and the first measurement of question 4 (done 2026-11-22; see the ninth); 2h the validator's remaining rules (done 2026-11-22; see the tenth).
 3. **agent86-desktop**, in its own repository, on the published 1.2.0 (its exact pin of `agent86-core` moves from `=1.1.0`). agent86-web follows on 1.2.2.
 4. **The ACP extension and its text fallback** (1.2.2; planned as 1.2.1 until 2026-11-22).
-5. **The terminal renderer** (1.2.1; planned as 1.2.4, then 1.2.2, until 2026-11-22).
+5. **The terminal renderer** (1.2.1; planned as 1.2.4, then 1.2.2, until 2026-11-22), in five parts (see the eleventh amendment): 5a, the config and the core entry points (done 2026-11-22).
 6. **Docs** (1.2.0, extended by each later release): `docs/agent86ui.md`, the README's and the site's claims, and the plan's differences.
 
 ## Consequences
@@ -282,3 +282,32 @@ Slice 2h built what the third amendment listed as missing before the crate is fi
 - **Errors said once:** a narrowed `oneOf` branch's "unevaluated properties" complaint stands only when nothing else failed in the same place.
 
 Still left out, with reasons in the harness: agent functions (four cases, left out of the first version), 0.9 data models (two), a catalog component schema with `additionalProperties: false`, which rejects the envelope's own keys under the specification's schemas as composed (one), and a case whose stub catalogs need a permissive stand-in the harness does not build (one).
+
+## Amendment: the terminal renderer's plan, and hosted models (2026-11-22)
+
+Slice 5, the terminal renderer (1.2.1), was planned with the maintainer before any of its code. Where it differs from the decision above, or settles what it left open:
+
+- **Five parts:** 5a, the config and the core entry points; 5b, drawing; 5c, the blocking wait, which turns `render_ui` on in the interface; 5d, actions after the turn; 5e, resume, the transcript view, and the docs.
+- **The interface keeps its own renderer.** `App` holds an `agent86_ui` `Runtime` fed by the `TurnEvent::Ui` messages, as an embedder's renderer would be, so what the user types and presses never touches the agent's copy in `UiSession`, and the state machine stays testable with synthetic events.
+- **The look:** a magenta heavy-line frame titled `agent86UI · drawn by the agent · <surfaceId>`, with no numbered choices, so it never looks like an approval or one of agent86's own panels (which are cyan and rounded).
+- **Where it is:** the newest surface that is up stays in the live region above the input box, capped at about 40% of the screen like the reply's tail; the others collapse to one line. When a surface is answered, deleted, or replaced, a static copy of its last state goes into scrollback.
+- **Keys:** Alt+Up focuses a surface while idle. Inside one, Tab and Shift+Tab or Up and Down move between inputs, Space toggles a check box or picks a choice, Left and Right move a slider, typing edits a text field, Enter presses the focused button, and Escape goes back to the input box (or dismisses a waiting surface).
+- **`openUrl`** shows the URL and asks y/n, then opens it with the system opener, `http` and `https` only.
+- **The renderer is attached after the terminal starts, not in `setup::assemble`.** `setup::attach_renderer` builds the `UiSession` from the config (the basic catalog, the egress guardrail's mode, `[ui] agent86ui_remote_media`), offers `render_ui` through `Harness::attach_ui` (which `sdk::AgentBuilder::ui` now uses too), and replays a resumed session's surfaces. The interface calls it once its terminal is up, so the plain loop, including the fallback when the terminal cannot start, never has the tool to take back, and `assemble`'s signature (shared with `run` and ACP) is unchanged. `[ui] agent86ui = "off"` leaves it out.
+- **The waiter is set later.** `UiSession::set_waiter` installs the answer to a waiting call once the interface's event channel exists, as the vault's `set_prompt` does for secrets; `can_wait`, and so the prompt's `wait` rule, follow it per request.
+- **One entry point for actions after a turn.** `Harness::accept_ui_action` checks an action, records `ui_action` (`waited: false`), and gives the text the turn runs on; `sdk::Agent::ui_action` and the interface both use it and run the text as a plain turn.
+- **Config:** `[ui] agent86ui` (`auto` or `off`, default `auto`) is in `trust::TRUST_FREE`; `[ui] agent86ui_remote_media` (default `false`) needs trust. `run`, the plain loop, and ACP read neither.
+
+**Question 4, hosted models** (2026-11-22, `tests/agent86ui_live.rs`, one run of the five tasks each, through OpenRouter):
+
+| Model | drew a surface | valid first try | valid within one correction |
+|---|---|---|---|
+| `anthropic/claude-sonnet-5.5` | 5/5 | 5/5 | 5/5 |
+| `google/gemini-3.8-flash` | 5/5 | 5/5 | 5/5 |
+| `anthropic/claude-haiku-5.5` | 5/5 | 3/5 | 5/5 |
+| `moonshotai/kimi-k3.1-pro` | 5/5 | 2/5 | 5/5 |
+| `qwen/qwen3.8-27b` | 5/5 | 2/5 | 5/5 |
+| `openai/gpt-6.2-sol` | 5/5 | 1/5 | 5/5 |
+| `deepseek/deepseek-v4.1-flash` | 5/5 | 1/5 | 3/5 |
+
+Every first failure of `gpt-6.2-sol` was a hyphenated component id (`submit-label`), which the prompt does not yet rule out; `deepseek` once put a value where a child id goes. The check reported "no render_ui call" in place of the first error for several models, a fault in its reporting. Whether `auto` should mean "on for models known to manage it" stays the maintainer's call, to be settled before 5c turns `render_ui` on in the interface.

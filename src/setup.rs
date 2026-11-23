@@ -247,6 +247,39 @@ pub fn assemble_in(
     })
 }
 
+/// Declare the interactive interface's renderer (agent86UI, beyond Python; ADR
+/// 0005): the basic catalog, under the egress guardrail's mode and
+/// `[ui] agent86ui_remote_media`, with `render_ui` offered and the surfaces of
+/// a resumed `state` rebuilt from its history. Called by the interface once the
+/// terminal has started, so `run`, the plain loop (including the fallback when
+/// the terminal cannot start), and ACP never offer the tool; `[ui] agent86ui =
+/// "off"` leaves it out too. The interface installs the answer to a waiting
+/// call itself (`UiSession::set_waiter`), once its event channel exists.
+/// Returns whether a renderer is attached.
+pub fn attach_renderer(
+    harness: &mut Harness,
+    config: &Config,
+    state: &crate::session::AgentState,
+) -> bool {
+    if config.ui.agent86ui == crate::config::Agent86UiMode::Off {
+        return false;
+    }
+    let Ok(session) = crate::agent86ui::UiSession::new(vec![crate::sdk::Catalog::basic().clone()])
+    else {
+        return false;
+    };
+    let session = session
+        .with_egress(config.guardrails.egress)
+        .with_remote_media(config.ui.agent86ui_remote_media);
+    if harness.attach_ui(session).is_err() {
+        return false;
+    }
+    if let Some(ui) = harness.context.ui.clone() {
+        ui.replay(state, &harness.context);
+    }
+    true
+}
+
 /// The triage router for `config`, as Python's `ModelRouter`: routed models are
 /// built from the config the session started with, as Python's harness keeps it.
 pub fn build_router(config: &Config) -> Router {
@@ -320,5 +353,125 @@ fn enforce_retention(config: &Config, store: &SessionStore, recorder: &Recorder)
                 .collect();
             recorder.event("memory", "retention_prune", fields);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(root: &Path) -> Config {
+        let paths = ConfigPaths {
+            user: Some(root.join("user.toml")),
+            project: root.join("project.toml"),
+            project_trust: crate::config::ProjectTrust::Trusted,
+        };
+        let mut config =
+            crate::config::load_config(&paths, &crate::config::Overrides::default()).unwrap();
+        config.memory.enabled = false;
+        config.agents.enabled = false;
+        config.mcp.enabled = false;
+        config.providers.insert(
+            "local".into(),
+            crate::config::ProviderConfig {
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                ..Default::default()
+            },
+        );
+        config.model.default = "local:m".into();
+        config
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agent86-setup-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn offers_render_ui(harness: &Harness) -> bool {
+        harness
+            .registry
+            .specs()
+            .iter()
+            .any(|spec| spec.name == crate::agent86ui::RENDER_UI)
+    }
+
+    #[test]
+    fn assembly_never_offers_render_ui_until_the_interface_attaches_it() {
+        let root = temp_root("renderer");
+        let config = config(&root);
+        let mut assembly = assemble_in(&config, &root, None, None).unwrap();
+        assert!(
+            !offers_render_ui(&assembly.harness),
+            "run and the plain loop"
+        );
+        assert!(assembly.harness.context.ui.is_none());
+
+        let state = crate::session::AgentState::new();
+        assert!(attach_renderer(&mut assembly.harness, &config, &state));
+        assert!(offers_render_ui(&assembly.harness));
+        let ui = assembly.harness.context.ui.clone().unwrap();
+        assert!(!ui.remote_media());
+        assert!(!ui.can_wait(), "the interface installs its own answer");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_renderer_follows_the_settings() {
+        let root = temp_root("renderer-settings");
+        let mut config = config(&root);
+        let state = crate::session::AgentState::new();
+
+        config.ui.agent86ui = crate::config::Agent86UiMode::Off;
+        let mut assembly = assemble_in(&config, &root, None, None).unwrap();
+        assert!(!attach_renderer(&mut assembly.harness, &config, &state));
+        assert!(!offers_render_ui(&assembly.harness));
+
+        config.ui.agent86ui = crate::config::Agent86UiMode::Auto;
+        config.ui.agent86ui_remote_media = true;
+        config.guardrails.egress = crate::config::EgressMode::Redact;
+        let mut assembly = assemble_in(&config, &root, None, None).unwrap();
+        assert!(attach_renderer(&mut assembly.harness, &config, &state));
+        let ui = assembly.harness.context.ui.clone().unwrap();
+        assert!(ui.remote_media());
+        assert_eq!(ui.egress(), crate::config::EgressMode::Redact);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_resumed_session_s_surfaces_come_back() {
+        let root = temp_root("renderer-replay");
+        let config = config(&root);
+        let mut assembly = assemble_in(&config, &root, None, None).unwrap();
+        let mut state = crate::session::AgentState::new();
+        let step = serde_json::json!({
+            "index": 1,
+            "phase": "execute",
+            "tool_calls": [{
+                "id": "c1",
+                "name": crate::agent86ui::RENDER_UI,
+                "arguments": {"messages": [{
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s1",
+                        "catalogId": crate::sdk::Catalog::basic().id(),
+                        "components": [{"id": "root", "component": "Text", "text": "Hi"}]
+                    }
+                }]}
+            }],
+            "results": [{"call_id": "c1", "name": crate::agent86ui::RENDER_UI, "content": "Rendered surface s1."}]
+        });
+        state.steps.push(serde_json::from_value(step).unwrap());
+        assert!(attach_renderer(&mut assembly.harness, &config, &state));
+        let ui = assembly.harness.context.ui.clone().unwrap();
+        assert_eq!(ui.surface_ids(), ["s1"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
