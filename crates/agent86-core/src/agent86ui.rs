@@ -60,8 +60,10 @@ pub struct UiSession {
     /// Media may load from `https` URLs, not only `data:` URLs and workspace
     /// files.
     remote_media: bool,
-    /// Answers a waiting call, when the program can.
-    waiter: Option<UiWaiter>,
+    /// Answers a waiting call, when the program can. Behind a lock, so a
+    /// surface that installs its answer after the harness is built (the
+    /// interface, once its event channel exists) can set it.
+    waiter: Mutex<Option<UiWaiter>>,
 }
 
 impl std::fmt::Debug for UiSession {
@@ -85,7 +87,7 @@ impl UiSession {
             runtime: Mutex::new(runtime),
             egress: EgressMode::Off,
             remote_media: false,
-            waiter: None,
+            waiter: Mutex::new(None),
         })
     }
 
@@ -104,20 +106,34 @@ impl UiSession {
     }
 
     /// Let a call wait for the user's answer, asking `waiter`.
-    pub fn with_waiter(mut self, waiter: Option<UiWaiter>) -> Self {
-        self.waiter = waiter;
+    pub fn with_waiter(self, waiter: Option<UiWaiter>) -> Self {
+        self.set_waiter(waiter);
         self
+    }
+
+    /// Install (or, with `None`, remove) the answer to a waiting call. The
+    /// prompt section is rebuilt per request, so it offers `wait` from the next
+    /// request on.
+    pub fn set_waiter(&self, waiter: Option<UiWaiter>) {
+        *self.waiter.lock().unwrap_or_else(PoisonError::into_inner) = waiter;
+    }
+
+    fn waiter(&self) -> Option<UiWaiter> {
+        self.waiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Whether a call may wait: someone answers.
     pub fn can_wait(&self) -> bool {
-        self.waiter.is_some()
+        self.waiter().is_some()
     }
 
     /// Ask the program for the user's answer (`None`: dismissed, or nobody
-    /// answers).
+    /// answers). The lock is not held while the program answers.
     pub fn wait(&self, request: &UiWait) -> Option<Action> {
-        self.waiter.as_ref().and_then(|waiter| waiter(request))
+        self.waiter().and_then(|waiter| waiter(request))
     }
 
     /// Whether `action` could have come from a surface up now: its surface
@@ -507,6 +523,44 @@ pub fn action_text(action: &Action) -> String {
 }
 
 impl crate::agent::Harness {
+    /// Declare a renderer: put `session` on the tool context and offer the
+    /// model `render_ui`. Both assembly paths (`sdk::AgentBuilder::ui` and the
+    /// binary's interface, through `setup::attach_renderer`) go through it.
+    /// Sub-agents never draw: `ToolContext::fork` drops the session.
+    pub fn attach_ui(&mut self, session: UiSession) -> Result<(), String> {
+        self.registry
+            .register(Box::new(crate::tools::render_ui::RenderUiTool))?;
+        self.context.ui = Some(std::sync::Arc::new(session));
+        Ok(())
+    }
+
+    /// Take an action from a surface no call was waiting on (ADR 0005: it
+    /// becomes the next user message): check that it could have come from a
+    /// surface up now, record it as `ui_action` (never its values), and give
+    /// the text the turn runs on, `[ui action] <name> on <surfaceId>: ...`. The
+    /// caller runs that as a plain turn, whose own vault redaction and ingress
+    /// guardrail cover it as they cover typed input. `Err` names what was
+    /// wrong, never the values, and nothing is recorded.
+    pub fn accept_ui_action(&self, sid: &str, action: &Action) -> Result<String, String> {
+        let ui = self
+            .context
+            .ui
+            .as_deref()
+            .ok_or_else(|| String::from("this agent has no renderer"))?;
+        ui.check_action(action, None)?;
+        self.recorder.event(
+            sid,
+            "ui_action",
+            vec![
+                ("surface", serde_json::json!(action.surface_id)),
+                ("name", serde_json::json!(action.name)),
+                ("component", serde_json::json!(action.source_component_id)),
+                ("waited", serde_json::json!(false)),
+            ],
+        );
+        Ok(action_text(action))
+    }
+
     /// Wait for the user's answer to a `wait: true` call, through the prompt
     /// queue like a secret prompt (one question at a time, declined once the
     /// turn is cancelled), and make it the call's result. The answer goes
@@ -969,6 +1023,33 @@ mod tests {
         assert!(section.contains(&format!("### Catalog `{}`", agent86_ui::BASIC_CATALOG_ID)));
         assert!(section.contains("## Catalog Guidelines"));
         assert!(section.contains("[ui action] submit on <surfaceId>"));
+    }
+
+    #[test]
+    fn a_waiter_set_later_offers_wait_from_then_on() {
+        let session = UiSession::new(vec![Catalog::basic().clone()]).unwrap();
+        let request = UiWait {
+            surface_ids: vec!["s".into()],
+        };
+        assert!(!session.can_wait());
+        assert!(!session.prompt_section().contains("\"wait\": true"));
+        assert_eq!(session.wait(&request), None);
+
+        session.set_waiter(Some(std::sync::Arc::new(|wait: &UiWait| {
+            Some(Action::new(
+                "ok",
+                wait.surface_ids[0].clone(),
+                "root",
+                "2026-11-22T00:00:00Z",
+                Map::new(),
+            ))
+        })));
+        assert!(session.can_wait());
+        assert!(session.prompt_section().contains("\"wait\": true"));
+        assert_eq!(session.wait(&request).map(|a| a.name), Some("ok".into()));
+
+        session.set_waiter(None);
+        assert!(!session.can_wait());
     }
 
     #[test]

@@ -620,21 +620,21 @@ impl AgentBuilder {
                 .map_err(BuildError::Tool)?;
         }
         #[cfg(feature = "agent86ui")]
+        let mut ui_session = None;
+        #[cfg(feature = "agent86ui")]
         if let Some(ui) = self.ui {
             if ui.catalogs.is_empty() {
                 return Err(BuildError::Ui(
                     "a renderer needs at least one catalog".into(),
                 ));
             }
-            let session = crate::agent86ui::UiSession::new(ui.catalogs)
-                .map_err(|error| BuildError::Ui(error.to_string()))?
-                .with_egress(self.guardrails.egress)
-                .with_remote_media(ui.remote_media)
-                .with_waiter(ui.on_wait);
-            context.ui = Some(Arc::new(session));
-            registry
-                .register(Box::new(crate::tools::render_ui::RenderUiTool))
-                .map_err(BuildError::Tool)?;
+            ui_session = Some(
+                crate::agent86ui::UiSession::new(ui.catalogs)
+                    .map_err(|error| BuildError::Ui(error.to_string()))?
+                    .with_egress(self.guardrails.egress)
+                    .with_remote_media(ui.remote_media)
+                    .with_waiter(ui.on_wait),
+            );
         }
         let mut session_limits = crate::limits::SessionLimits::default();
         session_limits.prompt = self.on_limit;
@@ -691,6 +691,10 @@ impl AgentBuilder {
             cancel: Default::default(),
             subagents: Default::default(),
         };
+        #[cfg(feature = "agent86ui")]
+        if let Some(session) = ui_session {
+            harness.attach_ui(session).map_err(BuildError::Tool)?;
+        }
         harness.context.can_delegate = harness.delegation_offered(&harness.context, 0);
         harness.gate.queue.watch(harness.cancel.clone());
         harness
@@ -1399,24 +1403,10 @@ impl Agent {
         action: Action,
         on_event: impl FnMut(TurnEvent<'_>),
     ) -> Result<RunResult, RunError> {
-        let ui = self
+        let text = self
             .harness
-            .context
-            .ui
-            .clone()
-            .ok_or_else(|| RunError::UiAction("this agent has no renderer".into()))?;
-        ui.check_action(&action, None).map_err(RunError::UiAction)?;
-        self.harness.recorder.event(
-            &self.conversation.0.session_id,
-            "ui_action",
-            vec![
-                ("surface", json!(action.surface_id)),
-                ("name", json!(action.name)),
-                ("component", json!(action.source_component_id)),
-                ("waited", json!(false)),
-            ],
-        );
-        let text = crate::agent86ui::action_text(&action);
+            .accept_ui_action(&self.conversation.0.session_id, &action)
+            .map_err(RunError::UiAction)?;
         self.run_with_events(Turn::Goal(text), on_event).await
     }
 

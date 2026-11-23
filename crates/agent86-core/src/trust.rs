@@ -40,6 +40,9 @@ pub const TRUST_FREE: &[&str] = &[
     "ui.update_check",
     "ui.thinking",
     "ui.tool_use",
+    // The default is already `auto`, so an untrusted file can only turn it off;
+    // `ui.agent86ui_remote_media` loosens what a surface fetches and needs trust.
+    "ui.agent86ui",
     "tools.web_max_chars",
     "tools.mention_max_bytes",
     "mcp.enabled",
@@ -392,6 +395,20 @@ mod tests {
         let kept: Table = "[model]\ndefault = \"openai:gpt-4o\"\n\n[ui]\nspinner = false\n"
             .parse()
             .unwrap();
+        assert_eq!(layer, kept);
+    }
+
+    #[test]
+    fn agent86ui_is_trust_free_but_remote_media_is_not() {
+        let mut layer: Table = "[ui]\nagent86ui = \"off\"\nagent86ui_remote_media = true\n"
+            .parse()
+            .unwrap();
+        let taken: Vec<String> = take_untrusted(&mut layer)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(taken, ["ui.agent86ui_remote_media"]);
+        let kept: Table = "[ui]\nagent86ui = \"off\"\n".parse().unwrap();
         assert_eq!(layer, kept);
     }
 
