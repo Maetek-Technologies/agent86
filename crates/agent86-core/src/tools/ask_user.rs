@@ -82,7 +82,7 @@ impl Tool for AskUserTool {
         args: &Map<String, Value>,
         ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        if !ctx.asker.can_ask() {
+        if !crate::ask::reachable(ctx) {
             return Ok(failure(
                 self.name(),
                 "Nobody can answer questions here, so none were asked. Go on with what you \

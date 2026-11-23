@@ -1,6 +1,7 @@
-//! The live agent86UI check (ADR 0005, question 4; opt-in, never in CI): how
-//! often real models write `render_ui` batches that validate on the first try,
-//! and within one correction.
+//! The live agent86UI check (ADR 0005, question 4, and ADR 0006; opt-in, never
+//! in CI): how often real models write `render_ui` batches and `ask_user` calls
+//! that are valid on the first try, and within one correction, and which of the
+//! two (or neither, asking in prose) they reach for first.
 //!
 //! Runs only with `AGENT86_TEST_UI_LIVE=1`. The models are
 //! `AGENT86_TEST_UI_MODELS`, comma-separated `provider:model` refs, else
@@ -8,12 +9,14 @@
 //! (`~/.agent86/config.toml`) and keys from their environment variables or the
 //! OS keyring, as the CLI resolves them. Each model gets the same five tasks,
 //! each `AGENT86_TEST_UI_RUNS` times (default 1), in a throwaway workspace with
-//! nothing but `render_ui` offered and every wait dismissed; nothing it draws
-//! goes anywhere. `AGENT86_TEST_UI_TASKS` picks another set (ADR 0006):
-//! `large`, four forms of seven to nine questions, or `session`, the session
-//! that failed, replayed (a prose turn over a home folder with the read-only
-//! tools, then a request for a form), which a clean context does not
-//! reproduce. The results print as a table:
+//! `render_ui` and `ask_user` offered (since 1.2.2, a renderer that answers waits
+//! gets both) and every wait dismissed; nothing it draws goes anywhere.
+//! `AGENT86_TEST_UI_TASKS` picks another set (ADR 0006): `large`, four forms of
+//! seven to nine questions; `session`, the session that failed, replayed (a
+//! prose turn over a home folder with the read-only tools, then a request for a
+//! form), which a clean context does not reproduce; or `ask`, six requests that
+//! need clarifying questions without naming a form. The results print as a
+//! table:
 //!
 //! ```text
 //! AGENT86_TEST_UI_LIVE=1 cargo test --test agent86ui_live -- --nocapture
@@ -57,11 +60,28 @@ const SESSION_TASKS: &[&str] = &["Let's plan out a better way to organize the co
 
 const TURN_BREAK: &str = "\n---\n";
 
+/// Requests that need clarifying questions without naming a form (ADR 0006):
+/// `AGENT86_TEST_UI_TASKS=ask` measures how often the model asks through
+/// `ask_user` rather than in its reply, and whether the call is valid.
+const ASK_TASKS: &[&str] = &[
+    "Let's plan out a better way to organize the content in this folder. Ask me clarifying questions. Do not change anything yet.",
+    "I want to set up a new project here. Before you start, ask me whatever you need to know.",
+    "Plan a weekend trip for me. Ask me what you need to know first.",
+    "Help me write a cover letter. Get the details you need from me before you write anything.",
+    "I need a script that cleans up old log files. Check the details with me before writing it.",
+    "We need to pick a database for this app. Ask me about the requirements first.",
+];
+
 #[derive(Default)]
 struct Outcome {
+    /// Calls to `render_ui` or `ask_user`, the tools that reach the user.
     calls: usize,
     first_valid: Option<usize>,
     error: Option<String>,
+    /// The first of those tools the model called.
+    first_tool: Option<String>,
+    /// No such call, and the answer asks a question: asked in prose.
+    prose: bool,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -75,10 +95,13 @@ async fn models_write_valid_render_ui_batches() {
     let config = load_config(&ConfigPaths::discover(), &Overrides::default())
         .expect("the user's config loads");
     let set = std::env::var("AGENT86_TEST_UI_TASKS").unwrap_or_default();
-    let session = set == "session";
+    // The session and the clarifying requests run over a home folder, with the
+    // read-only tools, as an agent in a real directory would.
+    let session = set == "session" || set == "ask";
     let tasks = match set.as_str() {
         "large" => LARGE_TASKS,
         "session" => SESSION_TASKS,
+        "ask" => ASK_TASKS,
         _ => TASKS,
     };
     // Each task this many times (`AGENT86_TEST_UI_RUNS`, default 1): one run
@@ -141,9 +164,11 @@ async fn models_write_valid_render_ui_batches() {
                 Ok(()) => agent
                     .run_with_events(*last, |event| {
                         if let TurnEvent::ToolResult { call, result, .. } = event {
-                            if call.name == "render_ui" {
+                            if call.name == "render_ui" || call.name == "ask_user" {
                                 outcome.calls += 1;
-                                // A dismissed wait drew (the waiter declined).
+                                outcome.first_tool.get_or_insert(call.name.clone());
+                                // A dismissed wait drew (the waiter declined); a
+                                // dismissed `ask_user` form is an ok result.
                                 let drew = result.ok
                                     || result
                                         .error
@@ -163,8 +188,11 @@ async fn models_write_valid_render_ui_batches() {
                         }
                     })
                     .await
-                    .map(|_| ()),
+                    .map(|result| result.answer),
             };
+            let result = result.map(|answer| {
+                outcome.prose = outcome.calls == 0 && answer.contains('?');
+            });
             if let Err(error) = result {
                 outcome.error.get_or_insert(error.to_string());
             }
@@ -177,9 +205,18 @@ async fn models_write_valid_render_ui_batches() {
             .iter()
             .filter(|o| o.first_valid.is_some_and(|n| n <= 2))
             .count();
+        let by = |tool: &str| {
+            outcomes
+                .iter()
+                .filter(|o| o.first_tool.as_deref() == Some(tool))
+                .count()
+        };
+        let prose = outcomes.iter().filter(|o| o.prose).count();
         rows.push(format!(
-            "{reference}: drew in {tried}/{n}, valid first try {first}/{n}, within one correction {within_two}/{n}",
-            n = tasks.len()
+            "{reference}: drew in {tried}/{n}, valid first try {first}/{n}, within one correction {within_two}/{n}; first through ask_user {asked}/{n}, render_ui {drawn}/{n}, asked in prose {prose}/{n}",
+            n = tasks.len(),
+            asked = by("ask_user"),
+            drawn = by("render_ui"),
         ));
         for (task, outcome) in tasks.iter().zip(&outcomes) {
             if outcome.first_valid != Some(1) {
@@ -188,7 +225,11 @@ async fn models_write_valid_render_ui_batches() {
                     task.chars().take(48).collect::<String>(),
                     outcome.calls,
                     outcome.first_valid,
-                    outcome.error.as_deref().unwrap_or("no render_ui call")
+                    outcome.error.as_deref().unwrap_or(if outcome.prose {
+                        "asked in prose"
+                    } else {
+                        "no render_ui or ask_user call"
+                    })
                 ));
             }
         }

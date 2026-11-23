@@ -179,6 +179,17 @@ To check alongside item 6: half the session's retries wrote `{"path": ...}` for 
 
 No run failed on broken JSON. A repaired call counts as valid on the first try, since the user saw the form. Gemini's remaining failures were A2UI's rules (a message without `"version"`), which only `ask_user` removes. The two runs that never drew made no `render_ui` call within the check's four steps, which is a different problem from this one.
 
+**After slice 4** (2026-11-23, `ask_user` offered through the renderer's waiter, every form dismissed):
+
+| Model (through OpenRouter) | Task set | Runs | first through `ask_user` | valid first try | asked in prose |
+|---|---|---|---|---|---|
+| `anthropic/claude-haiku-5.5` | `ask` | 18 | 18 | 18 | 0 |
+| `google/gemini-3.8-flash` | `ask` | 18 | 18 | 17 | 0 |
+| `anthropic/claude-haiku-5.5` | `session` | 4 | 4 | 4 | 0 |
+| `google/gemini-3.8-flash` | `session` | 4 | 4 | 4 | 0 |
+
+Both models asked through `ask_user` every time, including on requests that never mentioned a form, and neither reached for `render_ui` or asked in prose. The one call that was not valid on the first try was `gemini-3.8-flash` writing an option longer than the 120 characters then allowed, fixed by its next call; the limit is now 200. The `session` replay, which `render_ui` alone drew validly on the first try in 2 of 6 (Haiku) and 1 of 4 (Gemini), went 4 of 4 for both. The remaining measurement (ten tasks, the other hosted models, and a local ~27B model) is slice 8.
+
 ### Slices
 
 1. **Core:** `ask_user`, its argument checks, the answers, the `QuestionPrompt` hook through the prompt queue, the built form and its validator test, the prompt section, the `ask_user` trace kind, and `[ui] ask_user`. Tested with recorded calls against the mock server and a scripted hook. Done 2026-11-23 (`src/ask.rs`, `tools/ask_user.rs`), with these settled as it was built:
@@ -186,14 +197,17 @@ No run failed on broken JSON. A repaired call counts as valid on the first try, 
    - The tool only checks the questions and hands the `ask::Form` to the main loop in its result's metadata (`ask::ASK_KEY`), as a waiting `render_ui` call does. The loop asks (`Harness::ask_questions`, a new `QuestionKind::Ask` in the prompt queue), so the answers pass the vault and the ingress guardrail where typed input does.
    - A hook returns an `ask::Reply`: the `Outcome` (`Answered` with the values by id, or `Dismissed`) and the `Via`. The loop normalizes the values (`Form::accept`), so every surface's answers read the same.
    - `yes_no` is a Yes/No ChoicePicker in the built form, not a CheckBox: a CheckBox starts unchecked, so a required question could not tell "no" from "not answered".
-   - Limits: question text 300 characters, the title and each option 120.
+   - Limits: question text 300 characters, the title 120, each option 200 (120 until slice 4's live check, where `gemini-3.8-flash` once wrote a longer option; a refusal costs a round trip, so the limit only keeps forms readable).
 2. **The terminal interface:** the hook as the built form, drawn by the agent86UI renderer and answered in place, including "Other", required questions, Escape and Ctrl+C, and the Ctrl+O transcript view. Done 2026-11-23 (`ui::ask_in_form`), with these settled as it was built:
    - Required questions are enforced in the form, not only reported afterwards: Send carries one `@checks` rule (`required` on each required answer, joined with `and`), so the renderer dims it and ignores Enter until they are answered. `Form::accept` still lists any left empty, for surfaces that do not enforce checks.
    - The surface is `agent86_ask_<n>` (`ask::FORM_SURFACE_PREFIX`) and is drawn only by the interface's renderer, never the agent's `UiSession`, so `render_ui` cannot change it and a resumed session does not redraw it. `render_ui` refuses surface ids with that prefix, since a model-drawn surface of the same id would otherwise replace the form on screen. The frame is titled `agent86UI · questions from the agent` instead of the id.
    - The title is plain text, since the terminal renderer does not render Markdown in a Text.
    - `[ui] ask_user` decides; `[ui] agent86ui = "off"` does not turn the form off, since the model writes none of it.
 3. **The plain loop:** the text hook. Done 2026-11-23 (`ask_text::ask_in_text`, installed by `repl::plain_loop` when stdin is a terminal, never by `setup::assemble`, which `run` shares): numbered options take a number or the user's own words, an answer that does not fit its kind is asked again, `/skip` alone (or end of input, or Ctrl+C, which cancels the turn) dismisses, and model text goes through `escape::show_controls`.
-4. **`sdk`:** the built form through an embedder's `Ui` and `on_wait`, with no new API, so agent86-desktop picks it up from the release.
+4. **`sdk`:** the built form through an embedder's `Ui` and `on_wait`, with no new API, so agent86-desktop picks it up from the release. Done 2026-11-23, with these settled as it was built:
+   - It is a mode of the loop, not a hook (`Asker::set_draws_form`, set by `Harness::offer_questions_as_forms` from `AgentBuilder::build`): only the loop's `emit` can hand the embedder `TurnEvent::Ui`, so `Harness::ask_questions` draws the form (`createSurface` for `agent86_ask_<n>`), asks the renderer's waiter through the prompt queue, and sends a `deleteSurface` afterwards. A hook, where a surface installed one, still comes first.
+   - It is offered only when the `Ui` has `on_wait` and the basic catalog, which the form is built in. `ask::reachable` decides, for the tool and the prompt section alike.
+   - The form is never kept in the agent's `UiSession` (`Agent::surfaces` does not list it); an action is taken as the answer only when it names the form's surface, else it reads as a dismissal.
 5. **ACP:** the questions extension, the text fallback that ends the turn, and the agent86UI extension's path once ADR 0005's slice 4 lands. They ship together with that slice or before it.
 6. **Strict mode:** `Tool::strict()` and the adapters, checked against each provider's documentation.
 7. **`render_ui` hardened:** items 1 to 7 above. They are independent of slices 1 to 6 and can land first. Done 2026-11-23, in three parts: 7a, where the JSON broke, `{}` in the replay, and calls answered before dispatch traced; 7b, the closer repair and the advice on a repeat; 7c, the optional `context`, `{"path": ...}` read as `@path` (the check item 6 asked for: A2UI 1.0 does take it as a literal object), and the prompt's rule on building large surfaces in parts.

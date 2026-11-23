@@ -1495,6 +1495,108 @@ fn submit(surface: &str, component: &str, context: Value) -> agent86_core::sdk::
     )
 }
 
+// `ask_user` through an embedder's renderer (ADR 0006, slice 4): the form is
+// drawn as `TurnEvent::Ui` and answered through the `Ui::on_wait` waiter.
+
+#[cfg(feature = "agent86ui")]
+fn plan_questions() -> Value {
+    json!({"title": "Your plan", "questions": [
+        {"id": "plan", "question": "Which plan?", "kind": "choice", "options": ["Basic", "Pro"]},
+        {"id": "note", "question": "Anything else?", "kind": "text", "optional": true}
+    ]})
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_renderer_that_answers_waits_answers_ask_user_with_the_built_form() {
+    use agent86_core::sdk::{AgentMessageKind, Ui};
+    let workspace = Workspace::new("ask-sdk");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "ask_user", plan_questions())]),
+        text("Pro it is."),
+    ]);
+    let waits: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let seen = Arc::clone(&waits);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic().on_wait(move |wait| {
+            seen.lock().unwrap().push(wait.surface_ids.clone());
+            Some(submit(
+                &wait.surface_ids[0],
+                "send",
+                json!({"answers": {"plan": ["__other__"], "note": ""},
+                       "other": {"plan": "Team, if it exists"}}),
+            ))
+        }))
+        .build()
+        .unwrap();
+    assert!(agent.tool_names().contains(&"ask_user".to_owned()));
+
+    let mut drawn = Vec::new();
+    let result = agent
+        .run_with_events("Help me pick a plan", |event| {
+            if let TurnEvent::Ui(message) = event {
+                drawn.push(match &message.kind {
+                    AgentMessageKind::CreateSurface(create) => {
+                        format!("create {}", create.surface_id)
+                    }
+                    AgentMessageKind::DeleteSurface(delete) => {
+                        format!("delete {}", delete.surface_id)
+                    }
+                    other => format!("{other:?}"),
+                });
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.answer, "Pro it is.");
+    assert_eq!(drawn, ["create agent86_ask_1", "delete agent86_ask_1"]);
+    assert_eq!(*waits.lock().unwrap(), [["agent86_ask_1"]]);
+    assert_eq!(
+        observation(&provider, "c1"),
+        "The user answered:\n{\"plan\": \"Team, if it exists\", \"note\": null}\nIn their own words, not one of the options: plan."
+    );
+    let system = &provider.requests()[0].messages[0].content;
+    assert!(system.contains("## Asking the user"), "{system}");
+    assert!(system.contains("never render_ui"), "{system}");
+    // The form is the interface's to draw, never the agent's to keep.
+    assert!(agent.surfaces().is_empty());
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_dismissed_form_through_the_renderer_is_reported_as_such() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ask-sdk-dismiss");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "ask_user", plan_questions())]),
+        text("Going with defaults."),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic().on_wait(|_| None))
+        .build()
+        .unwrap();
+    agent.run("Help me pick a plan").await.unwrap();
+    assert_eq!(observation(&provider, "c1"), agent86_core::ask::DISMISSED);
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
+async fn a_renderer_that_cannot_answer_waits_is_not_offered_ask_user() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ask-sdk-none");
+    let agent = Agent::builder()
+        .provider(Scripted::new(vec![text("Hi.")]))
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    assert_eq!(agent.tool_names(), ["render_ui"]);
+}
+
 #[cfg(feature = "agent86ui")]
 #[tokio::test]
 async fn a_waiting_call_gets_the_users_action_after_the_surface_is_drawn() {

@@ -694,6 +694,10 @@ impl AgentBuilder {
         #[cfg(feature = "agent86ui")]
         if let Some(session) = ui_session {
             harness.attach_ui(session).map_err(BuildError::Tool)?;
+            // A renderer that answers waits answers `ask_user` too (ADR 0006).
+            harness
+                .offer_questions_as_forms()
+                .map_err(BuildError::Tool)?;
         }
         harness.context.can_delegate = harness.delegation_offered(&harness.context, 0);
         harness.gate.queue.watch(harness.cancel.clone());
