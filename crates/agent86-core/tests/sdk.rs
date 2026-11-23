@@ -1266,6 +1266,38 @@ async fn a_button_without_context_is_drawn_sending_the_forms_values() {
 
 #[cfg(feature = "agent86ui")]
 #[tokio::test]
+async fn render_ui_cannot_use_the_surface_names_of_agent86s_own_forms() {
+    use agent86_core::sdk::Ui;
+    let workspace = Workspace::new("ui-reserved");
+    let mut form = name_form();
+    form["messages"][0]["createSurface"]["surfaceId"] = json!("agent86_ask_1");
+    let provider = Scripted::new(vec![calls(&[("c1", "render_ui", form)]), text("Done.")]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .ui(Ui::basic())
+        .build()
+        .unwrap();
+    let mut drawn = 0;
+    agent
+        .run_with_events("Ask me my name", |event| {
+            if let TurnEvent::Ui(_) = event {
+                drawn += 1;
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(drawn, 0);
+    let seen = observation(&provider, "c1");
+    assert!(seen.contains("nothing was drawn"), "{seen}");
+    assert!(
+        seen.contains("/0/createSurface/surfaceId: surface ids starting with agent86_ask_ are agent86's own forms"),
+        "{seen}"
+    );
+}
+
+#[cfg(feature = "agent86ui")]
+#[tokio::test]
 async fn without_a_renderer_render_ui_is_not_offered() {
     let workspace = Workspace::new("ui-none");
     let provider = Scripted::new(vec![text("Hello.")]);

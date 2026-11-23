@@ -187,7 +187,11 @@ No run failed on broken JSON. A repaired call counts as valid on the first try, 
    - A hook returns an `ask::Reply`: the `Outcome` (`Answered` with the values by id, or `Dismissed`) and the `Via`. The loop normalizes the values (`Form::accept`), so every surface's answers read the same.
    - `yes_no` is a Yes/No ChoicePicker in the built form, not a CheckBox: a CheckBox starts unchecked, so a required question could not tell "no" from "not answered".
    - Limits: question text 300 characters, the title and each option 120.
-2. **The terminal interface:** the hook as the built form, drawn by the agent86UI renderer and answered in place, including "Other", required questions, Escape and Ctrl+C, and the Ctrl+O transcript view.
+2. **The terminal interface:** the hook as the built form, drawn by the agent86UI renderer and answered in place, including "Other", required questions, Escape and Ctrl+C, and the Ctrl+O transcript view. Done 2026-11-23 (`ui::ask_in_form`), with these settled as it was built:
+   - Required questions are enforced in the form, not only reported afterwards: Send carries one `@checks` rule (`required` on each required answer, joined with `and`), so the renderer dims it and ignores Enter until they are answered. `Form::accept` still lists any left empty, for surfaces that do not enforce checks.
+   - The surface is `agent86_ask_<n>` (`ask::FORM_SURFACE_PREFIX`) and is drawn only by the interface's renderer, never the agent's `UiSession`, so `render_ui` cannot change it and a resumed session does not redraw it. `render_ui` refuses surface ids with that prefix, since a model-drawn surface of the same id would otherwise replace the form on screen. The frame is titled `agent86UI · questions from the agent` instead of the id.
+   - The title is plain text, since the terminal renderer does not render Markdown in a Text.
+   - `[ui] ask_user` decides; `[ui] agent86ui = "off"` does not turn the form off, since the model writes none of it.
 3. **The plain loop:** the text hook.
 4. **`sdk`:** the built form through an embedder's `Ui` and `on_wait`, with no new API, so agent86-desktop picks it up from the release.
 5. **ACP:** the questions extension, the text fallback that ends the turn, and the agent86UI extension's path once ADR 0005's slice 4 lands. They ship together with that slice or before it.

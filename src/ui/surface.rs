@@ -23,6 +23,9 @@ use serde_json::Value;
 /// What the frame's title says, before the surface id.
 pub const TITLE: &str = "agent86UI · drawn by the agent";
 
+/// The title of a form agent86 built for `ask_user` (ADR 0006).
+pub const QUESTIONS_TITLE: &str = "agent86UI · questions from the agent";
+
 /// The components a user can act on, which take the focus in turn.
 const FOCUSABLE: &[&str] = &[
     "Button",
@@ -425,10 +428,20 @@ fn frame(id: &str, body: Body, width: usize) -> Drawn {
     let inner = width - 4;
     let id = sanitize(id).replace('\n', " ");
     let room = width.saturating_sub(4);
-    // A narrow frame drops "drawn by the agent" before it cuts the surface id.
-    let mut title = Line::styled(Style::BoldMagenta, format!(" {TITLE} · {id} "));
+    // A form agent86 built for `ask_user` (ADR 0006) says whose questions they
+    // are rather than its internal id.
+    let (full, short) = if id.starts_with(crate::ask::FORM_SURFACE_PREFIX) {
+        (
+            format!(" {QUESTIONS_TITLE} "),
+            " agent86UI · questions ".to_owned(),
+        )
+    } else {
+        // A narrow frame drops "drawn by the agent" before it cuts the surface id.
+        (format!(" {TITLE} · {id} "), format!(" agent86UI · {id} "))
+    };
+    let mut title = Line::styled(Style::BoldMagenta, full);
     if title.width() > room {
-        title = Line::styled(Style::BoldMagenta, format!(" agent86UI · {id} "));
+        title = Line::styled(Style::BoldMagenta, short);
     }
     let title = title.truncate(room);
     let fill = width.saturating_sub(3 + title.width());

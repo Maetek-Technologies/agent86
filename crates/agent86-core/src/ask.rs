@@ -694,6 +694,11 @@ impl crate::agent::Harness {
     }
 }
 
+/// How the surface of a form agent86 builds is named (`agent86_ask_<n>`), so a
+/// surface can tell it from one the model drew, and `render_ui` refuses the
+/// prefix, so the model cannot replace a form while the user answers it.
+pub const FORM_SURFACE_PREFIX: &str = "agent86_ask_";
+
 /// The option the built form adds to every choice question, and the value it
 /// stands for in the data model.
 #[cfg(feature = "agent86ui")]
@@ -715,8 +720,7 @@ pub fn form_messages(form: &Form, surface_id: &str, catalog_id: &str) -> Vec<Val
     let mut other = Map::new();
     if let Some(title) = &form.title {
         children.push(json!("title"));
-        components
-            .push(json!({"id": "title", "component": "Text", "text": format!("**{title}**")}));
+        components.push(json!({"id": "title", "component": "Text", "text": title}));
     }
     for question in &form.questions {
         let id = &question.id;
@@ -779,12 +783,31 @@ pub fn form_messages(form: &Form, surface_id: &str, catalog_id: &str) -> Vec<Val
         }
     }
     children.push(json!("send"));
-    components.push(
-        json!({"id": "send", "component": "Button", "child": "send_label",
+    let mut send = json!({"id": "send", "component": "Button", "child": "send_label",
         "variant": "primary",
         "action": {"event": {"name": "answers", "context": {
-            "answers": {"@path": "/answers"}, "other": {"@path": "/other"}}}}}),
-    );
+            "answers": {"@path": "/answers"}, "other": {"@path": "/other"}}}}});
+    // Send stays disabled until every required question has an answer.
+    let required: Vec<Value> = form
+        .questions
+        .iter()
+        .filter(|question| !question.optional)
+        .map(|question| {
+            json!({"@call": "required", "args": {"value": {"@path": format!("/answers/{}", question.id)}}})
+        })
+        .collect();
+    let condition = match required.len() {
+        0 => None,
+        1 => required.into_iter().next(),
+        _ => Some(json!({"@call": "and", "args": {"values": required}})),
+    };
+    if let Some(condition) = condition {
+        send["@checks"] = json!([{
+            "condition": condition,
+            "message": "Answer every question not marked (optional) to send.",
+        }]);
+    }
+    components.push(send);
     components.push(json!({"id": "send_label", "component": "Text", "text": "Send answers"}));
     components.insert(
         0,
@@ -1016,7 +1039,18 @@ mod tests {
         ] {
             runtime.input("ask_1", path, value).unwrap();
         }
+        // `notes` is required and still empty, so Send is disabled.
         let send = runtime.node("ask_1", "send").unwrap();
+        assert!(!send.is_valid());
+        assert_eq!(
+            send.failures[0]["message"],
+            "Answer every question not marked (optional) to send."
+        );
+        runtime
+            .input("ask_1", "/answers/notes", json!("Leave .ssh alone."))
+            .unwrap();
+        let send = runtime.node("ask_1", "send").unwrap();
+        assert!(send.is_valid(), "{:?}", send.failures);
         let action = runtime
             .components("ask_1")
             .unwrap()
@@ -1035,14 +1069,14 @@ mod tests {
                 "scope": "Personal content only",
                 "goal": ["Reduce clutter", "Archive the photos"],
                 "keep": null,
-                "notes": null,
+                "notes": "Leave .ssh alone.",
                 "budget": 4,
                 "archive": false,
                 "by": "2026-12-01"
             })
         );
         assert_eq!(accepted.typed, ["goal"]);
-        assert_eq!(accepted.unanswered, ["notes"]);
+        assert!(accepted.unanswered.is_empty());
     }
 
     #[cfg(feature = "agent86ui")]
