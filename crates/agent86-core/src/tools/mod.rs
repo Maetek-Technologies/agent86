@@ -1185,6 +1185,14 @@ impl ToolRegistry {
                 Ok(call) => {
                     let (call, repaired) = repaired_call(tool.as_ref(), call);
                     let mut result = tool.run(&call, ctx);
+                    if !result.ok {
+                        if let Some(hint) = unparsed_json_hint(&tool.parameters(), &call.arguments)
+                        {
+                            let error = result.error.get_or_insert_with(String::new);
+                            error.push('\n');
+                            error.push_str(&hint);
+                        }
+                    }
                     if !repaired.is_empty() {
                         result
                             .metadata
@@ -1294,6 +1302,38 @@ pub fn repair_arguments(
         }
     }
     (!repaired.is_empty()).then_some((repaired_arguments, repaired))
+}
+
+/// Beyond Python: what to tell the model when it sent an array or an object
+/// argument as a string holding JSON that does not parse, so
+/// [`repair_arguments`] could not unwrap it and the tool's own error ("Input
+/// should be a valid list") does not say why. Models that make the mistake tend
+/// to repeat it; naming where the JSON broke lets them fix it. `None` when no
+/// argument looks like that.
+pub fn unparsed_json_hint(schema: &Value, arguments: &Map<String, Value>) -> Option<String> {
+    let properties = schema.get("properties")?.as_object()?;
+    let hints: Vec<String> = arguments
+        .iter()
+        .filter_map(|(name, value)| {
+            let text = value.as_str()?.trim();
+            let accepted = accepted_types(properties.get(name)?);
+            let wanted = match text.chars().next()? {
+                '[' if accepted.contains(&"array") => "array",
+                '{' if accepted.contains(&"object") => "object",
+                _ => return None,
+            };
+            if accepted.contains(&"string") {
+                return None;
+            }
+            let error = serde_json::from_str::<Value>(text).err()?;
+            Some(format!(
+                "'{name}' was sent as a string holding JSON that does not parse ({error}). \
+                 Send it as a JSON {wanted} itself, not inside a string, and check that \
+                 every bracket and brace closes in order."
+            ))
+        })
+        .collect();
+    (!hints.is_empty()).then(|| hints.join("\n"))
 }
 
 /// The JSON types a property schema accepts: its `type` (a name or a list), and

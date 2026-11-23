@@ -387,6 +387,66 @@ fn strings_that_do_not_repair_are_passed_on_unchanged() {
 }
 
 #[test]
+fn a_json_string_that_does_not_parse_is_explained_when_the_call_fails() {
+    // Beyond Python: a model wrapped render_ui's `messages` in a string whose
+    // brackets closed out of order, three times running, on "Input should be a
+    // valid list" alone.
+    let schema = json!({"properties": {
+        "messages": {"type": "array"},
+        "options": {"type": "object"},
+        "text": {"type": "string"},
+    }});
+    let arguments = json!({
+        "messages": "[{\"a\": {}}]}",
+        "options": "{\"depth\": 2",
+        "text": "[not json",
+    });
+    let hint = agent86::tools::unparsed_json_hint(&schema, arguments.as_object().unwrap())
+        .expect("a hint");
+    assert!(
+        hint.contains("'messages' was sent as a string holding JSON that does not parse (")
+            && hint.contains("Send it as a JSON array itself"),
+        "{hint}"
+    );
+    assert!(
+        hint.contains("'options'") && hint.contains("JSON object itself"),
+        "{hint}"
+    );
+    assert!(
+        !hint.contains("'text'"),
+        "a string parameter is never second-guessed"
+    );
+
+    // Dispatch adds it to the failed call's error.
+    let registry = builtin_registry();
+    registry
+        .register(Box::new(agent86::tools::render_ui::RenderUiTool))
+        .unwrap();
+    let ctx = ToolContext::new(&std::env::temp_dir()).unwrap();
+    let result = registry.dispatch(
+        &call(
+            "render_ui",
+            json!({"messages": "[{\"version\": \"1.0\"}}]"}),
+        ),
+        &ctx,
+    );
+    let error = error_of(&result);
+    assert!(
+        error.starts_with("Invalid arguments for 'render_ui': messages: Input should be a valid list\n'messages' was sent as a string"),
+        "{error}"
+    );
+
+    // JSON that parses (repaired instead), plain words, and real arrays get none.
+    for value in [json!("[1, 2]"), json!("markdown"), json!([1])] {
+        let arguments = json!({"messages": value});
+        assert_eq!(
+            agent86::tools::unparsed_json_hint(&schema, arguments.as_object().unwrap()),
+            None
+        );
+    }
+}
+
+#[test]
 fn builtin_tools_without_array_parameters_are_unaffected() {
     let ws = Workspace::new("repair-builtin");
     ws.write("a.txt", b"hello\n");
