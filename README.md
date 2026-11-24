@@ -8,9 +8,9 @@
 [![License: MIT](https://img.shields.io/github/license/Maetek-Technologies/agent86)](LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Maetek-Technologies/agent86/badge)](https://scorecard.dev/viewer/?uri=github.com/Maetek-Technologies/agent86)
 
-[![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.package%5B%27rust-version%27%5D&label=rust&suffix=%2B&logo=rust&color=dea584)](https://www.rust-lang.org)
-[![Edition](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.package.edition&label=edition&logo=rust&color=dea584)](https://doc.rust-lang.org/edition-guide/)
-[![Tokio](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.dependencies.tokio.version&label=tokio&color=463f7a)](https://tokio.rs)
+[![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=rust&suffix=%2B&logo=rust&color=dea584)](https://www.rust-lang.org)
+[![Edition](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.workspace.package.edition&label=edition&logo=rust&color=dea584)](https://doc.rust-lang.org/edition-guide/)
+[![Tokio](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FMaetek-Technologies%2Fagent86%2Fmain%2FCargo.toml&query=%24.workspace.dependencies.tokio.version&label=tokio&color=463f7a)](https://tokio.rs)
 [![candle](https://img.shields.io/badge/candle-0.11-ffd21e?logo=huggingface)](https://github.com/huggingface/candle)
 [![SQLite](https://img.shields.io/badge/SQLite-bundled-003b57?logo=sqlite)](https://www.sqlite.org)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue?logo=modelcontextprotocol)](https://modelcontextprotocol.io)
