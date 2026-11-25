@@ -69,9 +69,7 @@ pub const DEFAULT_API_KEY_ENV: &str = "GEMINI_API_KEY";
 /// were kept); Google validates only the current turn.
 pub const SKIP_SIGNATURE: &str = "skip_thought_signature_validator";
 
-/// The prefix of a stop reason that means the provider ended the reply itself
-/// (`stopped:SAFETY`); the loop announces it and does not ask again.
-pub const STOPPED_PREFIX: &str = "stopped:";
+pub use super::STOPPED_PREFIX;
 
 /// How much of an error body is kept.
 const ERROR_BODY_LIMIT: usize = 2000;

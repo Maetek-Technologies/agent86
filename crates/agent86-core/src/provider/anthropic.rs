@@ -146,6 +146,19 @@ pub fn normalize_stop_reason(raw: Option<&str>) -> Option<StopReason> {
     })
 }
 
+/// The completion's stop reason on the wire. Beyond Python, which reports it as
+/// `other` (so the loop took a refusal for an empty answer and asked again), a
+/// `refusal` is `stopped:refusal`, which the loop announces once.
+pub fn completion_stop_reason(raw: Option<&str>) -> Option<String> {
+    if raw == Some("refusal") {
+        return Some(format!("{}refusal", super::STOPPED_PREFIX));
+    }
+    normalize_stop_reason(raw).map(|reason| match serde_json::to_value(reason) {
+        Ok(Value::String(text)) => text,
+        _ => String::new(),
+    })
+}
+
 /// The minimum cacheable prefix length for `model`, by the longest matching prefix.
 pub fn cache_minimum_tokens(model: &str) -> u64 {
     let ident = model
@@ -857,7 +870,7 @@ impl StreamState<'_> {
             ..Usage::default()
         };
         let provider = self.provider;
-        let stop_reason = normalize_stop_reason(turn.stop_reason.as_deref());
+        let stop_reason = completion_stop_reason(turn.stop_reason.as_deref());
         self.pending.push_back(CompletionDelta {
             text: String::new(),
             done: true,
@@ -865,10 +878,7 @@ impl StreamState<'_> {
                 text,
                 tool_calls,
                 usage: provider.pricing.priced_usage(&provider.price_ref, usage),
-                stop_reason: stop_reason.map(|reason| match serde_json::to_value(reason) {
-                    Ok(Value::String(text)) => text,
-                    _ => String::new(),
-                }),
+                stop_reason,
                 model: Some(provider.model.clone()),
                 thinking,
             }),
@@ -923,6 +933,23 @@ mod tests {
             normalize_stop_reason(Some("refusal")),
             Some(StopReason::Other)
         );
+    }
+
+    #[test]
+    fn a_refusal_is_a_stop_the_provider_made() {
+        assert_eq!(
+            completion_stop_reason(Some("refusal")).as_deref(),
+            Some("stopped:refusal")
+        );
+        assert_eq!(
+            completion_stop_reason(Some("end_turn")).as_deref(),
+            Some("end_turn")
+        );
+        assert_eq!(
+            completion_stop_reason(Some("pause_turn")).as_deref(),
+            Some("other")
+        );
+        assert_eq!(completion_stop_reason(None), None);
     }
 
     #[test]

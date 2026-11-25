@@ -16,6 +16,11 @@ pub mod reasoning;
 pub mod remote_windows;
 pub mod retry;
 
+/// The prefix of a stop reason that means the provider ended the reply itself
+/// (Gemini's `stopped:SAFETY`, an OpenAI-compatible `stopped:content_filter`, a
+/// model's `stopped:refusal`); the loop announces it once and does not ask again.
+pub const STOPPED_PREFIX: &str = "stopped:";
+
 use crate::config::{Config, ProviderConfig};
 use crate::pricing::PriceTable;
 use crate::secrets::{resolve_api_key, OsKeyring, SecretStore};
