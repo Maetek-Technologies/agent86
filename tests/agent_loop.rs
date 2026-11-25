@@ -23,6 +23,7 @@ use agent86::session::{AgentState, SessionStore};
 use agent86::tools::{builtin_registry, ToolContext};
 use agent86::turn::{final_answer, RunOutput};
 use agent86::types::{AgentPhase, ApprovalMode, Message, Role};
+use agent86::verify::{Verify, VerifyStatus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -166,6 +167,27 @@ async fn run_on(
     gate: ApprovalGate,
     guardrails: Guardrails,
 ) -> Result<RunOutput, HarnessError> {
+    run_verified(
+        provider,
+        workspace,
+        limits,
+        goal,
+        gate,
+        guardrails,
+        Default::default(),
+    )
+    .await
+}
+
+async fn run_verified(
+    provider: std::sync::Arc<dyn agent86::provider::Provider>,
+    workspace: &Workspace,
+    limits: LimitsConfig,
+    goal: &str,
+    gate: ApprovalGate,
+    guardrails: Guardrails,
+    verify: Verify,
+) -> Result<RunOutput, HarnessError> {
     let harness = Harness {
         provider,
         router: Default::default(),
@@ -186,6 +208,7 @@ async fn run_on(
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify,
     };
     let mut state = AgentState::new();
     let output = harness.run_turn(&mut state, goal, |_| {}).await?;
@@ -195,6 +218,7 @@ async fn run_on(
         steps: state.step_count() as u64,
         usage: state.usage,
         turn: state.last_turn.clone(),
+        verification: harness.verify.last(),
         final_answer: final_answer(&state.messages).to_owned(),
     })
 }
@@ -332,6 +356,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     };
     let mut state = AgentState::new();
     let mut seen = Vec::new();
@@ -999,6 +1024,7 @@ async fn reasoning_is_reported_apart_from_the_output_and_kept_out_of_the_history
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     };
     let mut state = AgentState::new();
     let mut thinking = Vec::new();
@@ -1066,6 +1092,7 @@ fn saving_harness(server: &MockServer, workspace: &Workspace, store: SessionStor
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     }
 }
 
@@ -1407,6 +1434,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness
@@ -1509,6 +1537,7 @@ async fn recorded_turn(
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     };
     let mut state = AgentState::new();
     let _ = harness.run_turn(&mut state, goal, |_| {}).await;
@@ -1636,6 +1665,7 @@ fn cancellable(
         cancel: cancel.clone(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     }
 }
 
@@ -2879,4 +2909,158 @@ async fn context_sizing_off_sends_results_as_python_does() {
         .find(|message| message.role == Role::Tool)
         .unwrap();
     assert_eq!(kept.content, "b".repeat(20_000));
+}
+
+/// A check that passes once `ok.txt` exists, in the shell `run_command` uses.
+fn ok_file_check() -> &'static str {
+    if cfg!(windows) {
+        "if exist ok.txt (exit 0) else (echo ok.txt is missing & exit 1)"
+    } else {
+        "test -f ok.txt || { echo ok.txt is missing; exit 1; }"
+    }
+}
+
+async fn run_gate(server: &MockServer, workspace: &Workspace, verify: Verify) -> RunOutput {
+    run_verified(
+        std::sync::Arc::new(provider(server)),
+        workspace,
+        limits(),
+        "make the check pass",
+        ApprovalGate::new(ApprovalMode::Auto, None),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+        verify,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_failed_check_goes_back_to_the_model_until_it_passes() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "call_1",
+            "write_file",
+            r#"{"path": "notes.txt", "content": "hi"}"#,
+        )]),
+        sse_text("Done.", "stop"),
+        sse_tool_calls(&[(
+            "call_2",
+            "write_file",
+            r#"{"path": "ok.txt", "content": "ok"}"#,
+        )]),
+        sse_text("Fixed.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("verify-fail-then-pass");
+    let command = ok_file_check();
+
+    let output = run_gate(&server, &workspace, Verify::new(Some(command), 2)).await;
+
+    assert_eq!(output.final_answer, "Fixed.");
+    assert!(output.output.contains(&format!(
+        "\n[verify] `{command}` failed; sent back to the model (1 of 2)\n"
+    )));
+    assert!(output
+        .output
+        .ends_with(&format!("\n[verify] `{command}` passed\n")));
+    let verification = output.verification.unwrap();
+    assert_eq!(verification.status, VerifyStatus::Passed);
+    assert_eq!((verification.runs, verification.sent_back), (2, 1));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    let messages = requests[2].body["messages"].as_array().unwrap();
+    let feedback = messages.last().unwrap();
+    assert_eq!(feedback["role"], "user");
+    let text = feedback["content"].as_str().unwrap();
+    assert!(text.starts_with(&format!(
+        "[verification] The check `{command}` failed with exit code 1"
+    )));
+    assert!(text.contains("ok.txt is missing"), "{text}");
+    // The rejected answer stays in the history, before the feedback.
+    assert_eq!(messages[messages.len() - 2]["content"], "Done.");
+}
+
+#[tokio::test]
+async fn the_answer_stands_once_the_attempts_run_out() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "call_1",
+            "write_file",
+            r#"{"path": "a.txt", "content": "a"}"#,
+        )]),
+        sse_text("Done.", "stop"),
+        sse_text("Still done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("verify-attempts-out");
+
+    let output = run_gate(&server, &workspace, Verify::new(Some("exit 1"), 1)).await;
+
+    assert_eq!(output.final_answer, "Still done.");
+    assert!(output
+        .output
+        .ends_with("\n[verify] `exit 1` still fails; the answer stands unverified\n"));
+    let verification = output.verification.unwrap();
+    assert_eq!(verification.status, VerifyStatus::Failed);
+    assert_eq!((verification.runs, verification.sent_back), (2, 1));
+    assert_eq!(server.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn a_turn_that_changed_nothing_is_not_checked() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("call_1", "list_dir", "{}")]),
+        sse_text("It holds a README.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("verify-read-only");
+
+    let output = run_gate(&server, &workspace, Verify::new(Some("exit 1"), 2)).await;
+
+    assert_eq!(output.final_answer, "It holds a README.");
+    assert!(!output.output.contains("[verify]"));
+    let verification = output.verification.unwrap();
+    assert_eq!(verification.status, VerifyStatus::Skipped);
+    assert_eq!(verification.reason.as_deref(), Some("nothing changed"));
+    assert_eq!(verification.runs, 0);
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn a_check_the_approval_gate_refuses_is_skipped_and_said() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[(
+            "call_1",
+            "write_file",
+            r#"{"path": "a.txt", "content": "a"}"#,
+        )]),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("verify-refused");
+    // `ask` with no prompt declines every side-effecting call, the write too, so
+    // the write is approved by a prompt that refuses only commands.
+    let prompt: ApprovalPrompt = Box::new(|name, _| name != "run_command");
+    let output = run_verified(
+        std::sync::Arc::new(provider(&server)),
+        &workspace,
+        limits(),
+        "write it",
+        ApprovalGate::new(ApprovalMode::Ask, Some(prompt)),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+        Verify::new(Some("exit 0"), 2),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.final_answer, "Done.");
+    assert!(
+        output.output.contains("\n[verify] `exit 0` not run: "),
+        "{}",
+        output.output
+    );
+    let verification = output.verification.unwrap();
+    assert_eq!(verification.status, VerifyStatus::Skipped);
+    assert_eq!(verification.runs, 0);
 }

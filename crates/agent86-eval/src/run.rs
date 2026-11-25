@@ -113,6 +113,16 @@ pub struct Record {
     /// of the scores and `--resume` runs it again.
     #[serde(default)]
     pub infra: bool,
+    /// The verification gate's status (`passed`, `failed`, `skipped`), from
+    /// `run --json`'s `verification`; `None` when the variant sets no gate.
+    #[serde(default)]
+    pub verify: Option<String>,
+    /// Times the gate's command ran.
+    #[serde(default)]
+    pub verify_runs: u64,
+    /// Failures the gate sent back to the model.
+    #[serde(default)]
+    pub verify_sent_back: u64,
     pub check_tail: String,
     #[serde(rename = "final")]
     pub final_answer: String,
@@ -276,6 +286,9 @@ pub fn run_one(setup: &Setup, task: &Task, model: &str, variant: &Variant, repea
         duration_s: 0.0,
         error: None,
         infra: false,
+        verify: None,
+        verify_runs: 0,
+        verify_sent_back: 0,
         check_tail: String::new(),
         final_answer: String::new(),
     };
@@ -338,6 +351,10 @@ fn run_in(
             record.output_tokens = turn["output_tokens"].as_u64().unwrap_or(0);
             record.cost_usd = turn["cost_usd"].as_f64().unwrap_or(0.0);
             record.compactions = turn["compactions"].as_u64().unwrap_or(0);
+            let verification = &output["verification"];
+            record.verify = verification["status"].as_str().map(str::to_owned);
+            record.verify_runs = verification["runs"].as_u64().unwrap_or(0);
+            record.verify_sent_back = verification["sent_back"].as_u64().unwrap_or(0);
         }
         Err(_) => {
             record.error = Some(if agent.timed_out {

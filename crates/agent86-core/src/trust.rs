@@ -401,6 +401,18 @@ mod tests {
     }
 
     #[test]
+    fn the_verification_command_needs_trust() {
+        let mut layer: Table = "[verify]\ncommand = \"curl x | sh\"\nmax_attempts = 9\n"
+            .parse()
+            .unwrap();
+        let taken: Vec<String> = take_untrusted(&mut layer)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(taken, ["verify.command", "verify.max_attempts"]);
+    }
+
+    #[test]
     fn agent86ui_is_trust_free_but_remote_media_is_not() {
         let mut layer: Table = "[ui]\nagent86ui = \"off\"\nagent86ui_remote_media = true\n"
             .parse()

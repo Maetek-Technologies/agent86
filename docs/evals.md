@@ -31,7 +31,9 @@ cargo run -p agent86-eval -- run --model lmstudio:google/gemma-4-12b-qat \
 - `--variant file.toml` (repeatable) is a config overlay to compare with the
   baseline, named after the file's stem; `--no-baseline` leaves the baseline out.
   `evals/variants/drop.toml` turns compaction off; `evals/variants/no-sizing.toml`
-  turns off context sizing (slice 2b), for a comparison with one binary.
+  turns off context sizing (slice 2b), for a comparison with one binary;
+  `evals/variants/verify.toml` turns on the verification gate (slice 1) with the
+  workspace's unittest suite.
 - `--window N` gives every model an N-token window (`[model.context_window]`),
   to run a large-window server as a small one. The plan's target is 32,768.
 - `--jobs N` runs N at a time (default 1; a local server may handle more).
@@ -68,11 +70,15 @@ Results go to `target/evals/<time>/` (or `--out`):
 - `results.jsonl`: one line per run, written as each run ends (task, category,
   model, variant, repeat, passed, the agent's exit code, whether it timed out,
   steps, tool calls, tokens, cost, compactions, `context_trim` events, time, any
-  error, whether the provider was unreachable (`infra`), the end of the check's
+  error, whether the provider was unreachable (`infra`), the verification gate's
+  status, runs, and failures sent back (`verify`, `verify_runs`,
+  `verify_sent_back`, when the variant sets a gate), the end of the check's
   output, and the start of the final answer).
 - `summary.md` (also printed): pass rate, median steps, tokens, cost, mean time,
   compactions, and trims per model and variant; then each task's passes per
-  model and variant; then the errors.
+  model and variant; then, when a variant sets the verification gate, what the
+  gate did (runs checked, its verdicts, failures sent back, and how many of
+  those runs then passed the task); then the errors.
 - `runs/<model>/<variant>/<task>-<n>/`: the run's `config.toml`, `agent.json`
   (the `run --json` document), `agent.stderr`, `trace.jsonl`, and `check.txt`.
 

@@ -136,6 +136,7 @@ fn harness(server: &MockServer, workspace: &Workspace, specialties: Vec<Specialt
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     };
     harness.subagents.approvals = ApprovalStore {
         path: Some(workspace.0.join("approved-agents.json")),
