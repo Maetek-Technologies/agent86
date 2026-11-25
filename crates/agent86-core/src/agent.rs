@@ -27,9 +27,10 @@ use crate::config::{AgentsConfig, CompactionMode, LimitsConfig};
 use crate::guardrails::Guardrails;
 use crate::limits::LimitKind;
 use crate::memory::working::{
-    apply_summary, compacted_notice, compaction_cut, compaction_failed_notice, conversation_budget,
-    count_spec_tokens, count_tokens, fit, fits, python_strip, render_transcript, KEEP_RECENT,
-    SUMMARY_MAX_TOKENS, SUMMARY_SYSTEM_PROMPT,
+    apply_progress, apply_summary, compacted_notice, compaction_failed_notice, compaction_plan,
+    conversation_budget, count_spec_tokens, count_tokens, fit_pinned, fits, python_strip,
+    summary_request_text, trimmed_notice, Cut, Fitted, KEEP_RECENT, SUMMARY_MAX_TOKENS,
+    SUMMARY_RETRY_NOTE, SUMMARY_SYSTEM_PROMPT,
 };
 use crate::observability::Recorder;
 use crate::prompt::time_note;
@@ -58,6 +59,54 @@ pub const CONTINUE_PROMPT: &str = "Continue exactly where you left off; do not r
 
 /// How many times one turn may ask for more after hitting the output cap.
 pub const MAX_CONTINUATIONS: u64 = 3;
+
+/// Tokens held back in a summary request for the chat template and the
+/// estimate's error, beyond Python.
+const SUMMARY_MARGIN_TOKENS: u64 = 256;
+
+/// The least transcript a summary request is given, however small the window.
+const MIN_TRANSCRIPT_TOKENS: u64 = 1_024;
+
+/// Why [`Harness::write_summary`] wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SummaryError {
+    Cancelled,
+    /// The provider failed; the text is what the trace records.
+    Failed(String),
+    /// Both attempts came back empty.
+    Empty,
+}
+
+/// What [`Harness::write_summary`] produced, and what it spent doing so.
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenSummary {
+    pub outcome: Result<String, SummaryError>,
+    pub usage: Usage,
+    pub model: String,
+}
+
+/// A compaction to announce: the notice, and the summary when one was written.
+struct Compaction {
+    notice: String,
+    summary: Option<String>,
+}
+
+/// What a turn keeps about its place in the history while it fits and
+/// compacts it, beyond Python.
+struct TurnWindow<'g> {
+    /// The turn's message as the user sent it, kept verbatim through compactions.
+    goal_text: &'g str,
+    /// Where the turn's message is in the history.
+    goal: usize,
+    /// Where a continuation in progress began; compaction never reaches it.
+    continuation: Option<usize>,
+    /// After a failed summary, the history size at which one is tried again.
+    retry_at: Option<u64>,
+    /// Whether this turn has said that fitting leaves messages out.
+    trim_announced: bool,
+    /// How many messages the last request left out.
+    trimmed: usize,
+}
 
 /// The user-visible line announcing continuation `index`.
 pub fn continuation_notice(index: u64) -> String {
@@ -474,115 +523,217 @@ impl Harness {
         )
     }
 
+    /// The tools a main-loop request offers: the registry's, narrowed under
+    /// `run --agent` to what the specialty may call.
+    fn request_tools(&self) -> Vec<ToolSpec> {
+        let mut tools = self.registry.specs();
+        tools.retain(|spec| self.context.scope_allows(&spec.name));
+        tools
+    }
+
+    /// Write a summary of `messages` with the compaction summarizer (its prompt,
+    /// the cheap route when routing is on), as Python's summary call, with two
+    /// things beyond Python: the transcript is cut to fit the summarizer's own
+    /// window ([`fit_transcript`](crate::memory::working::fit_transcript)), and an
+    /// empty reply (a thinking model can spend the whole cap reasoning) is asked
+    /// for once more, with a larger cap and [`SUMMARY_RETRY_NOTE`]. The usage of
+    /// every attempt is returned, also on failure, since it was spent.
+    pub(crate) async fn write_summary(&self, messages: &[Message]) -> WrittenSummary {
+        let (summarizer, window) = self.summary_model();
+        let model = summarizer.model().to_owned();
+        let first_cap = SUMMARY_MAX_TOKENS * 2;
+        // Four times the first cap, but no more than a quarter of the window, so the
+        // retry still leaves the transcript room; never less than the first cap
+        // unless that is over half the window.
+        let share = |divisor: u64| u32::try_from(window / divisor).unwrap_or(u32::MAX);
+        let retry_cap = (SUMMARY_MAX_TOKENS * 8)
+            .min(share(4))
+            .max(first_cap.min(share(2)));
+        let instructions = message(Role::System, SUMMARY_SYSTEM_PROMPT);
+        let overhead = count_tokens(std::slice::from_ref(&instructions))
+            + count_tokens(&[message(Role::User, SUMMARY_RETRY_NOTE)])
+            + SUMMARY_MARGIN_TOKENS;
+        let room = window
+            .saturating_sub(overhead + u64::from(retry_cap))
+            .max(MIN_TRANSCRIPT_TOKENS);
+        let transcript =
+            summary_request_text(messages, usize::try_from(room * 4).unwrap_or(usize::MAX));
+        let mut usage = Usage::default();
+        let mut attempt = 0;
+        loop {
+            let (text, cap) = if attempt == 0 {
+                (transcript.clone(), first_cap)
+            } else {
+                (format!("{transcript}\n\n{SUMMARY_RETRY_NOTE}"), retry_cap)
+            };
+            let request = CompletionRequest {
+                model: model.clone(),
+                messages: vec![instructions.clone(), message(Role::User, &text)],
+                tools: Vec::new(),
+                temperature: 0.0,
+                // A summary is a bounded artefact; it should not cost more than the span.
+                max_tokens: Some(cap),
+                stream: false,
+            };
+            let completion = tokio::select! {
+                biased;
+                // The next safe point sees the cancel and closes the turn out.
+                () = self.cancel.cancelled() => {
+                    return WrittenSummary { outcome: Err(SummaryError::Cancelled), usage, model };
+                }
+                completion = summarizer.complete(request) => completion,
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(error) => {
+                    return WrittenSummary {
+                        outcome: Err(SummaryError::Failed(format!("ProviderError: {error}"))),
+                        usage,
+                        model,
+                    }
+                }
+            };
+            usage = usage + completion.usage;
+            let text = python_strip(&completion.text).to_owned();
+            if !text.is_empty() {
+                return WrittenSummary {
+                    outcome: Ok(text),
+                    usage,
+                    model,
+                };
+            }
+            if attempt > 0 {
+                return WrittenSummary {
+                    outcome: Err(SummaryError::Empty),
+                    usage,
+                    model,
+                };
+            }
+            attempt += 1;
+        }
+    }
+
     /// Replace the oldest over-budget span with a summary, in place, before a model
     /// call, as Python's `_compact_if_needed`. Dropping the oldest turns (still
     /// available as `compaction = "drop"`) makes a long session forget its own
     /// goal; a summary keeps the goal, the decisions, and the paths found.
     ///
+    /// Beyond Python, the span may reach inside the current turn
+    /// ([`compaction_plan`]): the turn's message is kept verbatim with the summary
+    /// appended, so a long single turn compacts too instead of losing its goal to
+    /// fitting. A failed or empty summary is not tried again until the history has
+    /// grown by a quarter of the budget, so a summarizer that cannot answer is not
+    /// asked every step.
+    ///
     /// Never fails the turn: a summary that cannot be written falls back to the drop
-    /// that fitting the request does anyway, and says so. Returns the notice to
-    /// stream, how many messages the history lost, so indices into it can follow,
-    /// and the summary when one was written.
+    /// that fitting the request does anyway, and says so.
     async fn compact_if_needed(
         &self,
         state: &mut AgentState,
         extra_system: Option<&str>,
         summary: &mut TurnSummary,
         breaker: &mut CircuitBreaker,
-        protect_from: usize,
-    ) -> Option<(String, usize, Option<String>)> {
+        window: &mut TurnWindow<'_>,
+    ) -> Option<Compaction> {
         if self.limits.compaction != CompactionMode::Summarize {
             return None;
         }
         let system = self.system_message(extra_system);
-        let budget = self.context_budget(&system, &self.registry.specs());
+        let budget = self.context_budget(&system, &self.request_tools());
         if fits(&state.messages, budget) {
             return None;
         }
-        let cut = compaction_cut(&state.messages, budget, KEEP_RECENT, Some(protect_from));
-        if cut == 0 {
-            // Everything left is the current turn or its tool blocks: nothing is old
-            // enough to compact, so fitting trims and the provider's limits take over.
+        let tokens = count_tokens(&state.messages);
+        if window.retry_at.is_some_and(|at| tokens < at) {
             return None;
         }
+        // Everything left is recent or the current turn's own message and tool
+        // blocks: nothing may be compacted, so fitting trims and the provider's
+        // limits take over.
+        let cut = compaction_plan(
+            &state.messages,
+            budget,
+            KEEP_RECENT,
+            window.goal,
+            window.continuation,
+        )?;
         let sid = state.session_id.clone();
-        let prefix = &state.messages[..cut];
+        let end = cut.cut();
+        let replaced = cut.replaced();
+        let prefix = &state.messages[..end];
         let dropped_tokens = count_tokens(prefix);
-        let summarizer = self.summary_provider();
-        let request = CompletionRequest {
-            model: summarizer.model().to_owned(),
-            messages: vec![
-                message(Role::System, SUMMARY_SYSTEM_PROMPT),
-                message(Role::User, &render_transcript(prefix)),
-            ],
-            tools: Vec::new(),
-            temperature: 0.0,
-            // A summary is a bounded artefact; it should not cost more than the span.
-            max_tokens: Some(SUMMARY_MAX_TOKENS * 2),
-            stream: false,
-        };
-        let completion = tokio::select! {
-            biased;
-            // The next safe point sees the cancel and closes the turn out.
-            () = self.cancel.cancelled() => return None,
-            completion = summarizer.complete(request) => completion,
-        };
-        let failed = |status: &str, error: Option<String>| {
+        let written = self.write_summary(prefix).await;
+        summary.add_usage(&written.usage);
+        breaker.record_cost(written.usage.cost_usd);
+        let failed = |window: &mut TurnWindow<'_>, status: &str, error: Option<String>| {
+            window.retry_at = Some(tokens + (budget / 4).max(1));
             let mut fields = vec![
                 ("status", json!(status)),
                 ("fallback", json!("drop")),
-                ("dropped", json!(cut)),
+                ("dropped", json!(replaced)),
             ];
             if let Some(error) = error {
                 fields.push(("error", json!(error)));
             }
             self.recorder.event(&sid, "compaction", fields);
-            Some((compaction_failed_notice(cut), 0, None))
+            Some(Compaction {
+                notice: compaction_failed_notice(replaced),
+                summary: None,
+            })
         };
-        let completion = match completion {
-            Ok(completion) => completion,
-            Err(error) => return failed("failed", Some(format!("ProviderError: {error}"))),
+        let text = match written.outcome {
+            Ok(text) => text,
+            Err(SummaryError::Cancelled) => return None,
+            Err(SummaryError::Failed(error)) => return failed(window, "failed", Some(error)),
+            Err(SummaryError::Empty) => return failed(window, "empty", None),
         };
-        let text = python_strip(&completion.text).to_owned();
-        if text.is_empty() {
-            return failed("empty", None);
-        }
+        window.retry_at = None;
 
         // The originals are archived before they leave the live conversation.
         if let Some(memory) = &self.memory {
             let _ = memory.record_compaction(&sid, &text, prefix);
         }
         let before = state.messages.len();
-        let kept = state.messages.split_off(cut);
-        state.messages = apply_summary(&text, kept);
+        let kept = state.messages.split_off(end);
+        state.messages = match cut {
+            Cut::Earlier(_) => apply_summary(&text, kept),
+            Cut::WithinTurn { .. } => apply_progress(window.goal_text, &text, kept),
+        };
+        let removed = before - state.messages.len();
+        // Indices into the history move with it. (Python keeps the old ones, which
+        // go stale after a compaction mid-turn.)
+        window.goal = match cut {
+            Cut::Earlier(_) => window.goal - removed,
+            Cut::WithinTurn { .. } => 0,
+        };
+        if let Some(start) = window.continuation.as_mut() {
+            *start -= removed;
+        }
         summary.compactions += 1;
-        summary.add_usage(&completion.usage);
-        breaker.record_cost(completion.usage.cost_usd);
-        self.recorder.event(
-            &sid,
-            "compaction",
-            vec![
-                ("status", json!("ok")),
-                ("dropped", json!(cut)),
-                ("dropped_tokens", json!(dropped_tokens)),
-                (
-                    "summary_tokens",
-                    json!(count_tokens(&[message(Role::User, &text)])),
-                ),
-                ("kept", json!(state.messages.len())),
-                ("model", json!(summarizer.model())),
-            ],
-        );
+        let mut fields = vec![
+            ("status", json!("ok")),
+            ("dropped", json!(replaced)),
+            ("dropped_tokens", json!(dropped_tokens)),
+            (
+                "summary_tokens",
+                json!(count_tokens(&[message(Role::User, &text)])),
+            ),
+            ("kept", json!(state.messages.len())),
+            ("model", json!(written.model)),
+        ];
+        if matches!(cut, Cut::WithinTurn { .. }) {
+            fields.push(("scope", json!("turn")));
+        }
+        self.recorder.event(&sid, "compaction", fields);
         // Saved at once: a resume must see the compacted history, not a stale copy
         // that would re-inflate the context on the next turn.
         if let Some(memory) = &self.memory {
             let _ = memory.persist(state);
         }
-        Some((
-            compacted_notice(cut),
-            before - state.messages.len(),
-            Some(text),
-        ))
+        Some(Compaction {
+            notice: compacted_notice(replaced),
+            summary: Some(text),
+        })
     }
 
     /// Run one user turn on `state`, passing every piece of streamed text,
@@ -784,9 +935,17 @@ impl Harness {
             Some(recalled) => format!("{time}\n\n{recalled}"),
             None => time,
         });
-        // Where this turn begins: compaction never reaches past it, so the ask being
-        // answered right now is never summarized away.
-        let mut turn_start = state.messages.len();
+        // Where this turn begins. Its message is never summarized away nor left out
+        // of a request (beyond Python, whose fitting drops it first in a long turn);
+        // compaction may reach past it, keeping it verbatim.
+        let mut window = TurnWindow {
+            goal_text: goal,
+            goal: state.messages.len(),
+            continuation: None,
+            retry_at: None,
+            trim_announced: false,
+            trimmed: 0,
+        };
         state.messages.push(message(Role::User, goal));
         let mut limits = self.limits.clone();
         limits.max_steps = self.max_steps();
@@ -825,40 +984,39 @@ impl Harness {
 
             // Compact before the request is built, so the model call sees the
             // compacted history. Once per step, never nested.
-            if let Some((notice, removed, compacted)) = self
+            window.continuation = continuation_start;
+            if let Some(compaction) = self
                 .compact_if_needed(
                     state,
                     recall_note.as_deref(),
                     summary,
                     &mut breaker,
-                    turn_start,
+                    &mut window,
                 )
                 .await
             {
-                // Indices into the history move with it. (Python keeps the old
-                // ones, which go stale after a compaction mid-turn.)
-                turn_start -= removed;
-                if let Some(start) = continuation_start.as_mut() {
-                    *start -= removed;
-                }
+                continuation_start = window.continuation;
+                // A failed summary says what fitting drops; a written one starts
+                // the count again.
+                window.trim_announced = compaction.summary.is_none();
                 // Said out loud: a conversation that quietly lost its oldest turns
                 // looks, from the user's seat, like a model that forgot.
                 emit(TurnEvent::Compacted {
-                    notice: &notice,
-                    summary: compacted.as_deref(),
+                    notice: &compaction.notice,
+                    summary: compaction.summary.as_deref(),
                 });
             }
 
             let mut completion = {
                 let system = self.system_message(recall_note.as_deref());
-                let mut tools = self.registry.specs();
                 // Under `run --agent`, only what the specialty may call is offered.
-                tools.retain(|spec| self.context.scope_allows(&spec.name));
+                let tools = self.request_tools();
                 let budget = self.context_budget(&system, &tools);
-                let conversation = fit(&state.messages, budget);
-                let mut request_messages = Vec::with_capacity(conversation.len() + 1);
+                let fitted = fit_pinned(&state.messages, budget, Some(window.goal));
+                self.announce_trim(&sid, &fitted, budget, &mut window, &mut emit);
+                let mut request_messages = Vec::with_capacity(fitted.messages.len() + 1);
                 request_messages.push(system);
-                request_messages.extend(conversation.iter().cloned());
+                request_messages.extend(fitted.messages);
                 if std::mem::take(&mut ask_again) {
                     request_messages.push(message(Role::User, ANSWER_PROMPT));
                 }
@@ -1322,6 +1480,40 @@ impl Harness {
     /// Close out a cancelled turn and say so, as Python's `_cancelled`. The partial
     /// exchange is kept: the user stopped the agent, they did not undo it. The phase
     /// is `error`; "cancelled" is carried by the trace's `status` and `reason`.
+    /// Beyond Python, which trims silently: when fitting leaves messages out of a
+    /// request, the trace gets a `context_trim` event each time the count changes,
+    /// and the turn says so once (again after a compaction has written a summary).
+    fn announce_trim(
+        &self,
+        sid: &str,
+        fitted: &Fitted,
+        budget: u64,
+        window: &mut TurnWindow<'_>,
+        emit: &mut impl FnMut(TurnEvent<'_>),
+    ) {
+        if fitted.dropped == window.trimmed {
+            return;
+        }
+        window.trimmed = fitted.dropped;
+        if fitted.dropped == 0 {
+            return;
+        }
+        self.recorder.event(
+            sid,
+            "context_trim",
+            vec![
+                ("dropped", json!(fitted.dropped)),
+                ("kept", json!(fitted.messages.len())),
+                ("budget", json!(budget)),
+                ("goal_pinned", json!(fitted.pinned)),
+            ],
+        );
+        if !window.trim_announced {
+            window.trim_announced = true;
+            emit(TurnEvent::Notice(&trimmed_notice(fitted.dropped)));
+        }
+    }
+
     fn cancelled(&self, state: &mut AgentState, steps: u32, emit: &mut impl FnMut(TurnEvent<'_>)) {
         state.phase = AgentPhase::Error;
         self.recorder.event(

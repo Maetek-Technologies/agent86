@@ -7,12 +7,11 @@
 use crate::agent::{Harness, HarnessError, TurnEvent, CANCELLED_NOTICE};
 use crate::agents_def::Specialty;
 use crate::config::EgressMode;
-use crate::memory::working::{render_transcript, SUMMARY_MAX_TOKENS, SUMMARY_SYSTEM_PROMPT};
 use crate::session::AgentState;
 use crate::subagent::Spawn;
 use crate::tools::delegate::NAME as DELEGATE;
 use crate::turn::TurnSummary;
-use crate::types::{AgentPhase, CompletionRequest, Message, Role, Step, ToolCall, Usage};
+use crate::types::{AgentPhase, Message, Role, Step, ToolCall, Usage};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
@@ -310,25 +309,8 @@ impl Harness {
         if state.messages.is_empty() {
             return None;
         }
-        let summarizer = self.summary_provider();
-        let request = CompletionRequest {
-            model: summarizer.model().to_owned(),
-            messages: vec![
-                message(Role::System, SUMMARY_SYSTEM_PROMPT),
-                message(Role::User, &render_transcript(&state.messages)),
-            ],
-            tools: Vec::new(),
-            temperature: 0.0,
-            max_tokens: Some(SUMMARY_MAX_TOKENS * 2),
-            stream: false,
-        };
-        let completion = tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => return None,
-            completion = summarizer.complete(request) => completion.ok()?,
-        };
-        let text = completion.text.trim().to_owned();
-        (!text.is_empty()).then_some((text, completion.usage))
+        let written = self.write_summary(&state.messages).await;
+        written.outcome.ok().map(|text| (text, written.usage))
     }
 
     /// `run --agent`: make `specialty` the main agent of this harness. Its

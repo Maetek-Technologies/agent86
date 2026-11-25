@@ -30,7 +30,7 @@ use crate::agent::{
 use crate::agents_def::Specialty;
 use crate::approval::ApprovalPreview;
 use crate::limits::LimitKind;
-use crate::memory::working::fit;
+use crate::memory::working::fit_pinned;
 use crate::prompt::time_note;
 use crate::provider::{Provider, ProviderError};
 use crate::tools::delegate::{self, DelegateRequest, NAME as DELEGATE};
@@ -1282,7 +1282,8 @@ impl Harness {
             let cap = output_cap(cap_raised);
             let budget = self.context_budget_with(&system, &specs, model.context_window, cap);
             let mut request_messages = vec![system.clone()];
-            request_messages.extend(fit(&messages, budget).iter().cloned());
+            // Beyond Python: the task (the first message) is never the part left out.
+            request_messages.extend(fit_pinned(&messages, budget, Some(0)).messages);
             if std::mem::take(&mut ask_again) {
                 request_messages.push(message(Role::User, ANSWER_PROMPT.to_owned()));
             }

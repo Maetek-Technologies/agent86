@@ -2414,3 +2414,284 @@ async fn without_a_hook_ask_user_is_not_offered() {
         .unwrap()
         .contains("Asking the user"));
 }
+
+// Context that keeps the task (beyond Python): a long single turn compacts inside
+// itself, fitting never drops the turn's own message, and a summarizer that
+// cannot answer is not asked every step.
+
+/// A harness over `server` with these limits and recorder, and a workspace file
+/// whose every read is about 500 tokens of observation.
+fn window_harness(
+    server: &MockServer,
+    workspace: &Workspace,
+    limits: LimitsConfig,
+    recorder: Recorder,
+) -> Harness {
+    std::fs::write(workspace.root.join("big.txt"), "a".repeat(2_000)).unwrap();
+    let mut harness = cancellable(
+        server,
+        workspace,
+        ApprovalGate::new(ApprovalMode::Ask, None),
+        recorder,
+        &CancelToken::default(),
+    );
+    harness.limits = limits;
+    harness
+}
+
+fn limits_with(max_context_tokens: u64, compaction: CompactionMode) -> LimitsConfig {
+    LimitsConfig {
+        max_context_tokens,
+        compaction,
+        ..limits()
+    }
+}
+
+fn read_big(id: &str) -> Reply {
+    sse_tool_calls(&[(id, "read_file", r#"{"path": "big.txt"}"#)])
+}
+
+fn request_roles(request: &support::Recorded) -> Vec<String> {
+    request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["role"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn events_of<'a>(events: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|event| event["kind"] == kind)
+        .collect()
+}
+
+const LONG_GOAL: &str = "read big.txt four times";
+
+#[tokio::test]
+async fn a_long_single_turn_compacts_inside_itself_and_keeps_its_goal() {
+    use agent86::memory::working::PROGRESS_HEADER;
+    let summary = "GOAL: read big.txt four times.\nFACTS: big.txt is 2000 a's.";
+    let server = MockServer::start(vec![
+        read_big("c1"),
+        read_big("c2"),
+        read_big("c3"),
+        read_big("c4"),
+        sse_text(summary, "stop"),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("window-within-turn");
+    let traces = workspace.root.join("traces");
+    let harness = window_harness(
+        &server,
+        &workspace,
+        limits_with(1_800, CompactionMode::Summarize),
+        trace_recorder(&traces),
+    );
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, LONG_GOAL, |_| {})
+        .await
+        .unwrap();
+    assert!(
+        output.contains("[compacted 2 messages into a summary]"),
+        "{output}"
+    );
+    assert!(!output.contains("[context full"), "{output}");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 6);
+    // The summary request covers the turn's message and its first round trip.
+    let transcript = requests[4].body["messages"][1]["content"].as_str().unwrap();
+    assert!(
+        transcript.starts_with(&format!("USER: {LONG_GOAL}\n")),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("TOOL result of read_file"),
+        "{transcript}"
+    );
+    // The next request leads with the goal, verbatim, and the progress after it.
+    let expected = format!("{LONG_GOAL}\n\n{PROGRESS_HEADER}\n{summary}");
+    assert_eq!(
+        requests[5].body["messages"][1]["content"],
+        expected.as_str()
+    );
+    assert_eq!(
+        request_roles(&requests[5]),
+        [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool"
+        ]
+    );
+    // The history keeps it too, and the turn's answer is still its own.
+    assert_eq!(state.messages[0].content, expected);
+    assert_eq!(final_answer(&state.messages), "done");
+    assert_eq!(state.last_turn.as_ref().unwrap().compactions, 1);
+
+    let events = trace_events(&traces);
+    let compactions = events_of(&events, "compaction");
+    assert_eq!(compactions.len(), 1, "{compactions:?}");
+    assert_eq!(compactions[0]["status"], "ok");
+    assert_eq!(compactions[0]["scope"], "turn");
+    assert_eq!(compactions[0]["dropped"], 2);
+}
+
+#[tokio::test]
+async fn fitting_keeps_the_goal_and_says_once_that_it_left_messages_out() {
+    let server = MockServer::start(vec![
+        read_big("c1"),
+        read_big("c2"),
+        read_big("c3"),
+        read_big("c4"),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("window-trim");
+    let traces = workspace.root.join("traces");
+    let harness = window_harness(
+        &server,
+        &workspace,
+        limits_with(1_100, CompactionMode::Drop),
+        trace_recorder(&traces),
+    );
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, LONG_GOAL, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        output
+            .matches("earlier messages left out of this request")
+            .count(),
+        1,
+        "{output}"
+    );
+    assert!(
+        output.contains("[context full; 2 earlier messages"),
+        "{output}"
+    );
+
+    let requests = server.requests();
+    for request in &requests[3..] {
+        // Python's fit would lead with the oldest round trip it kept; the goal stays.
+        assert_eq!(request.body["messages"][1]["content"], LONG_GOAL);
+        assert_eq!(request.body["messages"][2]["role"], "assistant");
+    }
+    assert_eq!(
+        request_roles(&requests[3]),
+        ["system", "user", "assistant", "tool", "assistant", "tool"]
+    );
+    // Nothing is lost from the session: trimming is the request's alone.
+    assert_eq!(state.messages.len(), 10);
+
+    let events = trace_events(&traces);
+    let trims = events_of(&events, "context_trim");
+    assert_eq!(trims.len(), 2, "{trims:?}");
+    assert_eq!(trims[0]["dropped"], 2);
+    assert_eq!(trims[0]["goal_pinned"], true);
+    assert_eq!(trims[0]["budget"], 1_100);
+    assert_eq!(trims[1]["dropped"], 4);
+    assert!(events_of(&events, "compaction").is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_summary_is_not_asked_for_again_until_the_history_grows() {
+    let server = MockServer::start(vec![
+        read_big("c1"),
+        read_big("c2"),
+        read_big("c3"),
+        read_big("c4"),
+        Reply::Status {
+            status: 400,
+            headers: Vec::new(),
+            body: json!({"error": {"message": "no summaries today"}}).to_string(),
+        },
+        // A small step: the history grows by far less than a quarter of the budget.
+        sse_tool_calls(&[("c5", "read_file", r#"{"path": "notes.txt"}"#)]),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("window-backoff");
+    let traces = workspace.root.join("traces");
+    let harness = window_harness(
+        &server,
+        &workspace,
+        limits_with(1_800, CompactionMode::Summarize),
+        trace_recorder(&traces),
+    );
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, LONG_GOAL, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(final_answer(&state.messages), "done");
+    assert_eq!(
+        output
+            .matches("[compaction failed; dropped 2 messages]")
+            .count(),
+        1,
+        "{output}"
+    );
+    // The failure said what fitting drops; no second notice for it.
+    assert!(!output.contains("[context full"), "{output}");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 7, "one summary request, not two");
+    assert!(
+        requests[6].body.get("tools").is_some(),
+        "the last is the turn's"
+    );
+
+    let events = trace_events(&traces);
+    let compactions = events_of(&events, "compaction");
+    assert_eq!(compactions.len(), 1, "{compactions:?}");
+    assert_eq!(compactions[0]["status"], "failed");
+}
+
+#[tokio::test]
+async fn an_empty_summary_is_asked_for_once_more_with_room_to_answer() {
+    use agent86::memory::working::SUMMARY_RETRY_NOTE;
+    let server = MockServer::start(vec![
+        read_big("c1"),
+        read_big("c2"),
+        read_big("c3"),
+        read_big("c4"),
+        sse_reasoning("thinking about what to keep...", ""),
+        sse_text("GOAL: read big.txt.", "stop"),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("window-empty-summary");
+    let traces = workspace.root.join("traces");
+    let harness = window_harness(
+        &server,
+        &workspace,
+        limits_with(1_800, CompactionMode::Summarize),
+        trace_recorder(&traces),
+    );
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, LONG_GOAL, |_| {})
+        .await
+        .unwrap();
+    assert!(
+        output.contains("[compacted 2 messages into a summary]"),
+        "{output}"
+    );
+    let requests = server.requests();
+    assert_eq!(requests[4].body["max_completion_tokens"], 1200);
+    assert_eq!(requests[5].body["max_completion_tokens"], 4800);
+    let retry = requests[5].body["messages"][1]["content"].as_str().unwrap();
+    assert!(retry.ends_with(SUMMARY_RETRY_NOTE), "{retry}");
+    let events = trace_events(&traces);
+    assert_eq!(events_of(&events, "compaction")[0]["status"], "ok");
+    assert!(state.messages[0].content.ends_with("GOAL: read big.txt."));
+}
