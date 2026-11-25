@@ -37,6 +37,20 @@ cargo run -p agent86-eval -- run --model lmstudio:google/gemma-4-12b-qat \
 - `--agent86 PATH` is the binary; by default the newer of `target/release` and
   `target/debug`. The summary names the binary and its version.
 - `--keep` leaves each run's workspace and home in the temporary directory.
+- `--resume DIR` continues an earlier eval in that results directory: runs that
+  finished with their provider reachable are kept, and only the missing or
+  unreachable ones run. Give the same models, tasks, variants, and repeats.
+- `--stop-after-unreachable N` (default 3; 0 never stops) stops handing out runs
+  once N in a row could not reach their provider, rather than failing every run
+  left against a server that is down; `--resume` continues from there.
+
+A run whose provider could not be reached or broke off mid-stream (agent86's
+"Cannot reach", "failed while streaming", HTTP 502 to 504, and the like) says
+nothing about the model: it is printed as `DOWN`, recorded with `infra: true`,
+counted in the summary's Unreachable column, and left out of every score.
+Against a local server, start with `--jobs 1`: several runs at a time keep its
+GPU at full load for as long as the eval lasts, far more than interactive use,
+and that has been seen to take the serving machine down.
 
 Each run gets a fresh copy of the task's workspace and a fresh isolated home
 (`HOME` and `USERPROFILE`, every `AGENT86_*` variable of yours removed), whose
@@ -53,7 +67,8 @@ Results go to `target/evals/<time>/` (or `--out`):
 - `results.jsonl`: one line per run, written as each run ends (task, category,
   model, variant, repeat, passed, the agent's exit code, whether it timed out,
   steps, tool calls, tokens, cost, compactions, `context_trim` events, time, any
-  error, the end of the check's output, and the start of the final answer).
+  error, whether the provider was unreachable (`infra`), the end of the check's
+  output, and the start of the final answer).
 - `summary.md` (also printed): pass rate, median steps, tokens, cost, mean time,
   compactions, and trims per model and variant; then each task's passes per
   model and variant; then the errors.

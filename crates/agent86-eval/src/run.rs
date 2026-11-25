@@ -3,7 +3,7 @@
 
 use crate::process::{run, Outcome};
 use crate::task::Task;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,8 +66,28 @@ pub struct Setup {
     pub keep: bool,
 }
 
+/// What in agent86's error output means the provider could not be reached or
+/// broke off, rather than that the model failed: a server down, restarting, or
+/// dropping connections. Such a run says nothing about the model.
+const UNREACHABLE: &[&str] = &[
+    "Cannot reach ",
+    "failed while streaming",
+    "error sending request",
+    "dns error",
+    "Connection refused",
+    "connection refused",
+    "HTTP 502",
+    "HTTP 503",
+    "HTTP 504",
+];
+
+/// Whether `stderr` from a failed run says the provider was unreachable.
+pub fn provider_unreachable(stderr: &str) -> bool {
+    UNREACHABLE.iter().any(|needle| stderr.contains(needle))
+}
+
 /// One row of `results.jsonl`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     pub task: String,
     pub category: String,
@@ -89,6 +109,10 @@ pub struct Record {
     pub duration_s: f64,
     /// What went wrong outside the check (a setup failure, an agent error).
     pub error: Option<String>,
+    /// The provider could not be reached or broke off, so the run is left out
+    /// of the scores and `--resume` runs it again.
+    #[serde(default)]
+    pub infra: bool,
     pub check_tail: String,
     #[serde(rename = "final")]
     pub final_answer: String,
@@ -251,6 +275,7 @@ pub fn run_one(setup: &Setup, task: &Task, model: &str, variant: &Variant, repea
         context_trims: 0,
         duration_s: 0.0,
         error: None,
+        infra: false,
         check_tail: String::new(),
         final_answer: String::new(),
     };
@@ -327,6 +352,7 @@ fn run_in(
     if !agent.success() && record.error.is_none() {
         record.error = Some(agent.tail(800));
     }
+    record.infra = !agent.success() && provider_unreachable(&agent.stderr);
     record.final_answer = clip(&final_answer, FINAL_CHARS);
     if let Ok(trace) = std::fs::read_to_string(config_dir.join("traces").join("trace.jsonl")) {
         record.context_trims = count_kind(&trace, "context_trim");

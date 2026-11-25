@@ -47,7 +47,7 @@ enum Command {
         tasks: Vec<String>,
     },
     /// Run tasks against models and score them.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 }
 
 #[derive(clap::Args)]
@@ -89,6 +89,57 @@ struct RunArgs {
     /// Keep each run's workspace and home (under the system temp directory).
     #[arg(long)]
     keep: bool,
+    /// Continue an earlier eval in this results directory: runs that finished
+    /// with their provider reachable are kept, and only the missing or
+    /// unreachable ones run. Give the same models, tasks, variants, and repeats.
+    #[arg(long, conflicts_with = "out")]
+    resume: Option<PathBuf>,
+    /// Stop the eval after this many runs in a row could not reach their
+    /// provider (a server down or rebooting), rather than fail every run left;
+    /// 0 never stops. `--resume` picks up where it stopped.
+    #[arg(long, default_value_t = 3)]
+    stop_after_unreachable: usize,
+}
+
+/// A run's place in the grid: task, model, variant, repeat.
+type RunKey = (String, String, String, u32);
+
+fn key_of(record: &Record) -> RunKey {
+    (
+        record.task.clone(),
+        record.model.clone(),
+        record.variant.clone(),
+        record.repeat,
+    )
+}
+
+/// The runs an earlier eval in `dir` finished with its provider reachable, the
+/// last of each kept, so `--resume` neither repeats nor loses them.
+fn finished_runs(dir: &Path) -> Result<Vec<Record>, String> {
+    let path = dir.join("results.jsonl");
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut kept: Vec<Record> = Vec::new();
+    for (number, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+    {
+        let record: Record = serde_json::from_str(line)
+            .map_err(|error| format!("{} line {}: {error}", path.display(), number + 1))?;
+        // Results written before `infra` existed carry only the error text.
+        let unreachable = record.infra
+            || record
+                .error
+                .as_deref()
+                .is_some_and(run::provider_unreachable);
+        if unreachable {
+            continue;
+        }
+        kept.retain(|earlier| key_of(earlier) != key_of(&record));
+        kept.push(record);
+    }
+    Ok(kept)
 }
 
 /// The repository root this binary was built from.
@@ -151,7 +202,7 @@ fn main() {
     let result = match cli.command {
         Command::List => list(&evals),
         Command::Validate { tasks } => validate(&evals, &tasks),
-        Command::Run(args) => run_all(&evals, args),
+        Command::Run(args) => run_all(&evals, *args),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
@@ -221,9 +272,15 @@ fn run_all(evals: &Path, args: RunArgs) -> Result<(), String> {
     let stamp = jiff::ZonedDateTime::now()
         .strftime("%Y%m%d-%H%M%S")
         .to_string();
-    let out_dir = args
-        .out
-        .unwrap_or_else(|| repo_root().join("target").join("evals").join(&stamp));
+    let (out_dir, finished) = match &args.resume {
+        Some(dir) => (dir.clone(), finished_runs(dir)?),
+        None => (
+            args.out
+                .clone()
+                .unwrap_or_else(|| repo_root().join("target").join("evals").join(&stamp)),
+            Vec::new(),
+        ),
+    };
     std::fs::create_dir_all(&out_dir).map_err(|error| format!("{}: {error}", out_dir.display()))?;
     let eval_config = std::fs::read_to_string(evals.join("config.toml")).unwrap_or_default();
     let setup = Setup {
@@ -241,31 +298,50 @@ fn run_all(evals: &Path, args: RunArgs) -> Result<(), String> {
         keep: args.keep,
     };
 
+    let done: std::collections::HashSet<RunKey> = finished.iter().map(key_of).collect();
     let mut queue = VecDeque::new();
     for model in &args.models {
         for variant in &variants {
             for task in &tasks {
                 for repeat in 1..=args.repeat {
-                    queue.push_back((task.clone(), model.clone(), variant.clone(), repeat));
+                    let key = (task.id.clone(), model.clone(), variant.name.clone(), repeat);
+                    if !done.contains(&key) {
+                        queue.push_back((task.clone(), model.clone(), variant.clone(), repeat));
+                    }
                 }
             }
         }
     }
     let total = queue.len();
     eprintln!(
-        "{total} runs: {} tasks x {} models x {} variants x {} repeats -> {}",
+        "{total} runs: {} tasks x {} models x {} variants x {} repeats{} -> {}",
         tasks.len(),
         args.models.len(),
         variants.len(),
         args.repeat,
+        if finished.is_empty() {
+            String::new()
+        } else {
+            format!(", {} already finished", finished.len())
+        },
         out_dir.display()
     );
     let queue = Mutex::new(queue);
     let (sender, receiver) = mpsc::channel::<Record>();
     let results_path = out_dir.join("results.jsonl");
+    // On a resume, the file is rewritten with the runs kept, so it ends with
+    // one line per run.
     let mut results = std::fs::File::create(&results_path)
         .map_err(|error| format!("{}: {error}", results_path.display()))?;
-    let mut records = Vec::new();
+    for record in &finished {
+        if let Ok(line) = serde_json::to_string(record) {
+            let _ = writeln!(results, "{line}");
+        }
+    }
+    let mut records = finished;
+    let mut fresh = 0;
+    let mut streak = 0;
+    let mut stopped = false;
     std::thread::scope(|scope| {
         for _ in 0..args.jobs.max(1) {
             let sender = sender.clone();
@@ -287,10 +363,16 @@ fn run_all(evals: &Path, args: RunArgs) -> Result<(), String> {
             if let Ok(line) = serde_json::to_string(&record) {
                 let _ = writeln!(results, "{line}");
             }
+            fresh += 1;
             eprintln!(
-                "[{}/{total}] {} {} | {} | {} #{} ({} steps, {:.0}s){}",
-                records.len() + 1,
-                if record.passed { "pass" } else { "FAIL" },
+                "[{fresh}/{total}] {} {} | {} | {} #{} ({} steps, {:.0}s){}",
+                if record.infra {
+                    "DOWN"
+                } else if record.passed {
+                    "pass"
+                } else {
+                    "FAIL"
+                },
                 record.task,
                 record.model,
                 record.variant,
@@ -309,16 +391,33 @@ fn run_all(evals: &Path, args: RunArgs) -> Result<(), String> {
                     )
                 })
             );
+            // A provider that stays unreachable fails every run left; stop
+            // handing out work instead, and let `--resume` finish later.
+            streak = if record.infra { streak + 1 } else { 0 };
+            if args.stop_after_unreachable > 0 && streak >= args.stop_after_unreachable && !stopped
+            {
+                stopped = true;
+                queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                eprintln!(
+                    "stopping: {streak} runs in a row could not reach their provider; \
+                     the runs already started will finish"
+                );
+            }
             records.push(record);
         }
     });
-    let summary = format!(
-        "{}
-Binary: `{}` ({version}). Runs: {total}.
-",
+    let mut summary = format!(
+        "{}\nBinary: `{}` ({version}). Runs: {}.\n",
         report::summary(&records),
-        setup.agent86.display()
+        setup.agent86.display(),
+        records.len()
     );
+    if stopped {
+        summary.push_str(&format!(
+            "\nStopped early: the provider stopped answering. Continue with `--resume {}` and the same arguments.\n",
+            out_dir.display()
+        ));
+    }
     let summary_path = out_dir.join("summary.md");
     std::fs::write(&summary_path, &summary)
         .map_err(|error| format!("{}: {error}", summary_path.display()))?;
@@ -350,6 +449,58 @@ mod tests {
             .collect();
         let _ = std::fs::remove_dir_all(&scratch);
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn a_resume_keeps_finished_runs_and_drops_unreachable_ones() {
+        let dir = std::env::temp_dir().join(format!("agent86-eval-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let row = |task: &str, repeat: u32, passed: bool, extra: &str| {
+            format!(
+                "{{\"task\":\"{task}\",\"category\":\"bugfix\",\"model\":\"m:x\",\"variant\":\"baseline\",\
+                 \"repeat\":{repeat},\"passed\":{passed},\"agent_exit\":0,\"timed_out\":false,\"steps\":3,\
+                 \"tool_calls\":1,\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":0.0,\"compactions\":0,\
+                 \"context_trims\":0,\"duration_s\":1.0,\"check_tail\":\"\",\"final\":\"\"{extra}}}"
+            )
+        };
+        let lines = [
+            row("a", 1, true, ",\"error\":null"),
+            row("b", 1, false, ",\"error\":\"x\",\"infra\":true"),
+            // Written before `infra` existed: only the error text says so.
+            row(
+                "c",
+                1,
+                false,
+                ",\"error\":\"agent86 wrote no result: Cannot reach http://box:8000\"",
+            ),
+            row("d", 1, false, ",\"error\":\"Circuit tripped\""),
+            // A rerun of `a` replaces the earlier row.
+            row("a", 1, false, ",\"error\":null"),
+        ];
+        std::fs::write(dir.join("results.jsonl"), lines.join("\n") + "\n").unwrap();
+        let kept = finished_runs(&dir).unwrap();
+        let summary: Vec<(String, bool)> =
+            kept.iter().map(|r| (r.task.clone(), r.passed)).collect();
+        assert_eq!(summary, [("d".to_owned(), false), ("a".to_owned(), false)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreachable_providers_are_told_from_model_failures() {
+        assert!(run::provider_unreachable(
+            "error: Cannot reach http://spark:8000/v1/chat/completions: error sending request"
+        ));
+        assert!(run::provider_unreachable(
+            "error: vllm: the connection to http://spark:8000 failed while streaming model \"q\""
+        ));
+        assert!(run::provider_unreachable(
+            "error: HTTP 503: upstream unavailable"
+        ));
+        assert!(!run::provider_unreachable(
+            "error: Circuit tripped: aborted after 4 consecutive tool errors"
+        ));
+        assert!(!run::provider_unreachable("error: HTTP 400: bad request"));
     }
 
     #[test]
