@@ -801,6 +801,43 @@ async fn a_reply_the_provider_stops_is_announced_once_and_not_asked_again() {
     assert_eq!(server.requests().len(), 1, "not asked again");
 }
 
+#[tokio::test]
+async fn a_content_filter_is_announced_once_and_not_asked_again() {
+    // OpenRouter's shape for an Anthropic model's refusal, as seen in the eval set.
+    let filtered = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\
+                    \"finish_reason\":\"content_filter\",\"native_finish_reason\":\"refusal\"}]}\n\n\
+                    data: [DONE]\n\n";
+    let server = MockServer::start(vec![Reply::Sse(filtered.to_owned())]).await;
+    let workspace = Workspace::new("content-filter");
+
+    let output = run(&server, &workspace, limits(), "hello").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        "\n[openai stopped the reply: content_filter (refusal)]\n"
+    );
+    assert_eq!(server.requests().len(), 1, "not asked again");
+}
+
+#[tokio::test]
+async fn a_structured_refusal_is_shown_and_announced() {
+    let refused =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\
+                   \"refusal\":\"I can't help with that.\"},\"finish_reason\":null}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+    let server = MockServer::start(vec![Reply::Sse(refused.to_owned())]).await;
+    let workspace = Workspace::new("structured-refusal");
+
+    let output = run(&server, &workspace, limits(), "hello").await.unwrap();
+
+    assert_eq!(
+        output.output,
+        "I can't help with that.\n[openai stopped the reply: refusal]\n"
+    );
+    assert_eq!(server.requests().len(), 1, "not asked again");
+}
+
 /// A Gemini provider on `server`, as the factory would build it.
 fn gemini(server: &MockServer) -> std::sync::Arc<dyn agent86::provider::Provider> {
     let config = agent86::provider::google::GoogleConfig {

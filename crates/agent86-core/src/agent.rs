@@ -1145,11 +1145,12 @@ impl Harness {
                 emit(TurnEvent::Notice(REASONING_LOOP_NOTICE));
             }
             // Beyond Python: the provider ended the reply itself (Gemini's SAFETY,
-            // RECITATION, ...). Said once, and not asked about again.
+            // RECITATION, ...; an OpenAI-compatible content filter; a model's
+            // refusal). Said once, and not asked about again.
             let stopped = completion
                 .stop_reason
                 .as_deref()
-                .and_then(|reason| reason.strip_prefix(crate::provider::google::STOPPED_PREFIX))
+                .and_then(|reason| reason.strip_prefix(crate::provider::STOPPED_PREFIX))
                 .map(str::to_owned);
             if let Some(reason) = &stopped {
                 emit(TurnEvent::Notice(&format!(

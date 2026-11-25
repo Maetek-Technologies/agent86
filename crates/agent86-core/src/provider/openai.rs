@@ -8,7 +8,7 @@
 use super::capabilities::supports_sampling_params;
 use super::reasoning::{ReasoningFilter, REASONING_LOOP};
 use super::retry::{is_retryable_status, parse_retry_after, RetryPolicy, DEFAULT_MAX_RETRIES};
-use super::{hints, DeltaStream, Provider, ProviderError, ServerKind};
+use super::{hints, DeltaStream, Provider, ProviderError, ServerKind, STOPPED_PREFIX};
 use crate::pricing::PriceTable;
 use crate::pyjson::python_json_dumps;
 use crate::secrets::redact;
@@ -381,6 +381,32 @@ pub fn normalize_stop_reason(raw: Option<&str>, has_tool_calls: bool) -> Option<
     }
 }
 
+/// The completion's stop reason on the wire. Beyond Python, which reports both as
+/// `other` (so the loop took them for an empty answer and asked again): a reply a
+/// content filter ended is `stopped:content_filter`, with OpenRouter's
+/// `native_finish_reason` after it when that says more (`content_filter (refusal)`
+/// for an Anthropic model's refusal), and a reply that carried a structured refusal
+/// and otherwise ended cleanly is `stopped:refusal`. The loop announces either once.
+pub fn stop_reason(
+    finish_reason: Option<&str>,
+    native: Option<&str>,
+    refused: bool,
+    has_tool_calls: bool,
+) -> Option<String> {
+    if finish_reason == Some("content_filter") {
+        let detail = match native {
+            Some(native) if native != "content_filter" => format!(" ({native})"),
+            _ => String::new(),
+        };
+        return Some(format!("{STOPPED_PREFIX}content_filter{detail}"));
+    }
+    let normalized = normalize_stop_reason(finish_reason, has_tool_calls);
+    if refused && matches!(normalized, None | Some(StopReason::EndTurn)) {
+        return Some(format!("{STOPPED_PREFIX}refusal"));
+    }
+    normalized.map(stop_reason_wire)
+}
+
 /// True when an error body says `max_completion_tokens` is not a parameter it knows.
 pub fn is_max_tokens_rejection(body: &str) -> bool {
     let low = body.to_lowercase();
@@ -460,6 +486,10 @@ struct TurnState {
     completion_tokens: u64,
     cached_tokens: u64,
     finish_reason: Option<String>,
+    /// OpenRouter's `native_finish_reason`: the upstream provider's own word.
+    native_finish_reason: Option<String>,
+    /// The model sent a `refusal` (OpenAI's structured refusal text).
+    refused: bool,
     emitted: bool,
 }
 
@@ -695,7 +725,15 @@ impl StreamState<'_> {
                     return Ok(());
                 }
             }
-            if let Some(piece) = delta.and_then(|d| d.get("content")).and_then(Value::as_str) {
+            // Beyond Python: a structured refusal (OpenAI's `refusal`, sent instead of
+            // `content`) is the model's answer, so it is shown as text, and the reply
+            // ends as one the provider stopped.
+            let refusal = non_empty_str(delta.and_then(|d| d.get("refusal")));
+            if refusal.is_some() {
+                self.turn.refused = true;
+            }
+            let content = delta.and_then(|d| d.get("content")).and_then(Value::as_str);
+            for piece in [content, refusal].into_iter().flatten() {
                 if !piece.is_empty() {
                     let held = self.turn.thinking.flush();
                     self.show_thinking(held);
@@ -721,6 +759,9 @@ impl StreamState<'_> {
                     self.turn.finish_reason = Some(other.to_string());
                 }
                 _ => {}
+            }
+            if let Some(native) = non_empty_str(choice.get("native_finish_reason")) {
+                self.turn.native_finish_reason = Some(native.to_owned());
             }
         }
         Ok(())
@@ -765,8 +806,12 @@ impl StreamState<'_> {
         let stop_reason = if looped {
             Some(REASONING_LOOP.to_owned())
         } else {
-            normalize_stop_reason(turn.finish_reason.as_deref(), !tool_calls.is_empty())
-                .map(stop_reason_wire)
+            stop_reason(
+                turn.finish_reason.as_deref(),
+                turn.native_finish_reason.as_deref(),
+                turn.refused,
+                !tool_calls.is_empty(),
+            )
         };
         self.pending.push_back(CompletionDelta {
             text: String::new(),
@@ -883,6 +928,45 @@ mod tests {
         );
         assert_eq!(normalize_stop_reason(None, true), Some(StopReason::ToolUse));
         assert_eq!(normalize_stop_reason(None, false), None);
+    }
+
+    #[test]
+    fn filters_and_refusals_are_stops_the_provider_made() {
+        let stop = |finish, native, refused, tools| stop_reason(finish, native, refused, tools);
+        assert_eq!(
+            stop(Some("content_filter"), Some("refusal"), false, false).as_deref(),
+            Some("stopped:content_filter (refusal)")
+        );
+        assert_eq!(
+            stop(Some("content_filter"), None, false, false).as_deref(),
+            Some("stopped:content_filter")
+        );
+        assert_eq!(
+            stop(Some("content_filter"), Some("content_filter"), false, false).as_deref(),
+            Some("stopped:content_filter")
+        );
+        assert_eq!(
+            stop(Some("stop"), None, true, false).as_deref(),
+            Some("stopped:refusal")
+        );
+        assert_eq!(
+            stop(None, None, true, false).as_deref(),
+            Some("stopped:refusal")
+        );
+        // A refusal does not hide a cut-off reply or tool calls.
+        assert_eq!(
+            stop(Some("length"), None, true, false).as_deref(),
+            Some("max_tokens")
+        );
+        assert_eq!(
+            stop(Some("stop"), None, true, true).as_deref(),
+            Some("tool_use")
+        );
+        assert_eq!(
+            stop(Some("stop"), Some("end_turn"), false, false).as_deref(),
+            Some("end_turn")
+        );
+        assert_eq!(stop(None, None, false, false), None);
     }
 
     #[test]
