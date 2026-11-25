@@ -120,6 +120,7 @@ fn harness(server: &MockServer, workspace: &Workspace, skill: &Arc<Skill>) -> Ha
             compaction: CompactionMode::Summarize,
             parallel_tools: true,
             tool_timeout_s: 60,
+            context_sizing: true,
         },
         agents: AgentsConfig {
             enabled: false,
@@ -148,6 +149,7 @@ fn harness(server: &MockServer, workspace: &Workspace, skill: &Arc<Skill>) -> Ha
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     }
 }
 

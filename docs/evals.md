@@ -30,7 +30,8 @@ cargo run -p agent86-eval -- run --model lmstudio:google/gemma-4-12b-qat \
   deterministic even at temperature 0, so compare rates over several repeats.
 - `--variant file.toml` (repeatable) is a config overlay to compare with the
   baseline, named after the file's stem; `--no-baseline` leaves the baseline out.
-  `evals/variants/drop.toml` turns compaction off.
+  `evals/variants/drop.toml` turns compaction off; `evals/variants/no-sizing.toml`
+  turns off context sizing (slice 2b), for a comparison with one binary.
 - `--window N` gives every model an N-token window (`[model.context_window]`),
   to run a large-window server as a small one. The plan's target is 32,768.
 - `--jobs N` runs N at a time (default 1; a local server may handle more).

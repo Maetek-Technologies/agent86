@@ -62,6 +62,7 @@ fn limits() -> LimitsConfig {
         compaction: CompactionMode::Summarize,
         parallel_tools: true,
         tool_timeout_s: 60,
+        context_sizing: true,
     }
 }
 
@@ -184,6 +185,7 @@ async fn run_on(
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness.run_turn(&mut state, goal, |_| {}).await?;
@@ -329,6 +331,7 @@ async fn turn_events_carry_the_calls_and_results_in_the_order_the_text_streams()
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     let mut state = AgentState::new();
     let mut seen = Vec::new();
@@ -995,6 +998,7 @@ async fn reasoning_is_reported_apart_from_the_output_and_kept_out_of_the_history
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     let mut state = AgentState::new();
     let mut thinking = Vec::new();
@@ -1061,6 +1065,7 @@ fn saving_harness(server: &MockServer, workspace: &Workspace, store: SessionStor
         memory: Some(store),
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     }
 }
 
@@ -1401,6 +1406,7 @@ async fn redact_mode_never_shows_the_raw_text() {
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     let mut state = AgentState::new();
     let output = harness
@@ -1502,6 +1508,7 @@ async fn recorded_turn(
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     let mut state = AgentState::new();
     let _ = harness.run_turn(&mut state, goal, |_| {}).await;
@@ -1628,6 +1635,7 @@ fn cancellable(
         memory: None,
         cancel: cancel.clone(),
         subagents: Default::default(),
+        calibration: Default::default(),
     }
 }
 
@@ -2480,6 +2488,9 @@ fn limits_with(max_context_tokens: u64, compaction: CompactionMode) -> LimitsCon
     LimitsConfig {
         max_context_tokens,
         compaction,
+        // These pin compaction and fitting as slice 2a built them; sizing, which
+        // would age these results first, has tests of its own.
+        context_sizing: false,
         ..limits()
     }
 }
@@ -2731,4 +2742,141 @@ async fn an_empty_summary_is_asked_for_once_more_with_room_to_answer() {
     let events = trace_events(&traces);
     assert_eq!(events_of(&events, "compaction")[0]["status"], "ok");
     assert!(state.messages[0].content.ends_with("GOAL: read big.txt."));
+}
+
+fn sizing_limits(max_context_tokens: u64) -> LimitsConfig {
+    LimitsConfig {
+        max_context_tokens,
+        compaction: CompactionMode::Summarize,
+        ..limits()
+    }
+}
+
+#[tokio::test]
+async fn a_result_larger_than_its_share_of_the_window_keeps_its_start_and_end() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "read_file", r#"{"path": "log.txt"}"#)]),
+        sse_text("found it", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("sizing-result-cap");
+    let log = format!("START{}{}END", "a".repeat(10_000), "z".repeat(10_000));
+    std::fs::write(workspace.root.join("log.txt"), &log).unwrap();
+    // A 3,000-token budget caps a result at the 8,000-character floor.
+    let harness = window_harness(
+        &server,
+        &workspace,
+        sizing_limits(3_000),
+        Recorder::disabled(),
+    );
+    let mut state = AgentState::new();
+    harness
+        .run_turn(&mut state, "find the error", |_| {})
+        .await
+        .unwrap();
+
+    let requests = server.requests();
+    let sent = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(sent.starts_with("START"), "{}", &sent[..80]);
+    assert!(sent.ends_with("END"));
+    assert!(sent.contains("characters left out of the middle of this result"));
+    assert!(sent.chars().count() < 8_400, "{}", sent.chars().count());
+    // The session holds what the model saw.
+    let kept = state
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .unwrap();
+    assert_eq!(kept.content, sent);
+}
+
+#[tokio::test]
+async fn aging_older_results_saves_a_long_turn_a_summary() {
+    let server = MockServer::start(vec![
+        read_big("c1"),
+        read_big("c2"),
+        read_big("c3"),
+        read_big("c4"),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("sizing-aging");
+    let traces = workspace.root.join("traces");
+    // The budget slice 2a's test compacts at: four 500-token results overflow it.
+    let harness = window_harness(
+        &server,
+        &workspace,
+        sizing_limits(1_800),
+        trace_recorder(&traces),
+    );
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, LONG_GOAL, |_| {})
+        .await
+        .unwrap();
+
+    assert!(!output.contains("[compacted"), "{output}");
+    assert!(!output.contains("[context full"), "{output}");
+    assert_eq!(final_answer(&state.messages), "done");
+    let requests = server.requests();
+    // No summary call: the four reads and the answer.
+    assert_eq!(requests.len(), 5);
+    let last: Vec<&str> = requests[4].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(last.len(), 4, "every result is still sent");
+    assert!(last[0].contains("older result shortened from 2000 characters"));
+    assert_eq!(last[3], "a".repeat(2_000), "the latest is whole");
+    // The session keeps every result whole.
+    let whole = state
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .all(|message| message.content == "a".repeat(2_000));
+    assert!(whole);
+
+    let events = trace_events(&traces);
+    assert!(events_of(&events, "compaction").is_empty());
+    let aged = events_of(&events, "context_age");
+    assert!(!aged.is_empty(), "{events:?}");
+    assert_eq!(aged[0]["budget"], 1_800);
+}
+
+#[tokio::test]
+async fn context_sizing_off_sends_results_as_python_does() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "read_file", r#"{"path": "log.txt"}"#)]),
+        sse_text("found it", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("sizing-off");
+    std::fs::write(workspace.root.join("log.txt"), "b".repeat(20_000)).unwrap();
+    let limits = LimitsConfig {
+        context_sizing: false,
+        ..sizing_limits(30_000)
+    };
+    let harness = window_harness(&server, &workspace, limits, Recorder::disabled());
+    let mut state = AgentState::new();
+    harness
+        .run_turn(&mut state, "read it", |_| {})
+        .await
+        .unwrap();
+    let kept = state
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .unwrap();
+    assert_eq!(kept.content, "b".repeat(20_000));
 }

@@ -23,6 +23,7 @@ pub mod entries;
 pub mod hub;
 #[cfg(feature = "local-embeddings")]
 pub mod sentence_transformers;
+pub mod sizing;
 pub mod working;
 
 use crate::session::{SessionStore, StoreError};
