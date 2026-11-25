@@ -1,0 +1,9 @@
+category = "feature"
+measures = "one field threaded through three layers (model, validation, serialization), each with its own rule"
+timeout_s = 600
+goal = """Add an optional phone number to contacts in the contacts package:
+- Contact gets a `phone` field, None by default, after the existing fields.
+- validate_contact rejects a phone that is set but invalid, with the same kind of error as the other fields. A valid phone is a "+" optionally at the start, then digits, spaces, and hyphens only, with 7 to 15 digits in all.
+- to_dict includes "phone" only when it is set, stored as given; from_dict reads it when present.
+Contacts saved before this change (dicts with no "phone") must still load. The existing tests must keep passing."""
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

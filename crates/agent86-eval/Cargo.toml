@@ -1,0 +1,21 @@
+[package]
+name = "agent86-eval"
+description = "The eval set for agent86's harness: repository tasks with hidden checks, run through `agent86 run --json`"
+# Never published or released: the release workflow builds only the root package.
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+{
+  "service_name": "orders",
+  "http": {
+    "request_timeout_s": 30,
+    "max_connections": 30,
+    "user_agent": "service/2.3"
+  },
+  "database": {
+    "query_timeout_s": 30,
+    "path": "data/orders.db"
+  },
+  "cache": {
+    "ttl_s": 30
+  }
+}

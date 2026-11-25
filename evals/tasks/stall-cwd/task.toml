@@ -1,0 +1,5 @@
+category = "stall"
+measures = "a stall nudge (slice 3): the error points at the settings file, which is fine; the obvious fixes fail the same way"
+timeout_s = 600
+goal = "tests/test_config.py fails with a KeyError. Find the real cause and fix it in the application code. Do not change the tests, and do not move, copy, or edit app/settings.ini."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

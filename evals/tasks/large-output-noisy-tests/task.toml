@@ -1,0 +1,5 @@
+category = "large-output"
+measures = "command output sized to the window (slice 2b): the suite logs about 1 MB before unittest's failure report"
+timeout_s = 600
+goal = "The test suite (python -m unittest discover -s tests -t .) fails. Find out why and fix it in stats.py. Do not change the tests."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

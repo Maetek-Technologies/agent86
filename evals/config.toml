@@ -1,0 +1,17 @@
+# Applied to every eval run's isolated home, after the [providers] and
+# [pricing] tables of your own ~/.agent86/config.toml and before the variant's
+# overlay and what each run sets itself (the model, the task's budgets, --window).
+# Nothing else of your own config is used: no MCP servers, skills, or routing.
+
+[memory]
+# The hashing embedder: no model download, and no memory carried between runs
+# (every run has a fresh home anyway).
+embeddings = "hash:256"
+
+[observability]
+# Each run's trace is copied next to its result (compactions, trims).
+trace = true
+
+[limits]
+max_steps = 40
+max_cost_usd = 2.0

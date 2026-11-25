@@ -1,0 +1,6 @@
+category = "long-context"
+measures = "compaction (slice 2): twelve ~1,500-token reads that must be done one at a time, with facts from the first needed at the end"
+timeout_s = 900
+goal = "Start by reading notes/start.txt. Each note has a line 'CODE: <word>', a line 'VALUE: <number>', and a line 'NEXT: <path>' naming the next note to read. Follow the chain with read_file, one note at a time, until a note says 'NEXT: none'. Then answer with every code word in the order you found them, and the sum of all the values."
+setup = ["{python}", "{setup}/make_notes.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

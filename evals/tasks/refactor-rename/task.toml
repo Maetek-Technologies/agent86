@@ -1,0 +1,5 @@
+category = "refactor"
+measures = "multi-file edits that must all land"
+timeout_s = 600
+goal = "Rename the function calc_total to order_total throughout the inventory package: its definition, every call, and the package's exports. Keep calc_total importable from inventory.pricing as a deprecated alias: calling it must emit a DeprecationWarning and return the same result as order_total. The tests in tests/ must still pass."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

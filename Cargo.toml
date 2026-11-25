@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/agent86-core", "crates/agent86-ui"]
+members = ["crates/agent86-core", "crates/agent86-ui", "crates/agent86-eval"]
 resolver = "2"
 
 # One version, edition, MSRV, and license for both crates. Set the version here

@@ -72,6 +72,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent86-eval"
+version = "1.2.2"
+dependencies = [
+ "clap",
+ "jiff",
+ "serde",
+ "serde_json",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
 name = "agent86-ui"
 version = "1.2.2"
 dependencies = [

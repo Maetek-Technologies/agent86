@@ -1,0 +1,5 @@
+category = "bugfix"
+measures = "a bug the visible test names, and the same rule broken on a path it does not test"
+timeout_s = 600
+goal = "test_calendar_utils.py fails. Fix calendar_utils.py so add_business_days does what its docstring says. Do not change the tests."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

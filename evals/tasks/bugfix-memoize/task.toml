@@ -1,0 +1,5 @@
+category = "bugfix"
+measures = "two bugs in one small function, one of which no visible test shows"
+timeout_s = 600
+goal = "A report shows wrong numbers, and test_cache.py fails: memoize in cache.py returns cached results for calls it should not. Fix memoize so it does everything its docstring says. Do not change the tests."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]
