@@ -136,8 +136,6 @@ address, in nine categories:
 
 ## Not built yet
 
-- A baseline run recorded in the plan: a local model at a 32k window and one
-  frontier model, several repeats each.
 - Comparing two result directories (today, run the variants in one invocation).
 - Killing the agent's child processes at the runner's time limit: only
   `agent86` itself is killed, and its own commands have their own timeouts.
