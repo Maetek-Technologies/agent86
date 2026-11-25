@@ -44,6 +44,7 @@ context_reserve_tokens = 4096
 compaction = "summarize"
 parallel_tools = true
 tool_timeout_s = 60
+context_sizing = true
 
 [sandbox]
 mode = "subprocess"
@@ -382,6 +383,10 @@ pub struct LimitsConfig {
     pub parallel_tools: bool,
     /// Seconds a single sandboxed tool may run before its process tree is killed.
     pub tool_timeout_s: u64,
+    /// Beyond Python: tool results capped to a share of the window, older ones
+    /// sent as stubs once it fills, and the budget calibrated against reported
+    /// tokens (`crate::memory::sizing`). `false` fits requests as Python does.
+    pub context_sizing: bool,
 }
 
 /// `[skills]`.

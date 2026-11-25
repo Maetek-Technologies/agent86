@@ -96,6 +96,7 @@ fn harness(server: &MockServer, workspace: &Workspace, specialties: Vec<Specialt
             compaction: CompactionMode::Summarize,
             parallel_tools: true,
             tool_timeout_s: 60,
+            context_sizing: true,
         },
         agents: AgentsConfig {
             enabled: true,
@@ -134,6 +135,7 @@ fn harness(server: &MockServer, workspace: &Workspace, specialties: Vec<Specialt
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     harness.subagents.approvals = ApprovalStore {
         path: Some(workspace.0.join("approved-agents.json")),

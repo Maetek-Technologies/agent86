@@ -26,6 +26,7 @@ use crate::config::EgressMode;
 use crate::config::{AgentsConfig, CompactionMode, LimitsConfig};
 use crate::guardrails::Guardrails;
 use crate::limits::LimitKind;
+use crate::memory::sizing::{aged_view, calibrated, result_cap, shorten_middle};
 use crate::memory::working::{
     apply_progress, apply_summary, compacted_notice, compaction_failed_notice, compaction_plan,
     conversation_budget, count_spec_tokens, count_tokens, fit_pinned, fits, python_strip,
@@ -106,6 +107,8 @@ struct TurnWindow<'g> {
     trim_announced: bool,
     /// How many messages the last request left out.
     trimmed: usize,
+    /// How many tool results the last request sent aged (`crate::memory::sizing`).
+    aged: usize,
 }
 
 /// The user-visible line announcing continuation `index`.
@@ -422,6 +425,9 @@ pub struct Harness {
     /// Specialist sub-agents' state (beyond Python): notices for the user and the
     /// approvals of project specialties (`crate::subagent`).
     pub subagents: crate::subagent::SubagentState,
+    /// Reported against estimated input tokens, per model (beyond Python;
+    /// `crate::memory::sizing::Calibration`).
+    pub calibration: crate::memory::sizing::Calibration,
 }
 
 impl Harness {
@@ -495,13 +501,52 @@ impl Harness {
     /// `_context_budget`: the window minus what the request spends before any
     /// history (the system message and the tool catalogue, both of which change at
     /// runtime), minus the room the response needs.
+    ///
+    /// Beyond Python, the budget shrinks for a model whose reported input tokens
+    /// have run above the estimate (`crate::memory::sizing::Calibration`).
     pub(crate) fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
-        self.context_budget_with(
+        let budget = self.context_budget_with(
             system,
             specs,
             self.active_context_window(),
             self.output_cap(),
+        );
+        if !self.limits.context_sizing {
+            return budget;
+        }
+        calibrated(
+            budget,
+            self.calibration.ratio(self.active_provider().model()),
         )
+    }
+
+    /// A tool result cut to its share of `budget`, unless `[limits] context_sizing`
+    /// is off (`crate::memory::sizing::result_cap`).
+    pub(crate) fn cap_result(&self, content: String, budget: u64) -> String {
+        if !self.limits.context_sizing {
+            return content;
+        }
+        shorten_middle(
+            &content,
+            result_cap(budget, self.context.policy.max_output_chars),
+        )
+    }
+
+    /// `messages` as a request carries them: aged once the window fills, unless
+    /// `[limits] context_sizing` is off (`crate::memory::sizing::aged_view`).
+    pub(crate) fn request_view(
+        &self,
+        messages: &[Message],
+        budget: u64,
+    ) -> crate::memory::sizing::Aged {
+        if self.limits.context_sizing {
+            aged_view(messages, budget)
+        } else {
+            crate::memory::sizing::Aged {
+                messages: messages.to_vec(),
+                aged: 0,
+            }
+        }
     }
 
     /// [`Harness::context_budget`] for a model with this window and output cap (a
@@ -640,7 +685,9 @@ impl Harness {
         }
         let system = self.system_message(extra_system);
         let budget = self.context_budget(&system, &self.request_tools());
-        if fits(&state.messages, budget) {
+        // Beyond Python: judged on what a request would carry, so a history that
+        // fits once its older results are aged costs no summary.
+        if fits(&self.request_view(&state.messages, budget).messages, budget) {
             return None;
         }
         let tokens = count_tokens(&state.messages);
@@ -945,6 +992,7 @@ impl Harness {
             retry_at: None,
             trim_announced: false,
             trimmed: 0,
+            aged: 0,
         };
         state.messages.push(message(Role::User, goal));
         let mut limits = self.limits.clone();
@@ -1007,12 +1055,20 @@ impl Harness {
                 });
             }
 
+            // The request's estimated size, for calibration, and the budget the
+            // step's results are capped against.
+            let estimated;
+            let step_budget;
             let mut completion = {
                 let system = self.system_message(recall_note.as_deref());
                 // Under `run --agent`, only what the specialty may call is offered.
                 let tools = self.request_tools();
                 let budget = self.context_budget(&system, &tools);
-                let fitted = fit_pinned(&state.messages, budget, Some(window.goal));
+                step_budget = budget;
+                // Beyond Python: older results go as stubs once the window fills.
+                let aged = self.request_view(&state.messages, budget);
+                self.announce_age(&sid, aged.aged, budget, &mut window);
+                let fitted = fit_pinned(&aged.messages, budget, Some(window.goal));
                 self.announce_trim(&sid, &fitted, budget, &mut window, &mut emit);
                 let mut request_messages = Vec::with_capacity(fitted.messages.len() + 1);
                 request_messages.push(system);
@@ -1020,6 +1076,7 @@ impl Harness {
                 if std::mem::take(&mut ask_again) {
                     request_messages.push(message(Role::User, ANSWER_PROMPT));
                 }
+                estimated = count_tokens(&request_messages) + count_spec_tokens(&tools);
                 let request = CompletionRequest {
                     model: provider.model().to_owned(),
                     messages: request_messages,
@@ -1114,6 +1171,13 @@ impl Harness {
             };
 
             breaker.record_step(&completion.usage);
+            if self.limits.context_sizing {
+                self.calibration.observe(
+                    provider.model(),
+                    estimated,
+                    completion.usage.input_tokens,
+                );
+            }
             summary.steps = u64::from(breaker.steps());
             summary.add_usage(&completion.usage);
             // Beyond Python: what this call used, and the session so far, for a
@@ -1425,6 +1489,8 @@ impl Harness {
                 step.usage = step.usage + delegated;
                 breaker.record_cost(delegated.cost_usd);
                 let (content, findings) = self.guardrails.observe(observation(&result));
+                // Beyond Python: no result takes more than its share of the window.
+                let content = self.cap_result(content, step_budget);
                 if let Some(findings) = findings {
                     self.recorder.event(
                         &sid,
@@ -1513,6 +1579,21 @@ impl Harness {
             window.trim_announced = true;
             emit(TurnEvent::Notice(&trimmed_notice(fitted.dropped)));
         }
+    }
+
+    /// Beyond Python: a `context_age` trace event whenever the number of tool
+    /// results a request sends aged changes (`crate::memory::sizing::aged_view`).
+    /// Nothing is said to the user: the session keeps every result whole.
+    fn announce_age(&self, sid: &str, aged: usize, budget: u64, window: &mut TurnWindow<'_>) {
+        if aged == window.aged {
+            return;
+        }
+        window.aged = aged;
+        self.recorder.event(
+            sid,
+            "context_age",
+            vec![("aged", json!(aged)), ("budget", json!(budget))],
+        );
     }
 
     fn cancelled(&self, state: &mut AgentState, steps: u32, emit: &mut impl FnMut(TurnEvent<'_>)) {
@@ -2119,6 +2200,7 @@ mod tests {
             compaction: CompactionMode::Summarize,
             parallel_tools: true,
             tool_timeout_s: 60,
+            context_sizing: true,
         }
     }
 

@@ -220,6 +220,7 @@ pub fn assemble_in(
         mcp,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     };
     harness.configure_output(config, &model_ref.provider);
     harness.context.can_delegate = harness.delegation_offered(&harness.context, 0);

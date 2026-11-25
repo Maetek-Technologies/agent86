@@ -1283,7 +1283,9 @@ impl Harness {
             let budget = self.context_budget_with(&system, &specs, model.context_window, cap);
             let mut request_messages = vec![system.clone()];
             // Beyond Python: the task (the first message) is never the part left out.
-            request_messages.extend(fit_pinned(&messages, budget, Some(0)).messages);
+            // Beyond Python: older results aged as the window fills, as in the main loop.
+            let view = self.request_view(&messages, budget);
+            request_messages.extend(fit_pinned(&view.messages, budget, Some(0)).messages);
             if std::mem::take(&mut ask_again) {
                 request_messages.push(message(Role::User, ANSWER_PROMPT.to_owned()));
             }
@@ -1470,6 +1472,7 @@ impl Harness {
                 delegated = delegated + usage;
                 progress.record(breaker.steps(), spent.cost_usd + delegated.cost_usd);
                 let (content, findings) = self.guardrails.observe(observation(&result));
+                let content = self.cap_result(content, budget);
                 if let Some(findings) = findings {
                     self.recorder.event(
                         &sid,

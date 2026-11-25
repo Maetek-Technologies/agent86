@@ -82,6 +82,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
             compaction: CompactionMode::Summarize,
             parallel_tools: true,
             tool_timeout_s: 60,
+            context_sizing: true,
         },
         agents,
         system: Message {
@@ -115,6 +116,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     }
 }
 

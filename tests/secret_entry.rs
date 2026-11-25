@@ -63,6 +63,7 @@ fn limits() -> LimitsConfig {
         compaction: CompactionMode::Summarize,
         parallel_tools: true,
         tool_timeout_s: 60,
+        context_sizing: true,
     }
 }
 
@@ -121,6 +122,7 @@ fn harness(server: &MockServer, workspace: &Workspace, registry: ToolRegistry) -
         memory: None,
         cancel: Default::default(),
         subagents: Default::default(),
+        calibration: Default::default(),
     }
 }
 

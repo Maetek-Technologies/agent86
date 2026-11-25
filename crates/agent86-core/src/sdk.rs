@@ -690,6 +690,7 @@ impl AgentBuilder {
             memory: store,
             cancel: Default::default(),
             subagents: Default::default(),
+            calibration: Default::default(),
         };
         #[cfg(feature = "agent86ui")]
         if let Some(session) = ui_session {

@@ -1,0 +1,5 @@
+# Context sizing off (slice 2b): results capped only by the tools, never aged,
+# and the budget never calibrated, as Python fits requests
+# (`--variant evals/variants/no-sizing.toml`).
+[limits]
+context_sizing = false
