@@ -192,14 +192,15 @@ impl Harness {
     }
 
     /// The model that writes compaction summaries, as Python's `_summary_provider`:
-    /// the cheap route when routing is on (and it can be built), else the active one.
-    pub(crate) fn summary_provider(&self) -> Arc<dyn Provider> {
+    /// the cheap route when routing is on (and it can be built), else the active one,
+    /// with its context window (beyond Python, which never fits the summary request).
+    pub(crate) fn summary_model(&self) -> (Arc<dyn Provider>, u64) {
         if self.router.enabled() {
             if let Ok(model) = self.router.model_for(&self.router.cheap) {
-                return model.provider;
+                return (model.provider, model.context_window);
             }
         }
-        self.active_provider()
+        (self.active_provider(), self.active_context_window())
     }
 }
 
