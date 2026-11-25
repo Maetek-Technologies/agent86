@@ -1,0 +1,5 @@
+category = "verification"
+measures = "a verification gate (slice 1): edge cases a first attempt usually misses, with tests to run"
+timeout_s = 600
+goal = "Implement parse_csv_line in csvline.py as its docstring describes, without using the csv module. The tests are in test_csv.py."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

@@ -1,0 +1,4 @@
+# Compaction off: requests are only fitted to the window, never summarized.
+# A reference point for slice 2 (`--variant evals/variants/drop.toml`).
+[limits]
+compaction = "drop"

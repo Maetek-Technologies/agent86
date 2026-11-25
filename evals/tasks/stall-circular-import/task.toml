@@ -1,0 +1,5 @@
+category = "stall"
+measures = "a stall nudge (slice 3): reordering the imports, the first thing tried, fails the same way"
+timeout_s = 600
+goal = "Importing shop.models fails with an ImportError, so the tests in tests/ cannot run. Fix it without merging the modules, moving functions or classes between them, or removing anything. The tests must pass, and both modules must import on their own, in either order."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

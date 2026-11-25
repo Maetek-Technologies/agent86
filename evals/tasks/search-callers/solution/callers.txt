@@ -1,0 +1,16 @@
+apply_notification_batch
+apply_notification_window
+apply_report_batch
+apply_report_window
+apply_shipping_batch
+build_invoice_entry
+build_notification_draft
+check_report_totals
+close_cart_window
+close_notification_draft
+close_report_totals
+load_admin_draft
+load_report_entry
+open_admin_record
+send_promotion_summary
+sync_return_window

@@ -1,0 +1,6 @@
+category = "search"
+measures = "every use of a flag found and removed among forty files, keeping the right branch each time"
+timeout_s = 600
+goal = "The legacy export format is retired. Remove the ENABLE_LEGACY_EXPORT feature flag from the project entirely: the flag itself, every check of it, the legacy code path, and the legacy_format function. Everything must behave as it does today with the flag turned off. Leave the other feature flags alone."
+setup = ["{python}", "{setup}/make_filler.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

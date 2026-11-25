@@ -1,0 +1,6 @@
+category = "large-output"
+measures = "a 4 MB data file no read can hold, with traps for a careless count"
+timeout_s = 600
+goal = "data/events.jsonl holds one JSON event per line, each with a \"user\", a \"type\", and a \"ts\" timestamp in ISO 8601 with a UTC offset. Which user made the most events of type \"purchase\" in November 2026, counting by UTC time? Write just that user's id to answer.txt."
+setup = ["{python}", "{setup}/make_events.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

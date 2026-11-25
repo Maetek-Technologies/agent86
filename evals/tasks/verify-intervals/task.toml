@@ -1,0 +1,5 @@
+category = "verification"
+measures = "a verification gate (slice 1): boundary cases the visible tests only partly cover"
+timeout_s = 600
+goal = "Implement merge_intervals in intervals.py as its docstring describes. Some tests are in test_intervals.py."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

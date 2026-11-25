@@ -1,0 +1,6 @@
+category = "search"
+measures = "search tools: three places to change among forty files, and look-alike values that must stay"
+timeout_s = 600
+goal = "HTTP requests in this project time out after 30 seconds. Raise the HTTP request timeout to 45 seconds everywhere it is configured. Other settings that happen to be 30 (retry delays, page sizes, cache lifetimes, database timeouts, connection limits) must stay exactly as they are."
+setup = ["{python}", "{setup}/make_filler.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

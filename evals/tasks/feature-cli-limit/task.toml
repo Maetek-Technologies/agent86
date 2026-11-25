@@ -1,0 +1,5 @@
+category = "feature"
+measures = "a change through a command-line interface, checked by running it"
+timeout_s = 600
+goal = "Add two options to the top_words.py command. --limit N prints the N most common words instead of 10; N must be a whole number of at least 1, and anything else is a usage error (argparse's, exit status 2). --ignore-case counts words without regard to case and prints them in lower case. Without the options, the output must stay exactly as it is now."
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

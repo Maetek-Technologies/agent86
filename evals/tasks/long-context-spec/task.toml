@@ -1,0 +1,6 @@
+category = "long-context"
+measures = "compaction (slice 2): eight rules spread through a 30 KB spec, all of which the code must follow"
+timeout_s = 900
+goal = "Implement price_quote in quote.py so that it follows every rule in docs/pricing-spec.md. The spec is long; the rules are numbered PQ-1 to PQ-8 and are spread through it."
+setup = ["{python}", "{setup}/make_spec.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

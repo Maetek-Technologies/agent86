@@ -1,0 +1,6 @@
+category = "large-output"
+measures = "tool output sized to the window (slice 2b): the one error sits past read_file's cap in a 400 KB log"
+timeout_s = 600
+goal = "Last night's billing job failed. Its log is logs/nightly.log. Find out why it failed and fix the code so it does not fail that way again."
+setup = ["{python}", "{setup}/make_log.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

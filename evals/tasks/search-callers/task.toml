@@ -1,0 +1,6 @@
+category = "search"
+measures = "following calls through a package: direct, aliased, and through module attributes, past look-alike names"
+timeout_s = 900
+goal = "Find every function in the shop package that calls charge_card, directly or indirectly (by calling a function that does, at any depth). Write their names to callers.txt, one per line, and nothing else. Do not change any code."
+setup = ["{python}", "{setup}/make_shop.py"]
+check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]
