@@ -138,6 +138,25 @@ A client that names the capability in its own `clientCapabilities._meta["com.mae
 
 `reason` is the model's text, with any value already held replaced by its placeholder; `replacing` says a value is held under the name already, and `remembered` that it is remembered for the project (so a remember choice should start on). The answer is `{"outcome": "entered", "value": "…", "remember": false}` or `{"outcome": "declined"}`; anything else, an error, an empty value, or a `session/cancel` while it waits declines, and the model is told. The question waits its turn with approvals (a `questions` state event shows it as kind `secret`, without its name), and the model cannot ask for a name that would change how programs run (`PATH`, `LD_*`, `NODE_OPTIONS`, and so on). Typing a secret after `/secret` in such a client's box still stores nothing: the command's reply points at the client's own entry instead.
 
+## agent86UI (an extension)
+
+From 1.2.3, a client that renders [A2UI 1.0](https://a2ui.org) (agent86-web, for one) can let the model draw interactive surfaces, such as a form, a choice, or a confirmation, instead of asking in prose (see [agent86ui.md](agent86ui.md) for what the model can draw and what agent86 refuses).
+
+`initialize` advertises `agentCapabilities._meta["com.maetek.agent86/a2ui"] = {"version": 1, "catalogIds": ["https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"]}`, the catalogs agent86 draws with (the basic catalog only; the id is the specification's, `agent86_ui::BASIC_CATALOG_ID`). A client that renders them names the capability in its own `clientCapabilities._meta` as an object listing what it supports:
+
+```json
+{"_meta": {"com.maetek.agent86/a2ui": {"supportedCatalogIds": ["https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"]}}}
+```
+
+Only a client whose `supportedCatalogIds` holds the basic catalog's id is offered `render_ui` (and the part of the system prompt that describes it); `true`, which the other extensions take, is not enough, since a renderer has to say what it draws. Other clients are not offered the tool; a text version for them is planned for 1.2.3 too.
+
+- **Drawing.** Each message the model draws is sent, already validated against the catalog and with every held secret replaced by its placeholder, as a notification: `_com.maetek.agent86/a2ui/render` with `{"sessionId": "...", "messages": [...]}`, the A2UI messages to apply in order (`createSurface`, `updateComponents`, `updateDataModel`, `deleteSurface`). It arrives between the `render_ui` call's `tool_call` and its result, whatever `/toolview` says, since a surface is a question to the user.
+- **A call that waits.** When the model needs the answer before going on (`render_ui` with `wait: true`), agent86 asks the client with a request, `_com.maetek.agent86/a2ui/wait`, `{"sessionId": "...", "surfaceIds": ["..."]}`, and waits as long as the user takes. Answer `{"outcome": "action", "action": {...}}` with the A2UI `action` the user's press produced (`name`, `surfaceId`, `sourceComponentId`, `timestamp`, `context`), or `{"outcome": "dismissed"}`. The action must come from one of the surfaces named and a component it has; its text (`[ui action] submit on form: {"name": "Ada"}`) becomes the call's result, through the same secret redaction and injection guardrail as typed text. A dismissal, an error, anything else, or a `session/cancel` while it waits leaves the surface up and tells the model a later action comes as a message. The question waits its turn with approvals (a `questions` state event shows it as kind `ui`).
+- **An action after the turn.** A press on a surface no call waits on is sent as a request between turns, `_com.maetek.agent86/a2ui/action`, `{"sessionId": "...", "action": {...}}`. agent86 checks that the surface is up and holds the component, records it (`ui_action` in the trace, never its values), and runs a turn on the action's text, as if the user had typed it: the request streams that turn's updates and answers `{"stopReason": "..."}`, as `session/prompt` does. A surface that is not up, a component it does not have, or an action that is not one is error `-32602`, with no turn; so is `callAgentFunction`, since agent86 has no agent functions. Like any other request, it is refused while a prompt turn runs.
+- **Loading a session.** `session/load` replays the history, then sends one `_com.maetek.agent86/a2ui/render` holding each surface still up as a single `createSurface` (its components and its data model as they are now), rebuilt from the saved steps. `session/resume` sends none, as it replays nothing.
+
+`[ui] agent86ui` and `[ui] agent86ui_remote_media` are the terminal's settings and are not read here: the client's capability decides, and surfaces may show only `data:` URLs and the workspace's own files as media.
+
 ## What is different from the terminal
 
 - **Settings come from where the editor starts agent86.** The project's `.agent86/config.toml` is the one in that directory, which is normally the project folder. A multi-folder window uses the folder the editor chose.

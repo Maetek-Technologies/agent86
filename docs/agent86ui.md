@@ -10,7 +10,7 @@ A2UI is Google's protocol, and agent86 is not affiliated with or endorsed by Goo
 |---|---|
 | Programs embedding `agent86-core` (`sdk`), such as agent86-desktop | From 1.2.0 |
 | The terminal interface | From 1.2.1: see [In the terminal](#in-the-terminal) |
-| ACP clients (agent86-web, editors) | Planned for 1.2.3: the `com.maetek.agent86/a2ui` extension, and a text version for other clients |
+| ACP clients (agent86-web, editors) | 1.2.3: clients that render A2UI, through the `com.maetek.agent86/a2ui` extension ([ACP.md](ACP.md#agent86ui-an-extension)); a text version for other clients is planned for 1.2.3 too |
 | `agent86 run`, the plain loop, piped input, CI | Never: the tool is not offered, so their output is unchanged |
 
 The model can only draw where a surface has declared a renderer, so `render_ui` and its part of the system prompt (which costs a few thousand tokens per request) are absent everywhere else.
@@ -137,4 +137,4 @@ Neither holds what a surface showed or what the user entered. As for every tool,
 ## What it does not do yet
 
 - A2UI over A2A or AG-UI, A2UI in MCP servers' output, renderer and agent functions, and A2UI 0.9 are left out.
-- ACP clients get agent86UI in 1.2.3. An embedder turns it on with `AgentBuilder::ui`; the `[ui]` settings are the interface's.
+- ACP clients that do not render A2UI get no surfaces yet (a text version is planned for 1.2.3). An embedder turns agent86UI on with `AgentBuilder::ui`, and an ACP client with the `com.maetek.agent86/a2ui` capability; the `[ui]` settings are the interface's.

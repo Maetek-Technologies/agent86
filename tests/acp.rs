@@ -6,8 +6,9 @@
 mod support;
 
 use agent86::acp::{
-    SECRETS_CAPABILITY, SECRET_FORGET_METHOD, SECRET_LIST_METHOD, SECRET_REQUEST_METHOD,
-    SECRET_SET_METHOD, STATE_CAPABILITY, STATE_METHOD,
+    A2UI_ACTION_METHOD, A2UI_CAPABILITY, A2UI_RENDER_METHOD, A2UI_WAIT_METHOD, SECRETS_CAPABILITY,
+    SECRET_FORGET_METHOD, SECRET_LIST_METHOD, SECRET_REQUEST_METHOD, SECRET_SET_METHOD,
+    STATE_CAPABILITY, STATE_METHOD,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -141,6 +142,8 @@ impl Workspace {
             wants_state: false,
             hold_until_waiting: false,
             secret_entry: None,
+            wants_ui: false,
+            ui_answer: None,
             received: Vec::new(),
         }
     }
@@ -181,6 +184,11 @@ struct Client {
     /// What the user types into this client's own masked entry when the agent asks
     /// for a secret (the secrets extension); `None` declines.
     secret_entry: Option<&'static str>,
+    /// Whether `initialize` said this client renders A2UI (the a2ui extension).
+    wants_ui: bool,
+    /// How the user answers a surface the agent waits on: the A2UI action to send,
+    /// or `None` to dismiss it.
+    ui_answer: Option<Value>,
     /// Every stdout line, as read.
     received: Vec<String>,
 }
@@ -199,6 +207,9 @@ struct Exchange {
     /// The `_com.maetek.agent86/session/event` notifications' events, for a client
     /// that asked for them; any other client fails on one.
     state: Vec<Value>,
+    /// The A2UI messages of the `_com.maetek.agent86/a2ui/render` notifications, in
+    /// order, for a client that renders them; any other client fails on one.
+    ui: Vec<Value>,
     response: Value,
 }
 
@@ -241,6 +252,7 @@ impl Client {
         let mut files = Vec::new();
         let mut usage = Vec::new();
         let mut state = Vec::new();
+        let mut ui = Vec::new();
         let mut held: Option<Value> = None;
         loop {
             let mut text = String::new();
@@ -261,6 +273,7 @@ impl Client {
                     files,
                     usage,
                     state,
+                    ui,
                     response: message,
                 };
             }
@@ -277,6 +290,31 @@ impl Client {
                 let result = match self.secret_entry {
                     Some(value) => json!({"outcome": "entered", "value": value, "remember": false}),
                     None => json!({"outcome": "declined"}),
+                };
+                self.send(&json!({"jsonrpc": "2.0", "id": message["id"], "result": result}));
+                requests.push(message);
+                continue;
+            }
+            if message["method"] == A2UI_RENDER_METHOD {
+                assert!(
+                    self.wants_ui,
+                    "surfaces sent to a client that does not draw them: {message}"
+                );
+                assert!(message.get("id").is_none(), "{message}");
+                ui.extend(
+                    message["params"]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .cloned(),
+                );
+                continue;
+            }
+            if message["method"] == A2UI_WAIT_METHOD {
+                assert!(self.wants_ui, "{message}");
+                let result = match &self.ui_answer {
+                    Some(action) => json!({"outcome": "action", "action": action}),
+                    None => json!({"outcome": "dismissed"}),
                 };
                 self.send(&json!({"jsonrpc": "2.0", "id": message["id"], "result": result}));
                 requests.push(message);
@@ -430,6 +468,7 @@ impl Client {
     /// `initialize` advertising `capabilities`, e.g. `{"fs": {"readTextFile": true}}`.
     fn initialize_with(&mut self, capabilities: Value) -> Value {
         self.wants_state = capabilities["_meta"][STATE_CAPABILITY] == json!(true);
+        self.wants_ui = capabilities["_meta"][A2UI_CAPABILITY].is_object();
         self.request(
             "initialize",
             json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
@@ -955,6 +994,261 @@ async fn a_client_with_its_own_entry_hands_over_secrets_and_never_sees_them_agai
             !body.contains(SET_VALUE) && !body.contains(ENTERED),
             "{body}"
         );
+    }
+}
+
+// agent86UI over ACP (ADR 0005, slice 4): a client that renders A2UI draws the
+// model's surfaces, answers a call that waits, and sends actions after the turn.
+
+const BASIC: &str = agent86::sdk::agent86_ui::BASIC_CATALOG_ID;
+/// So no permission request joins the wait request among an exchange's requests.
+const AUTO: &str = "[guardrails]\napproval = \"auto\"\n";
+
+/// `clientCapabilities` for a client that renders the basic catalog.
+fn renders_a2ui() -> Value {
+    json!({"_meta": {A2UI_CAPABILITY: {"supportedCatalogIds": [BASIC]}}})
+}
+
+/// `render_ui`'s arguments: a form asking for a name, with an OK button.
+fn name_form(wait: bool) -> String {
+    json!({"wait": wait, "messages": [{"version": "1.0", "createSurface": {
+        "surfaceId": "form",
+        "catalogId": BASIC,
+        "components": [
+            {"id": "root", "component": "Column", "children": ["name", "ok"]},
+            {"id": "name", "component": "TextField", "label": "Name", "value": {"@path": "/name"}},
+            {"id": "ok", "component": "Button", "child": "ok_label",
+             "action": {"event": {"name": "submit", "context": {"name": {"@path": "/name"}}}}},
+            {"id": "ok_label", "component": "Text", "text": "OK"}
+        ],
+        "dataModel": {"name": ""}
+    }}]})
+    .to_string()
+}
+
+/// The OK button pressed with `name` typed.
+fn submitted(name: &str) -> Value {
+    json!({"name": "submit", "surfaceId": "form", "sourceComponentId": "ok",
+           "timestamp": "2026-11-26T10:00:00Z", "context": {"name": name}})
+}
+
+fn offers(request: &support::Recorded, tool: &str) -> bool {
+    request.body["tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == tool))
+}
+
+#[tokio::test]
+async fn a_client_that_renders_a2ui_draws_surfaces_and_answers_a_waiting_call() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "render_ui", &name_form(true))]),
+        sse_text("Hello, Ada.", "stop"),
+        // The action sent after the turn.
+        sse_text("Changed to Grace.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config("acp-a2ui", Some(&server), AUTO);
+    let project = workspace.project();
+    let (init, turn, action, unknown, agent_function, malformed) = tokio::task::spawn_blocking({
+        let project = project.clone();
+        let mut client = workspace.connect();
+        move || {
+            client.ui_answer = Some(submitted("Ada"));
+            let init = client.initialize_with(renders_a2ui());
+            let session = client.new_session(&project);
+            let turn = client.prompt(&session, "Ask me my name");
+            let action = client.request(
+                A2UI_ACTION_METHOD,
+                json!({"sessionId": session, "action": submitted("Grace")}),
+            );
+            let mut elsewhere = submitted("x");
+            elsewhere["surfaceId"] = json!("nowhere");
+            let unknown = client
+                .request(
+                    A2UI_ACTION_METHOD,
+                    json!({"sessionId": session, "action": elsewhere}),
+                )
+                .response;
+            let agent_function = client
+                .request(
+                    A2UI_ACTION_METHOD,
+                    json!({"sessionId": session, "callAgentFunction": {"name": "f"}}),
+                )
+                .response;
+            let malformed = client
+                .request(
+                    A2UI_ACTION_METHOD,
+                    json!({"sessionId": session, "action": {"name": 1}}),
+                )
+                .response;
+            client.finish();
+            (init, turn, action, unknown, agent_function, malformed)
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        init["result"]["agentCapabilities"]["_meta"][A2UI_CAPABILITY],
+        json!({"version": 1, "catalogIds": [BASIC]})
+    );
+    // Drawn: the surface, as the model sent it, then the wait for the answer.
+    assert_eq!(turn.response["result"]["stopReason"], "end_turn");
+    assert_eq!(turn.ui.len(), 1, "{:?}", turn.ui);
+    assert_eq!(turn.ui[0]["createSurface"]["surfaceId"], "form");
+    assert_eq!(turn.ui[0]["version"], "1.0");
+    assert_eq!(turn.requests.len(), 1, "{:?}", turn.requests);
+    assert_eq!(turn.requests[0]["method"], A2UI_WAIT_METHOD);
+    assert_eq!(turn.requests[0]["params"]["surfaceIds"], json!(["form"]));
+    let requests = server.requests();
+    assert!(offers(&requests[0], "render_ui"));
+    // The answer is the call's result.
+    let result = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(result["role"], "tool");
+    let content = result["content"].as_str().unwrap();
+    assert!(
+        content.contains(r#"[ui action] submit on form: {"name": "Ada"}"#),
+        "{content}"
+    );
+
+    // After the turn, an action runs a turn of its own on its text.
+    assert_eq!(
+        action.response["result"]["stopReason"], "end_turn",
+        "{}",
+        action.response
+    );
+    assert_eq!(action.text_of("agent_message_chunk"), "Changed to Grace.");
+    let user = requests[2].body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(user["role"], "user");
+    assert!(
+        user["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(r#"[ui action] submit on form: {"name": "Grace"}"#),
+        "{user}"
+    );
+    // Refused, with no turn: a surface that is not up, an agent function, and an
+    // action that is not one.
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nowhere"),
+        "{unknown}"
+    );
+    assert_eq!(agent_function["error"]["code"], -32602, "{agent_function}");
+    assert!(
+        agent_function["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("agent functions"),
+        "{agent_function}"
+    );
+    assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+    assert_eq!(server.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn a_dismissed_surface_stays_up_and_a_loaded_session_draws_it_again() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "render_ui", &name_form(true))]),
+        sse_text("Tell me when you are ready.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config("acp-a2ui-load", Some(&server), AUTO);
+    let project = workspace.project();
+    let (session, turn) = tokio::task::spawn_blocking({
+        let project = project.clone();
+        let mut client = workspace.connect();
+        move || {
+            client.initialize_with(renders_a2ui());
+            let session = client.new_session(&project);
+            let turn = client.prompt(&session, "Ask me my name");
+            client.finish();
+            (session, turn)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(turn.requests[0]["method"], A2UI_WAIT_METHOD);
+    let result = server.requests()[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert!(
+        result["content"].as_str().unwrap().contains("stays up"),
+        "{result}"
+    );
+
+    let loaded = tokio::task::spawn_blocking({
+        let mut client = workspace.connect();
+        move || {
+            client.initialize_with(renders_a2ui());
+            let loaded = client.load_session(&session, &project);
+            client.finish();
+            loaded
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        loaded.response.get("result").is_some(),
+        "{}",
+        loaded.response
+    );
+    // After the history, the surface as it is now: one createSurface.
+    assert_eq!(loaded.ui.len(), 1, "{:?}", loaded.ui);
+    let surface = &loaded.ui[0]["createSurface"];
+    assert_eq!(surface["surfaceId"], "form");
+    assert_eq!(surface["catalogId"], BASIC);
+    assert!(
+        surface["components"]
+            .as_array()
+            .is_some_and(|c| c.len() == 4),
+        "{surface}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_without_the_basic_catalog_is_not_offered_render_ui() {
+    let server = MockServer::start(vec![sse_text("Hi.", "stop"), sse_text("Hi.", "stop")]).await;
+    let workspace = Workspace::with_config("acp-a2ui-none", Some(&server), AUTO);
+    let project = workspace.project();
+    tokio::task::spawn_blocking({
+        let mut first = workspace.connect();
+        let mut second = workspace.connect();
+        move || {
+            // Without the extension, and with it but only another catalog.
+            first.initialize();
+            let session = first.new_session(&project);
+            first.prompt(&session, "Hello");
+            first.finish();
+            second.initialize_with(
+                json!({"_meta": {A2UI_CAPABILITY: {"supportedCatalogIds": ["https://example.com/other.json"]}}}),
+            );
+            second.wants_ui = false;
+            let session = second.new_session(&project);
+            second.prompt(&session, "Hello");
+            second.finish();
+        }
+    })
+    .await
+    .unwrap();
+    for request in server.requests() {
+        assert!(!offers(&request, "render_ui"), "{}", request.body);
     }
 }
 
