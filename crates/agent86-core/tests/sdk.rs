@@ -2134,3 +2134,33 @@ async fn a_resumed_session_gets_its_surfaces_back_from_the_history() {
         .unwrap();
     assert!(plain.surfaces().is_empty());
 }
+
+#[tokio::test]
+async fn the_default_prompt_names_the_platform_only_when_commands_can_run() {
+    let workspace = Workspace::new("platform");
+    let system = |builtins: Builtins, custom: Option<&str>| {
+        let provider = Scripted::new(vec![text("ok")]);
+        let mut builder = Agent::builder()
+            .provider(provider.clone())
+            .workspace(&workspace.0)
+            .builtins(builtins);
+        if let Some(text) = custom {
+            builder = builder.system_prompt(text);
+        }
+        let mut agent = builder.build().unwrap();
+        async move {
+            agent.run("hi").await.unwrap();
+            provider.requests()[0].messages[0].content.clone()
+        }
+    };
+
+    let all = system(Builtins::All, None).await;
+    assert!(all.contains("\n\nEnvironment: Platform: "), "{all}");
+    assert!(all.contains("run_command runs each command with"), "{all}");
+    // Without a tool that runs commands, and under a prompt of the caller's, none.
+    let read_only = system(Builtins::ReadOnly, None).await;
+    assert!(!read_only.contains("Platform:"), "{read_only}");
+    let custom = system(Builtins::All, Some("You are a build bot.")).await;
+    assert!(custom.starts_with("You are a build bot."));
+    assert!(!custom.contains("Platform:"), "{custom}");
+}

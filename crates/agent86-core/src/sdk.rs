@@ -125,6 +125,19 @@ pub enum Builtins {
     All,
 }
 
+/// The system prompt when none is given (see [`AgentBuilder::system_prompt`]).
+fn default_system(runs_commands: bool) -> String {
+    let identity = crate::prompt::BASE_IDENTITY.trim();
+    if runs_commands {
+        format!(
+            "{identity}\n\nEnvironment: {}",
+            crate::prompt::platform_note(crate::config::SandboxMode::Subprocess)
+        )
+    } else {
+        identity.to_owned()
+    }
+}
+
 /// Why [`AgentBuilder::build`] failed.
 ///
 /// `#[non_exhaustive]` (since 1.2.0): later releases may add reasons, so a
@@ -280,8 +293,11 @@ impl AgentBuilder {
         self
     }
 
-    /// The system prompt; agent86's own identity ([`crate::prompt::BASE_IDENTITY`])
-    /// when not set.
+    /// The system prompt; when not set, agent86's own identity
+    /// ([`crate::prompt::BASE_IDENTITY`]), followed, when `run_command` or
+    /// `python_exec` is offered, by a line naming the platform, the shell
+    /// commands run with, and the Python command
+    /// ([`crate::prompt::platform_note`]), since a model otherwise assumes Linux.
     pub fn system_prompt(mut self, text: impl Into<String>) -> Self {
         self.system = Some(text.into());
         self
@@ -536,6 +552,10 @@ impl AgentBuilder {
         }
 
         let registry = registry_for(self.builtins);
+        // Beyond Python: the default prompt says where commands run, when they can.
+        let runs_commands = ["run_command", "python_exec"]
+            .iter()
+            .any(|name| registry.get(name).is_some());
         for tool in self.tools {
             registry.register(tool).map_err(BuildError::Tool)?;
         }
@@ -672,9 +692,7 @@ impl AgentBuilder {
 
         let mut limits = self.limits;
         limits.max_output_tokens = self.max_output_tokens;
-        let mut system = self
-            .system
-            .unwrap_or_else(|| crate::prompt::BASE_IDENTITY.trim().to_owned());
+        let mut system = self.system.unwrap_or_else(|| default_system(runs_commands));
         system.push_str(&crate::prompt::skills_section(
             skills.values().map(AsRef::as_ref),
         ));
