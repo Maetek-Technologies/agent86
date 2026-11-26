@@ -760,6 +760,11 @@ pub struct ProviderConfig {
     /// that serves it badly.
     #[serde(default)]
     pub routing: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The sampling temperature sent to this section's models (beyond Python,
+    /// which always sends 0.0), 0 to 2; a specialty's own `temperature` wins.
+    /// Unset keeps 0.0. Not applied to Gemini, which takes no sampling settings.
+    #[serde(default)]
+    pub temperature: Option<f32>,
     /// The kind of server a section reaches (beyond Python): `"vllm"` or
     /// `"lmstudio"` gives any section that server's behaviour (an optional key, the
     /// window and model list it reports, local pricing, and hints for its errors),
@@ -787,6 +792,7 @@ impl Default for ProviderConfig {
             max_tokens: None,
             prompt_cache: true,
             routing: None,
+            temperature: None,
             adapter: None,
             store: false,
         }

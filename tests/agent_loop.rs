@@ -3150,3 +3150,34 @@ async fn stall_nudge_off_leaves_the_turn_as_python_runs_it() {
     let last = requests[2].body["messages"].as_array().unwrap();
     assert_eq!(last.last().unwrap()["role"], "tool");
 }
+
+#[tokio::test]
+async fn a_sections_temperature_is_sent_in_place_of_pythons_zero() {
+    let server = MockServer::start(vec![sse_text("ok", "stop"), sse_text("ok", "stop")]).await;
+    let workspace = Workspace::new("temperature-section");
+    run_verified(
+        std::sync::Arc::new(provider(&server).with_temperature(Some(0.7))),
+        &workspace,
+        limits(),
+        "hi",
+        ApprovalGate::new(ApprovalMode::Auto, None),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+        Verify::default(),
+    )
+    .await
+    .unwrap();
+    run_verified(
+        std::sync::Arc::new(provider(&server)),
+        &workspace,
+        limits(),
+        "hi",
+        ApprovalGate::new(ApprovalMode::Auto, None),
+        guardrails(IngressMode::Warn, EgressMode::Warn),
+        Verify::default(),
+    )
+    .await
+    .unwrap();
+    let requests = server.requests();
+    assert_eq!(requests[0].body["temperature"], serde_json::json!(0.7));
+    assert_eq!(requests[1].body["temperature"], serde_json::json!(0.0));
+}

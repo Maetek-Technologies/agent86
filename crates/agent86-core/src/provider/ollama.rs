@@ -41,6 +41,8 @@ pub struct OllamaProvider {
     base_url: String,
     config: OllamaConfig,
     client: reqwest::Client,
+    /// The section's `temperature` (beyond Python).
+    temperature: Option<f32>,
 }
 
 /// Map an Ollama `done_reason` onto the shared [`StopReason`] vocabulary.
@@ -98,7 +100,15 @@ impl OllamaProvider {
             base_url,
             config,
             client,
+            temperature: None,
         })
+    }
+
+    /// The section's `temperature` (beyond Python), which the harness sends
+    /// unless a specialty sets its own (`Provider::temperature`).
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -118,7 +128,10 @@ impl OllamaProvider {
     /// The streaming `/api/chat` payload for `request`.
     pub fn payload(&self, request: &CompletionRequest) -> Value {
         let mut options = Map::new();
-        options.insert("temperature".to_owned(), json!(request.temperature));
+        options.insert(
+            "temperature".to_owned(),
+            super::temperature_json(request.temperature),
+        );
         if let Some(num_ctx) = self.config.num_ctx.filter(|&n| n > 0) {
             // Room for the prompt and the answer; Ollama's small default window
             // otherwise fills with tool observations and cuts the answer short.
@@ -196,6 +209,10 @@ impl OllamaProvider {
 }
 
 impl Provider for OllamaProvider {
+    fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
     fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError> {
         Ok(std::sync::Arc::new(Self {
             model: self.model.clone(),
@@ -208,6 +225,7 @@ impl Provider for OllamaProvider {
                 .map_err(|error| ProviderError::Client {
                     detail: error_chain(&error),
                 })?,
+            temperature: self.temperature,
         }))
     }
 

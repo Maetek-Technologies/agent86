@@ -437,3 +437,13 @@ fn the_factory_needs_a_key_and_names_its_variable() {
         ("anthropic", "claude-opus-4-8")
     );
 }
+
+#[test]
+fn a_temperature_above_the_messages_apis_range_is_held_at_one() {
+    let provider = provider("claude-sonnet-4-6", AnthropicConfig::default());
+    let mut warm = request("hi");
+    warm.temperature = 1.4;
+    assert_eq!(provider.payload(&warm)["temperature"], json!(1.0));
+    warm.temperature = 0.5;
+    assert_eq!(provider.payload(&warm)["temperature"], json!(0.5));
+}

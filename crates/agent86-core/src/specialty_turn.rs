@@ -323,8 +323,11 @@ impl Harness {
         let scope = Self::specialty_scope(specialty, &preloaded, &self.context);
         self.context.scope = Some(Arc::new(scope));
         self.context.can_delegate = self.delegation_offered(&self.context, 0);
-        self.subagents
-            .set_main(Some((Self::specialty_persona(specialty), preloaded)));
+        self.subagents.set_main(Some((
+            Self::specialty_persona(specialty),
+            preloaded,
+            specialty.temperature,
+        )));
     }
 
     /// The approval `run --agent` needs before it starts.

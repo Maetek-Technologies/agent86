@@ -243,8 +243,9 @@ pub struct SubagentState {
     observer: Mutex<Option<SubagentObserver>>,
 }
 
-/// A specialty running as the main agent: its persona and preloaded skills.
-type MainSpecialty = (String, Vec<Arc<crate::skills::Skill>>);
+/// A specialty running as the main agent: its persona, preloaded skills, and
+/// temperature.
+type MainSpecialty = (String, Vec<Arc<crate::skills::Skill>>, Option<f32>);
 
 impl SubagentState {
     pub(crate) fn set_main(&self, main: Option<MainSpecialty>) {
@@ -1293,7 +1294,11 @@ impl Harness {
                 model: provider.model().to_owned(),
                 messages: request_messages,
                 tools: specs,
-                temperature: 0.0,
+                // Beyond Python: the specialty's, else its model's section's.
+                temperature: crate::agent::request_temperature(
+                    provider.as_ref(),
+                    specialty.as_ref().and_then(|s| s.temperature),
+                ),
                 // A deliberate fix: Python sends none, so a sub-agent gets the
                 // provider's default (8192 on Anthropic, the server's own on an
                 // OpenAI-compatible endpoint), which no setting but the provider's

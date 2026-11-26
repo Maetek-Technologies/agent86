@@ -63,7 +63,7 @@ impl Source {
 }
 
 /// One specialty.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Specialty {
     pub name: String,
     pub description: String,
@@ -78,6 +78,9 @@ pub struct Specialty {
     pub max_steps: Option<u32>,
     /// Applies only when stricter than the session's mode.
     pub approval: Option<ApprovalMode>,
+    /// Its sampling temperature, 0 to 2 (beyond Python), over its model's
+    /// provider section's and the default 0.0.
+    pub temperature: Option<f32>,
     /// Tools always asked about, whatever the session's mode (but `deny`).
     pub confirm: Vec<String>,
     /// Skills whose instructions are preloaded into its system message.
@@ -163,6 +166,13 @@ pub fn parse(stem: &str, text: &str, source: Source) -> Result<Specialty, String
             _ => return Err("its 'approval' must be auto, ask, or deny".into()),
         }),
     };
+    let temperature = match meta.get("temperature") {
+        None => None,
+        Some(value) => match text_value(Some(value)).parse::<f32>() {
+            Ok(value) if (0.0..=2.0).contains(&value) => Some(value),
+            _ => return Err("its 'temperature' must be a number from 0 to 2".into()),
+        },
+    };
     let worktree = match meta.get("isolation") {
         None => false,
         Some(value) => match text_value(Some(value)).as_str() {
@@ -178,6 +188,7 @@ pub fn parse(stem: &str, text: &str, source: Source) -> Result<Specialty, String
         model,
         max_steps,
         approval,
+        temperature,
         confirm,
         skills,
         worktree,
@@ -343,7 +354,7 @@ mod tests {
     fn a_full_definition_reads_every_key() {
         let specialty = parsed(
             "---\nname: reviewer\ndescription: >\n  Reviews\n  diffs.\ntools: read_file, list_dir\n\
-             model: anthropic:claude-sonnet-5-5\nmax_steps: 12\napproval: ask\nconfirm: [run_command]\n\
+             model: anthropic:claude-sonnet-5-5\nmax_steps: 12\napproval: ask\ntemperature: 0.6\nconfirm: [run_command]\n\
              skills:\n  - lint\nisolation: worktree\n---\n\nYou review.\n",
         )
         .unwrap();
@@ -359,6 +370,7 @@ mod tests {
         );
         assert_eq!(specialty.max_steps, Some(12));
         assert_eq!(specialty.approval, Some(ApprovalMode::Ask));
+        assert_eq!(specialty.temperature, Some(0.6));
         assert_eq!(specialty.confirm, ["run_command"]);
         assert_eq!(specialty.skills, ["lint"]);
         assert!(specialty.worktree);
@@ -395,6 +407,9 @@ mod tests {
             ("max_steps: 0\n", "max_steps"),
             ("max_steps: many\n", "max_steps"),
             ("approval: sometimes\n", "approval"),
+            ("temperature: warm\n", "temperature"),
+            ("temperature: 2.5\n", "temperature"),
+            ("temperature: -0.1\n", "temperature"),
             ("isolation: container\n", "isolation"),
         ] {
             let error = parsed(&format!("{base}{extra}---\nx")).unwrap_err();

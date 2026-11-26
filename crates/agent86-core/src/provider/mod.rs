@@ -136,6 +136,13 @@ pub fn provider_for_ref_with_store(
 /// [`provider_for_ref`] with a key that was typed but not stored yet: the
 /// connection test sends it as it is, skipping the environment and the keyring,
 /// as Python's `provider_for_ref(..., api_key=key)` does.
+/// A temperature as JSON. Widening an `f32` to `f64` would send 0.7 as
+/// 0.699999988079071, so it goes through its shortest decimal form.
+pub(crate) fn temperature_json(temperature: f32) -> serde_json::Value {
+    let value = temperature.to_string().parse::<f64>().unwrap_or(0.0);
+    serde_json::json!(value)
+}
+
 pub fn provider_for_ref_with_key(
     reference: &ModelRef,
     config: &Config,
@@ -164,6 +171,18 @@ fn build_provider(
         }
     }
 
+    // Beyond Python: a section's own temperature. Gemini takes none (see
+    // google.rs), so it is not applied there.
+    let temperature = section.temperature;
+    if let Some(value) = temperature {
+        if !(0.0..=2.0).contains(&value) {
+            return Err(ProviderError::InvalidSetting {
+                provider: name.to_owned(),
+                detail: format!("temperature must be between 0 and 2, not {value}"),
+            });
+        }
+    }
+
     if name == "anthropic" {
         // Python leaves the section's timeouts to the SDK's own (see anthropic.rs).
         let provider = AnthropicProvider::new(
@@ -181,7 +200,8 @@ fn build_provider(
             },
             api_key(name, &section),
         )?
-        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        .with_pricing(PriceTable::from_config(config), reference.to_string())
+        .with_temperature(temperature);
         return Ok(Box::new(provider));
     }
 
@@ -223,7 +243,8 @@ fn build_provider(
                 read_timeout: seconds("read_timeout_s", section.read_timeout_s)?,
                 max_retries: section.max_retries,
             },
-        )?;
+        )?
+        .with_temperature(temperature);
         return Ok(Box::new(provider));
     }
 
@@ -241,7 +262,8 @@ fn build_provider(
             openai_config,
             api_key(name, &section),
         )?
-        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        .with_pricing(PriceTable::from_config(config), reference.to_string())
+        .with_temperature(temperature);
         return Ok(Box::new(provider));
     }
 
@@ -270,7 +292,8 @@ fn build_provider(
             openai_config,
             api_key(name, &section),
         )?
-        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        .with_pricing(PriceTable::from_config(config), reference.to_string())
+        .with_temperature(temperature);
         return Ok(Box::new(provider));
     }
 
@@ -287,7 +310,8 @@ fn build_provider(
     let api_key = api_key(name, &section);
     let openai_config = openai_config(name, &section, require_key)?;
     let provider = OpenAiProvider::new(reference.model.clone(), openai_config, api_key)?
-        .with_pricing(PriceTable::from_config(config), reference.to_string());
+        .with_pricing(PriceTable::from_config(config), reference.to_string())
+        .with_temperature(temperature);
     Ok(Box::new(provider))
 }
 
@@ -351,6 +375,13 @@ pub trait Provider: Send + Sync {
     /// request has loaded the model and then kept for this provider's life. `None`
     /// leaves the window computed at startup or on `/model`.
     fn live_context_window(&self) -> Option<u64> {
+        None
+    }
+
+    /// The `temperature` its config section sets (beyond Python; Python sends
+    /// 0.0 always). `None`, the default, leaves the harness's 0.0, unless a
+    /// specialty sets its own.
+    fn temperature(&self) -> Option<f32> {
         None
     }
 

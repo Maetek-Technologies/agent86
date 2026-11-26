@@ -9,7 +9,9 @@ mod support;
 
 use agent86::config::{load_config, Config, ConfigPaths, Overrides, ProjectTrust, ProviderConfig};
 use agent86::provider::remote_windows::vllm_context_window;
-use agent86::provider::{provider_for_ref_with_store, Provider, ProviderError};
+use agent86::provider::{
+    provider_for_ref_with_key, provider_for_ref_with_store, Provider, ProviderError,
+};
 use agent86::secrets::{NoSecretStore, SecretStore};
 use agent86::types::{CompletionDelta, CompletionRequest, Message, ModelRef, Role};
 use futures_util::StreamExt;
@@ -298,4 +300,49 @@ async fn the_window_is_the_served_models_max_model_len() {
         vllm_context_window("openai", "gpt-4o", &config, &NoSecretStore),
         None
     );
+}
+
+#[test]
+fn a_sections_temperature_reaches_every_adapter_but_geminis() {
+    let mut config = builtin_config();
+    config.providers.insert(
+        "box".into(),
+        ProviderConfig {
+            base_url: Some("http://127.0.0.1:9/v1".into()),
+            adapter: Some("vllm".into()),
+            ..Default::default()
+        },
+    );
+    for name in ["box", "anthropic", "ollama", "google", "openai"] {
+        config.providers.entry(name.into()).or_default().temperature = Some(0.7);
+    }
+    for (reference, expected) in [
+        ("box:qwen3", Some(0.7)),
+        ("anthropic:claude-sonnet-4-6", Some(0.7)),
+        ("ollama:qwen3", Some(0.7)),
+        ("openai:gpt-5", Some(0.7)),
+        // Gemini takes no sampling settings.
+        ("google:gemini-4-pro", None),
+    ] {
+        let provider = provider_for_ref_with_key(&model(reference), &config, "k").unwrap();
+        assert_eq!(provider.temperature(), expected, "{reference}");
+        assert_eq!(
+            provider.fresh().unwrap().temperature(),
+            expected,
+            "{reference}"
+        );
+    }
+    // Unset is the default, 0.0, decided by the harness.
+    config.providers.get_mut("openai").unwrap().temperature = None;
+    let plain = provider_for_ref_with_key(&model("openai:gpt-5"), &config, "k").unwrap();
+    assert_eq!(plain.temperature(), None);
+
+    config.providers.get_mut("box").unwrap().temperature = Some(2.5);
+    let Err(error) = provider_for_ref_with_store(&model("box:m"), &config, &NoSecretStore) else {
+        panic!("a temperature out of range must not build");
+    };
+    assert!(matches!(error, ProviderError::InvalidSetting { .. }));
+    assert!(error
+        .to_string()
+        .contains("temperature must be between 0 and 2"));
 }

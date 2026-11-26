@@ -100,6 +100,8 @@ pub struct OpenAiProvider {
     price_ref: String,
     /// The window learned from the server ([`OpenAiConfig::live_window`]).
     learned_window: Mutex<Option<u64>>,
+    /// The section's `temperature` (beyond Python).
+    temperature: Option<f32>,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -159,7 +161,15 @@ impl OpenAiProvider {
             client,
             pricing: PriceTable::builtin(),
             learned_window: Mutex::new(None),
+            temperature: None,
         })
+    }
+
+    /// The section's `temperature` (beyond Python), which the harness sends
+    /// unless a specialty sets its own (`Provider::temperature`).
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
     }
 
     /// Price usage with `pricing`, looked up under `price_ref`.
@@ -188,7 +198,7 @@ impl OpenAiProvider {
             "stream_options": {"include_usage": true},
         });
         if supports_sampling_params(&self.model) {
-            payload["temperature"] = json!(request.temperature);
+            payload["temperature"] = super::temperature_json(request.temperature);
         }
         let max_tokens = request
             .max_tokens
@@ -274,6 +284,10 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
+    fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
     fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError> {
         Ok(std::sync::Arc::new(Self {
             model: self.model.clone(),
@@ -289,6 +303,7 @@ impl Provider for OpenAiProvider {
                 })?,
             pricing: self.pricing.clone(),
             price_ref: self.price_ref.clone(),
+            temperature: self.temperature,
             learned_window: Mutex::new(
                 *self
                     .learned_window
