@@ -14,7 +14,10 @@
 //! - [`StallKind::RepeatedFailure`]: one tool has failed the same way
 //!   [`REPEATED_FAILURES`] times, even with changes in between, so the fixes so far
 //!   have not reached the cause.
-//! - [`StallKind::ReadsWithoutChange`]: [`READS_WITHOUT_CHANGE`] reads in a row.
+//! - [`StallKind::RepeatedReads`]: [`REPEATED_READS`] reads that repeat an
+//!   earlier one (the same tool and arguments) with nothing changed in between.
+//!   Reads of something new never count, however many: reading a package in one
+//!   batch, or following a chain of files one at a time, is not going in circles.
 //!
 //! "The same way" compares what the model was shown, with timings and addresses
 //! masked ([`signature`]), so a test run that only took longer still matches.
@@ -32,8 +35,10 @@ use std::sync::OnceLock;
 /// [`StallKind::RepeatedFailure`].
 pub const REPEATED_FAILURES: u32 = 3;
 
-/// Reads in a row that make a [`StallKind::ReadsWithoutChange`].
-pub const READS_WITHOUT_CHANGE: u32 = 15;
+/// Repeated reads, since the last change, that make a [`StallKind::RepeatedReads`].
+/// In the eval set, the runs that went in circles re-read the same files 6 and 24
+/// times; of 216 others, none passed 2.
+pub const REPEATED_READS: u32 = 3;
 
 /// Tools that only look.
 pub const READ_TOOLS: &[&str] = &["read_file", "list_dir", "search_files", "find_files"];
@@ -43,7 +48,7 @@ pub const READ_TOOLS: &[&str] = &["read_file", "list_dir", "search_files", "find
 pub enum StallKind {
     RepeatedCall,
     RepeatedFailure,
-    ReadsWithoutChange,
+    RepeatedReads,
 }
 
 impl StallKind {
@@ -52,7 +57,7 @@ impl StallKind {
         match self {
             Self::RepeatedCall => "repeated_call",
             Self::RepeatedFailure => "repeated_failure",
-            Self::ReadsWithoutChange => "reads_without_change",
+            Self::RepeatedReads => "repeated_reads",
         }
     }
 }
@@ -63,7 +68,7 @@ pub struct Stall {
     pub kind: StallKind,
     /// The tool, for the two failure kinds.
     pub tool: Option<String>,
-    /// How many times (failures, or reads in a row).
+    /// How many times (failures, or repeated reads).
     pub count: u32,
 }
 
@@ -85,10 +90,11 @@ impl Stall {
                  causes it, and change your approach.",
                 self.count
             ),
-            StallKind::ReadsWithoutChange => format!(
-                "[stall] {} reads in a row without acting. If you know enough to answer or to \
-                 make the change, do it now; otherwise decide exactly what you are still missing \
-                 and look only for that.",
+            StallKind::RepeatedReads => format!(
+                "[stall] You have read the same thing again {} times with nothing changed in \
+                 between, so reading it again will not tell you more. If you know enough to \
+                 answer or to make the change, do it now; otherwise decide exactly what you are \
+                 still missing and look only for that.",
                 self.count
             ),
         }
@@ -106,7 +112,7 @@ impl Stall {
                 self.tool.as_deref().unwrap_or_default(),
                 self.count
             ),
-            StallKind::ReadsWithoutChange => format!("{} reads in a row", self.count),
+            StallKind::RepeatedReads => format!("{} repeated reads", self.count),
         };
         format!("\n[stall] {what}; reminded the model\n")
     }
@@ -158,7 +164,10 @@ pub struct StallWatch {
     failed_calls: HashMap<(String, String), (u64, u32)>,
     /// Failures per tool and signature.
     failures: HashMap<(String, u64), u32>,
-    reads: u32,
+    /// Each successful read (tool and arguments): the change count when it ran.
+    read_calls: HashMap<(String, String), u32>,
+    /// Reads that repeated an earlier one since the last change.
+    repeated_reads: u32,
     nudged: Vec<StallKind>,
     pending: Option<Stall>,
 }
@@ -179,16 +188,19 @@ impl StallWatch {
         }
         let name = call.name.as_str();
         if READ_TOOLS.contains(&name) && result.ok {
-            self.reads += 1;
-            if self.reads >= READS_WITHOUT_CHANGE {
-                self.raise(StallKind::ReadsWithoutChange, None, self.reads);
+            let key = (name.to_owned(), arguments_key(call));
+            if self.read_calls.insert(key, self.changes) == Some(self.changes) {
+                self.repeated_reads += 1;
+                if self.repeated_reads >= REPEATED_READS {
+                    self.raise(StallKind::RepeatedReads, Some(name), self.repeated_reads);
+                }
             }
             return;
         }
-        self.reads = 0;
         if result.ok {
             if crate::verify::CHANGING_TOOLS.contains(&name) {
                 self.changes += 1;
+                self.repeated_reads = 0;
             }
             return;
         }
@@ -314,21 +326,57 @@ mod tests {
     }
 
     #[test]
-    fn reads_in_a_row_without_acting_are_counted_until_something_else_runs() {
+    fn new_reads_never_count_however_many() {
+        // A package read in one batch, or a chain of notes one at a time.
         let mut watch = StallWatch::new(true);
-        let read = call("read_file", json!({"path": "a.py"}));
-        for _ in 0..READS_WITHOUT_CHANGE - 1 {
-            watch.saw(&read, &result(true), "text");
-        }
-        watch.saw(&tests_run(), &result(true), "ok");
-        for _ in 0..READS_WITHOUT_CHANGE - 1 {
+        for index in 0..40 {
+            let read = call("read_file", json!({"path": format!("shop/m{index}.py")}));
             watch.saw(&read, &result(true), "text");
         }
         assert_eq!(watch.take(), None);
+    }
+
+    #[test]
+    fn reading_the_same_thing_again_with_nothing_changed_is_repeated_reads() {
+        let mut watch = StallWatch::new(true);
+        let read = call("read_file", json!({"path": "a.py"}));
+        let search = call("search_files", json!({"pattern": "x", "path": "."}));
         watch.saw(&read, &result(true), "text");
+        watch.saw(&search, &result(true), "text");
+        // A change in between: reading again may show something new.
+        watch.saw(
+            &call("edit_file", json!({"path": "a.py"})),
+            &result(true),
+            "ok",
+        );
+        watch.saw(&read, &result(true), "text");
+        watch.saw(&search, &result(true), "text");
+        // A read of something new does not reset the count.
+        watch.saw(
+            &call("read_file", json!({"path": "b.py"})),
+            &result(true),
+            "text",
+        );
+        watch.saw(&read, &result(true), "text");
+        watch.saw(&search, &result(true), "text");
+        assert_eq!(watch.take(), None);
+        // Keys in another order are the same read.
+        let reordered = call("search_files", json!({"path": ".", "pattern": "x"}));
+        watch.saw(&reordered, &result(true), "text");
         let stall = watch.take().unwrap();
-        assert_eq!(stall.kind, StallKind::ReadsWithoutChange);
-        assert_eq!(stall.count, READS_WITHOUT_CHANGE);
+        assert_eq!(stall.kind, StallKind::RepeatedReads);
+        assert_eq!(stall.count, REPEATED_READS);
+        assert_eq!(stall.tool.as_deref(), Some("search_files"));
+        assert_eq!(
+            stall.notice(),
+            "\n[stall] 3 repeated reads; reminded the model\n"
+        );
+        assert!(stall
+            .note()
+            .starts_with("[stall] You have read the same thing again 3 times"));
+        // Once a turn.
+        watch.saw(&read, &result(true), "text");
+        assert_eq!(watch.take(), None);
     }
 
     #[test]

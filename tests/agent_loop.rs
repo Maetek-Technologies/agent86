@@ -2520,8 +2520,10 @@ fn limits_with(max_context_tokens: u64, compaction: CompactionMode) -> LimitsCon
         max_context_tokens,
         compaction,
         // These pin compaction and fitting as slice 2a built them; sizing, which
-        // would age these results first, has tests of its own.
+        // would age these results first, has tests of its own; so does the stall
+        // nudge, which these tests' repeated reads of `big.txt` would draw.
         context_sizing: false,
+        stall_nudge: false,
         ..limits()
     }
 }
@@ -3124,6 +3126,68 @@ async fn a_failed_call_repeated_unchanged_gets_one_reminder() {
     assert_eq!(stalls[0]["tool"], "read_file");
     assert_eq!(stalls[1]["shape"], "repeated_failure");
     assert_eq!(stalls[1]["count"], 3);
+}
+
+#[tokio::test]
+async fn a_wide_batch_of_reads_is_not_a_stall_but_reading_it_again_is() {
+    // Seen in the eval: a whole package read in one step of parallel calls was
+    // nudged as "15 reads in a row", and the model answered before working it out.
+    let workspace = Workspace::new("stall-reads");
+    let paths: Vec<String> = (0..15).map(|index| format!("m{index}.py")).collect();
+    for path in &paths {
+        std::fs::write(workspace.root.join(path), "def f():\n    pass\n").unwrap();
+    }
+    let arguments: Vec<(String, String)> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (format!("r{index}"), format!(r#"{{"path": "{path}"}}"#)))
+        .collect();
+    let batch: Vec<(&str, &str, &str)> = arguments
+        .iter()
+        .map(|(id, args)| (id.as_str(), "read_file", args.as_str()))
+        .collect();
+    // The first three again, under new call ids.
+    let again: Vec<(&str, &str, &str)> = ["a0", "a1", "a2"]
+        .into_iter()
+        .zip(&batch)
+        .map(|(id, (_, name, args))| (id, *name, *args))
+        .collect();
+    let server = MockServer::start(vec![
+        sse_tool_calls(&batch),
+        sse_tool_calls(&again),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let traces = workspace.root.join("traces");
+    let harness = window_harness(&server, &workspace, limits(), trace_recorder(&traces));
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, "read the package", |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(final_answer(&state.messages), "done");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let after_batch = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(after_batch.last().unwrap()["role"], "tool");
+    let after_again = requests[2].body["messages"].as_array().unwrap();
+    assert!(after_again.last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[stall] You have read the same thing again 3 times"));
+    assert_eq!(
+        output
+            .matches("\n[stall] 3 repeated reads; reminded the model\n")
+            .count(),
+        1,
+        "{output}"
+    );
+    let events = trace_events(&traces);
+    let stalls = events_of(&events, "stall");
+    assert_eq!(stalls.len(), 1, "{events:?}");
+    assert_eq!(stalls[0]["shape"], "repeated_reads");
+    assert_eq!(stalls[0]["tool"], "read_file");
 }
 
 #[tokio::test]
