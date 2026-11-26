@@ -3181,3 +3181,58 @@ async fn a_sections_temperature_is_sent_in_place_of_pythons_zero() {
     assert_eq!(requests[0].body["temperature"], serde_json::json!(0.7));
     assert_eq!(requests[1].body["temperature"], serde_json::json!(0.0));
 }
+
+#[tokio::test]
+async fn a_small_window_holds_the_default_output_cap_to_its_share() {
+    let server = MockServer::start(vec![
+        sse_text("a", "stop"),
+        sse_text("b", "stop"),
+        sse_text("c", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("sized-output");
+    let run = |limits: LimitsConfig, cap: u32| {
+        let mut harness = window_harness(&server, &workspace, limits, Recorder::disabled());
+        harness.context_window = 20_480;
+        harness.max_tokens = cap;
+        async move {
+            harness
+                .run_turn(&mut AgentState::new(), "hi", |_| {})
+                .await
+                .unwrap();
+        }
+    };
+    // The built-in 8,192 takes a quarter of a 20k window.
+    run(limits(), 8_192).await;
+    // A cap the user set is taken as given.
+    run(
+        LimitsConfig {
+            max_output_tokens: 6_000,
+            ..limits()
+        },
+        6_000,
+    )
+    .await;
+    // Sizing off: Python's cap.
+    run(
+        LimitsConfig {
+            context_sizing: false,
+            ..limits()
+        },
+        8_192,
+    )
+    .await;
+    let requests = server.requests();
+    let caps: Vec<&Value> = requests
+        .iter()
+        .map(|request| &request.body["max_completion_tokens"])
+        .collect();
+    assert_eq!(
+        caps,
+        [
+            &serde_json::json!(5_120),
+            &serde_json::json!(6_000),
+            &serde_json::json!(8_192)
+        ]
+    );
+}

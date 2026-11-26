@@ -1222,7 +1222,13 @@ impl Harness {
             raised.unwrap_or_else(|| {
                 self.session_limits
                     .get(LimitKind::Output)
-                    .unwrap_or(model.max_tokens)
+                    .unwrap_or_else(|| {
+                        self.sized_output(
+                            model.max_tokens,
+                            model.context_window,
+                            &model.output_setting,
+                        )
+                    })
             })
         };
         let mut spent = Usage::default();
@@ -1281,7 +1287,13 @@ impl Harness {
             // held out of the trim so it is never the part dropped, on the window
             // and cap of the model it runs on.
             let cap = output_cap(cap_raised);
-            let budget = self.context_budget_with(&system, &specs, model.context_window, cap);
+            let budget = self.context_budget_with(
+                &system,
+                &specs,
+                model.context_window,
+                cap,
+                provider.model(),
+            );
             let mut request_messages = vec![system.clone()];
             // Beyond Python: the task (the first message) is never the part left out.
             // Beyond Python: older results aged as the window fills, as in the main loop.

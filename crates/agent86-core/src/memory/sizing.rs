@@ -13,11 +13,12 @@
 //!   The session and the trace keep them whole; only the request is shortened.
 //! - [`Calibration`]: the input tokens each response reports, against what the
 //!   estimate said, per model; a model whose tokenizer counts more than the
-//!   estimate gets a proportionally smaller budget.
+//!   estimate gets a proportionally smaller share of the window for everything a
+//!   request sends ([`calibrated_budget`]).
 //!
 //! The shares are starting points for the eval set to decide, not claims.
 
-use crate::memory::working::count_tokens;
+use crate::memory::working::{conversation_budget, count_tokens, MIN_CONVERSATION_TOKENS};
 use crate::types::{Message, Role};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -42,10 +43,47 @@ pub const STUB_THRESHOLD_CHARS: usize = 1_200;
 /// How much of an aged result's start its stub keeps (characters).
 pub const STUB_HEAD_CHARS: usize = 400;
 
+/// The output cap is at most one in N of the window, so a small window keeps
+/// room for the conversation: a fixed 8,192-token cap plus the 4,096 reserve is
+/// half of a 24k window.
+pub const OUTPUT_SHARE: u64 = 4;
+
+/// `[limits] max_output_tokens`'s built-in value, the only cap that is sized: one
+/// the user chose is taken as given.
+pub const DEFAULT_OUTPUT_CAP: u32 = 8_192;
+
+/// The reserve (slack for the provider counting differently) is at most one in
+/// N of the window; [`Calibration`] covers most of that difference now.
+pub const RESERVE_SHARE: u64 = 16;
+
 /// Calibration never trusts a ratio above this (a misreport would starve the
 /// conversation) and never one below 1 (a prompt cache that reports only the
 /// tokens it evaluated would otherwise inflate the budget).
 pub const MAX_RATIO: f64 = 2.0;
+
+/// The output cap for a window of `window` tokens: the configured `cap`, at most
+/// [`OUTPUT_SHARE`] of the window. Binds only on a small window (under 32k for
+/// the default 8,192). A window at or under
+/// [`DEFAULT_CONTEXT_WINDOW`](crate::provider::capabilities::DEFAULT_CONTEXT_WINDOW)
+/// leaves the cap as it is: that is what agent86 assumes for a model whose
+/// window it does not know, and an answer cut to 2,048 tokens on a guess would
+/// cost more than the room it saves.
+pub fn sized_output_cap(cap: u32, window: u64) -> u32 {
+    if window <= crate::provider::capabilities::DEFAULT_CONTEXT_WINDOW {
+        return cap;
+    }
+    let share = u32::try_from(window / OUTPUT_SHARE).unwrap_or(u32::MAX);
+    cap.min(share)
+}
+
+/// The reserve for a window of `window` tokens: the configured one, at most
+/// [`RESERVE_SHARE`] of the window. An unknown window (0) leaves it as it is.
+pub fn sized_reserve(reserve: u64, window: u64) -> u64 {
+    if window == 0 {
+        return reserve;
+    }
+    reserve.min(window / RESERVE_SHARE)
+}
 
 /// The cap, in characters, on one tool result for a conversation budget of
 /// `budget` tokens: [`RESULT_SHARE`] of it at about 4 characters a token, at
@@ -175,13 +213,40 @@ impl Calibration {
     }
 }
 
-/// `budget` (in estimated tokens) for a model whose real count runs `ratio`
-/// times the estimate.
-pub fn calibrated(budget: u64, ratio: f64) -> u64 {
+/// [`conversation_budget`] for a model whose real count runs `ratio` times the
+/// estimate. Only what a request sends is counted that way: the window less the
+/// room kept for the response (the same reserve, held under half the window)
+/// is divided by the ratio, and the overhead (the system message and the tool
+/// catalogue, at their estimated size) comes off after. Dividing the
+/// conversation budget alone would leave the overhead under-counted by the
+/// same ratio, and a request over the real window.
+pub fn calibrated_budget(
+    window: u64,
+    overhead_tokens: u64,
+    reserve_tokens: u64,
+    output_tokens: u64,
+    hard_cap: u64,
+    ratio: f64,
+) -> u64 {
     if ratio <= 1.0 {
-        return budget;
+        return conversation_budget(
+            window,
+            overhead_tokens,
+            reserve_tokens,
+            output_tokens,
+            hard_cap,
+        );
     }
-    (budget as f64 / ratio) as u64
+    let reserve = (reserve_tokens + output_tokens).min(window / 2);
+    let sendable = (window.saturating_sub(reserve) as f64 / ratio) as u64;
+    let budget = sendable
+        .saturating_sub(overhead_tokens)
+        .max(MIN_CONVERSATION_TOKENS);
+    if hard_cap > 0 {
+        budget.min(hard_cap)
+    } else {
+        budget
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +270,34 @@ mod tests {
         assert_eq!(result_cap(115_000, 100_000), 100_000);
         // The tools' own cap wins over the floor.
         assert_eq!(result_cap(1_024, 5_000), 5_000);
+    }
+
+    #[test]
+    fn the_sized_default_is_the_configs_default() {
+        assert_eq!(
+            crate::config::builtin_config().limits.max_output_tokens,
+            DEFAULT_OUTPUT_CAP
+        );
+    }
+
+    #[test]
+    fn the_response_keeps_a_share_of_a_small_window_only() {
+        // 20k: a quarter for the answer, a sixteenth of slack (6,400, not 10,240).
+        assert_eq!(sized_output_cap(8_192, 20_480), 5_120);
+        assert_eq!(sized_reserve(4_096, 20_480), 1_280);
+        // 32k: the cap fits its quarter, the reserve shrinks.
+        assert_eq!(sized_output_cap(8_192, 32_768), 8_192);
+        assert_eq!(sized_reserve(4_096, 32_768), 2_048);
+        // Large windows are untouched.
+        assert_eq!(sized_output_cap(8_192, 200_000), 8_192);
+        assert_eq!(sized_reserve(4_096, 200_000), 4_096);
+        // The window assumed for an unknown model, or anything smaller, leaves
+        // the cap alone; just above it, a quarter (2,048 and up).
+        assert_eq!(sized_output_cap(8_192, 8_192), 8_192);
+        assert_eq!(sized_output_cap(8_192, 4_096), 8_192);
+        assert_eq!(sized_output_cap(8_192, 0), 8_192);
+        assert_eq!(sized_output_cap(8_192, 12_288), 3_072);
+        assert_eq!(sized_reserve(4_096, 0), 4_096);
     }
 
     #[test]
@@ -280,7 +373,39 @@ mod tests {
         assert_eq!(calibration.ratio("other"), 1.0);
         calibration.observe("wild", 100, 10_000);
         assert_eq!(calibration.ratio("wild"), MAX_RATIO);
-        assert_eq!(calibrated(12_000, 1.2), 10_000);
-        assert_eq!(calibrated(12_000, 1.0), 12_000);
+    }
+
+    #[test]
+    fn calibration_counts_the_overhead_at_the_ratio_too() {
+        // 32,768 with 12,288 kept for the response: 20,480 may be sent, which at
+        // a ratio of 2 is 10,240 estimated tokens, 3,000 of them the overhead.
+        assert_eq!(
+            calibrated_budget(32_768, 3_000, 4_096, 8_192, 0, 2.0),
+            7_240
+        );
+        // Dividing the uncalibrated budget instead would allow 8,740: the
+        // overhead's other 3,000 real tokens would go over the window.
+        assert_eq!(
+            conversation_budget(32_768, 3_000, 4_096, 8_192, 0) / 2,
+            8_740
+        );
+        // At 1 (or no responses yet) it is Python's budget.
+        assert_eq!(
+            calibrated_budget(32_768, 3_000, 4_096, 8_192, 0, 1.0),
+            conversation_budget(32_768, 3_000, 4_096, 8_192, 0)
+        );
+        // The reserve stays under half the window, the floor and the cap hold.
+        assert_eq!(
+            calibrated_budget(20_480, 1_000, 4_096, 8_192, 0, 2.0),
+            4_120
+        );
+        assert_eq!(
+            calibrated_budget(8_192, 6_000, 4_096, 8_192, 0, 2.0),
+            MIN_CONVERSATION_TOKENS
+        );
+        assert_eq!(
+            calibrated_budget(32_768, 3_000, 4_096, 8_192, 5_000, 2.0),
+            5_000
+        );
     }
 }

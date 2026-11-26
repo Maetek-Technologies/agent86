@@ -26,12 +26,14 @@ use crate::config::EgressMode;
 use crate::config::{AgentsConfig, CompactionMode, LimitsConfig};
 use crate::guardrails::Guardrails;
 use crate::limits::LimitKind;
-use crate::memory::sizing::{aged_view, calibrated, result_cap, shorten_middle};
+use crate::memory::sizing::{
+    aged_view, calibrated_budget, result_cap, shorten_middle, sized_reserve,
+};
 use crate::memory::working::{
     apply_progress, apply_summary, compacted_notice, compaction_failed_notice, compaction_plan,
-    conversation_budget, count_spec_tokens, count_tokens, fit_pinned, fits, python_strip,
-    summary_request_text, trimmed_notice, Cut, Fitted, KEEP_RECENT, SUMMARY_MAX_TOKENS,
-    SUMMARY_RETRY_NOTE, SUMMARY_SYSTEM_PROMPT,
+    count_spec_tokens, count_tokens, fit_pinned, fits, python_strip, summary_request_text,
+    trimmed_notice, Cut, Fitted, KEEP_RECENT, SUMMARY_MAX_TOKENS, SUMMARY_RETRY_NOTE,
+    SUMMARY_SYSTEM_PROMPT,
 };
 use crate::observability::Recorder;
 use crate::prompt::time_note;
@@ -507,18 +509,12 @@ impl Harness {
     /// Beyond Python, the budget shrinks for a model whose reported input tokens
     /// have run above the estimate (`crate::memory::sizing::Calibration`).
     pub(crate) fn context_budget(&self, system: &Message, specs: &[ToolSpec]) -> u64 {
-        let budget = self.context_budget_with(
+        self.context_budget_with(
             system,
             specs,
             self.active_context_window(),
             self.output_cap(),
-        );
-        if !self.limits.context_sizing {
-            return budget;
-        }
-        calibrated(
-            budget,
-            self.calibration.ratio(self.active_provider().model()),
+            self.active_provider().model(),
         )
     }
 
@@ -551,22 +547,35 @@ impl Harness {
         }
     }
 
-    /// [`Harness::context_budget`] for a model with this window and output cap (a
-    /// specialist sub-agent on a model of its own).
+    /// [`Harness::context_budget`] for `model` with this window and output cap (a
+    /// sub-agent, perhaps on a model of its own). Beyond Python, with
+    /// `[limits] context_sizing` on, it is calibrated for the model
+    /// (`crate::memory::sizing::calibrated_budget`) and the reserve is held to a
+    /// share of the window (`sized_reserve`; the output cap already is).
     pub(crate) fn context_budget_with(
         &self,
         system: &Message,
         specs: &[ToolSpec],
         window: u64,
         output_cap: u32,
+        model: &str,
     ) -> u64 {
         let overhead = count_tokens(std::slice::from_ref(system)) + count_spec_tokens(specs);
-        conversation_budget(
+        let (ratio, reserve) = if self.limits.context_sizing {
+            (
+                self.calibration.ratio(model),
+                sized_reserve(self.limits.context_reserve_tokens, window),
+            )
+        } else {
+            (1.0, self.limits.context_reserve_tokens)
+        };
+        calibrated_budget(
             window,
             overhead,
-            self.limits.context_reserve_tokens,
+            reserve,
             u64::from(output_cap),
             self.limits.max_context_tokens,
+            ratio,
         )
     }
 
