@@ -9,7 +9,7 @@ use agent86_core::sdk::providers::{
 };
 use agent86_core::sdk::{
     Agent, ApprovalMode, BuildError, Builtins, Conversation, FnTool, LimitKind, McpServer, Memory,
-    Model, Otel, Role, RunError, SubAgents, ToolCall, Turn, TurnEvent, Usage,
+    Model, Otel, Role, RunError, SubAgents, ToolCall, Turn, TurnEvent, Usage, VerifyStatus,
 };
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -934,6 +934,36 @@ async fn a_given_secret_reaches_commands_but_never_the_model() {
         assert!(!format!("{request:?}").contains(TOKEN));
     }
     assert!(!agent.conversation().to_json().contains(TOKEN));
+}
+
+#[tokio::test]
+async fn a_verification_gate_sends_a_failure_back_before_the_answer_stands() {
+    let workspace = Workspace::new("verify-gate");
+    let provider = Scripted::new(vec![
+        calls(&[("c1", "write_file", json!({"path": "a.txt", "content": "a"}))]),
+        text("done"),
+        text("done, really"),
+    ]);
+    let mut agent = Agent::builder()
+        .provider(provider.clone())
+        .workspace(&workspace.0)
+        .builtins(Builtins::All)
+        .approval(ApprovalMode::Auto)
+        .verify("exit 1", 1)
+        .build()
+        .unwrap();
+    let result = agent.run("write a").await.unwrap();
+    assert_eq!(result.answer, "done, really");
+    let verification = result.verification.unwrap();
+    assert_eq!(verification.status, VerifyStatus::Failed);
+    assert_eq!((verification.runs, verification.sent_back), (2, 1));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let feedback = requests[2].messages.last().unwrap();
+    assert_eq!(feedback.role, Role::User);
+    assert!(feedback
+        .content
+        .starts_with("[verification] The check `exit 1` failed"));
 }
 
 #[test]

@@ -1,0 +1,10 @@
+# The verification gate (slice 1): a turn that changed the workspace is checked
+# by running the workspace's own unittest suite before its answer stands; a
+# failure goes back to the model, twice at most (`--variant evals/variants/verify.toml`).
+#
+# Not `python -m unittest`, which exits 5 when it finds no tests (Python 3.12+),
+# as in the tasks that ship none: an empty suite passes here. Single quotes inside,
+# so the command reads the same to cmd.exe and to sh.
+[verify]
+command = '''python -c "import sys, unittest; r = unittest.TextTestRunner().run(unittest.defaultTestLoader.discover('.')); sys.exit(not r.wasSuccessful())"'''
+max_attempts = 2

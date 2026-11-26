@@ -106,6 +106,10 @@ ask_user = "auto"
 [run]
 output = "final"
 
+[verify]
+command = ""
+max_attempts = 2
+
 [guardrails]
 approval = "ask"
 ingress = "warn"
@@ -169,6 +173,8 @@ pub struct Config {
     pub pricing: PricingConfig,
     pub ui: UiConfig,
     pub run: RunConfig,
+    /// The verification gate (`[verify]`, beyond Python; `crate::verify`).
+    pub verify: VerifyConfig,
     /// Every layer merged, before deserializing; `/config` shows it.
     #[serde(skip)]
     pub table: Table,
@@ -272,6 +278,17 @@ pub enum Agent86UiMode {
     #[default]
     Auto,
     Off,
+}
+
+/// The verification gate (`[verify]`, beyond Python; `crate::verify`). It runs a
+/// command, so a project file sets it only once trusted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct VerifyConfig {
+    /// Run when a turn that changed the workspace gives its final answer; blank
+    /// turns the gate off.
+    pub command: String,
+    /// Failures sent back to the model in one turn before the answer stands.
+    pub max_attempts: u32,
 }
 
 /// `agent86 run` settings (`[run]`, beyond Python).

@@ -108,6 +108,8 @@ pub fn summary(all: &[Record]) -> String {
         out.push('\n');
     }
 
+    verification(&mut out, &groups);
+
     let failures: Vec<&Record> = records
         .iter()
         .copied()
@@ -130,6 +132,43 @@ pub fn summary(all: &[Record]) -> String {
         }
     }
     out
+}
+
+/// The verification gate's work per model and variant, when any run had one:
+/// how many runs it checked, how often it sent a failure back, and how many of
+/// those runs then passed the task's check, which is what says it helped.
+fn verification(out: &mut String, groups: &BTreeMap<Group, Vec<&Record>>) {
+    if !groups.values().flatten().any(|r| r.verify.is_some()) {
+        return;
+    }
+    out.push_str("\n## Verification gate\n\n");
+    out.push_str("| Model | Variant | Checked | Gate passed | Gate failed | Skipped | Sent back (runs) | Passed after a send-back |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|\n");
+    for ((model, variant), runs) in groups {
+        let gated: Vec<&&Record> = runs.iter().filter(|r| r.verify.is_some()).collect();
+        if gated.is_empty() {
+            continue;
+        }
+        let status = |s: &str| {
+            gated
+                .iter()
+                .filter(|r| r.verify.as_deref() == Some(s))
+                .count()
+        };
+        let checked = gated.iter().filter(|r| r.verify_runs > 0).count();
+        let sent: u64 = gated.iter().map(|r| r.verify_sent_back).sum();
+        let sent_runs: Vec<&&&Record> = gated.iter().filter(|r| r.verify_sent_back > 0).collect();
+        let recovered = sent_runs.iter().filter(|r| r.passed).count();
+        let _ = writeln!(
+            out,
+            "| {model} | {variant} | {checked} | {} | {} | {} | {sent} ({}) | {recovered}/{} |",
+            status("passed"),
+            status("failed"),
+            status("skipped"),
+            sent_runs.len(),
+            sent_runs.len()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +195,9 @@ mod tests {
             duration_s: 10.0,
             error: (!passed).then(|| "out of steps".to_owned()),
             infra: false,
+            verify: None,
+            verify_runs: 0,
+            verify_sent_back: 0,
             check_tail: String::new(),
             final_answer: String::new(),
         }
@@ -182,6 +224,31 @@ mod tests {
         // A task whose every run was unreachable has no cell, and no error line.
         assert!(!text.contains("| b | bugfix |"), "{text}");
         assert!(!text.contains("Cannot reach"), "{text}");
+    }
+
+    #[test]
+    fn the_gate_gets_its_own_table_only_when_a_run_had_one() {
+        let plain = summary(&[record("a", "baseline", true, 4)]);
+        assert!(!plain.contains("Verification gate"), "{plain}");
+
+        let gated = |task, passed, status: &str, runs, sent_back| Record {
+            verify: Some(status.to_owned()),
+            verify_runs: runs,
+            verify_sent_back: sent_back,
+            ..record(task, "verify", passed, 5)
+        };
+        let text = summary(&[
+            gated("a", true, "passed", 1, 0),
+            gated("b", true, "passed", 2, 1),
+            gated("c", false, "failed", 3, 2),
+            gated("d", true, "skipped", 0, 0),
+            record("a", "baseline", true, 4),
+        ]);
+        assert!(
+            text.contains("| m:x | verify | 3 | 2 | 1 | 1 | 3 (2) | 1/2 |"),
+            "{text}"
+        );
+        assert!(!text.contains("| m:x | baseline | 0 |"), "{text}");
     }
 
     #[test]

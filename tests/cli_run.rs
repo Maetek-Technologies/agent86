@@ -1200,6 +1200,41 @@ async fn yes_and_auto_approve_side_effects() {
 }
 
 #[tokio::test]
+async fn run_json_reports_the_verification_gate() {
+    let server = MockServer::start(write_request()).await;
+    let workspace = Workspace::with_mock_provider("verify-json", &server);
+    workspace.append_project_config("\n[verify]\ncommand = \"exit 3\"\nmax_attempts = 0\n");
+
+    let output = workspace
+        .run(&["--approval", "auto", "run", "--json", "make a file"])
+        .await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(
+        document["verification"],
+        serde_json::json!({
+            "command": "exit 3",
+            "status": "failed",
+            "runs": 1,
+            "sent_back": 0,
+        })
+    );
+    // `final` stays the last field.
+    let keys: Vec<&String> = document.as_object().unwrap().keys().collect();
+    assert_eq!(keys.last().unwrap().as_str(), "final");
+    assert_eq!(document["final"], "ok");
+    assert!(
+        document["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("\n[verify] `exit 3` still fails; the answer stands unverified\n"),
+        "{}",
+        document["output"]
+    );
+}
+
+#[tokio::test]
 async fn approval_deny_blocks_side_effects() {
     let server = MockServer::start(write_request()).await;
     let workspace = Workspace::with_mock_provider("approval-deny", &server);

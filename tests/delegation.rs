@@ -117,6 +117,7 @@ fn harness(server: &MockServer, workspace: &Workspace, agents: AgentsConfig) -> 
         cancel: Default::default(),
         subagents: Default::default(),
         calibration: Default::default(),
+        verify: Default::default(),
     }
 }
 

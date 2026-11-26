@@ -428,6 +428,8 @@ pub struct Harness {
     /// Reported against estimated input tokens, per model (beyond Python;
     /// `crate::memory::sizing::Calibration`).
     pub calibration: crate::memory::sizing::Calibration,
+    /// The verification gate (beyond Python; `crate::verify`): off by default.
+    pub verify: crate::verify::Verify,
 }
 
 impl Harness {
@@ -932,6 +934,7 @@ impl Harness {
         let sid = state.session_id.clone();
         self.recorder
             .event(&sid, "turn_start", vec![("task", json!(display_text))]);
+        self.verify.set_last(None);
 
         // Ingress guardrail on the user's input.
         let report = self.guardrails.inspect_ingress(goal);
@@ -1008,6 +1011,8 @@ impl Harness {
         let mut nudged = false;
         let mut ask_again = false;
         let mut unanswered_thinking = String::new();
+        // Beyond Python: the verification gate's progress (`crate::verify`).
+        let mut verify_run = crate::verify::VerifyRun::default();
 
         loop {
             // Never start another model call once cancelled: that is the expensive,
@@ -1387,13 +1392,24 @@ impl Harness {
                     )));
                     continue;
                 }
-                if let Some(start) = continuation_start {
+                if let Some(start) = continuation_start.take() {
                     // Collapse [partial, "continue", partial, ...] into one answer.
                     continuation_parts.push(text);
-                    let joined = continuation_parts.concat();
+                    let joined = std::mem::take(&mut continuation_parts).concat();
                     state.messages.truncate(start);
                     state.messages.push(message(Role::Assistant, &joined));
                     step.thought = joined;
+                }
+                // Beyond Python: with `[verify] command` set, a turn that changed the
+                // workspace ends only once the check passes or its attempts run out.
+                let steps_left = !breaker.out_of_steps();
+                if let crate::verify::Gate::SendBack(feedback) =
+                    self.verify_answer(&mut verify_run, steps_left, &sid, &mut emit)
+                {
+                    record_step(state, step);
+                    state.messages.push(message(Role::User, &feedback));
+                    self.checkpoint(state);
+                    continue;
                 }
                 let outcome = step.thought.clone();
                 record_step(state, step);
@@ -1514,6 +1530,7 @@ impl Harness {
                     ..message(Role::Tool, &content)
                 });
                 let ok = result.ok;
+                verify_run.saw(&call.name, ok);
                 step.results.push(result);
                 if let Err(tripped) = breaker.record_tool_result(ok) {
                     record_step(state, step);
@@ -1750,7 +1767,7 @@ impl Harness {
     /// Beyond Python, a call answered here is recorded as a `tool_call` event
     /// too, with Python's fields, so the trace says why a step's calls never ran
     /// (Python records only the calls it dispatches).
-    fn resolve_call(&self, call: &ToolCall, sid: &str) -> (Option<ToolResult>, bool) {
+    pub(crate) fn resolve_call(&self, call: &ToolCall, sid: &str) -> (Option<ToolResult>, bool) {
         let settled = |result: ToolResult| {
             self.record_tool_call(call, &result, sid);
             (Some(result), false)
@@ -1801,7 +1818,7 @@ impl Harness {
     }
 
     /// Run one approved call and record it in the flight recorder.
-    fn dispatch(&self, call: &ToolCall, sid: &str) -> ToolResult {
+    pub(crate) fn dispatch(&self, call: &ToolCall, sid: &str) -> ToolResult {
         let mut span = self.tool_span(call);
         let result = self.registry.dispatch(call, &self.context);
         span.set(vec![("tool.ok", json!(result.ok))]);

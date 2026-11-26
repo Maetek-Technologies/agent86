@@ -44,6 +44,10 @@ pub struct RunOutput {
     pub steps: u64,
     pub usage: Usage,
     pub turn: Option<TurnSummary>,
+    /// What the verification gate did (beyond Python; `crate::verify`), only when
+    /// `[verify] command` is set. Before `final`, which stays last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::verify::Verification>,
     /// The turn's answer alone: its last assistant message, without the `[tool] ...`
     /// lines, notices, or the text of earlier steps that `output` holds. Empty when the
     /// turn ended without one (cancelled, out of steps). Beyond Python, and appended

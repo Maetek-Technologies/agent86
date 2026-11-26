@@ -100,6 +100,7 @@ pub use crate::tools::{Tool, ToolContext, ToolError};
 pub use crate::turn::TurnSummary;
 pub use crate::types::{ApprovalMode, Role, ToolCall, ToolResult, ToolSpec, Usage};
 pub use crate::vault::SecretRequest;
+pub use crate::verify::{Verification, VerifyStatus};
 /// agent86UI's protocol layer (ADR 0005): A2UI 1.0 messages, catalogs, the
 /// validator, and the headless surface runtime a renderer can build on.
 #[cfg(feature = "agent86ui")]
@@ -213,6 +214,7 @@ pub struct AgentBuilder {
     session: Option<String>,
     skill_dirs: Vec<PathBuf>,
     subagents: Option<SubAgents>,
+    verify: Option<(String, u32)>,
     models: IndexMap<String, Model>,
     triage: Option<(String, String)>,
     otel: Option<Otel>,
@@ -246,6 +248,7 @@ impl Default for AgentBuilder {
             session: None,
             skill_dirs: Vec::new(),
             subagents: None,
+            verify: None,
             models: IndexMap::new(),
             triage: None,
             otel: None,
@@ -399,6 +402,16 @@ impl AgentBuilder {
     /// name both hold.
     pub fn skills_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.skill_dirs.push(dir.into());
+        self
+    }
+
+    /// A verification gate: when a turn that changed the workspace gives its final
+    /// answer, run `command` as a `run_command` call (under the approval mode, as
+    /// the model's own calls are) and send a failure back to the model, up to
+    /// `max_attempts` times, before the answer stands. [`RunResult::verification`]
+    /// says what it did.
+    pub fn verify(mut self, command: impl Into<String>, max_attempts: u32) -> Self {
+        self.verify = Some((command.into(), max_attempts));
         self
     }
 
@@ -691,6 +704,10 @@ impl AgentBuilder {
             cancel: Default::default(),
             subagents: Default::default(),
             calibration: Default::default(),
+            verify: match &self.verify {
+                Some((command, attempts)) => crate::verify::Verify::new(Some(command), *attempts),
+                None => Default::default(),
+            },
         };
         #[cfg(feature = "agent86ui")]
         if let Some(session) = ui_session {
@@ -1247,6 +1264,9 @@ pub struct RunResult {
     pub turn: Option<TurnSummary>,
     /// The conversation's usage so far.
     pub usage: Usage,
+    /// What the verification gate did this turn, when one is set
+    /// ([`AgentBuilder::verify`]).
+    pub verification: Option<Verification>,
 }
 
 /// One turn for [`Agent::run`]: a goal (a `&str` or `String` converts to one),
@@ -1385,6 +1405,7 @@ impl Agent {
             output,
             turn: self.conversation.0.last_turn.clone(),
             usage: self.conversation.0.usage,
+            verification: self.harness.verify.last(),
         })
     }
 

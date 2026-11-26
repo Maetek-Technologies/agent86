@@ -667,6 +667,7 @@ fn run(
         steps: state.step_count() as u64,
         usage: state.usage,
         turn: state.last_turn.clone(),
+        verification: harness.verify.last(),
         final_answer: harness
             .guardrails
             .inspect_egress(final_answer(&state.messages))

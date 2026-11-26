@@ -82,4 +82,6 @@ pub mod types;
 #[doc(hidden)]
 pub mod vault;
 #[doc(hidden)]
+pub mod verify;
+#[doc(hidden)]
 pub mod worktree;
