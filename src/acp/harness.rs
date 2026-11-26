@@ -160,6 +160,43 @@ fn secret_answer(reply: &Value) -> Option<crate::vault::SecretAnswer> {
     })
 }
 
+/// The renderer's waiter for a client that draws surfaces (beyond Python; ADR
+/// 0005): asks it with [`super::A2UI_WAIT_METHOD`] through the running turn's
+/// sink, and waits as long as the user takes. No turn, an error, a dismissal, a
+/// reply that is not an action, or a cancel (which drops the reply) is `None`,
+/// which the loop reports as dismissed, the surface left up.
+fn client_ui_waiter(sink: SinkSlot, session_id: String) -> crate::agent86ui::UiWaiter {
+    Arc::new(move |wait: &crate::agent86ui::UiWait| {
+        let running = sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        let params = json!({ "sessionId": session_id, "surfaceIds": wait.surface_ids });
+        let reply = running.call(super::A2UI_WAIT_METHOD, params, None).ok()?;
+        ui_answer(&reply)
+    })
+}
+
+/// The client's answer to [`super::A2UI_WAIT_METHOD`]: the action, or `None`.
+/// Whether the action could have come from the surfaces waited on is the
+/// loop's to check.
+fn ui_answer(reply: &Value) -> Option<crate::sdk::agent86_ui::Action> {
+    if reply.get("outcome").and_then(Value::as_str) != Some("action") {
+        return None;
+    }
+    serde_json::from_value(reply.get("action")?.clone()).ok()
+}
+
+/// A2UI messages as the client's renderer is sent them.
+fn ui_messages<'a>(
+    messages: impl IntoIterator<Item = &'a crate::sdk::agent86_ui::AgentMessage>,
+) -> Vec<Value> {
+    messages
+        .into_iter()
+        .filter_map(|message| serde_json::to_value(message).ok())
+        .collect()
+}
+
 /// `/thinking` and `/toolview`: show the level, or set it.
 fn show_level(name: &str, level: &mut DisplayLevel, arg: &str) -> String {
     if arg.is_empty() {
@@ -378,9 +415,10 @@ impl Presenter {
             {
                 sink.update(Update::Message(chunk.to_owned()))
             }
-            // An ACP session declares no renderer until the a2ui extension lands
-            // (ADR 0005, 1.2.3), so `render_ui` is not offered there yet.
-            TurnEvent::Ui(_) => {}
+            // Only a client with the a2ui extension has a renderer, so only it
+            // draws (ADR 0005); the messages were validated and redacted by then.
+            // Whatever the levels: a surface is a question to the user.
+            TurnEvent::Ui(message) => sink.update(Update::Ui(ui_messages([message]))),
             TurnEvent::Thinking(chunk) if !chunk.is_empty() => match self.thinking {
                 DisplayLevel::Full => sink.update(Update::Thought(chunk.to_owned())),
                 DisplayLevel::Summary => {
@@ -1139,6 +1177,27 @@ impl HarnessBackend {
                 .register(Box::new(crate::tools::secret::RequestSecretTool))
                 .map_err(|error| BackendError::internal(error.to_string()))?;
         }
+        // A client that renders A2UI is offered `render_ui` (beyond Python; ADR
+        // 0005), with the basic catalog, the session's egress mode, and no remote
+        // media, and answers a waiting call itself; a loaded session's surfaces
+        // come back from its steps. `[ui] agent86ui` is the terminal's: here the
+        // client's capability is the choice.
+        if self.client.a2ui {
+            let ui = crate::agent86ui::UiSession::new(vec![crate::sdk::Catalog::basic().clone()])
+                .map_err(|error| BackendError::internal(error.to_string()))?
+                .with_egress(self.config.guardrails.egress)
+                .with_waiter(Some(client_ui_waiter(
+                    Arc::clone(&sink),
+                    session_id.clone(),
+                )));
+            assembly
+                .harness
+                .attach_ui(ui)
+                .map_err(BackendError::internal)?;
+            if let Some(ui) = assembly.harness.context.ui.clone() {
+                ui.replay(&state, &assembly.harness.context);
+            }
+        }
         self.remember_cwd(&session_id, cwd);
         let session = Session {
             thinking: DisplayLevel::Full,
@@ -1833,11 +1892,34 @@ impl Backend for HarnessBackend {
             self.open(cwd, mcp_servers, Some(session_id))?;
         }
         let session = &self.sessions[session_id];
-        Ok(replay(
+        let mut history = replay(
             &session.state,
             &session.harness.context.secrets,
             &session.cards,
-        ))
+        );
+        // The surfaces up at the end of the history, each drawn as it is now.
+        if let Some(ui) = &session.harness.context.ui {
+            let surfaces = ui_messages(&ui.snapshot());
+            if !surfaces.is_empty() {
+                history.push(Update::Ui(surfaces));
+            }
+        }
+        Ok(history)
+    }
+
+    fn ui_action(
+        &mut self,
+        session_id: &str,
+        action: &crate::sdk::agent86_ui::Action,
+    ) -> Result<String, BackendError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| BackendError::not_found(format!("Session not found: {session_id}")))?;
+        session
+            .harness
+            .accept_ui_action(&session.state.session_id, action)
+            .map_err(|why| BackendError::invalid_params(format!("Invalid params: {why}")))
     }
 
     /// The memory methods on the session's own store, every text through its

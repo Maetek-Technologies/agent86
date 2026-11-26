@@ -108,6 +108,27 @@ pub const SECRET_FORGET_METHOD: &str = "_com.maetek.agent86/secret/forget";
 /// `{outcome: "declined"}`.
 pub const SECRET_REQUEST_METHOD: &str = "_com.maetek.agent86/secret/request";
 
+/// The capability for agent86UI, A2UI 1.0 surfaces the model draws (beyond
+/// Python; ADR 0005). The agent advertises it in `agentCapabilities._meta` with
+/// the catalogs it draws with. A client names it in `clientCapabilities._meta`
+/// as an object whose `supportedCatalogIds` holds the basic catalog's id (the
+/// only one agent86 draws with) to say it renders surfaces; only such a client
+/// is offered `render_ui` and sent [`A2UI_RENDER_METHOD`] and [`A2UI_WAIT_METHOD`].
+pub const A2UI_CAPABILITY: &str = "com.maetek.agent86/a2ui";
+/// The version of the a2ui methods' shapes.
+pub const A2UI_VERSION: u64 = 1;
+/// Agent to client, a notification: `{sessionId, messages}`, A2UI 1.0 messages
+/// for the client's renderer, already validated, in order.
+pub const A2UI_RENDER_METHOD: &str = "_com.maetek.agent86/a2ui/render";
+/// Agent to client, while a turn waits for the user's answer to surfaces it drew:
+/// `{sessionId, surfaceIds}` to `{outcome: "action", action}` (an A2UI `action`
+/// from one of those surfaces) or `{outcome: "dismissed"}`.
+pub const A2UI_WAIT_METHOD: &str = "_com.maetek.agent86/a2ui/wait";
+/// Client to agent, between turns: `{sessionId, action}` (an A2UI `action` on a
+/// surface no call waited on) runs a turn on the action, as `session/prompt`
+/// does, to `{stopReason}`. Agent functions (`callAgentFunction`) are refused.
+pub const A2UI_ACTION_METHOD: &str = "_com.maetek.agent86/a2ui/action";
+
 /// One secret method's request, checked (beyond Python). `Debug` never shows a
 /// value: [`crate::vault::SecretAnswer`] hides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +254,10 @@ pub enum Update {
     /// One of the harness's state events (beyond Python), sent as [`STATE_METHOD`]
     /// rather than `session/update`, and only to a client that asked for them.
     State(Value),
+    /// A2UI messages for the client's renderer (beyond Python), sent as
+    /// [`A2UI_RENDER_METHOD`] rather than `session/update`, and only to a client
+    /// with [`A2UI_CAPABILITY`], the only one offered `render_ui`.
+    Ui(Vec<Value>),
     /// The history was compacted (`compaction_update`, beyond Python), for a client
     /// with the `session.compaction` capability: `completed` with the summary, or
     /// `failed` with why (the history was trimmed instead).
@@ -459,6 +484,10 @@ pub struct ClientCapabilities {
     /// client draws its own masked entry, so it is asked for secrets
     /// ([`SECRET_REQUEST_METHOD`], beyond Python).
     pub secrets: bool,
+    /// `_meta["com.maetek.agent86/a2ui"]` was given as an object whose
+    /// `supportedCatalogIds` holds the basic catalog's id: the client renders
+    /// agent86UI surfaces ([`A2UI_CAPABILITY`], beyond Python).
+    pub a2ui: bool,
 }
 
 impl ClientCapabilities {
@@ -478,12 +507,20 @@ impl ClientCapabilities {
                 .and_then(|meta| meta.get(name))
                 .is_some_and(|value| value.is_object() || value == &Value::Bool(true))
         };
+        let basic = crate::sdk::Catalog::basic().id();
+        let a2ui = capabilities
+            .and_then(|capabilities| capabilities.get("_meta"))
+            .and_then(|meta| meta.get(A2UI_CAPABILITY))
+            .and_then(|a2ui| a2ui.get("supportedCatalogIds"))
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(basic)));
         Self {
             read_text_file: flag("readTextFile"),
             write_text_file: flag("writeTextFile"),
             compaction,
             state: extension(STATE_CAPABILITY),
             secrets: extension(SECRETS_CAPABILITY),
+            a2ui,
         }
     }
 }
@@ -632,6 +669,20 @@ pub trait Backend: Send {
         text: &str,
         sink: Arc<dyn TurnSink>,
     ) -> Result<Stop, BackendError>;
+
+    /// Take an action from a surface no call waited on ([`A2UI_ACTION_METHOD`]):
+    /// check it and give the text a turn runs on, which the connection then runs
+    /// through [`Backend::prompt`]. Refused by default, for a backend that draws
+    /// nothing.
+    fn ui_action(
+        &mut self,
+        _session_id: &str,
+        _action: &crate::sdk::agent86_ui::Action,
+    ) -> Result<String, BackendError> {
+        Err(BackendError::invalid_params(
+            "Invalid params: this session draws no surfaces",
+        ))
+    }
 }
 
 /// What the connection's thread waits on: the reader's lines and the turn's reports.
@@ -844,6 +895,7 @@ impl<B: Backend> Server<B> {
             | SECRET_SET_METHOD
             | SECRET_LIST_METHOD
             | SECRET_FORGET_METHOD
+            | A2UI_ACTION_METHOD
                 if !self.initialized =>
             {
                 Err(BackendError {
@@ -864,6 +916,7 @@ impl<B: Backend> Server<B> {
             SECRET_SET_METHOD | SECRET_LIST_METHOD | SECRET_FORGET_METHOD => {
                 self.secret_method(method, params)
             }
+            A2UI_ACTION_METHOD => self.ui_action(params, emit),
             other => Err(BackendError {
                 code: METHOD_NOT_FOUND,
                 message: format!("Method not found: {other}"),
@@ -1214,7 +1267,49 @@ impl<B: Backend> Server<B> {
                 return Ok(json!({ "stopReason": Stop::EndTurn.as_str() }));
             }
         }
+        self.run_turn(session_id, text, emit)
+    }
 
+    /// `_com.maetek.agent86/a2ui/action` (beyond Python; ADR 0005): an action on a
+    /// surface no call waited on, checked and recorded by the backend, then run as
+    /// a turn on its text (`[ui action] <name> on <surfaceId>: ...`), which the
+    /// turn's vault redaction and ingress guardrail cover as they cover a prompt.
+    fn ui_action(
+        &mut self,
+        params: &Value,
+        emit: &mut dyn FnMut(Value),
+    ) -> Result<Value, BackendError> {
+        let invalid =
+            |message: &str| BackendError::invalid_params(format!("Invalid params: {message}"));
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("sessionId must be a string"))?
+            .to_owned();
+        if params.get("callAgentFunction").is_some() {
+            return Err(invalid(
+                "agent functions are not supported; send a surface's action instead",
+            ));
+        }
+        let action: crate::sdk::agent86_ui::Action = params
+            .get("action")
+            .cloned()
+            .and_then(|action| serde_json::from_value(action).ok())
+            .ok_or_else(|| {
+                invalid("action must be an A2UI action (name, surfaceId, sourceComponentId, timestamp, context)")
+            })?;
+        let text = self.backend.ui_action(&session_id, &action)?;
+        self.run_turn(session_id, text, emit)
+    }
+
+    /// Run a turn on `text` for `session_id`, reporting as it goes, and answer
+    /// with its `stopReason`.
+    fn run_turn(
+        &mut self,
+        session_id: String,
+        text: String,
+        emit: &mut dyn FnMut(Value),
+    ) -> Result<Value, BackendError> {
         let sink: Arc<dyn TurnSink> = Arc::new(ChannelSink {
             events: self.sender.clone(),
             session_id: session_id.clone(),
@@ -1278,7 +1373,8 @@ impl<B: Backend> Server<B> {
                         // through, since a running tool is allowed to finish.
                         if cancel.requested
                             && (method == "session/request_permission"
-                                || method == SECRET_REQUEST_METHOD)
+                                || method == SECRET_REQUEST_METHOD
+                                || method == A2UI_WAIT_METHOD)
                         {
                             continue;
                         }
@@ -1709,17 +1805,27 @@ fn config_options_json(options: &[ConfigOption]) -> Value {
 
 /// The `session/update` notification for `update`.
 fn session_update(session_id: &str, update: &Update) -> Value {
-    if let Update::State(event) = update {
-        // A custom notification, not a `session/update`: the spec reserves the
-        // update kinds for itself.
-        return json!({
-            "jsonrpc": "2.0",
-            "method": STATE_METHOD,
-            "params": { "sessionId": session_id, "event": event }
-        });
+    // Custom notifications, not `session/update`: the spec reserves the update
+    // kinds for itself.
+    match update {
+        Update::State(event) => {
+            return json!({
+                "jsonrpc": "2.0",
+                "method": STATE_METHOD,
+                "params": { "sessionId": session_id, "event": event }
+            })
+        }
+        Update::Ui(messages) => {
+            return json!({
+                "jsonrpc": "2.0",
+                "method": A2UI_RENDER_METHOD,
+                "params": { "sessionId": session_id, "messages": messages }
+            })
+        }
+        _ => {}
     }
     let body = match update {
-        Update::State(_) => unreachable!("sent as its own notification above"),
+        Update::State(_) | Update::Ui(_) => unreachable!("sent as their own notifications above"),
         Update::User(text) => json!({
             "sessionUpdate": "user_message_chunk",
             "content": text_content(text)
@@ -1944,7 +2050,11 @@ fn initialize(params: &Value) -> Result<Value, String> {
             "_meta": {
                 STATE_CAPABILITY: { "version": STATE_VERSION },
                 MEMORY_CAPABILITY: { "version": MEMORY_VERSION },
-                SECRETS_CAPABILITY: { "version": SECRETS_VERSION }
+                SECRETS_CAPABILITY: { "version": SECRETS_VERSION },
+                A2UI_CAPABILITY: {
+                    "version": A2UI_VERSION,
+                    "catalogIds": [crate::sdk::Catalog::basic().id()]
+                }
             }
         },
         "agentInfo": {
@@ -2480,6 +2590,33 @@ mod tests {
         }
         assert!(!capabilities(json!({ STATE_CAPABILITY: true })).secrets);
         assert!(!ClientCapabilities::from_params(&json!({})).secrets);
+    }
+
+    #[test]
+    fn a_client_renders_surfaces_only_when_it_names_the_basic_catalog() {
+        let capabilities = |meta: Value| {
+            ClientCapabilities::from_params(&json!({ "clientCapabilities": { "_meta": meta } }))
+        };
+        let basic = crate::sdk::Catalog::basic().id();
+        assert!(
+            capabilities(json!({ A2UI_CAPABILITY: { "supportedCatalogIds": ["other", basic] } }))
+                .a2ui
+        );
+        // A renderer has to name what it draws: `true`, which the other extensions
+        // take, is not enough, nor are other catalogs.
+        for refused in [
+            json!(true),
+            json!({}),
+            json!({ "supportedCatalogIds": [] }),
+            json!({ "supportedCatalogIds": ["other"] }),
+            json!({ "supportedCatalogIds": basic }),
+        ] {
+            assert!(
+                !capabilities(json!({ A2UI_CAPABILITY: refused })).a2ui,
+                "{refused}"
+            );
+        }
+        assert!(!ClientCapabilities::from_params(&json!({})).a2ui);
     }
 
     #[test]
@@ -3705,6 +3842,7 @@ mod tests {
                     compaction: false,
                     state: false,
                     secrets: false,
+                    a2ui: false,
                 }),
                 "{capabilities}"
             );
