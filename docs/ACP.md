@@ -157,6 +157,25 @@ Only a client whose `supportedCatalogIds` holds the basic catalog's id is offere
 
 `[ui] agent86ui` and `[ui] agent86ui_remote_media` are the terminal's settings and are not read here: the client's capability decides, and surfaces may show only `data:` URLs and the workspace's own files as media.
 
+## Questions from the agent
+
+From 1.2.3, when the agent needs something from the user (a choice, a few details, a decision), it asks through `ask_user`, with all its questions at once, and every ACP client can answer, in one of three ways, picked when the session opens:
+
+- **A client that draws its own form** names `clientCapabilities._meta["com.maetek.agent86/questions"]` (`true` or an object); the agent advertises it as `{"version": 1}`. When the model asks, the client gets a request and the user answers in the client's form:
+
+  ```json
+  {"jsonrpc": "2.0", "id": 5, "method": "_com.maetek.agent86/questions/ask",
+   "params": {"sessionId": "…", "title": "Your plan", "questions": [
+     {"id": "plan", "question": "Which plan?", "kind": "choice", "options": ["Free", "Pro"]},
+     {"id": "seats", "question": "How many seats?", "kind": "number", "optional": true}]}}
+  ```
+
+  `kind` is `choice` (one of the options), `multi` (any of them), `text`, `long_text`, `number`, `yes_no`, or `date` (`YYYY-MM-DD`); a choice question should also let the user answer in their own words. Answer `{"answers": {"plan": "Pro", "seats": 3}}` (an answer that is not one of the options is taken as the user's own words; a required question left out is reported to the model as unanswered) or `{"dismissed": true}`. An error, anything else, or a `session/cancel` while it waits is a dismissal, and the model is told not to ask again in that turn. Any value a secret holds is replaced by its placeholder in the questions, and the answers go through the same redaction and injection guardrail as typed text. The question waits its turn with approvals (a `questions` state event shows it as kind `ask`).
+- **A client that renders A2UI** (see *agent86UI* above) and not that one gets agent86's own form, drawn through the a2ui extension: a surface named `agent86_ask_<n>` and an `_com.maetek.agent86/a2ui/wait` for it, answered with the action of its Send answers button, and taken down (`deleteSurface`) once answered. The form is built by agent86, so it is always valid.
+- **Any other client** gets the questions as text that ends the turn: numbered, each choice question's options lettered, ending `Answer in your reply, by number.` The turn stops there (`end_turn`, with no further model call), and the user's next prompt is the answer.
+
+`[ui] ask_user = "off"` in the config offers none of these, and the agent asks in its reply as before.
+
 ## What is different from the terminal
 
 - **Settings come from where the editor starts agent86.** The project's `.agent86/config.toml` is the one in that directory, which is normally the project folder. A multi-folder window uses the folder the editor chose.

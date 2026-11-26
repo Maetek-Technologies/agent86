@@ -36,7 +36,7 @@ From 1.2.2 ([ADR 0006](adr/0006-ask-user.md)), when the agent needs information,
 | The terminal interface | A form, answered in place (see [In the terminal](#in-the-terminal)) |
 | The plain loop, at a terminal | The questions as text, one at a time |
 | Programs embedding `agent86-core` whose `Ui` has `on_wait` | The form, through their own renderer (see [Embedding it](#embedding-it)) |
-| ACP clients | Planned for 1.2.3: through agent86's questions extension, agent86UI, or as text |
+| ACP clients | 1.2.3: the client's own form (agent86's questions extension), agent86's form through the a2ui extension, or else the questions as text that ends the turn ([ACP.md](ACP.md#questions-from-the-agent)) |
 | `agent86 run`, piped input, CI, sub-agents | Never offered: nobody can answer |
 
 `[ui] ask_user = "off"` turns it off, and the agent asks in its reply as before; a project file may set it without being trusted. Measured on seven hosted models and two local ones (ADR 0006), no model asked in prose, and when they asked, their `ask_user` call was valid on the first try 102 times in 104. A form the model draws itself with `render_ui` (below) stays available for anything that is not a list of questions.

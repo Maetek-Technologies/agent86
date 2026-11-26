@@ -503,7 +503,8 @@ pub enum Via {
     Form,
     /// An ACP client's own form, through agent86's questions extension.
     Extension,
-    /// Text, one question at a time (the plain loop).
+    /// Text: one question at a time (the plain loop), or all of them as the
+    /// agent's message, ending the turn (an ACP client that draws nothing).
     Text,
 }
 
@@ -548,6 +549,8 @@ pub type AskPrompt = Box<dyn Fn(&Form) -> Reply + Send + Sync>;
 pub struct Asker {
     prompt: Arc<Mutex<Option<Arc<AskPrompt>>>>,
     form: Arc<std::sync::atomic::AtomicBool>,
+    /// Ask as text, ending the turn ([`ASK_TEXT_KEY`]), when nothing else can.
+    text: Arc<std::sync::atomic::AtomicBool>,
     /// The last form surface's number, for `agent86_ask_<n>`.
     forms: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -558,6 +561,7 @@ impl std::fmt::Debug for Asker {
             .debug_struct("Asker")
             .field("can_ask", &self.can_ask())
             .field("draws_form", &self.draws_form())
+            .field("asks_in_text", &self.asks_in_text())
             .finish()
     }
 }
@@ -581,6 +585,15 @@ impl Asker {
 
     pub fn draws_form(&self) -> bool {
         self.form.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask as text that ends the turn, when no hook or form can (or stop).
+    pub fn set_asks_in_text(&self, text: bool) {
+        self.text.store(text, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn asks_in_text(&self) -> bool {
+        self.text.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The surface id of the next form agent86 draws (`agent86_ask_<n>`).
@@ -607,11 +620,65 @@ pub fn reachable(ctx: &crate::tools::ToolContext) -> bool {
     if ctx.asker.can_ask() {
         return true;
     }
+    draws_form(ctx) || ctx.asker.asks_in_text()
+}
+
+/// Whether the loop draws the built form and the context's renderer can answer.
+fn draws_form(ctx: &crate::tools::ToolContext) -> bool {
     #[cfg(feature = "agent86ui")]
     if ctx.asker.draws_form() {
         return ctx.ui.as_deref().is_some_and(|ui| ui.can_wait());
     }
+    let _ = ctx;
     false
+}
+
+/// Where a call's questions were shown as text (the text fallback), its result's
+/// metadata carries that text under this key: the loop sends it as the agent's
+/// message and ends the turn (ADR 0006).
+pub const ASK_TEXT_KEY: &str = "agent86_ask_text";
+
+/// The result of a call whose questions were shown as text.
+pub const SHOWN_AS_TEXT: &str = "This client cannot show a form, so the questions were shown \
+     to the user as text and the turn ends here. Their reply comes as the next user message; \
+     read the answers from it.";
+
+/// A form's questions as text, for a client that draws nothing (ADR 0006's text
+/// fallback): numbered, each choice question's options lettered, with what kind
+/// of answer each takes, and a line saying to answer in the reply.
+pub fn form_text(form: &Form) -> String {
+    let mut lines = Vec::new();
+    if let Some(title) = &form.title {
+        lines.push(title.clone());
+        lines.push(String::new());
+    }
+    for (index, question) in form.questions.iter().enumerate() {
+        let hint = match question.kind {
+            AnswerKind::YesNo => " (yes or no)",
+            AnswerKind::Number => " (a number)",
+            AnswerKind::Date => " (a date)",
+            AnswerKind::Multi => " (any of these)",
+            _ => "",
+        };
+        let optional = if question.optional { " (optional)" } else { "" };
+        lines.push(format!(
+            "{}. {}{hint}{optional}",
+            index + 1,
+            question.question
+        ));
+        if question.kind.has_options() {
+            let options: Vec<String> = question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(n, option)| format!("{}) {option}", char::from(b'a' + (n % 26) as u8)))
+                .collect();
+            lines.push(format!("   {}, or say something else", options.join("  ")));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Answer in your reply, by number.".into());
+    lines.join("\n")
 }
 
 /// The system-prompt section wherever `ask_user` is offered (ADR 0006). With
@@ -674,6 +741,18 @@ impl crate::agent::Harness {
         }
         self.context.asker.set_draws_form(true);
         Ok(true)
+    }
+
+    /// Offer `ask_user` where nobody can answer mid-turn (ADR 0006's text
+    /// fallback, for an ACP client that draws nothing): the questions are sent as
+    /// the agent's message and the turn ends; the user's reply is the answer.
+    pub fn offer_questions_as_text(&mut self) -> Result<(), String> {
+        if self.registry.get(ASK_USER).is_none() {
+            self.registry
+                .register(Box::new(crate::tools::ask_user::AskUserTool))?;
+        }
+        self.context.asker.set_asks_in_text(true);
+        Ok(())
     }
 
     /// Draw the built form through the context's renderer and wait for its
@@ -766,6 +845,20 @@ impl crate::agent::Harness {
             call: Some(call.id.clone()),
             ..Question::new(QuestionKind::Ask)
         };
+        // Nobody can answer mid-turn: the questions go out as text that ends
+        // the turn (ADR 0006), through the vault and the egress guardrail as the
+        // model's own text does.
+        if self.context.asker.prompt().is_none()
+            && !draws_form(&self.context)
+            && self.context.asker.asks_in_text()
+        {
+            let text = self.context.secrets.redact(&form_text(&form));
+            let (_, text) = self.guardrails.inspect_egress(&text);
+            record("shown", Some(Via::Text), 0);
+            let mut shown = success(ASK_USER, SHOWN_AS_TEXT.into());
+            shown.metadata.insert(ASK_TEXT_KEY.into(), json!(text));
+            return answered(shown);
+        }
         // A hook the surface installed, else the built form drawn through the
         // embedder's renderer.
         let asked = match self.context.asker.prompt() {

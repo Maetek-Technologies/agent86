@@ -129,6 +129,19 @@ pub const A2UI_WAIT_METHOD: &str = "_com.maetek.agent86/a2ui/wait";
 /// does, to `{stopReason}`. Agent functions (`callAgentFunction`) are refused.
 pub const A2UI_ACTION_METHOD: &str = "_com.maetek.agent86/a2ui/action";
 
+/// The capability for `ask_user` answered by the client's own form (beyond
+/// Python; ADR 0006). The agent advertises it in `agentCapabilities._meta`; a
+/// client names it in `clientCapabilities._meta` (`true` or an object) to draw
+/// the questions itself, and is then sent [`QUESTIONS_ASK_METHOD`].
+pub const QUESTIONS_CAPABILITY: &str = "com.maetek.agent86/questions";
+/// The version of the questions method's shapes.
+pub const QUESTIONS_VERSION: u64 = 1;
+/// Agent to client, while a turn waits: `{sessionId, title?, questions}` (the
+/// `ask_user` tool's own shape: each question's `id`, `question`, `kind`, and
+/// `options` and `optional` where given) to `{answers: {<id>: value}}` or
+/// `{dismissed: true}`.
+pub const QUESTIONS_ASK_METHOD: &str = "_com.maetek.agent86/questions/ask";
+
 /// One secret method's request, checked (beyond Python). `Debug` never shows a
 /// value: [`crate::vault::SecretAnswer`] hides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +501,10 @@ pub struct ClientCapabilities {
     /// `supportedCatalogIds` holds the basic catalog's id: the client renders
     /// agent86UI surfaces ([`A2UI_CAPABILITY`], beyond Python).
     pub a2ui: bool,
+    /// `_meta["com.maetek.agent86/questions"]` was given (`true` or an object):
+    /// the client draws `ask_user`'s questions itself ([`QUESTIONS_ASK_METHOD`],
+    /// beyond Python).
+    pub questions: bool,
 }
 
 impl ClientCapabilities {
@@ -521,6 +538,7 @@ impl ClientCapabilities {
             state: extension(STATE_CAPABILITY),
             secrets: extension(SECRETS_CAPABILITY),
             a2ui,
+            questions: extension(QUESTIONS_CAPABILITY),
         }
     }
 }
@@ -1374,7 +1392,8 @@ impl<B: Backend> Server<B> {
                         if cancel.requested
                             && (method == "session/request_permission"
                                 || method == SECRET_REQUEST_METHOD
-                                || method == A2UI_WAIT_METHOD)
+                                || method == A2UI_WAIT_METHOD
+                                || method == QUESTIONS_ASK_METHOD)
                         {
                             continue;
                         }
@@ -2054,7 +2073,8 @@ fn initialize(params: &Value) -> Result<Value, String> {
                 A2UI_CAPABILITY: {
                     "version": A2UI_VERSION,
                     "catalogIds": [crate::sdk::Catalog::basic().id()]
-                }
+                },
+                QUESTIONS_CAPABILITY: { "version": QUESTIONS_VERSION }
             }
         },
         "agentInfo": {
@@ -3843,6 +3863,7 @@ mod tests {
                     state: false,
                     secrets: false,
                     a2ui: false,
+                    questions: false,
                 }),
                 "{capabilities}"
             );
