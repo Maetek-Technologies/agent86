@@ -126,8 +126,25 @@ pub fn signature(observation: &str) -> u64 {
     hasher.finish()
 }
 
+/// The call's arguments as text with every object's keys sorted, so the same
+/// call written in another key order (models alternate) is still the same call.
 fn arguments_key(call: &ToolCall) -> String {
-    serde_json::to_string(&Value::Object(call.arguments.clone())).unwrap_or_default()
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                Value::Object(
+                    keys.into_iter()
+                        .map(|key| (key.clone(), sorted(&map[key])))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_string(&sorted(&Value::Object(call.arguments.clone()))).unwrap_or_default()
 }
 
 /// One turn's watch (see the module docs).
@@ -312,6 +329,24 @@ mod tests {
         let stall = watch.take().unwrap();
         assert_eq!(stall.kind, StallKind::ReadsWithoutChange);
         assert_eq!(stall.count, READS_WITHOUT_CHANGE);
+    }
+
+    #[test]
+    fn the_same_call_in_another_key_order_is_still_a_repeat() {
+        // Seen in the eval: `edit_file` sent six times, keys in alternating order.
+        let mut watch = StallWatch::new(true);
+        let first = call(
+            "edit_file",
+            json!({"new_string": "x", "old_string": "x", "path": "t.py"}),
+        );
+        let second = call(
+            "edit_file",
+            json!({"path": "t.py", "old_string": "x", "new_string": "x"}),
+        );
+        let error = "old_string and new_string are identical; nothing to do.";
+        watch.saw(&first, &result(false), error);
+        watch.saw(&second, &result(false), error);
+        assert_eq!(watch.take().map(|s| s.kind), Some(StallKind::RepeatedCall));
     }
 
     #[test]
