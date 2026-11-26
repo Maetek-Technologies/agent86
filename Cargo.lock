@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "agent86"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "agent86-core",
  "clap",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "agent86-core"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "agent86-ui",
  "apple-native-keyring-store",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agent86-eval"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "clap",
  "jiff",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agent86-ui"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "fancy-regex 0.20.2",
  "jiff",
