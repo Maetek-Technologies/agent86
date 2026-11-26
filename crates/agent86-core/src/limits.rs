@@ -278,10 +278,37 @@ impl Harness {
     }
 
     /// The output cap sent with every model call.
+    ///
+    /// Beyond Python, with `[limits] context_sizing` on, the built-in default cap
+    /// is held to a share of the active window
+    /// (`crate::memory::sizing::sized_output_cap`); a cap the user set (a
+    /// provider's `max_tokens`, `[limits] max_output_tokens` changed, or a
+    /// session override) is taken as given.
     pub fn output_cap(&self) -> u32 {
         self.session_limits
             .get(LimitKind::Output)
-            .unwrap_or(self.configured_output())
+            .unwrap_or_else(|| {
+                self.sized_output(
+                    self.configured_output(),
+                    self.active_context_window(),
+                    &self.output_setting(),
+                )
+            })
+    }
+
+    /// `cap`, which comes from `setting`, for a model with `window`: held to its
+    /// share when sizing is on and the cap is the built-in default.
+    pub(crate) fn sized_output(&self, cap: u32, window: u64, setting: &str) -> u32 {
+        let default = !setting.starts_with("[providers.")
+            && matches!(
+                self.limits.max_output_tokens,
+                0 | crate::memory::sizing::DEFAULT_OUTPUT_CAP
+            );
+        if self.limits.context_sizing && default {
+            crate::memory::sizing::sized_output_cap(cap, window)
+        } else {
+            cap
+        }
     }
 
     /// What to raise for a larger output cap, for messages: the session's override,
