@@ -269,6 +269,17 @@ impl UiSession {
         self.runtime().surface_ids().map(String::from).collect()
     }
 
+    /// Every surface up now as text, in surface id order, for a client that
+    /// cannot draw A2UI (ADR 0005's text fallback): a heading naming the surface,
+    /// then its components with every binding resolved ([`surface_text`]).
+    pub fn surface_texts(&self) -> Vec<String> {
+        let runtime = self.runtime();
+        let ids: Vec<String> = runtime.surface_ids().map(String::from).collect();
+        ids.iter()
+            .filter_map(|id| runtime.tree(id).map(|tree| surface_text(id, &tree)))
+            .collect()
+    }
+
     /// The system-prompt section: how to use `render_ui`, then each catalog's
     /// own instructions and a compact reference to its components and
     /// functions. Rebuilt per request, like the MCP section.
@@ -1188,6 +1199,193 @@ fn open_urls(value: &Value, at: &str, refuse: &mut impl FnMut(String, String)) {
     }
 }
 
+/// A surface as plain text, for a client that cannot draw it: a heading naming
+/// it, then a line or more per component, as the user would read it. Fields show
+/// their values (`(empty)` when there are none), choices are lettered with the
+/// chosen ones marked, check boxes and buttons are bracketed, media is its
+/// description and its URL (never a `data:` one), and what has no text form
+/// (Tabs, Modal) is named. Every string goes through
+/// [`crate::escape::show_controls`]; the values were redacted when drawn.
+pub fn surface_text(surface_id: &str, tree: &agent86_ui::runtime::Node) -> String {
+    let mut lines = vec![format!(
+        "[agent86UI surface {:?}: this client cannot draw it, so it is shown as text; \
+         answer in your reply]",
+        crate::escape::show_controls(surface_id)
+    )];
+    node_text(tree, &mut lines);
+    lines.join("\n")
+}
+
+/// A property as text: a string as it is, a number or a boolean as JSON writes
+/// it, anything else (or nothing) empty.
+fn prop(node: &agent86_ui::runtime::Node, key: &str) -> String {
+    let text = match node.properties.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(other) => other.to_string(),
+    };
+    crate::escape::show_controls(&text)
+}
+
+fn kids<'a>(node: &'a agent86_ui::runtime::Node, key: &str) -> &'a [agent86_ui::runtime::Node] {
+    node.children
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, nodes)| nodes.as_slice())
+        .unwrap_or_default()
+}
+
+/// `label: rest`, or `rest` alone when there is no label.
+fn labeled(label: &str, rest: &str) -> String {
+    if label.is_empty() {
+        rest.to_owned()
+    } else {
+        format!("{label}: {rest}")
+    }
+}
+
+fn node_text(node: &agent86_ui::runtime::Node, out: &mut Vec<String>) {
+    if node.placeholder {
+        out.push("…".into());
+        return;
+    }
+    match node.component.as_str() {
+        "Text" => {
+            let text = prop(node, "text");
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+        "Column" | "List" | "Row" => {
+            for child in kids(node, "children") {
+                node_text(child, out);
+            }
+        }
+        "Card" => {
+            for child in kids(node, "child") {
+                node_text(child, out);
+            }
+        }
+        "Divider" => out.push("---".into()),
+        "Button" => {
+            let label: Vec<String> = kids(node, "child")
+                .iter()
+                .flat_map(|child| child.walk())
+                .filter(|n| n.component == "Text")
+                .map(|n| prop(n, "text"))
+                .filter(|text| !text.is_empty())
+                .collect();
+            let label = if label.is_empty() {
+                crate::escape::show_controls(&node.id)
+            } else {
+                label.join(" ").replace('\n', " ")
+            };
+            out.push(format!("[{label}]"));
+        }
+        "TextField" | "DateTimeInput" => {
+            let value = prop(node, "value");
+            let shown = if value.is_empty() {
+                "(empty)".to_owned()
+            } else {
+                value
+            };
+            out.push(labeled(&prop(node, "label"), &shown));
+        }
+        "CheckBox" => {
+            let checked = node.properties.get("value").and_then(Value::as_bool) == Some(true);
+            let mark = if checked { "[x]" } else { "[ ]" };
+            out.push(format!("{mark} {}", prop(node, "label")));
+        }
+        "ChoicePicker" => {
+            let chosen: Vec<String> = match node.properties.get("value") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(String::from))
+                    .collect(),
+                Some(Value::String(one)) => vec![one.clone()],
+                _ => Vec::new(),
+            };
+            let options = node
+                .properties
+                .get("options")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let lettered: Vec<String> = options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let value = option.get("value").and_then(Value::as_str).unwrap_or("");
+                    let label = match option.get("label") {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(other) if !other.is_null() => other.to_string(),
+                        _ => value.to_owned(),
+                    };
+                    let letter = char::from(b'a' + (index % 26) as u8);
+                    let on = if chosen.iter().any(|c| c == value) {
+                        " (chosen)"
+                    } else {
+                        ""
+                    };
+                    format!("{letter}) {}{on}", crate::escape::show_controls(&label))
+                })
+                .collect();
+            out.push(labeled(&prop(node, "label"), &lettered.join("  ")));
+        }
+        "Slider" => {
+            let number = |key: &str| node.properties.get(key).and_then(Value::as_f64);
+            let show = |value: f64| {
+                if value.fract() == 0.0 && value.abs() < 1e15 {
+                    format!("{}", value as i64)
+                } else {
+                    format!("{value}")
+                }
+            };
+            let (min, max) = (number("min").unwrap_or(0.0), number("max").unwrap_or(100.0));
+            let value = number("value").unwrap_or(min);
+            out.push(labeled(
+                &prop(node, "label"),
+                &format!("{} ({} to {})", show(value), show(min), show(max)),
+            ));
+        }
+        kind @ ("Image" | "Video" | "AudioPlayer") => {
+            let what = match kind {
+                "Image" => "image",
+                "Video" => "video",
+                _ => "audio",
+            };
+            let mut text = format!("[{what}]");
+            let description = prop(node, "description");
+            if !description.is_empty() {
+                text.push(' ');
+                text.push_str(&description);
+            }
+            let url = prop(node, "url");
+            if !url.is_empty() && !url.starts_with("data:") {
+                text.push(' ');
+                text.push_str(&url);
+            }
+            out.push(text);
+        }
+        "Icon" => out.push(format!("[{}]", prop(node, "name"))),
+        other => {
+            let name = if other.is_empty() { "?" } else { other };
+            out.push(format!(
+                "(a {} is not shown as text)",
+                crate::escape::show_controls(name)
+            ));
+        }
+    }
+    for message in node.validation_errors() {
+        out.push(format!("  ! {}", crate::escape::show_controls(&message)));
+    }
+    for error in &node.errors {
+        out.push(format!("! {}", crate::escape::show_controls(error)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1568,6 +1766,68 @@ mod tests {
         assert_eq!(
             submit["action"]["event"]["context"],
             json!({"plan": {"@path": "/plan"}})
+        );
+    }
+
+    #[test]
+    fn a_surface_as_text_shows_each_component_as_the_user_reads_it() {
+        let session = UiSession::new(vec![Catalog::basic().clone()]).unwrap();
+        let report = session.apply(&[serde_json::json!({"version": "1.0", "createSurface": {
+            "surfaceId": "order",
+            "catalogId": agent86_ui::BASIC_CATALOG_ID,
+            "components": [
+                {"id": "root", "component": "Column",
+                 "children": ["title", "name", "note", "plan", "extras", "receipt", "seats",
+                              "line", "logo", "tabs", "row"]},
+                {"id": "title", "component": "Text", "text": "Your order\u{1b}[31m"},
+                {"id": "name", "component": "TextField", "label": "Name", "value": {"@path": "/name"}},
+                {"id": "note", "component": "TextField", "label": "Note", "value": {"@path": "/note"}},
+                {"id": "plan", "component": "ChoicePicker", "label": "Plan",
+                 "options": [{"label": "Free", "value": "free"}, {"label": "Pro", "value": "pro"}],
+                 "value": {"@path": "/plan"}},
+                {"id": "extras", "component": "ChoicePicker", "variant": "multipleSelection",
+                 "options": [{"label": "Gift wrap", "value": "wrap"}, {"label": "Card", "value": "card"}],
+                 "value": {"@path": "/extras"}},
+                {"id": "receipt", "component": "CheckBox", "label": "Email me the receipt",
+                 "value": {"@path": "/receipt"}},
+                {"id": "seats", "component": "Slider", "label": "Seats", "min": 1, "max": 10,
+                 "value": {"@path": "/seats"}},
+                {"id": "line", "component": "Divider"},
+                {"id": "logo", "component": "Image", "description": "Our logo",
+                 "url": "https://example.com/logo.png"},
+                {"id": "tabs", "component": "Tabs", "tabs": [{"title": "One", "child": "one"}]},
+                {"id": "one", "component": "Text", "text": "inside a tab"},
+                {"id": "row", "component": "Row", "children": ["ok", "cancel"]},
+                {"id": "ok", "component": "Button", "child": "ok_label",
+                 "action": {"event": {"name": "submit"}}},
+                {"id": "ok_label", "component": "Text", "text": "OK"},
+                {"id": "cancel", "component": "Button", "child": "cancel_label",
+                 "action": {"event": {"name": "cancel"}}},
+                {"id": "cancel_label", "component": "Text", "text": "Cancel"}
+            ],
+            "dataModel": {"name": "Ada", "note": "", "plan": ["pro"], "extras": ["wrap", "card"],
+                          "receipt": true, "seats": 3}
+        }})]);
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert_eq!(
+            session.surface_texts(),
+            [concat!(
+                "[agent86UI surface \"order\": this client cannot draw it, so it is shown as ",
+                "text; answer in your reply]\n",
+                // The escape is shown, never sent through.
+                "Your order\u{241b}[31m\n",
+                "Name: Ada\n",
+                "Note: (empty)\n",
+                "Plan: a) Free  b) Pro (chosen)\n",
+                "a) Gift wrap (chosen)  b) Card (chosen)\n",
+                "[x] Email me the receipt\n",
+                "Seats: 3 (1 to 10)\n",
+                "---\n",
+                "[image] Our logo https://example.com/logo.png\n",
+                "(a Tabs is not shown as text)\n",
+                "[OK]\n",
+                "[Cancel]"
+            )]
         );
     }
 }
