@@ -64,6 +64,7 @@ fn limits() -> LimitsConfig {
         parallel_tools: true,
         tool_timeout_s: 60,
         context_sizing: true,
+        stall_nudge: true,
     }
 }
 
@@ -3063,4 +3064,89 @@ async fn a_check_the_approval_gate_refuses_is_skipped_and_said() {
     let verification = output.verification.unwrap();
     assert_eq!(verification.status, VerifyStatus::Skipped);
     assert_eq!(verification.runs, 0);
+}
+
+fn read_missing(id: &str) -> Reply {
+    sse_tool_calls(&[(id, "read_file", r#"{"path": "missing.txt"}"#)])
+}
+
+#[tokio::test]
+async fn a_failed_call_repeated_unchanged_gets_one_reminder() {
+    let server = MockServer::start(vec![
+        read_missing("c1"),
+        read_missing("c2"),
+        read_missing("c3"),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("stall-repeated-call");
+    let traces = workspace.root.join("traces");
+    let harness = window_harness(&server, &workspace, limits(), trace_recorder(&traces));
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, "read missing.txt", |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(final_answer(&state.messages), "done");
+    assert_eq!(
+        output
+            .matches("\n[stall] `read_file` repeated a failed call; reminded the model\n")
+            .count(),
+        1,
+        "{output}"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    // After the first failure, nothing; after the repeat, the note follows the result.
+    let first = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(first.last().unwrap()["role"], "tool");
+    let second = requests[2].body["messages"].as_array().unwrap();
+    let note = second.last().unwrap();
+    assert_eq!(note["role"], "user");
+    assert!(note["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[stall] That call to `read_file` is the same as an earlier one"));
+    assert_eq!(second[second.len() - 2]["role"], "tool");
+    // Once a turn: the third failure (a repeated failure too) gets its own kind's
+    // reminder, never this one again.
+    let third = requests[3].body["messages"].as_array().unwrap();
+    assert!(third.last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[stall] `read_file` has now failed the same way 3 times"));
+
+    let events = trace_events(&traces);
+    let stalls = events_of(&events, "stall");
+    assert_eq!(stalls.len(), 2, "{events:?}");
+    assert_eq!(stalls[0]["shape"], "repeated_call");
+    assert_eq!(stalls[0]["tool"], "read_file");
+    assert_eq!(stalls[1]["shape"], "repeated_failure");
+    assert_eq!(stalls[1]["count"], 3);
+}
+
+#[tokio::test]
+async fn stall_nudge_off_leaves_the_turn_as_python_runs_it() {
+    let server = MockServer::start(vec![
+        read_missing("c1"),
+        read_missing("c2"),
+        sse_text("done", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("stall-off");
+    let limits = LimitsConfig {
+        stall_nudge: false,
+        ..limits()
+    };
+    let harness = window_harness(&server, &workspace, limits, Recorder::disabled());
+    let mut state = AgentState::new();
+    let output = harness
+        .run_turn(&mut state, "read missing.txt", |_| {})
+        .await
+        .unwrap();
+    assert!(!output.contains("[stall]"), "{output}");
+    let requests = server.requests();
+    let last = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(last.last().unwrap()["role"], "tool");
 }

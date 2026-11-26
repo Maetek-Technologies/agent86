@@ -1013,6 +1013,8 @@ impl Harness {
         let mut unanswered_thinking = String::new();
         // Beyond Python: the verification gate's progress (`crate::verify`).
         let mut verify_run = crate::verify::VerifyRun::default();
+        // Beyond Python: one reminder per way of going in circles (`crate::stall`).
+        let mut stall = crate::stall::StallWatch::new(self.limits.stall_nudge);
 
         loop {
             // Never start another model call once cancelled: that is the expensive,
@@ -1531,6 +1533,7 @@ impl Harness {
                 });
                 let ok = result.ok;
                 verify_run.saw(&call.name, ok);
+                stall.saw(call, &result, &content);
                 step.results.push(result);
                 if let Err(tripped) = breaker.record_tool_result(ok) {
                     record_step(state, step);
@@ -1538,7 +1541,11 @@ impl Harness {
                 }
             }
             // Every call has an observation by now, including any skipped because
-            // the cancel landed mid-batch.
+            // the cancel landed mid-batch, so a note can follow them.
+            if let Some(found) = stall.take() {
+                self.remind_of_stall(&found, &sid, &mut emit);
+                state.messages.push(message(Role::User, &found.note()));
+            }
             record_step(state, step);
             self.checkpoint(state);
             if self.cancel.is_cancelled() {
@@ -1596,6 +1603,26 @@ impl Harness {
             window.trim_announced = true;
             emit(TurnEvent::Notice(&trimmed_notice(fitted.dropped)));
         }
+    }
+
+    /// Beyond Python: say that the turn was going in circles and record it (a
+    /// `stall` trace event, since Python has none); the loop then sends the
+    /// model [`crate::stall::Stall::note`].
+    fn remind_of_stall(
+        &self,
+        found: &crate::stall::Stall,
+        sid: &str,
+        emit: &mut impl FnMut(TurnEvent<'_>),
+    ) {
+        emit(TurnEvent::Notice(&found.notice()));
+        let mut fields = vec![
+            ("shape", json!(found.kind.as_str())),
+            ("count", json!(found.count)),
+        ];
+        if let Some(tool) = &found.tool {
+            fields.push(("tool", json!(tool)));
+        }
+        self.recorder.event(sid, "stall", fields);
     }
 
     /// Beyond Python: a `context_age` trace event whenever the number of tool
@@ -2218,6 +2245,7 @@ mod tests {
             parallel_tools: true,
             tool_timeout_s: 60,
             context_sizing: true,
+            stall_nudge: true,
         }
     }
 
