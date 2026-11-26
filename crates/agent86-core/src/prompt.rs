@@ -53,13 +53,33 @@ pub fn time_note(now: &jiff::ZonedDateTime) -> String {
     )
 }
 
-/// Compile the system prompt into a single system message.
+/// Where `run_command` and `python_exec` run, for the environment line (beyond
+/// Python, whose line names no platform). Without it a model assumes Linux: in
+/// the eval set on Windows, two runs in three spent calls on `python3`,
+/// `/home/...`, or `/usr/bin`, none of which work there.
+pub fn platform_note(sandbox: crate::config::SandboxMode) -> String {
+    use crate::config::SandboxMode;
+    let (platform, shell, python) = match sandbox {
+        SandboxMode::Docker => ("Linux, in a container", "/bin/sh", "python"),
+        SandboxMode::Subprocess if cfg!(windows) => ("Windows", "cmd.exe", "python"),
+        SandboxMode::Subprocess if cfg!(target_os = "macos") => ("macOS", "/bin/sh", "python3"),
+        SandboxMode::Subprocess => ("Linux", "/bin/sh", "python3"),
+    };
+    format!(
+        "Platform: {platform}; run_command runs each command with {shell} in the workspace, and \
+         Python is `{python}`."
+    )
+}
+
+/// Compile the system prompt into a single system message. Beyond Python, the
+/// environment line names the platform ([`platform_note`]).
 pub fn build_system_prompt(config: &Config, skills: &crate::skills::Skills) -> Message {
     let mut content = format!(
-        "{}\n\nEnvironment: agent86 v{}. Default model: {}. Sandbox: {}.",
+        "{}\n\nEnvironment: agent86 v{}. Default model: {}. {} Sandbox: {}.",
         BASE_IDENTITY.trim(),
         env!("CARGO_PKG_VERSION"),
         config.model.default,
+        platform_note(config.sandbox.mode),
         config.sandbox.mode.as_str(),
     );
     content.push_str(&skills_section(skills.values().map(AsRef::as_ref)));
@@ -116,5 +136,26 @@ mod tests {
              2026-10-30 01:05 UTC. Tool results can be cached or out of date: when the \
              question is about the present, check the dates they carry."
         );
+    }
+
+    #[test]
+    fn the_platform_note_names_the_shell_and_python_run_command_gets() {
+        use crate::config::SandboxMode;
+        assert_eq!(
+            platform_note(SandboxMode::Docker),
+            "Platform: Linux, in a container; run_command runs each command with /bin/sh in \
+             the workspace, and Python is `python`."
+        );
+        let local = platform_note(SandboxMode::Subprocess);
+        if cfg!(windows) {
+            assert_eq!(
+                local,
+                "Platform: Windows; run_command runs each command with cmd.exe in the \
+                 workspace, and Python is `python`."
+            );
+        } else {
+            assert!(local.contains("/bin/sh"), "{local}");
+            assert!(local.ends_with("Python is `python3`."), "{local}");
+        }
     }
 }
