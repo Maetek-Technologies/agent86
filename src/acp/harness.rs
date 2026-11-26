@@ -1903,6 +1903,19 @@ impl Backend for HarnessBackend {
             if !surfaces.is_empty() {
                 history.push(Update::Ui(surfaces));
             }
+        } else if let Ok(ui) =
+            crate::agent86ui::UiSession::new(vec![crate::sdk::Catalog::basic().clone()])
+        {
+            // A client that cannot draw them (ADR 0005's text fallback, as amended
+            // 2026-11-26): surfaces drawn elsewhere (the terminal, a desktop app,
+            // a client with the a2ui extension) that are still up, so the model
+            // may be waiting on one, are rebuilt here only to be shown as text.
+            let ui = ui.with_egress(self.config.guardrails.egress);
+            if ui.replay(&session.state, &session.harness.context) > 0 {
+                for text in ui.surface_texts() {
+                    history.push(Update::Message(format!("\n\n{text}\n")));
+                }
+            }
         }
         Ok(history)
     }

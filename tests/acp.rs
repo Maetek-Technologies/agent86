@@ -1160,7 +1160,7 @@ async fn a_client_that_renders_a2ui_draws_surfaces_and_answers_a_waiting_call() 
 }
 
 #[tokio::test]
-async fn a_dismissed_surface_stays_up_and_a_loaded_session_draws_it_again() {
+async fn a_dismissed_surface_stays_up_and_a_loaded_session_shows_it_again() {
     let server = MockServer::start(vec![
         sse_tool_calls(&[("c1", "render_ui", &name_form(true))]),
         sse_text("Tell me when you are ready.", "stop"),
@@ -1194,6 +1194,7 @@ async fn a_dismissed_surface_stays_up_and_a_loaded_session_draws_it_again() {
     );
 
     let loaded = tokio::task::spawn_blocking({
+        let (session, project) = (session.clone(), project.clone());
         let mut client = workspace.connect();
         move || {
             client.initialize_with(renders_a2ui());
@@ -1219,6 +1220,29 @@ async fn a_dismissed_surface_stays_up_and_a_loaded_session_draws_it_again() {
             .as_array()
             .is_some_and(|c| c.len() == 4),
         "{surface}"
+    );
+
+    // A client that cannot draw it gets the surface as text after the history,
+    // and no render notification (the test client fails on one).
+    let as_text = tokio::task::spawn_blocking({
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let loaded = client.load_session(&session, &project);
+            client.finish();
+            loaded
+        }
+    })
+    .await
+    .unwrap();
+    assert!(as_text.ui.is_empty());
+    let shown = as_text.text_of("agent_message_chunk");
+    assert!(
+        shown.ends_with(
+            "\n\n[agent86UI surface \"form\": this client cannot draw it, so it is shown as \
+             text; answer in your reply]\nName: (empty)\n[OK]\n"
+        ),
+        "{shown}"
     );
 }
 
