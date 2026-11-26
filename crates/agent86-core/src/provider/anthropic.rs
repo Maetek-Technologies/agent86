@@ -118,6 +118,8 @@ pub struct AnthropicProvider {
     pricing: PriceTable,
     /// The name usage is priced under, normally the `provider:model` ref.
     price_ref: String,
+    /// The section's `temperature` (beyond Python).
+    temperature: Option<f32>,
 }
 
 impl fmt::Debug for AnthropicProvider {
@@ -269,7 +271,15 @@ impl AnthropicProvider {
             config,
             client,
             pricing: PriceTable::builtin(),
+            temperature: None,
         })
+    }
+
+    /// The section's `temperature` (beyond Python), which the harness sends
+    /// unless a specialty sets its own (`Provider::temperature`).
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
     }
 
     /// Price usage with `pricing`, looked up under `price_ref` (see the OpenAI adapter).
@@ -311,7 +321,9 @@ impl AnthropicProvider {
             payload["tools"] = Value::Array(tools);
         }
         if supports_sampling_params(&self.model) {
-            payload["temperature"] = json!(request.temperature);
+            // The Messages API takes 0 to 1; a setting meant for an
+            // OpenAI-compatible model (up to 2) is held at its top.
+            payload["temperature"] = super::temperature_json(request.temperature.clamp(0.0, 1.0));
         }
         payload["stream"] = json!(true);
         payload
@@ -367,6 +379,10 @@ impl AnthropicProvider {
 }
 
 impl Provider for AnthropicProvider {
+    fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
     fn fresh(&self) -> Result<std::sync::Arc<dyn Provider>, ProviderError> {
         Ok(std::sync::Arc::new(Self {
             model: self.model.clone(),
@@ -382,6 +398,7 @@ impl Provider for AnthropicProvider {
                 })?,
             pricing: self.pricing.clone(),
             price_ref: self.price_ref.clone(),
+            temperature: self.temperature,
         }))
     }
 

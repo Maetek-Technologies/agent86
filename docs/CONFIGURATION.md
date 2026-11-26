@@ -51,3 +51,14 @@ OpenRouter may serve a model from a host that handles it badly, for example one 
 [providers.openrouter.routing]
 ignore = ["Phala"]
 ```
+
+## Temperature
+
+agent86 sends `temperature` 0.0 to every model, as the Python version did. A provider section can set its own, from 0 to 2, for a model whose vendor recommends sampling at a higher temperature (many thinking models do):
+
+```toml
+[providers.vllm]
+temperature = 0.6
+```
+
+A specialist sub-agent can set its own in its frontmatter (`temperature: 1.0`), which wins over its model's section ([subagents.md](subagents.md)). Summaries always use 0.0. Anthropic's API takes 0 to 1, so a higher value is sent as 1; Gemini takes no sampling settings, so the setting does nothing there, and neither does it for a model that refuses sampling parameters. Like every provider setting, it needs a project to be trusted when it is set in the project's file.

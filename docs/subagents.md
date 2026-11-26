@@ -213,8 +213,8 @@ project file the model sees before approval.
 
 *Proposed:* parsing fails closed. A `tools:` line that is present but empty means no
 tools, so the parser has to tell empty from missing (for a skill, an empty list means
-unrestricted). A malformed `approval`, `confirm`, `skills`, `max_steps`, `isolation`,
-or `tools` value, or a missing `description`, skips the file with a notice rather than
+unrestricted). A malformed `approval`, `confirm`, `skills`, `max_steps`, `temperature`,
+`isolation`, or `tools` value, or a missing `description`, skips the file with a notice rather than
 running it with that key ignored.
 A tool name that no tool has is not malformed (section 2). `tools` and
 `confirm` accept the spellings `parse_allowed_tools` does. `parse_allowed_tools` cannot
@@ -241,7 +241,9 @@ the system prompt.
 
 Resolution: a defined specialty's body replaces the generic persona; `model`
 selects its own model (see *Model* below); `max_steps` is clamped under the
-turn's `steps` as `agent_steps` already is. *Proposed:* an unknown `agent` is
+turn's `steps` as `agent_steps` already is; `temperature` (0 to 2, beyond Python,
+added 2026-11-25) is sent in place of its model's provider section's, or the
+default 0.0, under `delegate`, `/agent`, and `run --agent` alike. *Proposed:* an unknown `agent` is
 answered as a failed call naming the specialties available, with no sub-agent
 run. If a call gives both `agent` and `role`, `agent` decides. *Proposed:* `files`
 and `summary` also work with `role` alone, since they only add to the first

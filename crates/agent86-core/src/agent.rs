@@ -440,7 +440,7 @@ impl Harness {
     pub(crate) fn system_message(&self, extra: Option<&str>) -> Message {
         let offered = self.delegation_offered(&self.context, 0);
         // Beyond Python: under `run --agent`, the specialty's filtered prompt.
-        if let Some((persona, preloaded)) = self.subagents.main() {
+        if let Some((persona, preloaded, _)) = self.subagents.main() {
             return self.filtered_system(&persona, &self.context, &preloaded, offered, extra);
         }
         self.system_for(&self.context, offered, extra)
@@ -1088,7 +1088,11 @@ impl Harness {
                     model: provider.model().to_owned(),
                     messages: request_messages,
                     tools,
-                    temperature: 0.0,
+                    // Beyond Python: `run --agent`'s specialty, else the section's.
+                    temperature: request_temperature(
+                        provider.as_ref(),
+                        self.subagents.main().and_then(|main| main.2),
+                    ),
                     max_tokens: Some(self.output_cap()),
                     stream: true,
                 };
@@ -2167,6 +2171,12 @@ pub fn observation(result: &ToolResult) -> String {
         (true, false) => body.to_owned(),
         (true, true) => "error".to_owned(),
     }
+}
+
+/// The temperature a request sends, beyond Python's fixed 0.0: the specialty's
+/// own, else its model's provider section's, else 0.0. Summaries keep 0.0.
+pub(crate) fn request_temperature(provider: &dyn Provider, specialty: Option<f32>) -> f32 {
+    specialty.or_else(|| provider.temperature()).unwrap_or(0.0)
 }
 
 /// Tool arguments as Python's `json.dumps(..., ensure_ascii=False)`, cut at 160 characters.

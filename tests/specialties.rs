@@ -1372,3 +1372,51 @@ async fn slash_agent_reports_on_a_card_of_its_own_and_a_project_file_uses_the_sp
     assert_eq!(seen[0], format!("started {id} repo 1 false"));
     assert_eq!(seen[1], format!("finished {id} repo true"));
 }
+
+#[tokio::test]
+async fn a_specialtys_temperature_wins_over_its_providers() {
+    const WARM: &str =
+        "---\nname: warm\ndescription: Brainstorms.\ntools: list_dir\ntemperature: 1.2\n---\n\nIdeas.";
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("d", "delegate", r#"{"agent": "warm", "task": "Ideas?"}"#)]),
+        sse_text("Three ideas.", "stop"),
+        sse_tool_calls(&[("p", "delegate", r#"{"role": "helper", "task": "Check."}"#)]),
+        sse_text("Checked.", "stop"),
+        sse_text("Done.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::new("temperature");
+    let mut delegating = harness(&server, &workspace, vec![specialty(WARM)]);
+    delegating.provider = Arc::new(provider(&server, "test/model").with_temperature(Some(0.3)));
+    let mut state = AgentState::new();
+    delegating
+        .run_turn(&mut state, "brainstorm", |_| {})
+        .await
+        .unwrap();
+    let requests = server.requests();
+    let sent: Vec<&serde_json::Value> = requests.iter().map(|r| &r.body["temperature"]).collect();
+    // The main loop and a plain sub-agent take the section's; the specialty its own.
+    assert_eq!(
+        sent,
+        [
+            &serde_json::json!(0.3),
+            &serde_json::json!(1.2),
+            &serde_json::json!(0.3),
+            &serde_json::json!(0.3),
+            &serde_json::json!(0.3),
+        ]
+    );
+
+    // `run --agent`: the main loop runs as the specialty, at its temperature.
+    let server = MockServer::start(vec![sse_text("Ideas.", "stop")]).await;
+    let mut main = harness(&server, &workspace, vec![specialty(WARM)]);
+    let warm = main.context.specialties.found["warm"].clone();
+    main.become_specialty(&warm);
+    main.run_turn(&mut AgentState::new(), "brainstorm", |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        server.requests()[0].body["temperature"],
+        serde_json::json!(1.2)
+    );
+}
