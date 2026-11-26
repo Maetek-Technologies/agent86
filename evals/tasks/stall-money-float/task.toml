@@ -1,5 +1,5 @@
 category = "stall"
-measures = "a stall nudge (slice 3): rounding the floats, the obvious fix, fails other cases the same way"
+measures = "fixing what the docstrings say beyond the visible tests: 1.005 needs exact Decimals rounded half up, and only the hidden check sees the float left in the tax (meant for the stall nudge, but models go straight to Decimal)"
 timeout_s = 600
 goal = "test_money.py fails. Fix money.py so its functions do what their docstrings say. Do not change the tests."
 check = ["{python}", "-m", "unittest", "discover", "-s", "eval_check", "-t", "."]

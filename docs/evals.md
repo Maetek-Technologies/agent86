@@ -129,7 +129,7 @@ address, in nine categories:
 | `verify-semver` | verification | Semantic Versioning precedence, with many corners and few visible tests |
 | `stall-cwd` | stall | The stall nudge (slice 3): the error points at the settings file, which is fine, and the obvious fixes fail the same way |
 | `stall-circular-import` | stall | A circular import that reordering the imports does not fix |
-| `stall-money-float` | stall | Money in floats, where rounding them, the obvious fix, fails other cases |
+| `stall-money-float` | stall | Money in floats; the visible test on 1.005 needs exact Decimals rounded half up, and only the hidden check sees the tax still in floats (it measures fixing what the docstrings say beyond the tests: Qwen goes straight to Decimal, so it never stalls here) |
 | `tests-duration` | tests | Tests written by the agent, which must pass on the real code and catch six mutants, each breaking one documented rule |
 
 ## Adding a task
