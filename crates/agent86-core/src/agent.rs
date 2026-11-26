@@ -1483,6 +1483,8 @@ impl Harness {
             for notice in self.take_notices() {
                 emit(TurnEvent::Notice(&format!("{notice}\n")));
             }
+            // Questions shown as text (ADR 0006's text fallback), which end the turn.
+            let mut asked_in_text: Option<String> = None;
             for (call, (result, delegated)) in tool_calls.iter().zip(results) {
                 summary.tool_calls += 1;
                 // What render_ui drew goes to the surface, never to the session or
@@ -1512,7 +1514,14 @@ impl Harness {
                 };
                 // An `ask_user` call asks now (ADR 0006), after anything drawn
                 // before it in the batch is out.
-                let result = self.ask_questions(call, result, &sid, &mut emit);
+                let mut result = self.ask_questions(call, result, &sid, &mut emit);
+                if let Some(Value::String(text)) = result.metadata.remove(crate::ask::ASK_TEXT_KEY)
+                {
+                    asked_in_text = Some(match asked_in_text.take() {
+                        Some(earlier) => format!("{earlier}\n\n{text}"),
+                        None => text,
+                    });
+                }
                 let result = self.annotate_broken_json(call, result, &repairs, &mut broken_streak);
                 // What a sub-agent spent is what this turn spent: in the summary, the
                 // step, and the cost cap, but not as one of this turn's steps.
@@ -1552,6 +1561,30 @@ impl Harness {
                     record_step(state, step);
                     return Err(tripped);
                 }
+            }
+            // ADR 0006's text fallback: the questions are the agent's message, kept
+            // as an ordinary assistant message after the results (so the history
+            // alternates as every provider requires, and reads naturally on resume
+            // and in Python), and the turn ends without another model call. No new
+            // stop reason is stored; the user's reply is the next turn.
+            if let Some(questions) = asked_in_text {
+                emit(TurnEvent::Text(&questions));
+                state.messages.push(message(Role::Assistant, &questions));
+                record_step(state, step);
+                state.phase = AgentPhase::Done;
+                self.recorder.event(
+                    &sid,
+                    "turn_end",
+                    vec![
+                        ("status", json!("done")),
+                        ("steps", json!(breaker.steps())),
+                        ("continuations", json!(summary.continuations)),
+                    ],
+                );
+                if let Some(memory) = &self.memory {
+                    let _ = memory.add_episode(&sid, goal, &questions, &Default::default());
+                }
+                return Ok(output);
             }
             // Every call has an observation by now, including any skipped because
             // the cancel landed mid-batch, so a note can follow them.

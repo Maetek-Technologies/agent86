@@ -6,9 +6,9 @@
 mod support;
 
 use agent86::acp::{
-    A2UI_ACTION_METHOD, A2UI_CAPABILITY, A2UI_RENDER_METHOD, A2UI_WAIT_METHOD, SECRETS_CAPABILITY,
-    SECRET_FORGET_METHOD, SECRET_LIST_METHOD, SECRET_REQUEST_METHOD, SECRET_SET_METHOD,
-    STATE_CAPABILITY, STATE_METHOD,
+    A2UI_ACTION_METHOD, A2UI_CAPABILITY, A2UI_RENDER_METHOD, A2UI_WAIT_METHOD,
+    QUESTIONS_ASK_METHOD, QUESTIONS_CAPABILITY, SECRETS_CAPABILITY, SECRET_FORGET_METHOD,
+    SECRET_LIST_METHOD, SECRET_REQUEST_METHOD, SECRET_SET_METHOD, STATE_CAPABILITY, STATE_METHOD,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -144,6 +144,8 @@ impl Workspace {
             secret_entry: None,
             wants_ui: false,
             ui_answer: None,
+            wants_questions: false,
+            questions_answer: None,
             received: Vec::new(),
         }
     }
@@ -189,6 +191,11 @@ struct Client {
     /// How the user answers a surface the agent waits on: the A2UI action to send,
     /// or `None` to dismiss it.
     ui_answer: Option<Value>,
+    /// Whether `initialize` said this client draws `ask_user`'s questions itself.
+    wants_questions: bool,
+    /// What the user answers to the questions extension's request: the answers by
+    /// question id, or `None` to dismiss.
+    questions_answer: Option<Value>,
     /// Every stdout line, as read.
     received: Vec<String>,
 }
@@ -308,6 +315,16 @@ impl Client {
                         .iter()
                         .cloned(),
                 );
+                continue;
+            }
+            if message["method"] == QUESTIONS_ASK_METHOD {
+                assert!(self.wants_questions, "{message}");
+                let result = match &self.questions_answer {
+                    Some(answers) => json!({"answers": answers}),
+                    None => json!({"dismissed": true}),
+                };
+                self.send(&json!({"jsonrpc": "2.0", "id": message["id"], "result": result}));
+                requests.push(message);
                 continue;
             }
             if message["method"] == A2UI_WAIT_METHOD {
@@ -469,6 +486,8 @@ impl Client {
     fn initialize_with(&mut self, capabilities: Value) -> Value {
         self.wants_state = capabilities["_meta"][STATE_CAPABILITY] == json!(true);
         self.wants_ui = capabilities["_meta"][A2UI_CAPABILITY].is_object();
+        let questions = &capabilities["_meta"][QUESTIONS_CAPABILITY];
+        self.wants_questions = questions == &json!(true) || questions.is_object();
         self.request(
             "initialize",
             json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
@@ -1274,6 +1293,184 @@ async fn a_client_without_the_basic_catalog_is_not_offered_render_ui() {
     for request in server.requests() {
         assert!(!offers(&request, "render_ui"), "{}", request.body);
     }
+}
+
+// `ask_user` over ACP (ADR 0006, slice 5): the client's own form, agent86's form
+// through the a2ui extension, or text that ends the turn.
+
+const PLAN_QUESTION: &str = r#"{"title": "Your plan", "questions": [
+    {"id": "plan", "question": "Which plan?", "kind": "choice", "options": ["Free", "Pro"]},
+    {"id": "seats", "question": "How many seats?", "kind": "number", "optional": true}
+]}"#;
+
+/// The last message of the model's `n`th request.
+fn last_sent(server: &MockServer, n: usize) -> Value {
+    server.requests()[n].body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn a_client_with_its_own_form_is_asked_the_questions_and_its_answers_are_the_result() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "ask_user", PLAN_QUESTION)]),
+        sse_text("Pro it is.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config("acp-questions", Some(&server), AUTO);
+    let project = workspace.project();
+    let (init, turn) = tokio::task::spawn_blocking({
+        let mut client = workspace.connect();
+        move || {
+            client.questions_answer = Some(json!({"plan": "Pro", "seats": 3}));
+            let init = client.initialize_with(json!({"_meta": {QUESTIONS_CAPABILITY: true}}));
+            let session = client.new_session(&project);
+            let turn = client.prompt(&session, "Set up my plan");
+            client.finish();
+            (init, turn)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        init["result"]["agentCapabilities"]["_meta"][QUESTIONS_CAPABILITY],
+        json!({"version": 1})
+    );
+    assert_eq!(turn.response["result"]["stopReason"], "end_turn");
+    assert_eq!(turn.requests.len(), 1, "{:?}", turn.requests);
+    let asked = &turn.requests[0]["params"];
+    assert_eq!(asked["title"], "Your plan");
+    assert_eq!(asked["questions"][0]["options"], json!(["Free", "Pro"]));
+    assert_eq!(asked["questions"][1]["optional"], true);
+    assert!(asked["sessionId"].is_string());
+    let result = last_sent(&server, 1);
+    assert_eq!(result["role"], "tool");
+    assert_eq!(
+        result["content"],
+        "The user answered:\n{\"plan\": \"Pro\", \"seats\": 3}"
+    );
+    assert_eq!(turn.text_of("agent_message_chunk"), "Pro it is.");
+}
+
+#[tokio::test]
+async fn a_client_that_renders_a2ui_answers_agent86s_own_form() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "ask_user", PLAN_QUESTION)]),
+        sse_text("Free it is.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config("acp-questions-form", Some(&server), AUTO);
+    let project = workspace.project();
+    let turn = tokio::task::spawn_blocking({
+        let mut client = workspace.connect();
+        move || {
+            client.ui_answer = Some(json!({"name": "answers", "surfaceId": "agent86_ask_1",
+                "sourceComponentId": "send", "timestamp": "2026-11-26T10:00:00Z",
+                "context": {"answers": {"plan": ["Free"], "seats": null}, "other": {}}}));
+            client.initialize_with(renders_a2ui());
+            let session = client.new_session(&project);
+            let turn = client.prompt(&session, "Set up my plan");
+            client.finish();
+            turn
+        }
+    })
+    .await
+    .unwrap();
+    // The form is drawn, waited on, and taken down.
+    assert_eq!(turn.ui[0]["createSurface"]["surfaceId"], "agent86_ask_1");
+    assert_eq!(
+        turn.ui.last().unwrap()["deleteSurface"]["surfaceId"],
+        "agent86_ask_1"
+    );
+    assert_eq!(turn.requests[0]["method"], A2UI_WAIT_METHOD);
+    let content = last_sent(&server, 1)["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        content.starts_with("The user answered:\n{\"plan\": \"Free\""),
+        "{content}"
+    );
+    assert_eq!(turn.text_of("agent_message_chunk"), "Free it is.");
+}
+
+#[tokio::test]
+async fn any_other_client_gets_the_questions_as_text_and_the_turn_ends() {
+    let server = MockServer::start(vec![
+        sse_tool_calls(&[("c1", "ask_user", PLAN_QUESTION)]),
+        sse_text("Pro, for 3 seats.", "stop"),
+    ])
+    .await;
+    let workspace = Workspace::with_config("acp-questions-text", Some(&server), AUTO);
+    let project = workspace.project();
+    let (asked, answered) = tokio::task::spawn_blocking({
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            let asked = client.prompt(&session, "Set up my plan");
+            let answered = client.prompt(&session, "1 b, 2 three");
+            client.finish();
+            (asked, answered)
+        }
+    })
+    .await
+    .unwrap();
+    // One model call: the turn ended on the questions, which the user read.
+    assert_eq!(asked.response["result"]["stopReason"], "end_turn");
+    assert!(asked.requests.is_empty(), "{:?}", asked.requests);
+    let shown = asked.text_of("agent_message_chunk");
+    assert_eq!(
+        shown,
+        "Your plan\n\n1. Which plan?\n   a) Free  b) Pro, or say something else\n\
+         2. How many seats? (a number) (optional)\n\nAnswer in your reply, by number."
+    );
+    // The reply is the next turn; the history holds the call, its result, the
+    // questions as the agent's message, and the reply.
+    assert_eq!(answered.text_of("agent_message_chunk"), "Pro, for 3 seats.");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles[roles.len() - 4..],
+        ["assistant", "tool", "assistant", "user"]
+    );
+    assert!(messages[messages.len() - 3]["content"]
+        .as_str()
+        .unwrap()
+        .contains("shown to the user as text"));
+    assert_eq!(messages[messages.len() - 2]["content"], shown.as_str());
+    assert_eq!(messages[messages.len() - 1]["content"], "1 b, 2 three");
+}
+
+#[tokio::test]
+async fn ask_user_off_offers_no_questions_to_any_client() {
+    let server = MockServer::start(vec![sse_text("Hi.", "stop")]).await;
+    let workspace = Workspace::with_config(
+        "acp-questions-off",
+        Some(&server),
+        "[guardrails]\napproval = \"auto\"\n[ui]\nask_user = \"off\"\n",
+    );
+    let project = workspace.project();
+    tokio::task::spawn_blocking({
+        let mut client = workspace.connect();
+        move || {
+            client.initialize();
+            let session = client.new_session(&project);
+            client.prompt(&session, "Hello");
+            client.finish();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!offers(&server.requests()[0], "ask_user"));
 }
 
 #[tokio::test]

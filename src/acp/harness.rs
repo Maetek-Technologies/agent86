@@ -177,6 +177,48 @@ fn client_ui_waiter(sink: SinkSlot, session_id: String) -> crate::agent86ui::UiW
     })
 }
 
+/// `ask_user`'s hook for a client that draws the questions itself (beyond
+/// Python; ADR 0006): asks it with [`super::QUESTIONS_ASK_METHOD`] through the
+/// running turn's sink, the questions in the tool's own shape with any value
+/// the vault holds replaced by its placeholder, and waits as long as the user
+/// takes. No turn, an error, or a reply that is neither answers nor a dismissal
+/// is a dismissal; a cancel never reaches here (the queue declines first).
+fn client_questions_prompt(
+    sink: SinkSlot,
+    session_id: String,
+    secrets: crate::vault::SecretVault,
+) -> crate::ask::AskPrompt {
+    Box::new(move |form: &crate::ask::Form| {
+        let dismissed = crate::ask::Reply {
+            outcome: crate::ask::Outcome::Dismissed,
+            via: crate::ask::Via::Extension,
+        };
+        let Some(running) = sink.lock().unwrap_or_else(PoisonError::into_inner).clone() else {
+            return dismissed;
+        };
+        let shown = serde_json::to_string(form)
+            .ok()
+            .map(|form| secrets.redact(&form))
+            .and_then(|form| serde_json::from_str::<Value>(&form).ok());
+        let Some(Value::Object(form)) = shown else {
+            return dismissed;
+        };
+        let mut params = Map::new();
+        params.insert("sessionId".into(), json!(session_id));
+        params.extend(form);
+        match running.call(super::QUESTIONS_ASK_METHOD, Value::Object(params), None) {
+            Ok(reply) => match reply.get("answers") {
+                Some(Value::Object(answers)) => crate::ask::Reply {
+                    outcome: crate::ask::Outcome::Answered(answers.clone()),
+                    via: crate::ask::Via::Extension,
+                },
+                _ => dismissed,
+            },
+            Err(_) => dismissed,
+        }
+    })
+}
+
 /// The client's answer to [`super::A2UI_WAIT_METHOD`]: the action, or `None`.
 /// Whether the action could have come from the surfaces waited on is the
 /// loop's to check.
@@ -1197,6 +1239,23 @@ impl HarnessBackend {
             if let Some(ui) = assembly.harness.context.ui.clone() {
                 ui.replay(&state, &assembly.harness.context);
             }
+        }
+        // `ask_user` (beyond Python; ADR 0006), unless `[ui] ask_user = "off"`:
+        // the client's own form where it draws one, else agent86's form through
+        // the a2ui extension, else the questions as text that ends the turn.
+        if self.config.ui.ask_user == crate::config::AskUserMode::Auto {
+            let offered = if self.client.questions {
+                assembly.harness.attach_questions(client_questions_prompt(
+                    Arc::clone(&sink),
+                    session_id.clone(),
+                    secrets.clone(),
+                ))
+            } else if self.client.a2ui {
+                assembly.harness.offer_questions_as_forms().map(|_| ())
+            } else {
+                assembly.harness.offer_questions_as_text()
+            };
+            offered.map_err(BackendError::internal)?;
         }
         self.remember_cwd(&session_id, cwd);
         let session = Session {
