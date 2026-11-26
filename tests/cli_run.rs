@@ -380,9 +380,10 @@ async fn run_streams_the_answer_to_stdout_and_the_summary_to_stderr() {
     let expected_system = format!(
         "{}
 
-Environment: agent86 v{}. Default model: mock:test/model. Sandbox: subprocess.",
+Environment: agent86 v{}. Default model: mock:test/model. {} Sandbox: subprocess.",
         fixture("prompt/base_identity.txt").trim(),
         env!("CARGO_PKG_VERSION"),
+        agent86::prompt::platform_note(agent86::config::SandboxMode::Subprocess),
     );
     assert_eq!(
         without_time(messages[0]["content"].as_str().unwrap()),
@@ -741,7 +742,10 @@ async fn the_system_prompt_reports_overridden_model_and_sandbox() {
         .unwrap()
         .to_owned();
     assert!(
-        without_time(&system).ends_with("Default model: mock:other-model. Sandbox: docker."),
+        without_time(&system).ends_with(&format!(
+            "Default model: mock:other-model. {} Sandbox: docker.",
+            agent86::prompt::platform_note(agent86::config::SandboxMode::Docker)
+        )),
         "{system}"
     );
 }

@@ -32,7 +32,10 @@ fn the_prompt_is_the_identity_plus_the_environment_line() {
 
     assert_eq!(message.role, Role::System);
     let expected = format!(
-        "{}\n\nEnvironment: agent86 v{}. Default model: openrouter:openai/gpt-4o-mini. Sandbox: docker.",
+        // Beyond Python: the platform, before the sandbox.
+        "{}\n\nEnvironment: agent86 v{}. Default model: openrouter:openai/gpt-4o-mini. \
+         Platform: Linux, in a container; run_command runs each command with /bin/sh in the \
+         workspace, and Python is `python`. Sandbox: docker.",
         fixture("prompt/base_identity.txt").trim(),
         env!("CARGO_PKG_VERSION"),
     );
