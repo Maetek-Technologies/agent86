@@ -45,6 +45,7 @@ compaction = "summarize"
 parallel_tools = true
 tool_timeout_s = 60
 context_sizing = true
+stall_nudge = true
 
 [sandbox]
 mode = "subprocess"
@@ -404,6 +405,10 @@ pub struct LimitsConfig {
     /// sent as stubs once it fills, and the budget calibrated against reported
     /// tokens (`crate::memory::sizing`). `false` fits requests as Python does.
     pub context_sizing: bool,
+    /// Beyond Python: one reminder when the turn goes in circles (a failed call
+    /// repeated, the same failure despite changes, reads without acting;
+    /// `crate::stall`). `false` leaves only the circuit breaker, as in Python.
+    pub stall_nudge: bool,
 }
 
 /// `[skills]`.

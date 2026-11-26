@@ -1,0 +1,4 @@
+# The stall nudge off (slice 3): only the circuit breaker, as in Python, for a
+# comparison with one binary (`--variant evals/variants/no-stall.toml`).
+[limits]
+stall_nudge = false

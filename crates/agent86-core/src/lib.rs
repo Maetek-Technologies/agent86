@@ -70,6 +70,8 @@ pub mod skills;
 #[doc(hidden)]
 pub mod specialty_turn;
 #[doc(hidden)]
+pub mod stall;
+#[doc(hidden)]
 pub mod subagent;
 #[doc(hidden)]
 pub mod tools;

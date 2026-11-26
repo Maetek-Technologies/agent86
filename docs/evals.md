@@ -33,7 +33,8 @@ cargo run -p agent86-eval -- run --model lmstudio:google/gemma-4-12b-qat \
   `evals/variants/drop.toml` turns compaction off; `evals/variants/no-sizing.toml`
   turns off context sizing (slice 2b), for a comparison with one binary;
   `evals/variants/verify.toml` turns on the verification gate (slice 1) with the
-  workspace's unittest suite.
+  workspace's unittest suite; `evals/variants/no-stall.toml` turns off the stall
+  nudge (slice 3).
 - `--window N` gives every model an N-token window (`[model.context_window]`),
   to run a large-window server as a small one. The plan's target is 32,768.
 - `--jobs N` runs N at a time (default 1; a local server may handle more).

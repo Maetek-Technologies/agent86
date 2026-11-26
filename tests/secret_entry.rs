@@ -64,6 +64,7 @@ fn limits() -> LimitsConfig {
         parallel_tools: true,
         tool_timeout_s: 60,
         context_sizing: true,
+        stall_nudge: true,
     }
 }
 
